@@ -1,0 +1,15 @@
+/target/
+**/target/
+*.rs.bk
+*.profraw
+*.profdata
+/.cache/
+/.venv-tools/
+*.tmp
+*.log
+nohup.out
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store

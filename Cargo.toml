@@ -1,0 +1,27 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/av1oxide",
+]
+exclude = [
+    ".cache",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.100.0"
+license = "BSD-2-Clause"
+repository = "https://github.com/hakantr/av1oxide"
+
+[workspace.lints.rust]
+missing_docs = "warn"
+
+[workspace.lints.rustdoc]
+private_intra_doc_links = "allow"
+redundant_explicit_links = "allow"
+
+[profile.robust]
+inherits = "release"
+overflow-checks = true
+debug-assertions = true
