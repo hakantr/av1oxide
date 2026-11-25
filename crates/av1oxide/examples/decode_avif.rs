@@ -1,4 +1,4 @@
-//! `av1oxide` `.avif` görüntü inceleme ve çözme örneği (`v0.3.1`).
+//! `av1oxide` `.avif` görüntü inceleme ve çözme örneği (`v0.3.2`).
 //!
 //! Çalıştırma:
 //!   cargo run --release -p av1oxide --example decode_avif

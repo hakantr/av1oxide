@@ -6,20 +6,67 @@ use crate::avif::image::{AvifImage, Rgb16Image, RgbImage, Rgba16Image, RgbaImage
 use crate::error::{Error, Result, SizeStage};
 use crate::frame::{BitDepth, ChromaFormat};
 
+/// `color_primaries` kod noktasına karşılık gelen CIE 1931 `(rX, rY, gX, gY, bX, bY, wX, wY)`
+/// birincil renk ve beyaz nokta koordinatlarını döndürür (`ITU-T H.273` Tablo 2).
+#[inline]
+fn color_primaries_cie_xy(color_primaries: u16) -> [f32; 8] {
+    match color_primaries {
+        1 => [0.64, 0.33, 0.30, 0.60, 0.15, 0.06, 0.3127, 0.3290], // BT.709
+        4 => [0.67, 0.33, 0.21, 0.71, 0.14, 0.08, 0.310, 0.316],   // BT.470M
+        5 => [0.64, 0.33, 0.29, 0.60, 0.15, 0.06, 0.3127, 0.3290], // BT.470BG
+        6 | 7 => [0.630, 0.340, 0.310, 0.595, 0.155, 0.070, 0.3127, 0.3290], // BT.601 / SMPTE 240M
+        8 => [0.681, 0.319, 0.243, 0.692, 0.145, 0.049, 0.310, 0.316], // Generic film
+        9 => [0.708, 0.292, 0.170, 0.797, 0.131, 0.046, 0.3127, 0.3290], // BT.2020
+        10 => [1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.3333, 0.3333],      // SMPTE ST 428-1 (XYZ)
+        11 => [0.680, 0.320, 0.265, 0.690, 0.150, 0.060, 0.314, 0.351], // SMPTE RP 431-2 (DCI P3)
+        12 => [0.680, 0.320, 0.265, 0.690, 0.150, 0.060, 0.3127, 0.3290], // SMPTE EG 432-1 (Display P3)
+        22 => [0.630, 0.340, 0.295, 0.605, 0.155, 0.077, 0.3127, 0.3290], // EBU Tech. 3213-E
+        _ => [0.64, 0.33, 0.30, 0.60, 0.15, 0.06, 0.3127, 0.3290],        // Varsayılan (BT.709)
+    }
+}
+
+/// Birincil renk koordinatlarından parlaklık katsayılarını `(Kr, Kb)` türetir (`ITU-T H.273` Denkl. 32–37).
+#[inline]
+fn chroma_derived_kr_kb(color_primaries: u16) -> (f32, f32) {
+    let [rx, ry, gx, gy, bx, by, wx, wy] = color_primaries_cie_xy(color_primaries);
+    let rz = 1.0f32 - (rx + ry);
+    let gz = 1.0f32 - (gx + gy);
+    let bz = 1.0f32 - (bx + by);
+    let wz = 1.0f32 - (wx + wy);
+    let denom =
+        wy * (rx * (gy * bz - by * gz) + gx * (by * rz - ry * bz) + bx * (ry * gz - gy * rz));
+    let kr = (ry
+        * (wx * (gy * bz - by * gz) + wy * (bx * gz - gx * bz) + wz * (gx * by - bx * gy)))
+        / denom;
+    let kb = (by
+        * (wx * (ry * gz - gy * rz) + wy * (gx * rz - rx * gz) + wz * (rx * gy - gx * ry)))
+        / denom;
+    (kr, kb)
+}
+
+/// Doğrusal YUV → RGB dönüşümünde desteklenmeyen veya ayrılmış `ITU-T H.273` `matrix_coefficients`
+/// kod noktalarını denetler.
+#[inline]
+fn validate_matrix_coefficients(matrix_coefficients: u16) -> Result<()> {
+    match matrix_coefficients {
+        0 | 1 | 2 | 4..=9 | 12 | 16 | 17 => Ok(()),
+        _ => Err(Error::Unsupported(
+            "doğrusal olmayan veya ayrılmış H.273 matrix_coefficients değeri doğrusal RGB dönüşümünde desteklenmiyor",
+        )),
+    }
+}
+
 /// `matrix_coefficients` değerine karşılık gelen `(Kr, Kb)` katsayılarını döndürür (`ITU-T H.273`).
 #[inline]
 fn matrix_kr_kb(matrix_coefficients: u16, color_primaries: u16) -> (f32, f32) {
     match matrix_coefficients {
-        1 => (0.2126, 0.0722),      // BT.709
-        4 => (0.30, 0.11),          // FCC
-        5 | 6 => (0.299, 0.114),    // BT.470BG / BT.601
-        7 => (0.212, 0.087),        // SMPTE ST 240
-        9 | 10 => (0.2627, 0.0593), // BT.2020 NCL
-        12 => match color_primaries {
-            9 => (0.2627, 0.0593),
-            _ => (0.2126, 0.0722),
-        },
-        _ => (0.299, 0.114), // Varsayılan (2 = Unspecified -> BT.601)
+        1 => (0.2126, 0.0722),   // BT.709
+        4 => (0.30, 0.11),       // FCC
+        5 | 6 => (0.299, 0.114), // BT.470BG / BT.601
+        7 => (0.212, 0.087),     // SMPTE ST 240
+        9 => (0.2627, 0.0593),   // BT.2020 NCL
+        12 => chroma_derived_kr_kb(color_primaries),
+        _ => (0.299, 0.114), // Varsayılan (2 = Unspecified -> MIAF §7.3.6.4 BT.601)
     }
 }
 
@@ -219,6 +266,7 @@ fn rescale_alpha_u8(src_alpha: u16, bit_depth: BitDepth) -> u8 {
 
 /// [`AvifImage`] düzlemlerini 16-bit RGB tamponuna dönüştürür.
 pub(crate) fn image_to_rgb16(img: &AvifImage) -> Result<Rgb16Image> {
+    validate_matrix_coefficients(img.color.matrix_coefficients)?;
     let w = img.width as usize;
     let h = img.height as usize;
     let cw = img.chroma_width as usize;
@@ -289,6 +337,7 @@ pub(crate) fn image_to_rgb16(img: &AvifImage) -> Result<Rgb16Image> {
 
 /// [`AvifImage`] düzlemlerini 16-bit RGBA tamponuna dönüştürür.
 pub(crate) fn image_to_rgba16(img: &AvifImage) -> Result<Rgba16Image> {
+    validate_matrix_coefficients(img.color.matrix_coefficients)?;
     let w = img.width as usize;
     let h = img.height as usize;
     let cw = img.chroma_width as usize;
@@ -366,6 +415,7 @@ pub(crate) fn image_to_rgba16(img: &AvifImage) -> Result<Rgba16Image> {
 
 /// [`AvifImage`] düzlemlerini 8-bit RGB tamponuna dönüştürür.
 pub(crate) fn image_to_rgb8(img: &AvifImage) -> Result<RgbImage> {
+    validate_matrix_coefficients(img.color.matrix_coefficients)?;
     let w = img.width as usize;
     let h = img.height as usize;
     let cw = img.chroma_width as usize;
@@ -435,6 +485,7 @@ pub(crate) fn image_to_rgb8(img: &AvifImage) -> Result<RgbImage> {
 
 /// [`AvifImage`] düzlemlerini 8-bit RGBA tamponuna dönüştürür.
 pub(crate) fn image_to_rgba8(img: &AvifImage) -> Result<RgbaImage> {
+    validate_matrix_coefficients(img.color.matrix_coefficients)?;
     let w = img.width as usize;
     let h = img.height as usize;
     let cw = img.chroma_width as usize;
@@ -507,4 +558,41 @@ pub(crate) fn image_to_rgba8(img: &AvifImage) -> Result<RgbaImage> {
         height: img.height,
         pixels,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{chroma_derived_kr_kb, validate_matrix_coefficients};
+    use crate::error::Error;
+
+    #[test]
+    fn h273_chroma_derived_kr_kb_matches_cie_primaries() {
+        // BT.709 (1): (0.2126, 0.0722)
+        let (kr709, kb709) = chroma_derived_kr_kb(1);
+        assert!((kr709 - 0.212639).abs() < 1e-4);
+        assert!((kb709 - 0.072192).abs() < 1e-4);
+
+        // BT.2020 (9): (0.2627, 0.0593)
+        let (kr2020, kb2020) = chroma_derived_kr_kb(9);
+        assert!((kr2020 - 0.262700).abs() < 1e-4);
+        assert!((kb2020 - 0.059302).abs() < 1e-4);
+
+        // Display P3 / SMPTE EG 432-1 (12): (0.228975, 0.079287)
+        let (kr_p3, kb_p3) = chroma_derived_kr_kb(12);
+        assert!((kr_p3 - 0.228975).abs() < 1e-4);
+        assert!((kb_p3 - 0.079287).abs() < 1e-4);
+    }
+
+    #[test]
+    fn h273_nonlinear_and_reserved_matrices_return_unsupported() {
+        for supported in [0u16, 1, 2, 4, 5, 6, 7, 8, 9, 12, 16, 17] {
+            assert_eq!(validate_matrix_coefficients(supported), Ok(()));
+        }
+        for unsupported in [3u16, 10, 11, 13, 14, 15, 18, 255] {
+            assert!(matches!(
+                validate_matrix_coefficients(unsupported),
+                Err(Error::Unsupported(_))
+            ));
+        }
+    }
 }

@@ -1,4 +1,4 @@
-# av1oxide (`v0.3.1`)
+# av1oxide (`v0.3.2`)
 
 [English](README.md) | **Türkçe**
 

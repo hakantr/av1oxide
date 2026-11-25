@@ -452,7 +452,7 @@ fn frame_from_c_picture(pic: &Dav1dPicture) -> Result<Frame, c_int> {
     Ok(frame)
 }
 
-/// Kütüphane sürüm dizesini döndürür (`"0.3.1"`).
+/// Kütüphane sürüm dizesini döndürür (`"0.3.2"`).
 ///
 /// # Safety
 ///
@@ -460,7 +460,7 @@ fn frame_from_c_picture(pic: &Dav1dPicture) -> Result<Frame, c_int> {
 /// geçerli bir C karakter dizesi işaretçisi döndürür.
 #[cfg_attr(feature = "capi", unsafe(no_mangle))]
 pub unsafe extern "C" fn dav1d_version() -> *const c_char {
-    c"0.3.1".as_ptr()
+    c"0.3.2".as_ptr()
 }
 
 /// `libdav1d` C-ABI sürüm numarasını (`0x0007_0000`) döndürür.
