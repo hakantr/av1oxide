@@ -14,6 +14,7 @@
 
 #![forbid(unsafe_code)]
 
+#[path = "common/helpers.rs"]
 mod common;
 
 use av1oxide::dsp::mc::{EmuEdgeFn, McDsp, skaler_devir_sayisi};

@@ -20,6 +20,7 @@
 
 #![forbid(unsafe_code)]
 
+#[path = "common/helpers.rs"]
 mod common;
 
 use common::cdef_fixture::{

@@ -538,7 +538,7 @@ fn x86_govdelerine_tek_giris_select() {
         }
         let text = fs::read_to_string(&file).expect("kaynak okunmalı");
         let lines = code_lines(&text);
-        if rel == "dsp/mod.rs" {
+        if rel == "dsp.rs" {
             // P30: tek giriş `DspDispatch::candidate_entry`'dir (kurulum ve
             // ölçüm onu çağırır); x86 başvurusu yalnız o işlevin gövdesinde.
             let govde = text

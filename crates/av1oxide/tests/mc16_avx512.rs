@@ -8,6 +8,7 @@
 
 #![forbid(unsafe_code)]
 
+#[path = "common/helpers.rs"]
 mod common;
 
 use av1oxide::dsp::mc::{Filter2d, MC_KUYRUK, McDsp, McPrepFn, McPutFn, skaler_devir_sayisi};

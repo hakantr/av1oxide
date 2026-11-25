@@ -28,6 +28,7 @@
 )]
 #![forbid(unsafe_code)]
 
+#[path = "common/helpers.rs"]
 mod common;
 
 use std::fs::File;

@@ -26,6 +26,9 @@ smallvec = { version = "1", default-features = false }
 [workspace.lints.cargo]
 unused_dependencies = "deny"
 
+[workspace.lints.clippy]
+mod_module_files = "deny"
+
 [workspace.lints.rust]
 missing_docs = "warn"
 

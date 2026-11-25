@@ -16,6 +16,7 @@
 //! (`DspDispatch::select(CpuFlags::detect())`); AVX2'siz makinede yalnız
 //! skaler yol sınanır.
 
+#[path = "common/helpers.rs"]
 mod common;
 
 #[cfg(target_arch = "x86_64")]

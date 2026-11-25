@@ -10,6 +10,7 @@
 
 #![forbid(unsafe_code)]
 
+#[path = "common/helpers.rs"]
 mod common;
 
 use av1oxide::dsp::mc::{MC_KUYRUK, McDsp, skaler_devir_sayisi};

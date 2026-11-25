@@ -33,6 +33,7 @@
 
 #![forbid(unsafe_code)]
 
+#[path = "common/helpers.rs"]
 mod common;
 
 use av1oxide::dsp::itx::{TX_SIZES, TX_TYPES, TxSize, TxType, is_supported};

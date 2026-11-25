@@ -10,6 +10,7 @@
 #![forbid(unsafe_code)]
 #![allow(clippy::too_many_arguments, clippy::needless_range_loop)]
 
+#[path = "common/helpers.rs"]
 mod common;
 
 use av1oxide::bitstream::frame_header::FilmGrainData;

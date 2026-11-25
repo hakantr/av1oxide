@@ -38,7 +38,7 @@ mod envanter;
 /// donanım zorunluluğu olmalıdır).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct UnsafeExemption {
-    /// Crate'e göre modül yolu (ör. `dsp/x86/mod.rs`).
+    /// Crate'e göre modül yolu (ör. `dsp/x86.rs`).
     pub module: &'static str,
     /// Muafiyetin gerekçesi (profil sonucu veya donanım zorunluluğu).
     pub reason: &'static str,
@@ -54,7 +54,7 @@ pub struct UnsafeExemption {
 /// toplandı. **F3d (P27):** yalnız test derlemesine giren x86 sözlük lane
 /// testleri (`dsp/x86/sozluk.rs`, `cfg(test)`) eklendi. Kapsam bilinçli olarak
 /// dardır: `unsafe` yalnız bu dört dosyadadır;
-/// kardeş modüller (`dsp/x86/mod.rs`, `dsp/mod.rs`, `dsp/cdef.rs`,
+/// kardeş modüller (`dsp/x86.rs`, `dsp.rs`, `dsp/cdef.rs`,
 /// `dsp/mc.rs`, `dsp/scalar/*`) ve diğer tüm modüller
 /// `#![forbid(unsafe_code)]` (ya da `deny`) taşır.
 pub const UNSAFE_EXEMPTIONS: &[UnsafeExemption] = &[
@@ -63,7 +63,7 @@ pub const UNSAFE_EXEMPTIONS: &[UnsafeExemption] = &[
         reason: "libdav1d (7.0.0) C-ABI uyumluluk katmanı FFI sınır dosyası: 19 `extern \"C\"` giriş noktasında \
                  C çağıranı tarafından verilen ham işaretçilerin null/boyut doğrulaması sonrası okunması/yazılması ve \
                  `Arc::into_raw`/`Arc::from_raw` tabanlı `Dav1dRef` referans sayımı; tüm FFI girişleri `catch_unwind` \
-                 ile sarılıdır ve kardeş modüller (`capi/mod.rs`, `capi/types.rs`, `capi/convert.rs`) `%100 #![forbid(unsafe_code)]` \
+                 ile sarılıdır ve kardeş modüller (`capi.rs`, `capi/types.rs`, `capi/convert.rs`) `%100 #![forbid(unsafe_code)]` \
                  altındadır.",
         phase: "v0.2.0",
     },
@@ -778,11 +778,11 @@ mod tests {
                 .expect("src altında olmalı")
                 .to_string_lossy()
                 .replace('\\', "/");
-            // Bu dosya (audit/mod.rs) politikayı **tanımlar** ve anahtar
+            // Bu dosya (audit.rs) politikayı **tanımlar** ve anahtar
             // sözcüğü zorunlu olarak adlandırır; kendi metnini taramak yanlış
             // pozitif üretir. Orada yaptırım `#![forbid(...)]`tir — derleyici
             // kesin kaynaktır.
-            if rel == "audit/mod.rs" {
+            if rel == "audit.rs" {
                 continue;
             }
             let text = fs::read_to_string(&file).expect("kaynak okunmalı");
@@ -832,7 +832,7 @@ mod tests {
                 .expect("src altında olmalı")
                 .to_string_lossy()
                 .replace('\\', "/");
-            if rel == "audit/mod.rs" {
+            if rel == "audit.rs" {
                 continue;
             }
             let text = fs::read_to_string(&file).expect("kaynak okunmalı");
@@ -929,10 +929,10 @@ mod tests {
                 .expect("src altında olmalı")
                 .to_string_lossy()
                 .replace('\\', "/");
-            // Bu dosya (audit/mod.rs) politikayı **tanımlar** ve anahtar
+            // Bu dosya (audit.rs) politikayı **tanımlar** ve anahtar
             // sözcüğü zorunlu olarak adlandırır; kendi metnini taramak yanlış
             // pozitif üretir.
-            if rel == "audit/mod.rs" {
+            if rel == "audit.rs" {
                 continue;
             }
             let text = fs::read_to_string(&file).expect("kaynak okunmalı");

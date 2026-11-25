@@ -37,6 +37,7 @@
 
 #![forbid(unsafe_code)]
 
+#[path = "common/helpers.rs"]
 mod common;
 
 use av1oxide::dsp::mc::{McBitDepth, McFn};

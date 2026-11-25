@@ -14,6 +14,7 @@
 
 #![forbid(unsafe_code)]
 
+#[path = "common/helpers.rs"]
 mod common;
 
 use av1oxide::decode::wedge::canonical_mask_bytes;

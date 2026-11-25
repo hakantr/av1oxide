@@ -41,6 +41,7 @@
 // Piksel indeksleri uyuşmazlık raporunda konum olarak kullanılır.
 #![allow(clippy::needless_range_loop)]
 
+#[path = "common/helpers.rs"]
 mod common;
 
 use av1oxide::dsp::ipred::{CflPredMode, Edge, IntraPredMode};

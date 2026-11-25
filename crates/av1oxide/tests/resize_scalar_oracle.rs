@@ -14,6 +14,7 @@
 //! değişkeni yoksa varsayılan `.cache/resize-oracle` dökümünü okur; döküm yoksa
 //! ön koşul eksiktir (`on_kosul::eksik`, P29) — sessizce geçmez.
 
+#[path = "common/helpers.rs"]
 mod common;
 
 use av1oxide::dsp::resize::{ResizeBitDepth, scalar_for};

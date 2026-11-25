@@ -17,6 +17,7 @@
 
 #![forbid(unsafe_code)]
 
+#[path = "common/helpers.rs"]
 mod common;
 
 use av1oxide::dsp::cdef::{CdefBitDepth, CdefDirFn, CdefEdgeFlags, CdefFilterFn};

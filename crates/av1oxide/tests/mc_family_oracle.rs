@@ -20,6 +20,7 @@
 #![forbid(unsafe_code)]
 #![allow(clippy::chunks_exact_to_as_chunks, clippy::while_let_loop)]
 
+#[path = "common/helpers.rs"]
 mod common;
 
 use av1oxide::dsp::mc::{Filter2d, MC_KUYRUK, McDsp, McPrepFn, McPutFn, N_W_MASK};

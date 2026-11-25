@@ -21,6 +21,7 @@
 
 #![forbid(unsafe_code)]
 
+#[path = "common/helpers.rs"]
 mod common;
 
 use av1oxide::bitstream::frame_header::FilmGrainData;

@@ -5,6 +5,7 @@
 #![forbid(unsafe_code)]
 
 #[cfg(target_arch = "aarch64")]
+#[path = "common/helpers.rs"]
 mod common;
 
 use av1oxide::cpu::{ArmCpuId, CpuFlags, CpuLevel};

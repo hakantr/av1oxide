@@ -16,6 +16,7 @@
 
 #![forbid(unsafe_code)]
 
+#[path = "common/helpers.rs"]
 mod common;
 
 use av1oxide::dsp::mc::{BlendDirFn, BlendFn, McDsp, skaler_devir_sayisi};

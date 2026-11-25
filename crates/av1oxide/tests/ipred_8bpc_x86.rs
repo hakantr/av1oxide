@@ -32,6 +32,7 @@
 #![forbid(unsafe_code)]
 #![allow(clippy::needless_range_loop, clippy::too_many_arguments)]
 
+#[path = "common/helpers.rs"]
 mod common;
 
 use av1oxide::cpu::{CpuFlags, CpuLevel};

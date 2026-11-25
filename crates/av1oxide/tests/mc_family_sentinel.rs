@@ -15,6 +15,7 @@
 #![forbid(unsafe_code)]
 #![allow(clippy::chunks_exact_to_as_chunks, clippy::while_let_loop)]
 
+#[path = "common/helpers.rs"]
 mod common;
 
 use av1oxide::dsp::mc::McDsp;

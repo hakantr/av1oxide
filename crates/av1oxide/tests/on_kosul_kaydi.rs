@@ -15,6 +15,7 @@
 
 #![forbid(unsafe_code)]
 
+#[path = "common/helpers.rs"]
 mod common;
 
 use common::on_kosul::{Ayar, Neden, eksik_ayarla, kayda_ekle};
