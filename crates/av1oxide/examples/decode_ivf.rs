@@ -1,4 +1,4 @@
-//! `av1oxide` çok-thread IVF akışı çözme ve YUV düzlem okuma örneği (`v0.1.0`).
+//! `av1oxide` çok-thread IVF akışı çözme ve YUV düzlem okuma örneği (`v0.4.0`).
 //!
 //! Çalıştırma:
 //!   cargo run --release -p av1oxide --example decode_ivf

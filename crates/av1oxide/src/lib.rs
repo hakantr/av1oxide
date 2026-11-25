@@ -1,4 +1,4 @@
-//! # av1oxide — %100 Kararlı Rust AV1 Video ve AVIF Görüntü Çözücüsü (`v0.3.2`)
+//! # av1oxide — %100 Kararlı Rust AV1 Video ve AVIF Görüntü Çözücüsü (`v0.4.0`)
 //!
 //! `av1oxide`, VideoLAN [`dav1d`](https://code.videolan.org/videolan/dav1d) (`1.5.4`)
 //! AV1 video çözücüsünün **%100 kararlı Rust** (`rustc 1.100.0`, Edition 2024) ve

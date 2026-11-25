@@ -1,4 +1,4 @@
-# av1oxide (`v0.3.2`)
+# av1oxide (`v0.4.0`)
 
 **English** | [Türkçe](README.tr.md)
 
@@ -41,7 +41,7 @@ Add `av1oxide` to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-av1oxide = "0.3"
+av1oxide = "0.4"
 ```
 
 To build and browse the local API documentation (`rustdoc`):
@@ -252,66 +252,97 @@ Five standalone examples are included in the crate:
 
 ---
 
-## Performance Comparison vs. `dav1d 1.5.4`
+## Performance & Memory Comparison vs. `dav1d 1.5.4` and `libavif 1.4.2`
 
-All benchmarks were measured under `100%` MD5 bit-exact output parity between `av1oxide` (`rustc 1.100.0 --release`) and the reference C/ASM `dav1d 1.5.4` (`99f3354ed0b9b4bf3c7c9347318dbcc522c94af5`).
+All benchmarks were measured under `100%` MD5 bit-exact output parity between `av1oxide` (`v0.4.0`, `rustc 1.100.0 --release`, `opt-level = 3`, `lto = "thin"`, `strip = "symbols"`), the reference C/ASM `dav1d 1.5.4` (`99f3354ed0b9b4bf3c7c9347318dbcc522c94af5`), and reference C `libavif 1.4.2` (`b8551fe61aaf92733234efc5e11cdfac5a5f54b3`, built with `-DAVIF_LIBYUV=OFF -DAVIF_LIBSHARPYUV=OFF` over `dav1d 1.5.4`). File I/O, container demuxing, and MD5 verification execute outside the timed decode window; each workload and decoder runs in an isolated subprocess across `5–7` interleaved runs, reporting median (`p50`) wall time, OS Peak RSS (`MiB`), and `av1oxide` live heap peak (`MiB`).
 
 ### 1. `x86_64` — AMD Ryzen 9 9950X3D (Zen 5, `16C / 32T`, `AVX-512ICL`)
 
-#### Single-Thread (`n_threads = 1`) Suite Summary
+#### Single-Thread (`n_threads = 1`, `max_frame_delay = 1`) Suite Summary
 
-| Suite | Streams / Frames | `av1oxide` Total (`ms`) | `dav1d` Total (`ms`) | Wall-Time Ratio (`av1oxide / dav1d`) | Geometric Mean | Median (`p50`) | MD5 Parity |
-|---|---:|---:|---:|---:|---:|---:|---:|
-| **`korpus`** | `19` streams / `964` frames | `647.7 ms` | `431.3 ms` | **`1.502×`** | `1.555×` | `1.767×` | `19 / 19` (`100%`) |
-| **`temsilci`** | `8` streams / `485` frames | `1,980.4 ms` | `1,070.7 ms` | **`1.850×`** | `1.589×` | `1.699×` | `8 / 8` (`100%`) |
+| Suite | Streams / Frames | `av1oxide` Total (`ms`) | `dav1d` Total (`ms`) | Wall-Time Ratio (`av1oxide / dav1d`) | Geometric Mean | Median (`p50`) | Suite Max `av1oxide` Peak RSS (`MiB`) | Suite Max `dav1d` Peak RSS (`MiB`) | RSS Ratio (`av1oxide / dav1d`) | MD5 Parity |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| **`korpus`** | `19` streams / `950` decoded frames | `645.5 ms` | `430.0 ms` | **`1.501×`** | `1.552×` | `1.741×` | `19.01 MiB` (`10.90 MiB` live heap) | `9.16 MiB` | `2.08×` | `19 / 19` (`100%`) |
+| **`temsilci`** | `8` streams / `485` decoded frames | `1,963.6 ms` | `1,063.1 ms` | **`1.847×`** | `1.593×` | `1.704×` | `1,231.36 MiB` (`1,212.62 MiB` live heap) | `608.98 MiB` | `2.02×` | `8 / 8` (`100%`) |
 
 #### Single-Thread (`n_threads = 1`) Representative Streams Breakdown
 
-| Stream | Resolution | Bit / Chroma | Frames | `av1oxide` (`ms/frame`) | `av1oxide` (`FPS`) | `dav1d` (`ms/frame`) | `dav1d` (`FPS`) | Ratio (`av1oxide / dav1d`) | Speedup vs. Scalar |
-|---|---|---|---:|---:|---:|---:|---:|---:|---:|
-| `422_oddheight_8b` | `64×63` | `8b` `4:2:2` | `80` | `0.292` | `3,418.8` | `0.253` | `3,957.3` | **`1.156×`** | `2.59×` |
-| `422_oddheight_10b` | `64×63` | `10b` `4:2:2` | `80` | `0.297` | `3,370.4` | `0.255` | `3,915.4` | **`1.165×`** | `2.79×` |
-| `vq002_inter_432x240` | `432×240` | `8b` `4:2:0` | `50` | `2.837` | `352.5` | `2.168` | `461.3` | **`1.309×`** | `4.06×` |
-| `test10755_cdef10_sb64` | `1024×512` | `10b` `4:2:0` | `24` | `2.660` | `375.9` | `1.645` | `607.8` | **`1.617×`** | `4.19×` |
-| `fg10_film_grain_50` | `352×288` | `10b` `4:2:0` | `100` | `0.835` | `1,197.5` | `0.469` | `2,131.7` | **`1.780×`** | `4.47×` |
-| `test25_8k_444_fg` | `7680×4320` | `8b` `4:4:4` | `6` | `248.828` | `4.0` | `126.890` | `7.9` | **`1.959×`** | `1.89×` |
-| `test1472_lr8_444` | `306×255` | `8b` `4:4:4` | `45` | `0.307` | `3,254.1` | `0.154` | `6,502.0` | **`1.996×`** | `4.14×` |
-| `ccvb_film_grain` | `640×480` | `8b` `4:2:0` | `100` | `1.372` | `728.8` | `0.670` | `1,493.2` | **`2.047×`** | `5.34×` |
+| Stream | Resolution | Bit / Chroma | Frames | `av1oxide` (`ms/frame`) | `av1oxide` (`FPS`) | `dav1d` (`ms/frame`) | `dav1d` (`FPS`) | Time Ratio (`av1oxide / dav1d`) | Speedup vs. Scalar | `av1oxide` Peak RSS / Live Heap (`MiB`) | `dav1d` Peak RSS (`MiB`) | RSS Ratio (`av1oxide / dav1d`) |
+|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| `422_oddheight_8b` | `64×63` | `8b` `4:2:2` | `80` | `0.293` | `3,415.8` | `0.253` | `3,951.8` | **`1.157×`** | `2.60×` | `6.92` / `0.37` | `3.66` | `1.89×` |
+| `422_oddheight_10b` | `64×63` | `10b` `4:2:2` | `80` | `0.296` | `3,373.9` | `0.255` | `3,919.0` | **`1.162×`** | `2.79×` | `7.48` / `0.56` | `3.91` | `1.91×` |
+| `vq002_inter_432x240` | `432×240` | `8b` `4:2:0` | `50` | `2.845` | `351.5` | `2.169` | `461.0` | **`1.312×`** | `4.08×` | `11.20` / `3.40` | `5.41` | `2.07×` |
+| `test10755_cdef10_sb64` | `1024×512` | `10b` `4:2:0` | `24` | `2.674` | `374.0` | `1.649` | `606.5` | **`1.622×`** | `4.17×` | `23.41` / `13.29` | `11.39` | `2.05×` |
+| `fg10_film_grain_50` | `352×288` | `10b` `4:2:0` | `100` | `0.835` | `1,197.8` | `0.467` | `2,139.8` | **`1.786×`** | `4.48×` | `14.66` / `6.79` | `6.40` | `2.29×` |
+| `test25_8k_444_fg` | `7680×4320` | `8b` `4:4:4` | `6` | `246.217` | `4.1` | `125.826` | `8.0` | **`1.957×`** | `1.89×` | `1,231.36` / `1,212.62` | `608.98` | `2.02×` |
+| `test1472_lr8_444` | `306×255` | `8b` `4:4:4` | `45` | `0.308` | `3,243.4` | `0.153` | `6,532.7` | **`2.014×`** | `4.12×` | `10.45` / `2.90` | `5.41` | `1.93×` |
+| `ccvb_film_grain` | `640×480` | `8b` `4:2:0` | `100` | `1.354` | `738.5` | `0.659` | `1,517.9` | **`2.055×`** | `5.42×` | `19.04` / `10.90` | `9.16` | `2.08×` |
 
-#### Multi-Thread (`AMD Ryzen 9 9950X3D`) Comparison
+#### Multi-Thread (`AMD Ryzen 9 9950X3D`) AV1 Comparison
 
-| Stream | Mode (`max_frame_delay`, `n_threads`) | `av1oxide` (`t=1`) | `av1oxide` (Multi-Thread) | `av1oxide` Self-Speedup | `dav1d` (Multi-Thread) | Ratio (`av1oxide / dav1d`) |
-|---|---|---:|---:|---:|---:|---:|
-| `vq002_inter_gop` (`432×240`, `8b`, `100×10` frames) | `mfd=1, t=8` | `272.6 ms` | `257.8 ms` | `1.06×` | `251.7 ms` | **`1.02×`** |
-| `fg10_film_grain_50` (`352×288`, `10b`, `150×15` frames) | `mfd=1, t=8` | `122.4 ms` | `104.4 ms` | `1.17×` | `75.5 ms` | **`1.38×`** |
-| `ccvb_film_grain` (`640×480`, `8b`, `300×3` frames) | `mfd=1, t=8` | `387.1 ms` | `310.5 ms` | `1.25×` | `203.0 ms` | **`1.53×`** |
-| `test10103_coklu_tile` (`1024×1024`, `10b`, `16` tiles) | `mfd=0, t=16` | `1,217.5 ms` | `234.3 ms` | **`5.20×`** | `136.9 ms` | **`1.71×`** |
-| `test25_8k_444_fg` (`7680×4320`, `8b` `4:4:4`, `120` tiles + FG) | `mfd=0, t=8` | `1,476.5 ms` | `159.6 ms` | **`9.25×`** | `63.1 ms` | **`2.53×`** (`t=4`: `2.18×`) |
-| `test25_8k_120_tile` (`7680×4320`, `12b`, `120` tiles) | `mfd=0, t=16` | `1,589.0 ms` | `401.0 ms` | **`3.96×`** | `99.9 ms` | **`4.01×`** |
+| Stream | Mode (`max_frame_delay`, `n_threads`) | `av1oxide` (`t=1`) | `av1oxide` (Multi-Thread) | `av1oxide` Self-Speedup | `dav1d` (Multi-Thread) | Time Ratio (`av1oxide / dav1d`) | `av1oxide` Peak RSS / Live Heap (`MiB`) | `dav1d` Peak RSS (`MiB`) | RSS Ratio (`av1oxide / dav1d`) | MD5 Parity |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| `vq002_inter_gop` (`432×240`, `8b`, `10×10=100` frames) | `mfd=1, t=8` | `272.9 ms` | `257.7 ms` | `1.06×` | `242.5 ms` | **`1.06×`** | `11.36` / `3.40` | `6.72` | `1.69×` | `100%` |
+| `fg10_film_grain_50` (`352×288`, `10b`, `10×15=150` frames) | `mfd=1, t=8` | `119.4 ms` | `103.4 ms` | `1.15×` | `71.5 ms` | **`1.45×`** | `14.81` / `7.14` | `7.46` | `1.98×` | `100%` |
+| `ccvb_film_grain` (`640×480`, `8b`, `100×3=300` frames) | `mfd=1, t=8` | `384.2 ms` | `298.4 ms` | `1.29×` | `182.2 ms` | **`1.64×`** | `19.46` / `11.39` | `9.97` | `1.95×` | `100%` |
+| `test10103_coklu_tile` (`1024×1024`, `10b`, `16` tiles, `8×15=120` frames) | `mfd=0, t=16` | `1,210.3 ms` | `258.6 ms` | **`4.68×`** | `141.1 ms` | **`1.83×`** | `196.18` / `94.59` | `315.22` | **`0.62×`** | `100%` |
+| `test10103_coklu_tile` (`1024×1024`, `10b`, `16` tiles, `8×15=120` frames) | `mfd=4, t=16` | `1,210.3 ms` | `241.6 ms` | **`5.01×`** | `145.3 ms` | **`1.66×`** | `219.47` / `95.27` | `306.50` | **`0.72×`** | `100%` |
+| `test25_8k_444_fg` (`7680×4320`, `8b` `4:4:4`, `120` tiles + FG, `6` frames) | `mfd=0, t=8` | `1,500.1 ms` | `429.5 ms` | **`3.49×`** | `186.9 ms` | **`2.30×`** (`t=4`: `2.58×`) | `1,990.94` / `1,416.23` | `1,416.41` | `1.41×` | `100%` |
+| `test25_8k_120_tile` (`7680×4320`, `12b`, `120` tiles, `10×2=20` frames) | `mfd=0, t=16` | `1,590.1 ms` | `570.0 ms` | **`2.79×`** | `165.5 ms` | **`3.44×`** | `1,321.86` / `811.50` | `1,020.45` | `1.30×` | `100%` |
+
+#### `.avif` Image Decoding + `RGBA8` Conversion (`av1oxide::avif` vs. C `libavif 1.4.2 + dav1d 1.5.4`)
+
+| Workload | Images / Mode | `av1oxide` Time (`ms`) | C `libavif` Time (`ms`) | Time Ratio (`av1oxide / libavif`) | `av1oxide` Peak RSS (`MiB`) | `av1oxide` Live Heap (`MiB`) | C `libavif` Peak RSS (`MiB`) | RSS Ratio (`av1oxide / libavif`) | `RGBA8` MD5 Parity |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| **`avif_corpus_156_t4`** | `156` valid `.avif` images, `n_threads = 4` (`1` pass) | `3,617.2 ms` | `2,477.6 ms` | **`1.460×`** | `183.33 MiB` | `99.15 MiB` | `103.39 MiB` | **`1.77×`** | `156 / 156` (`100%`) |
+| **`avif_bbb_4k_t8`** | `bbb_4k.avif` (`3840×2160`), `n_threads = 8` (`5` repeats) | `407.2 ms` | `273.7 ms` | **`1.488×`** | `75.30 MiB` | `67.06 MiB` | `51.23 MiB` | **`1.47×`** | `5 / 5` (`100%`) |
 
 ---
 
 ### 2. `aarch64` — Apple M4 Pro (`14C = 10P + 4E`, `NEON + DOTPROD`)
 
-#### Single-Thread (`n_threads = 1`) Suite Summary
+#### Single-Thread (`n_threads = 1`, `max_frame_delay = 1`) Suite Summary
 
-| Suite | Streams / Frames | SIMD Level | `av1oxide` Total (`ms`) | `dav1d` Total (`ms`) | Wall-Time Ratio (`av1oxide / dav1d`) | Geometric Mean | Median (`p50`) | MD5 Parity |
-|---|---:|---|---:|---:|---:|---:|---:|---:|
-| **`korpus`** | `19` streams / `964` frames | `NEON + DOTPROD` | `796.9 ms` | `486.4 ms` | **`1.638×`** | `1.680×` | `1.786×` | `19 / 19` (`100%`) |
-| **`temsilci`** | `8` streams / `485` frames | `NEON + DOTPROD` | `1,995.2 ms` | `1,117.0 ms` | **`1.786×`** | `1.675×` | `1.649×` | `8 / 8` (`100%`) |
+| Suite | SIMD Mode | Streams / Frames | `av1oxide` Total (`ms`) | `dav1d` Total (`ms`) | Wall-Time Ratio (`av1oxide / dav1d`) | Geometric Mean | Median (`p50`) | Suite Max `av1oxide` Peak RSS (`MiB`) | Suite Max `dav1d` Peak RSS (`MiB`) | RSS Ratio (`av1oxide / dav1d`) | MD5 Parity |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| **`korpus`** | `NEON + DOTPROD` (same-ISA) | `19` streams / `950` decoded frames | `738.5 ms` | `474.1 ms` | **`1.558×`** | `1.623×` | `1.599×` | `16.52 MiB` (`10.89 MiB` live heap) | `8.91 MiB` | `1.85×` | `19 / 19` (`100%`) |
+| **`temsilci`** | `NEON + DOTPROD` (same-ISA) | `8` streams / `485` decoded frames | `1,994.9 ms` | `1,123.8 ms` | **`1.775×`** | `1.560×` | `1.632×` | `1,234.05 MiB` (`1,212.62 MiB` live heap) | `610.30 MiB` | `2.02×` | `8 / 8` (`100%`) |
+| **`korpus`** | `tespit` (`dav1d` + `I8MM`) | `19` streams / `950` decoded frames | `734.2 ms` | `474.5 ms` | **`1.547×`** | `1.647×` | `1.585×` | `16.50 MiB` (`10.89 MiB` live heap) | `8.89 MiB` | `1.86×` | `19 / 19` (`100%`) |
+| **`temsilci`** | `tespit` (`dav1d` + `I8MM`) | `8` streams / `485` decoded frames | `1,982.5 ms` | `1,122.2 ms` | **`1.767×`** | `1.570×` | `1.622×` | `1,233.30 MiB` (`1,212.62 MiB` live heap) | `610.31 MiB` | `2.02×` | `8 / 8` (`100%`) |
 
-#### Multi-Thread (`Apple M4 Pro`) Comparison
+#### Single-Thread (`n_threads = 1`) Representative Streams Breakdown (`NEON + DOTPROD`)
 
-| Stream | Mode (`max_frame_delay`, `n_threads`) | `av1oxide` (`t=1`) | `av1oxide` (Multi-Thread) | `av1oxide` Self-Speedup | `dav1d` (Multi-Thread) | Ratio (`av1oxide / dav1d`) |
-|---|---|---:|---:|---:|---:|---:|
-| `vq002_inter_gop` (`432×240`, `8b`) | `mfd=1, t=4` | `318.0 ms` | `290.7 ms` | `1.09×` | `236.9 ms` | **`1.23×`** |
-| `test10103_coklu_tile` (`1024×1024`, `10b`, `16` tiles) | `mfd=0, t=14` | `1,558.9 ms` | `236.2 ms` | **`6.60×`** | `135.7 ms` | **`1.74×`** |
-| `test25_8k_444_fg` (`7680×4320`, `8b` `4:4:4`, `120` tiles + FG) | `mfd=0, t=14` | `1,410.1 ms` | `149.6 ms` | **`9.43×`** | `68.0 ms` | **`2.20×`** |
-| `test25_8k_120_tile` (`7680×4320`, `12b`, `120` tiles) | `mfd=0, t=14` | `1,687.5 ms` | `233.0 ms` | **`7.24×`** | `95.0 ms` | **`2.45×`** |
+| Stream | Resolution | Bit / Chroma | Frames | `av1oxide` (`ms/frame`) | `av1oxide` (`FPS`) | `dav1d` (`ms/frame`) | `dav1d` (`FPS`) | Time Ratio (`av1oxide / dav1d`) | Speedup vs. Scalar | `av1oxide` Peak RSS / Live Heap (`MiB`) | `dav1d` Peak RSS (`MiB`) | RSS Ratio (`av1oxide / dav1d`) |
+|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| `422_oddheight_8b` | `64×63` | `8b` `4:2:2` | `80` | `0.292` | `3,423.5` | `0.274` | `3,645.0` | **`1.065×`** | `1.52×` | `4.20` / `0.36` | `2.91` | `1.45×` |
+| `422_oddheight_10b` | `64×63` | `10b` `4:2:2` | `80` | `0.310` | `3,225.8` | `0.283` | `3,538.6` | **`1.097×`** | `1.74×` | `4.58` / `0.55` | `3.00` | `1.53×` |
+| `vq002_inter_432x240` | `432×240` | `8b` `4:2:0` | `50` | `3.263` | `306.5` | `2.526` | `395.8` | **`1.291×`** | `2.34×` | `8.64` / `3.39` | `5.08` | `1.70×` |
+| `test10755_cdef10_sb64` | `1024×512` | `10b` `4:2:0` | `24` | `2.760` | `362.4` | `1.947` | `513.5` | **`1.417×`** | `2.64×` | `20.70` / `13.28` | `11.56` | `1.79×` |
+| `fg10_film_grain_50` | `352×288` | `10b` `4:2:0` | `100` | `0.980` | `1,020.7` | `0.509` | `1,965.6` | **`1.926×`** | `2.98×` | `12.00` / `6.78` | `6.02` | `1.99×` |
+| `test25_8k_444_fg` | `7680×4320` | `8b` `4:4:4` | `6` | `234.857` | `4.3` | `127.112` | `7.9` | **`1.848×`** | `1.68×` | `1,234.05` / `1,212.62` | `610.30` | `2.02×` |
+| `test1472_lr8_444` | `306×255` | `8b` `4:4:4` | `45` | `0.366` | `2,735.2` | `0.182` | `5,501.9` | **`2.011×`** | `2.32×` | `8.34` / `2.90` | `4.95` | `1.68×` |
+| `ccvb_film_grain` | `640×480` | `8b` `4:2:0` | `100` | `1.938` | `516.0` | `0.845` | `1,183.6` | **`2.294×`** | `2.98×` | `16.44` / `10.89` | `8.91` | `1.85×` |
+
+#### Multi-Thread (`Apple M4 Pro`) AV1 Comparison
+
+| Stream | Mode (`max_frame_delay`, `n_threads`) | `av1oxide` (`t=1`) | `av1oxide` (Multi-Thread) | `av1oxide` Self-Speedup | `dav1d` (Multi-Thread) | Time Ratio (`av1oxide / dav1d`) | `av1oxide` Peak RSS / Live Heap (`MiB`) | `dav1d` Peak RSS (`MiB`) | RSS Ratio (`av1oxide / dav1d`) | MD5 Parity |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| `vq002_inter_gop` (`432×240`, `8b`, `10×10=100` frames) | `mfd=1, t=4` | `311.1 ms` | `277.9 ms` | `1.12×` | `231.1 ms` | **`1.20×`** | `9.50` / `3.39` | `5.97` | `1.59×` | `100%` |
+| `test10103_coklu_tile` (`1024×1024`, `10b`, `16` tiles, `8×15=120` frames) | `mfd=0, t=14` | `1,550.6 ms` | `238.2 ms` | **`6.51×`** | `137.5 ms` | **`1.73×`** | `140.00` / `94.42` | `102.77` | `1.36×` | `100%` |
+| `test10103_coklu_tile` (`1024×1024`, `10b`, `16` tiles, `8×15=120` frames) | `mfd=4, t=14` | `1,550.6 ms` | `239.4 ms` | **`6.48×`** | `136.9 ms` | **`1.75×`** | `139.89` / `94.69` | `103.03` | `1.36×` | `100%` |
+| `test25_8k_444_fg` (`7680×4320`, `8b` `4:4:4`, `120` tiles + FG, `6` frames) | `mfd=0, t=14` | `1,418.8 ms` | `147.7 ms` | **`9.60×`** | `66.2 ms` | **`2.23×`** | `2,055.83` / `1,705.67` | `1,398.83` | `1.47×` | `100%` |
+| `test25_8k_120_tile` (`7680×4320`, `12b`, `120` tiles, `10×2=20` frames) | `mfd=0, t=14` | `1,694.6 ms` | `238.7 ms` | **`7.10×`** | `97.3 ms` | **`2.45×`** | `1,410.64` / `1,131.39` | `1,097.81` | `1.28×` | `100%` |
+
+#### `.avif` Image Decoding + `RGBA8` Conversion (`av1oxide::avif` vs. C `libavif 1.4.2 + dav1d 1.5.4`)
+
+| Workload | Images / Mode | `av1oxide` Time (`ms`) | C `libavif` Time (`ms`) | Time Ratio (`av1oxide / libavif`) | `av1oxide` Peak RSS (`MiB`) | `av1oxide` Live Heap (`MiB`) | C `libavif` Peak RSS (`MiB`) | RSS Ratio (`av1oxide / libavif`) | `RGBA8` MD5 Parity |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| **`avif_corpus_156_t4`** | `156` valid `.avif` images, `n_threads = 4` (`1` pass) | `3,348.8 ms` | `2,600.8 ms` | **`1.288×`** | `335.95 MiB` | `106.74 MiB` | `205.16 MiB` | **`1.64×`** | `156 / 156` (`100%`) |
+| **`avif_bbb_4k_t8`** | `bbb_4k.avif` (`3840×2160`), `n_threads = 8` (`5` repeats) | `366.1 ms` | `222.8 ms` | **`1.644×`** | `104.80 MiB` | `67.06 MiB` | `51.31 MiB` | **`2.04×`** | `5 / 5` (`100%`) |
 
 ---
 
-### 3. Technical Analysis of Runtime Differences
+### 3. Technical Analysis of Runtime and Memory Differences
 
 #### Resource Checks with Negligible Runtime Cost (`~0%` Impact)
 
@@ -322,6 +353,13 @@ All benchmarks were measured under `100%` MD5 bit-exact output parity between `a
 - **Slice Bounds Checking (`23%–50%` of decode time):** High-resolution frames traverse millions of `4×4` / `8×8` blocks and neighbor tables. Whereas C `dav1d` accesses these structures through unchecked raw pointer arithmetic (`ptr += offset`), the entire non-DSP decoder core in `av1oxide` is compiled under `#![forbid(unsafe_code)]` and performs runtime bounds checks on every slice index (`slice[i]`). This accounts for the primary portion of the `~1.65×–1.71×` ratio measured between pure C and pure Rust when SIMD is disabled on both sides.
 - **SIMD Entry Validation and Zero Over-Read (`~2–5 ns` per call):** C `dav1d` Assembly routines perform no entry length checks and read 16–64 bytes past the end of buffers into padding regions (over-read). Every SIMD function in `av1oxide` validates slice length preconditions on entry and uses masked or bounded loads at edges to avoid reading past slice bounds; on short (`10–20 ns`) small-block (`4×4`) calls, this validation adds `15%–25%` execution time.
 - **Hand-Written Assembly vs. Compiler (`LLVM`) Code Generation:** `dav1d` uses approximately `265,000` lines of hand-written NASM/GAS Assembly that bypass standard function calling conventions (ABI) and manage CPU flag registers and 32 `zmm` registers directly, whereas `av1oxide` compiles stable Rust `core::arch` intrinsics through the standard LLVM ABI frame.
+
+#### Measured Technical Factors Behind the Memory (`Peak RSS`) Behavior
+
+- **Single-Thread Baseline and High-Resolution Planar Buffers (`~1.85×–2.08×` RSS):** On low- and medium-resolution streams (`16×16` to `640×480`), `av1oxide` live heap usage is `0.21–10.90 MiB`, while process resident set size (`6.9–19.0 MiB` on Linux `x86_64`, `4.2–16.5 MiB` on macOS `aarch64` vs. `2.9–9.2 MiB` for C `dav1d`) reflects the statically linked Rust runtime and multi-ISA SIMD dispatch code pages (`9.7 MiB` ELF on `x86_64`, `2.8 MiB` Mach-O on `aarch64`) compared to `dav1d`'s shared library mapping. On `8K` `4:4:4` streams with Film Grain (`test25_8k_444_fg`, `1,231–1,234 MiB` vs. `609–610 MiB`, `2.02×`), `av1oxide` allocates separate owned reference frame planes, loop-restoration stripe/CDEF staging buffers, and a separate Film Grain output copy so reference frame buffers remain immutable without aliasing raw pointers.
+- **8K Multi-Thread Frame-Delay Scaling (`~1.28×–1.47×` RSS):** Under multi-threaded frame-delay decoding on `8K` `120`-tile streams (`test25_8k_120_tile` `1.28×–1.30×` RSS; `test25_8k_444_fg` `1.41×–1.47×` RSS), both decoders maintain `n_fc = 3..4` concurrent frame contexts while sharing reference frames across threads (`Arc` + `DecodeBufPool` recycling in `av1oxide`), reducing the relative RSS gap compared to single-thread execution.
+- **16-Thread Multi-Tile Scratch Reuse (`0.62×–0.72×` RSS on `x86_64`):** On `1024×1024` `16`-tile `10-bit` streams at `n_threads = 16` (`test10103_coklu_tile`), `av1oxide` records `196.2–219.5 MiB` Peak RSS (`94.6–95.3 MiB` live heap) vs. `306.5–315.2 MiB` for `dav1d` (`0.62×–0.72×`) on Linux `x86_64`, because `av1oxide` reuses bounded worker scratch slots (`ScratchPool`) and recycled plane buffers (`DecodeBufPool`) on demand rather than pre-allocating full per-frame-thread tile and coefficient arenas upfront. On macOS `aarch64` (`t=14`), `16 KiB` virtual memory pages and system `libmalloc` thread-magazine caching result in `140.0 MiB` vs. `102.8 MiB` (`1.36×`, with `94.4 MiB` live heap).
+- **`.avif` Container and `RGBA8` Conversion (`1.47×–2.04×` RSS):** During `.avif` decoding (`67.1 MiB` live heap on `4K` `bbb_4k.avif`, `99.2–106.7 MiB` across the `156`-image corpus), `av1oxide::avif` stores decoded planar YUVA channels as `u16` slices prior to allocating the `RGBA8` output buffer (`31.64 MiB` at `3840×2160`), whereas C `libavif` stores `8-bit` planar channels as `uint8_t` buffers before `avifImageYUVToRGB`.
 
 ---
 

@@ -1,4 +1,4 @@
-//! `av1oxide` güvenilmeyen girdi için kaynak bütçesi, hata yakalama ve `reset()` örneği (`v0.1.0`).
+//! `av1oxide` güvenilmeyen girdi için kaynak bütçesi, hata yakalama ve `reset()` örneği (`v0.4.0`).
 //!
 //! Çalıştırma:
 //!   cargo run --release -p av1oxide --example bounded_decoder
