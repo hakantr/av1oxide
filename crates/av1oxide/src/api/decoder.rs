@@ -2193,15 +2193,10 @@ impl Decoder {
                 // OBU_META_ITUT_T35 (`src/obu.c:1445-1501`)
                 let start = reader.byte_position();
                 if let Some(rest) = obu.payload.get(start..) {
-                    let mut end = rest.len();
-                    while end > 0 && rest[end - 1] == 0 {
-                        end -= 1;
-                    }
-                    if end == 0 {
+                    let Some(end) = memchr::memrchr(0x80, rest) else {
                         return Ok(());
-                    }
-                    end -= 1; // trailing 0x80 baytı
-                    if rest.get(end) != Some(&0x80) || end == 0 {
+                    };
+                    if end == 0 || rest[end + 1..].iter().any(|&b| b != 0) {
                         return Ok(());
                     }
                     let country_code = rest[0];

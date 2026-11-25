@@ -26,6 +26,7 @@
 |---|---|---|---|---|
 | `crossbeam-utils` | `0.8` | `["std"]` | `crossbeam-rs` / Rust Concurrency Team | `CachePadded` cache-line isolation of shared atomic counters/slots (`thread::TaskBatch`, `thread::ScratchPool`, `frame::butce::Butce`) and `Backoff` in lock-free CAS loops |
 | `parking_lot` | `0.12` | `[]` (`not(target_arch = "wasm32")`) | `Amanieu d'Antras` / Rust `libs-team` | Non-poisoning compact userspace `Mutex` and `Condvar` (`sync`) across `thread::WorkerPool`, `thread::FrameSlot`, `api::Decoder`, and `decode::intra` |
+| `memchr` | `2` | `[]` | `Andrew Gallant (BurntSushi)` / Rust `libs-team` | SIMD/SWAR byte scanning (`memchr`, `memrchr`) for ISOBMFF NUL-terminated string parsing (`avif::boxes`) and OBU metadata trailing-byte locating (`api::Decoder`) |
 
 ---
 

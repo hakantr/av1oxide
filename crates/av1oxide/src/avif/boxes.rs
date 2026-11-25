@@ -174,10 +174,8 @@ fn read_cstring(buf: &[u8], offset: usize) -> Result<(String, usize)> {
     let tail = buf
         .get(offset..)
         .ok_or(Error::InvalidData("ISOBMFF dize ofseti sınır dışında"))?;
-    let nul_pos = tail
-        .iter()
-        .position(|&b| b == 0)
-        .ok_or(Error::InvalidData("ISOBMFF dizesi NUL ile sonlanmıyor"))?;
+    let nul_pos =
+        memchr::memchr(0, tail).ok_or(Error::InvalidData("ISOBMFF dizesi NUL ile sonlanmıyor"))?;
     let s = core::str::from_utf8(&tail[..nul_pos])
         .map_err(|_| Error::InvalidData("ISOBMFF dizesi geçerli UTF-8 değil"))?;
     Ok((s.to_owned(), offset + nul_pos + 1))
