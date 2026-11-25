@@ -2,8 +2,9 @@
 //!
 //! ## Tasarım Özeti (`ADR-0004-threading-ve-kaynak-yonetimi.md`)
 //!
-//! - `%100 #![forbid(unsafe_code)]`, sıfır dış bağımlılık (`std::thread`,
-//!   `std::sync::{Arc, Mutex, Condvar}`, `core::sync::atomic`).
+//! - `%100 #![forbid(unsafe_code)]`, sıfır üçüncü taraf medya/kodek bağımlılığı
+//!   (`std::thread`, `std::sync::{Arc, Mutex, Condvar}`, `core::sync::atomic`,
+//!   `crossbeam_utils::CachePadded`).
 //! - `effective_threads == 1` (`Config::default()`): **0** yardımcı iş parçacığı
 //!   açılır; görevler çağıran iş parçacığında sırayla ve sıfır senkronizasyon
 //!   yüküyle çalışır.
@@ -28,6 +29,7 @@ use crate::decode::intra::{DecodeBufPool, RefFrame};
 use crate::error::{Error, Result};
 use crate::frame::{BitDepth, ChromaFormat};
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use crossbeam_utils::CachePadded;
 use std::collections::VecDeque;
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
@@ -60,7 +62,7 @@ impl WorkerScratch {
 /// İşçi iş parçacığı başına bir adet `WorkerScratch` tutan havuz (BLK-07).
 #[derive(Debug)]
 pub struct ScratchPool {
-    slots: Vec<Mutex<WorkerScratch>>,
+    slots: Vec<CachePadded<Mutex<WorkerScratch>>>,
 }
 
 impl ScratchPool {
@@ -70,7 +72,7 @@ impl ScratchPool {
         let count = n_workers.max(1);
         let mut slots = Vec::with_capacity(count);
         for _ in 0..count {
-            slots.push(Mutex::new(WorkerScratch::default()));
+            slots.push(CachePadded::new(Mutex::new(WorkerScratch::default())));
         }
         Self { slots }
     }
@@ -114,11 +116,11 @@ struct TaskBatch {
     /// Bu partideki toplam görev sayısı.
     n_tasks: usize,
     /// Sıradaki görev indeksi (`0..n_tasks`).
-    next_task: AtomicUsize,
+    next_task: CachePadded<AtomicUsize>,
     /// Henüz tamamlanmamış görev sayısı.
-    remaining: AtomicUsize,
+    remaining: CachePadded<AtomicUsize>,
     /// Şimdiye kadar hata veren en küçük görev indeksi (`usize::MAX` = hata yok).
-    first_error_idx: AtomicUsize,
+    first_error_idx: CachePadded<AtomicUsize>,
     /// Görev çalıştırıcısı (`(worker_id, task_idx, &TaskBatch)`).
     runner: TaskRunnerFn,
     /// Parti tamamlanma koşul değişkeni kilidi.
@@ -613,9 +615,9 @@ impl WorkerPool {
 
         let batch = Arc::new(TaskBatch {
             n_tasks,
-            next_task: AtomicUsize::new(0),
-            remaining: AtomicUsize::new(n_tasks),
-            first_error_idx: AtomicUsize::new(usize::MAX),
+            next_task: CachePadded::new(AtomicUsize::new(0)),
+            remaining: CachePadded::new(AtomicUsize::new(n_tasks)),
+            first_error_idx: CachePadded::new(AtomicUsize::new(usize::MAX)),
             runner: Box::new(move |worker_id: usize, idx: usize, batch_ref: &TaskBatch| {
                 let mut guard = slots_worker[idx]
                     .lock()
@@ -686,9 +688,9 @@ impl WorkerPool {
 
         let batch = Arc::new(TaskBatch {
             n_tasks,
-            next_task: AtomicUsize::new(0),
-            remaining: AtomicUsize::new(n_tasks),
-            first_error_idx: AtomicUsize::new(usize::MAX),
+            next_task: CachePadded::new(AtomicUsize::new(0)),
+            remaining: CachePadded::new(AtomicUsize::new(n_tasks)),
+            first_error_idx: CachePadded::new(AtomicUsize::new(usize::MAX)),
             runner: Box::new(move |worker_id: usize, idx: usize, batch_ref: &TaskBatch| {
                 if let Err(err) = op(worker_id, idx) {
                     let mut slot = errors_worker[idx]
@@ -733,15 +735,17 @@ impl WorkerPool {
         batch.drain_tasks(0);
 
         // Bu partideki tüm görevlerin bitmesini bekle.
-        let mut done = batch
-            .done_lock
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        while !*done && batch.remaining.load(Ordering::Acquire) != 0 {
-            done = batch
-                .done_cv
-                .wait(done)
+        if batch.remaining.load(Ordering::Acquire) != 0 {
+            let mut done = batch
+                .done_lock
+                .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
+            while !*done && batch.remaining.load(Ordering::Acquire) != 0 {
+                done = batch
+                    .done_cv
+                    .wait(done)
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+            }
         }
 
         let mut st = shared

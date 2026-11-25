@@ -28,13 +28,14 @@
 use crate::error::{Error, Result, SizeStage};
 use core::ops::{Deref, DerefMut};
 use core::sync::atomic::{AtomicUsize, Ordering};
+use crossbeam_utils::{Backoff, CachePadded};
 use std::sync::Arc;
 
 /// Canlı ayırma defteri (atomik sayaçlarla iş parçacıkları arasında `&Butce` veya `Arc<Butce>` ile paylaşılır; BLK-08).
 #[derive(Debug)]
 pub(crate) struct Butce {
     sinir: Option<usize>,
-    canli: AtomicUsize,
+    canli: CachePadded<AtomicUsize>,
     tepe: AtomicUsize,
     taban: AtomicUsize,
     ust: Option<Arc<Butce>>,
@@ -74,7 +75,7 @@ impl Butce {
     pub(crate) fn yeni(sinir: Option<usize>, taban: usize) -> Self {
         Self {
             sinir,
-            canli: AtomicUsize::new(taban),
+            canli: CachePadded::new(AtomicUsize::new(taban)),
             tepe: AtomicUsize::new(0),
             taban: AtomicUsize::new(taban),
             ust: None,
@@ -90,7 +91,7 @@ impl Butce {
     pub(crate) fn alt_defter(ust: &Arc<Self>) -> Self {
         Self {
             sinir: ust.sinir,
-            canli: AtomicUsize::new(0),
+            canli: CachePadded::new(AtomicUsize::new(0)),
             tepe: AtomicUsize::new(0),
             taban: AtomicUsize::new(0),
             ust: Some(Arc::clone(ust)),
@@ -130,6 +131,7 @@ impl Butce {
     /// üzerinde yeniden ayırma/bırakma yapmadan) [`ButceTutucu`]'ya devreder.
     pub(crate) fn devret(&self, bayt: usize) -> Option<ButceTutucu> {
         let ust = self.ust.as_ref()?;
+        let backoff = Backoff::new();
         let mut canli = self.canli.load(Ordering::Relaxed);
         let aktarilan = loop {
             let a = bayt.min(canli);
@@ -139,7 +141,10 @@ impl Butce {
                 .compare_exchange_weak(canli, yeni, Ordering::AcqRel, Ordering::Relaxed)
             {
                 Ok(_) => break a,
-                Err(guncel) => canli = guncel,
+                Err(guncel) => {
+                    canli = guncel;
+                    backoff.spin();
+                }
             }
         };
         Some(ButceTutucu {
@@ -185,6 +190,7 @@ impl Butce {
         }
         // ORDERING: CAS döngüsünün başlangıç okuması; doğrulama CAS adımında
         // atomik olarak yapılır.
+        let backoff = Backoff::new();
         let mut canli = self.canli.load(Ordering::Relaxed);
         loop {
             let Some(istenen) = canli.checked_add(bayt) else {
@@ -222,7 +228,10 @@ impl Butce {
                     self.tepe.fetch_max(istenen, Ordering::Relaxed);
                     return Ok(());
                 }
-                Err(guncel) => canli = guncel,
+                Err(guncel) => {
+                    canli = guncel;
+                    backoff.spin();
+                }
             }
         }
     }
@@ -231,6 +240,7 @@ impl Butce {
     pub(crate) fn birak(&self, bayt: usize) {
         // ORDERING: Bırakılan bütçenin sonraki `ayir` CAS okumalarına
         // görünür olmasını sağlar (`Release`).
+        let backoff = Backoff::new();
         let mut canli = self.canli.load(Ordering::Relaxed);
         let dusulen = loop {
             let d = bayt.min(canli);
@@ -242,7 +252,10 @@ impl Butce {
                 Ordering::Relaxed,
             ) {
                 Ok(_) => break d,
-                Err(guncel) => canli = guncel,
+                Err(guncel) => {
+                    canli = guncel;
+                    backoff.spin();
+                }
             }
         };
         if let Some(ref ust) = self.ust

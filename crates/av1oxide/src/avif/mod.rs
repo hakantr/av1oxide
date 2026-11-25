@@ -1,4 +1,4 @@
-//! Sıfır dış bağımlılıklı, `%100 #![forbid(unsafe_code)]` `.avif` (AV1 Image File Format)
+//! Saf Rust, `%100 #![forbid(unsafe_code)]` `.avif` (AV1 Image File Format)
 //! okuyucu ve görüntü çözücü katmanı.
 //!
 //! Bu modül `ISO/IEC 14496-12` (ISOBMFF), `ISO/IEC 23008-12` (HEIF/MIAF) ve

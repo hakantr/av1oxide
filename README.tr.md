@@ -2,7 +2,7 @@
 
 [English](README.md) | **Türkçe**
 
-`av1oxide`, VideoLAN [`dav1d`](https://code.videolan.org/videolan/dav1d) (`1.5.4`) AV1 video çözücüsünün **%100 kararlı Rust** (`rustc 1.100.0`, Edition 2024), **sıfır çalışma zamanı dış bağımlılığı**, **`libdav1d` (`7.0.0`) ikili uyumlu C-ABI katmanı** ve **saf Rust `.avif` görüntü çözücü katmanı** ile yeniden gerçekleştirimidir.
+`av1oxide`, VideoLAN [`dav1d`](https://code.videolan.org/videolan/dav1d) (`1.5.4`) AV1 video çözücüsünün **%100 kararlı Rust** (`rustc 1.100.0`, Edition 2024), **sıfır üçüncü taraf medya veya kodek bağımlılığı**, **`libdav1d` (`7.0.0`) ikili uyumlu C-ABI katmanı** ve **saf Rust `.avif` görüntü çözücü katmanı** ile yeniden gerçekleştirimidir.
 
 - **Profiller ve Bit Derinlikleri:** Main (`0`), High (`1`), Professional (`2`); `8-bit`, `10-bit`, `12-bit`; `4:2:0`, `4:2:2`, `4:4:4` ve `Monochrome` (`4:0:0`).
 - **AV1 Hattı:** OBU ayrıştırma, Sequence/Frame Header, MSAC aritmetik entropi çözücü, ters dönüşümler (`ITX`), intra tahmin (`IPRED`, CfL, Palette), hareket telafisi (`MC`, Warp, Superres/Resize, IntraBC, `REFMVS`), halka içi filtreler (`LF`, `CDEF`, `LR` Wiener/SGR) ve Film Grain (`FG`) sentezi.
@@ -14,7 +14,17 @@
   - İkincil mimariler (`arm32`, `riscv64`, `loongarch64`, `powerpc64le`): `%100` güvenli skaler geri-düşüş
 - **Çok-Thread ve Bellek Bütçesi:** Kare içi (`Tile`, süperblok satırı, halka içi filtre) ve kareler arası (`FrameSlot`) paralellik (`Config::n_threads`, `Config::max_frame_delay`); tahsis öncesi piksel ve bellek tavanı (`Config::frame_size_limit`, `Config::allocation_limit`).
 - **`libdav1d` (`7.0.0`) Uyumlu C-ABI (`capi`):** 19 resmî `DAV1D_API` fonksiyonunun tamamını (`dav1d_open`, `dav1d_send_data`, `dav1d_get_picture`, `dav1d_apply_grain`, `dav1d_parse_sequence_header`, vb.) ve resmî `include/dav1d/*.h` C başlıklarını içerir.
-- **Sıfır Bağımlılıklı `.avif` Görüntü Okuyucu (`avif`):** `%100 #![forbid(unsafe_code)]` ISOBMFF/HEIF/MIAF/AVIF kapsayıcı ayrıştırıcısı; tekil `av01`, çok-thread `grid` karo birleştirme, `iden` türetilmiş görüntüler, yardımcı alfa (`auxl`/`auxC`) kanalı, `clap`/`irot`/`imir` dönüşümleri, `ICC`/`Exif`/`XMP` metaverisi ve ITU-T H.273 renk dönüşümleri (`RGB8`/`RGBA8`/`RGB16`/`RGBA16`) — lisans denetimli `AOMediaCodec/av1-avif` ve `AOMediaCodec/libavif` test korpusundaki `156 / 156` geçerli `.avif` görüntüsünde referans C `libavif` ile düzlemsel (`Y`, `U`, `V`, `Alpha`), `RGBA8` ve `RGBA16` çıktılarında `%100` MD5 bit-birebir eşitlik.
+- **Saf Rust `.avif` Görüntü Okuyucu (`avif`):** `%100 #![forbid(unsafe_code)]` ISOBMFF/HEIF/MIAF/AVIF kapsayıcı ayrıştırıcısı; tekil `av01`, çok-thread `grid` karo birleştirme, `iden` türetilmiş görüntüler, yardımcı alfa (`auxl`/`auxC`) kanalı, `clap`/`irot`/`imir` dönüşümleri, `ICC`/`Exif`/`XMP` metaverisi ve ITU-T H.273 renk dönüşümleri (`RGB8`/`RGBA8`/`RGB16`/`RGBA16`) — lisans denetimli `AOMediaCodec/av1-avif` ve `AOMediaCodec/libavif` test korpusundaki `156 / 156` geçerli `.avif` görüntüsünde referans C `libavif` ile düzlemsel (`Y`, `U`, `V`, `Alpha`), `RGBA8` ve `RGBA16` çıktılarında `%100` MD5 bit-birebir eşitlik.
+
+---
+
+## Bağımlılık Politikası
+
+`av1oxide`, hiçbir üçüncü taraf medya, kodek, görüntü işleme veya C bağlama kütüphanesine bağımlı değildir; tüm AV1 bit akışı/entropi/DSP çözme, ISOBMFF/AVIF kapsayıcı ayrıştırma, ITU-T H.273 renk dönüşümü ve `libdav1d` C-ABI katmanları depo içinde gerçekleştirilmiştir. Düşük seviyeli eşzamanlılık ve temel veri yapısı ilkel tipleri için yalnızca `rust-lang` organizasyonu ve Rust çekirdek ekip üyeleri tarafından geliştirilen aşağıdaki temel kütüphaneler kullanılır:
+
+| Kütüphane (`Crate`) | Sürüm | Özellikler (`default-features = false`) | Geliştirici / Grup | `av1oxide` İçindeki Kullanım Amacı |
+|---|---|---|---|---|
+| `crossbeam-utils` | `0.8` | `["std"]` | `crossbeam-rs` / Rust Eşzamanlılık Ekibi | Paylaşılan atomik sayaçların ve işçi yuvalarının (`thread::TaskBatch`, `thread::ScratchPool`, `frame::butce::Butce`) `CachePadded` ile önbellek satırı izolasyonu ve kilitsiz CAS döngülerinde `Backoff` bekleme kontrolü |
 
 ---
 

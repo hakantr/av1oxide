@@ -2,7 +2,7 @@
 
 **English** | [Türkçe](README.tr.md)
 
-`av1oxide` is a **100% stable-Rust** (`rustc 1.100.0`, Edition 2024) reimplementation of the VideoLAN [`dav1d`](https://code.videolan.org/videolan/dav1d) (`1.5.4`) AV1 video decoder with **zero runtime external dependencies**, a **`libdav1d` (`7.0.0`) binary-compatible C-ABI layer**, and a **pure-Rust `.avif` image decoder layer**.
+`av1oxide` is a **100% stable-Rust** (`rustc 1.100.0`, Edition 2024) reimplementation of the VideoLAN [`dav1d`](https://code.videolan.org/videolan/dav1d) (`1.5.4`) AV1 video decoder with **no external codec or media dependencies**, a **`libdav1d` (`7.0.0`) binary-compatible C-ABI layer**, and a **pure-Rust `.avif` image decoder layer**.
 
 - **Profiles & Bit Depths:** Main (`0`), High (`1`), Professional (`2`); `8-bit`, `10-bit`, `12-bit`; `4:2:0`, `4:2:2`, `4:4:4`, and `Monochrome` (`4:0:0`).
 - **AV1 Pipeline:** OBU parsing, Sequence/Frame Headers, MSAC arithmetic entropy decoder, inverse transforms (`ITX`), intra prediction (`IPRED`, CfL, Palette), motion compensation (`MC`, Warp, Superres/Resize, IntraBC, `REFMVS`), in-loop filters (`LF`, `CDEF`, `LR` Wiener/SGR), and Film Grain (`FG`) synthesis.
@@ -14,7 +14,17 @@
   - Secondary architectures (`arm32`, `riscv64`, `loongarch64`, `powerpc64le`): `100%` safe bit-exact scalar fallback
 - **Multithreading & Memory Budgets:** Intra-frame (`Tile`, superblock row, in-loop filter) and inter-frame (`FrameSlot`) parallelism (`Config::n_threads`, `Config::max_frame_delay`); pre-allocation pixel and memory limits (`Config::frame_size_limit`, `Config::allocation_limit`).
 - **`libdav1d` (`7.0.0`) Compatible C-ABI (`capi`):** Implements all 19 official `DAV1D_API` functions (`dav1d_open`, `dav1d_send_data`, `dav1d_get_picture`, `dav1d_apply_grain`, `dav1d_parse_sequence_header`, etc.) and ships the official `include/dav1d/*.h` C headers.
-- **Zero-Dependency `.avif` Image Reader (`avif`):** `100% #![forbid(unsafe_code)]` ISOBMFF/HEIF/MIAF/AVIF container parser supporting single `av01` items, multithreaded `grid` tile stitching, `iden` derived chains, auxiliary alpha (`auxl`/`auxC`), `clap`/`irot`/`imir` transforms, `ICC`/`Exif`/`XMP` metadata, and ITU-T H.273 conversions (`RGB8`/`RGBA8`/`RGB16`/`RGBA16`) — verified `100%` MD5 bit-exact parity (`156 / 156` valid `.avif` images across planar `Y`, `U`, `V`, `Alpha`, `RGBA8`, and `RGBA16`) against reference C `libavif` on the license-audited `AOMediaCodec/av1-avif` and `AOMediaCodec/libavif` corpora.
+- **Pure-Rust `.avif` Image Reader (`avif`):** `100% #![forbid(unsafe_code)]` ISOBMFF/HEIF/MIAF/AVIF container parser supporting single `av01` items, multithreaded `grid` tile stitching, `iden` derived chains, auxiliary alpha (`auxl`/`auxC`), `clap`/`irot`/`imir` transforms, `ICC`/`Exif`/`XMP` metadata, and ITU-T H.273 conversions (`RGB8`/`RGBA8`/`RGB16`/`RGBA16`) — verified `100%` MD5 bit-exact parity (`156 / 156` valid `.avif` images across planar `Y`, `U`, `V`, `Alpha`, `RGBA8`, and `RGBA16`) against reference C `libavif` on the license-audited `AOMediaCodec/av1-avif` and `AOMediaCodec/libavif` corpora.
+
+---
+
+## Dependency Policy
+
+`av1oxide` does not depend on any third-party codec, image, multimedia, or C binding crates; all AV1 bitstream/entropy/DSP decoding, ISOBMFF/AVIF container parsing, ITU-T H.273 color conversion, and `libdav1d` C-ABI layers are implemented in-tree. For low-level concurrency and data structure primitives, `av1oxide` uses the following foundational crates maintained by the `rust-lang` organization and Rust Core Team members:
+
+| Crate | Version | Features (`default-features = false`) | Maintainer / Group | Purpose in `av1oxide` |
+|---|---|---|---|---|
+| `crossbeam-utils` | `0.8` | `["std"]` | `crossbeam-rs` / Rust Concurrency Team | `CachePadded` cache-line isolation of shared atomic counters/slots (`thread::TaskBatch`, `thread::ScratchPool`, `frame::butce::Butce`) and `Backoff` in lock-free CAS loops |
 
 ---
 

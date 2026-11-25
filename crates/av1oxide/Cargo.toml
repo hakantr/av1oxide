@@ -1,9 +1,9 @@
 # av1oxide — AV1 video ve AVIF görüntü çözücü kütüphanesi (v0.3.2)
-# Sıfır dış bağımlılık: `[dependencies]` bilinçli olarak boştur.
+# Sıfır üçüncü taraf medya/kodek bağımlılığı; yalnızca çekirdek sistem kütüphaneleri kullanılır.
 
 [package]
 name = "av1oxide"
-description = "100% stable-Rust AV1 video and AVIF image decoder reimplementing dav1d, with libdav1d C-ABI (8/10/12-bit, SIMD, multithreaded, zero dependencies)"
+description = "100% stable-Rust AV1 video and AVIF image decoder reimplementing dav1d, with libdav1d C-ABI (8/10/12-bit, SIMD, multithreaded, no external codec/media dependencies)"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -23,6 +23,7 @@ path = "src/lib.rs"
 workspace = true
 
 [dependencies]
+crossbeam-utils.workspace = true
 
 # İsteğe bağlı derleme zamanı özellikleri (varsayılan kapalıdır).
 [features]

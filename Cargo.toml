@@ -14,12 +14,23 @@ rust-version = "1.100.0"
 license = "BSD-2-Clause"
 repository = "https://github.com/hakantr/av1oxide"
 
+[workspace.dependencies]
+crossbeam-utils = { version = "0.8", default-features = false, features = ["std"] }
+
+[workspace.lints.cargo]
+unused_dependencies = "deny"
+
 [workspace.lints.rust]
 missing_docs = "warn"
 
 [workspace.lints.rustdoc]
 private_intra_doc_links = "allow"
 redundant_explicit_links = "allow"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+strip = "symbols"
 
 [profile.robust]
 inherits = "release"

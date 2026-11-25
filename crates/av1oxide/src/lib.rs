@@ -2,7 +2,7 @@
 //!
 //! `av1oxide`, VideoLAN [`dav1d`](https://code.videolan.org/videolan/dav1d) (`1.5.4`)
 //! AV1 video çözücüsünün **%100 kararlı Rust** (`rustc 1.100.0`, Edition 2024) ve
-//! **sıfır çalışma zamanı dış bağımlılığı** ile yeniden gerçekleştirimidir.
+//! **sıfır üçüncü taraf medya veya kodek bağımlılığı** ile yeniden gerçekleştirimidir.
 //!
 //! ## Özellikler
 //!
@@ -29,7 +29,7 @@
 //!   ile ikili uyumlu 19 C fonksiyonu (`dav1d_open`, `dav1d_send_data`, `dav1d_get_picture`,
 //!   `dav1d_apply_grain`, `dav1d_parse_sequence_header`, vb.); `--features capi` ile
 //!   doğrudan `cdylib` (`.so`/`.dylib`/`.dll`) veya `staticlib` (`.a`) olarak derlenebilir.
-//! - **Sıfır Bağımlılıklı `.avif` Görüntü Okuyucu Katmanı ([`avif`]):** `%100 #![forbid(unsafe_code)]`
+//! - **Saf Rust `.avif` Görüntü Okuyucu Katmanı ([`avif`]):** `%100 #![forbid(unsafe_code)]`
 //!   ISOBMFF/HEIF/MIAF/AVIF kutu ayrıştırıcısı, tekil `av01`, `grid` karo birleştirme, `iden`,
 //!   yardımcı alfa (`auxl`/`auxC`) kanalı, `clap`/`irot`/`imir` dönüşümleri, `ICC`/`Exif`/`XMP`
 //!   metaverisi ve ITU-T H.273 renk dönüşümleri (`RGB8`/`RGBA8`/`RGB16`/`RGBA16`); resmî
