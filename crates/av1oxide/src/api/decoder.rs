@@ -54,10 +54,11 @@ use crate::dsp::DspDispatch;
 use crate::error::{BitstreamError, BitstreamErrorKind, Error, Result};
 use crate::frame::butce::{Butce, ButceTutucu};
 use crate::frame::{BitDepth, ChromaFormat, Frame};
+use crate::sync::{Condvar, Mutex};
 use crate::thread::{FrameSlot, WorkerPool};
 use core::sync::atomic::{AtomicBool, Ordering};
 use std::collections::VecDeque;
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::Arc;
 
 /// Çözücünün çağrı sırası durumu (BLK-01).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -191,10 +192,7 @@ struct InFlightDecodeTask {
 
 impl InFlightDecodeTask {
     fn is_done_nonblocking(&self) -> bool {
-        self.result
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .is_some()
+        self.result.lock().is_some()
     }
 }
 
@@ -391,15 +389,9 @@ impl Clone for Decoder {
                             break;
                         }
                     }
-                    let mut guard = task
-                        .result
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    let mut guard = task.result.lock();
                     while guard.is_none() {
-                        guard = task
-                            .done_cv
-                            .wait(guard)
-                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        guard = task.done_cv.wait(guard);
                     }
                     match guard.as_ref() {
                         Some(Ok(completed)) => {
@@ -1327,10 +1319,7 @@ impl Decoder {
             if run_res.is_err() {
                 task_worker.out_slot.mark_failed();
             }
-            let mut guard = task_worker
-                .result
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut guard = task_worker.result.lock();
             *guard = Some(run_res);
             task_worker.done_cv.notify_all();
         });
@@ -1438,15 +1427,9 @@ impl Decoder {
                 // Görev çalışıyorsa varsa alt-partilere yardım et, ardından `done_cv` üzerinde bekle.
                 while !task.is_done_nonblocking() {
                     if !self.pool.help_active_batch() {
-                        let mut guard = task
-                            .result
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        let mut guard = task.result.lock();
                         while guard.is_none() {
-                            guard = task
-                                .done_cv
-                                .wait(guard)
-                                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                            guard = task.done_cv.wait(guard);
                         }
                         break;
                     }
@@ -1454,7 +1437,6 @@ impl Decoder {
                 let res = task
                     .result
                     .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .take()
                     .unwrap_or(Err(Error::InvalidState("uçuş görevi sonuç üretmedi")));
                 self.allocation_peak = self.allocation_peak.max(self.pipeline_butce.tepe());
@@ -1538,15 +1520,9 @@ impl Decoder {
         }
         while let Some(entry) = self.in_flight.pop_front() {
             if let InFlightEntry::Decode(task) = entry {
-                let mut guard = task
-                    .result
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let mut guard = task.result.lock();
                 while guard.is_none() {
-                    guard = task
-                        .done_cv
-                        .wait(guard)
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    guard = task.done_cv.wait(guard);
                 }
             }
         }

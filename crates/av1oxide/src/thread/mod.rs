@@ -3,8 +3,8 @@
 //! ## Tasarım Özeti (`ADR-0004-threading-ve-kaynak-yonetimi.md`)
 //!
 //! - `%100 #![forbid(unsafe_code)]`, sıfır üçüncü taraf medya/kodek bağımlılığı
-//!   (`std::thread`, `std::sync::{Arc, Mutex, Condvar}`, `core::sync::atomic`,
-//!   `crossbeam_utils::CachePadded`).
+//!   (`std::thread`, `std::sync::Arc`, `crate::sync::{Mutex, Condvar}`,
+//!   `core::sync::atomic`, `crossbeam_utils::CachePadded`).
 //! - `effective_threads == 1` (`Config::default()`): **0** yardımcı iş parçacığı
 //!   açılır; görevler çağıran iş parçacığında sırayla ve sıfır senkronizasyon
 //!   yüküyle çalışır.
@@ -28,10 +28,11 @@
 use crate::decode::intra::{DecodeBufPool, RefFrame};
 use crate::error::{Error, Result};
 use crate::frame::{BitDepth, ChromaFormat};
+use crate::sync::{Condvar, Mutex};
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use crossbeam_utils::CachePadded;
 use std::collections::VecDeque;
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 
 /// Yardımcı iş parçacığı yığın boyutu (`2 MiB`; derin özyinelemeli
@@ -95,9 +96,7 @@ impl ScratchPool {
         F: FnOnce(&mut WorkerScratch) -> R,
     {
         let idx = worker_id % self.slots.len().max(1);
-        let mut guard = self.slots[idx]
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut guard = self.slots[idx].lock();
         f(&mut guard)
     }
 }
@@ -142,11 +141,7 @@ impl Drop for TaskDoneGuard<'_> {
         // `Acquire` ile önceki tüm görevlerin tamamlamalarını birleştirir
         // (`AcqRel`, ADR-0004 §4).
         if self.batch.remaining.fetch_sub(1, Ordering::AcqRel) == 1 {
-            let mut done = self
-                .batch
-                .done_lock
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut done = self.batch.done_lock.lock();
             *done = true;
             self.batch.done_cv.notify_all();
         }
@@ -253,10 +248,7 @@ impl FrameSlot {
     /// `Loop Restoration` biter bitmez (gecikmeli Film Grain'den **önce**)
     /// grain'siz `Arc<RefFrame>`'i yayınlar ve bekleyen bağımlı kareleri uyandırır.
     pub(crate) fn publish_ready(&self, rf: Arc<RefFrame>) {
-        let mut st = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut st = self.state.lock();
         if matches!(*st, SlotState::Pending) {
             *st = SlotState::Ready(rf);
             self.cv.notify_all();
@@ -266,10 +258,7 @@ impl FrameSlot {
     /// Geç hata veya iptal durumunda yuvayı `Failed` olarak işaretler ve
     /// bekleyen bağımlı kareleri kilitlenmeden uyandırır.
     pub(crate) fn mark_failed(&self) {
-        let mut st = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut st = self.state.lock();
         if matches!(*st, SlotState::Pending) {
             *st = SlotState::Failed;
             self.cv.notify_all();
@@ -280,10 +269,7 @@ impl FrameSlot {
     /// `slot_promises` içinde artık tutulmayan yuvaların `RefFrame` tamponlarının
     /// `Arc::try_unwrap` ile havuza geri dönüştürülebilmesi için).
     pub(crate) fn clear_ready(&self) {
-        let mut st = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut st = self.state.lock();
         if matches!(*st, SlotState::Ready(_)) {
             *st = SlotState::Failed;
         }
@@ -291,29 +277,20 @@ impl FrameSlot {
 
     /// Bloklamadan yuvanın `Failed` durumunda olup olmadığını döndürür.
     pub(crate) fn is_failed_nonblocking(&self) -> bool {
-        let st = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let st = self.state.lock();
         matches!(*st, SlotState::Failed)
     }
 
     /// Bloklamadan yuvanın `Ready` veya `Failed` (yani `Pending` dışı) olup olmadığını döndürür.
     pub(crate) fn is_done_nonblocking(&self) -> bool {
-        let st = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let st = self.state.lock();
         !matches!(*st, SlotState::Pending)
     }
 
     /// Yuvadaki `RefFrame` tamamlanana (veya hata/iptal olana) kadar `Condvar`
     /// üzerinde bekler (`spin-wait = 0`).
     pub(crate) fn wait(&self, cancelled: &AtomicBool) -> Option<Arc<RefFrame>> {
-        let mut st = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut st = self.state.lock();
         loop {
             // ORDERING: İptal bayrağı (`Release`) gözlemi.
             if cancelled.load(Ordering::Acquire) {
@@ -323,10 +300,7 @@ impl FrameSlot {
                 SlotState::Ready(rf) => return Some(Arc::clone(rf)),
                 SlotState::Failed => return None,
                 SlotState::Pending => {
-                    st = self
-                        .cv
-                        .wait(st)
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    st = self.cv.wait(st);
                 }
             }
         }
@@ -369,10 +343,7 @@ impl Drop for WorkerPool {
             && let Some(shared) = &self.shared
         {
             {
-                let mut st = shared
-                    .state
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let mut st = shared.state.lock();
                 st.shutdown = true;
                 st.active_batches.clear();
                 st.async_tasks.clear();
@@ -526,10 +497,7 @@ impl WorkerPool {
     {
         if let Some(shared) = &self.shared {
             {
-                let mut st = shared
-                    .state
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let mut st = shared.state.lock();
                 st.generation = st.generation.wrapping_add(1);
                 st.async_tasks.push_back(Box::new(task));
             }
@@ -543,10 +511,7 @@ impl WorkerPool {
     /// alınmamışsa) çekip döndürür.
     pub(crate) fn try_pop_async_task(&self) -> Option<AsyncTaskFn> {
         let shared = self.shared.as_ref()?;
-        let mut st = shared
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut st = shared.state.lock();
         st.async_tasks.pop_front()
     }
 
@@ -557,10 +522,7 @@ impl WorkerPool {
             return false;
         };
         let batch = {
-            let st = shared
-                .state
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let st = shared.state.lock();
             st.active_batches
                 .iter()
                 .find(|b| b.next_task.load(Ordering::Relaxed) < b.n_tasks)
@@ -619,9 +581,7 @@ impl WorkerPool {
             remaining: CachePadded::new(AtomicUsize::new(n_tasks)),
             first_error_idx: CachePadded::new(AtomicUsize::new(usize::MAX)),
             runner: Box::new(move |worker_id: usize, idx: usize, batch_ref: &TaskBatch| {
-                let mut guard = slots_worker[idx]
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let mut guard = slots_worker[idx].lock();
                 if let Some(ref mut item) = guard.0
                     && let Err(err) = op(worker_id, idx, item)
                 {
@@ -642,9 +602,7 @@ impl WorkerPool {
         // koy ve ilk (en küçük indeksli) hatayı deterministik sırada döndür.
         let mut first_err: Option<Error> = None;
         for slot in slots.iter() {
-            let mut guard = slot
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut guard = slot.lock();
             if let Some(item) = guard.0.take() {
                 tasks.push(item);
             }
@@ -693,9 +651,7 @@ impl WorkerPool {
             first_error_idx: CachePadded::new(AtomicUsize::new(usize::MAX)),
             runner: Box::new(move |worker_id: usize, idx: usize, batch_ref: &TaskBatch| {
                 if let Err(err) = op(worker_id, idx) {
-                    let mut slot = errors_worker[idx]
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    let mut slot = errors_worker[idx].lock();
                     *slot = Some(err);
                     // ORDERING: Bkz. `execute_tasks` `first_error_idx` açıklaması.
                     batch_ref.first_error_idx.fetch_min(idx, Ordering::AcqRel);
@@ -708,9 +664,7 @@ impl WorkerPool {
         self.dispatch_and_wait(shared, &batch);
 
         for slot in errors.iter() {
-            let mut guard = slot
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut guard = slot.lock();
             if let Some(err) = guard.take() {
                 return Err(err);
             }
@@ -720,10 +674,7 @@ impl WorkerPool {
 
     fn dispatch_and_wait(&self, shared: &Arc<SharedQueue>, batch: &Arc<TaskBatch>) {
         {
-            let mut st = shared
-                .state
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut st = shared.state.lock();
             st.generation = st.generation.wrapping_add(1);
             st.active_batches.push(Arc::clone(batch));
         }
@@ -736,22 +687,13 @@ impl WorkerPool {
 
         // Bu partideki tüm görevlerin bitmesini bekle.
         if batch.remaining.load(Ordering::Acquire) != 0 {
-            let mut done = batch
-                .done_lock
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut done = batch.done_lock.lock();
             while !*done && batch.remaining.load(Ordering::Acquire) != 0 {
-                done = batch
-                    .done_cv
-                    .wait(done)
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                done = batch.done_cv.wait(done);
             }
         }
 
-        let mut st = shared
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut st = shared.state.lock();
         st.active_batches.retain(|b| !Arc::ptr_eq(b, batch));
     }
 }
@@ -764,10 +706,7 @@ fn worker_loop(worker_id: usize, shared: &SharedQueue) {
     let mut seen_gen = 0u64;
     loop {
         let item = {
-            let mut st = shared
-                .state
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut st = shared.state.lock();
             loop {
                 if st.shutdown {
                     return;
@@ -789,10 +728,7 @@ fn worker_loop(worker_id: usize, shared: &SharedQueue) {
                     seen_gen = st.generation;
                     continue;
                 }
-                st = shared
-                    .work_cv
-                    .wait(st)
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                st = shared.work_cv.wait(st);
             }
         };
         match item {

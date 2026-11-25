@@ -114,6 +114,7 @@ pub mod dsp;
 pub mod entropy;
 pub mod error;
 pub mod frame;
+pub(crate) mod sync;
 pub mod tables;
 pub mod thread;
 

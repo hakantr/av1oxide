@@ -948,13 +948,13 @@ const MAX_POOLED_TMVS_VECS: usize = 12;
 /// devre dışı bırakılır; böylece boşta bekleyen hiçbir tampon bütçe sınırını
 /// daraltmaz.
 pub(crate) struct DecodeBufPool {
-    inner: std::sync::Mutex<BufPoolInner>,
+    inner: crate::sync::Mutex<BufPoolInner>,
 }
 
 impl DecodeBufPool {
     pub(crate) fn new() -> Self {
         Self {
-            inner: std::sync::Mutex::new(BufPoolInner {
+            inner: crate::sync::Mutex::new(BufPoolInner {
                 work_bufs: Vec::with_capacity(MAX_POOLED_WORK_BUFS),
                 u8_vecs: Vec::with_capacity(MAX_POOLED_U8_VECS),
                 tmvs_vecs: Vec::with_capacity(MAX_POOLED_TMVS_VECS),
@@ -963,10 +963,7 @@ impl DecodeBufPool {
     }
 
     pub(crate) fn clear(&self) {
-        let mut g = self
-            .inner
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut g = self.inner.lock();
         g.work_bufs.clear();
         g.u8_vecs.clear();
         g.tmvs_vecs.clear();
@@ -976,10 +973,7 @@ impl DecodeBufPool {
         if has_limit {
             return WorkFrameBufs::default();
         }
-        let mut g = self
-            .inner
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut g = self.inner.lock();
         g.work_bufs.pop().unwrap_or_default()
     }
 
@@ -987,10 +981,7 @@ impl DecodeBufPool {
         if has_limit {
             return;
         }
-        let mut g = self
-            .inner
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut g = self.inner.lock();
         if g.work_bufs.len() < MAX_POOLED_WORK_BUFS {
             g.work_bufs.push(entry);
         }
@@ -1000,10 +991,7 @@ impl DecodeBufPool {
         if has_limit || len == 0 {
             return Vec::new();
         }
-        let mut g = self
-            .inner
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut g = self.inner.lock();
         if let Some(pos) = g.u8_vecs.iter().rposition(|v| v.capacity() == len) {
             return g.u8_vecs.swap_remove(pos);
         }
@@ -1021,10 +1009,7 @@ impl DecodeBufPool {
         if has_limit {
             return [Vec::new(), Vec::new(), Vec::new()];
         }
-        let mut g = self
-            .inner
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut g = self.inner.lock();
         let mut take_one = |len: usize| -> Vec<u8> {
             if len == 0 {
                 return Vec::new();
@@ -1048,10 +1033,7 @@ impl DecodeBufPool {
         if has_limit || v.capacity() == 0 {
             return;
         }
-        let mut g = self
-            .inner
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut g = self.inner.lock();
         if g.u8_vecs.len() < MAX_POOLED_U8_VECS {
             g.u8_vecs.push(v);
         }
@@ -1061,10 +1043,7 @@ impl DecodeBufPool {
         if has_limit || len == 0 {
             return Vec::new();
         }
-        let mut g = self
-            .inner
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut g = self.inner.lock();
         if let Some(pos) = g
             .tmvs_vecs
             .iter()
@@ -1079,10 +1058,7 @@ impl DecodeBufPool {
         if has_limit {
             return;
         }
-        let mut g = self
-            .inner
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut g = self.inner.lock();
         for v in rf.pic.data {
             if v.capacity() > 0 && g.u8_vecs.len() < MAX_POOLED_U8_VECS {
                 g.u8_vecs.push(v);
@@ -9418,7 +9394,7 @@ fn decode_tiles_parallel(
     tile_cdfs: &mut Vec<CdfContext>,
     pool: &crate::thread::WorkerPool,
 ) -> Result<()> {
-    use std::sync::Mutex;
+    use crate::sync::Mutex;
 
     struct TileWork {
         tile_row: usize,
@@ -9659,34 +9635,20 @@ fn decode_tiles_parallel(
         w.pic_stride = tdec.pic.stride;
         w.pic_x_base = tdec.pic.x_base;
         w.pic_y_base = tdec.pic.y_base;
-        *w.pic_data[0]
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(py);
+        *w.pic_data[0].lock() = Some(py);
         if has_chroma {
-            *w.pic_data[1]
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(pu);
-            *w.pic_data[2]
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(pv);
+            *w.pic_data[1].lock() = Some(pu);
+            *w.pic_data[2].lock() = Some(pv);
         }
-        *w.lf
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = tdec.lf;
-        *w.cdef_state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(tdec.cdef_state);
+        *w.lf.lock() = tdec.lf;
+        *w.cdef_state.lock() = Some(tdec.cdef_state);
         w.lr = tdec.lr;
         w.lr_counts = tdec.lr_counts;
         if !tdec.segmap.is_empty() {
-            *w.segmap
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(tdec.segmap);
+            *w.segmap.lock() = Some(tdec.segmap);
         }
         if need_refmvs {
-            *w.refmvs
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(tdec.refmvs);
+            *w.refmvs.lock() = Some(tdec.refmvs);
         }
         w.tools = tdec.tools;
         res
@@ -9818,11 +9780,7 @@ fn decode_tiles_parallel(
                 let sv = *sv;
                 if let Some(max_rows) = data.len().checked_div(dst_stride) {
                     for w in works_for_workers.iter() {
-                        let Some(src_data) = w.pic_data[p]
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner)
-                            .take()
-                        else {
+                        let Some(src_data) = w.pic_data[p].lock().take() else {
                             continue;
                         };
                         let src_stride = w.pic_stride[p];
@@ -9858,12 +9816,7 @@ fn decode_tiles_parallel(
                 let iw4 = *iw4;
                 let ih4 = *ih4;
                 for w in works_for_workers.iter() {
-                    let Some(other_rmv) = w
-                        .refmvs
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .take()
-                    else {
+                    let Some(other_rmv) = w.refmvs.lock().take() else {
                         continue;
                     };
                     if !other_rmv.grid.is_empty() && other_rmv.stride > 0 {
@@ -9891,11 +9844,7 @@ fn decode_tiles_parallel(
                 let w4 = *w4;
                 let h4 = *h4;
                 for w in works_for_workers.iter() {
-                    let Some(src_lf) =
-                        w.lf.lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner)
-                            .take()
-                    else {
+                    let Some(src_lf) = w.lf.lock().take() else {
                         continue;
                     };
                     lf.merge_tile_from(
@@ -9918,12 +9867,7 @@ fn decode_tiles_parallel(
                 let segmap_stride = *segmap_stride;
                 let bh = *bh;
                 for w in works_for_workers.iter() {
-                    if let Some(other_seg) = w
-                        .segmap
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .take()
-                    {
+                    if let Some(other_seg) = w.segmap.lock().take() {
                         let sy0 = w.row_start.min(bh);
                         let sy1 = w.row_end.min(bh);
                         let sx0 = w.col_start.min(segmap_stride);
@@ -9943,12 +9887,7 @@ fn decode_tiles_parallel(
                             }
                         }
                     }
-                    if let Some(other_cdef) = w
-                        .cdef_state
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .take()
-                    {
+                    if let Some(other_cdef) = w.cdef_state.lock().take() {
                         cdef_state.merge_tile_from(
                             &other_cdef,
                             w.row_start,
