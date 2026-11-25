@@ -1,7 +1,5 @@
 [toolchain]
 # av1oxide — üretim toolchain kilidi
 channel = "1.100.0"
-
 components = ["rustfmt", "clippy"]
 
-targets = ["x86_64-unknown-linux-gnu"]

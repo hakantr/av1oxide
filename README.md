@@ -20,17 +20,19 @@
 
 ## Dependency Policy
 
-`av1oxide` does not depend on any third-party codec, image, multimedia, or C binding crates; all AV1 bitstream/entropy/DSP decoding, ISOBMFF/AVIF container parsing, ITU-T H.273 color conversion, and `libdav1d` C-ABI layers are implemented in-tree. For low-level concurrency and data structure primitives, `av1oxide` uses the following foundational crates maintained by the `rust-lang` organization and Rust Core Team members:
+`av1oxide` does not depend on any third-party codec, image, multimedia, or C media library crates; all AV1 bitstream/entropy/DSP decoding, ISOBMFF/AVIF container parsing, ITU-T H.273 color conversion, and `libdav1d` C-ABI layers are implemented in-tree. All external dependencies are strictly isolated as internal implementation details (`pub(crate)` / private); no types from any dependency crate are re-exported or exposed in `av1oxide`'s public (`pub`) API.
 
-| Crate | Version | Features (`default-features = false`) | Maintainer / Group | Purpose in `av1oxide` |
-|---|---|---|---|---|
-| `crossbeam-utils` | `0.8` | `["std"]` | `crossbeam-rs` / Rust Concurrency Team | `CachePadded` cache-line isolation of shared atomic counters/slots (`thread::TaskBatch`, `thread::ScratchPool`, `frame::butce::Butce`) and `Backoff` in lock-free CAS loops |
-| `parking_lot` | `0.12` | `[]` (`not(target_arch = "wasm32")`) | `Amanieu d'Antras` / Rust `libs-team` | Non-poisoning compact userspace `Mutex` and `Condvar` (`sync`) across `thread::WorkerPool`, `thread::FrameSlot`, `api::Decoder`, and `decode::intra` |
-| `memchr` | `2` | `[]` | `Andrew Gallant (BurntSushi)` / Rust `libs-team` | SIMD/SWAR byte scanning (`memchr`, `memrchr`) for ISOBMFF NUL-terminated string parsing (`avif::boxes`) and OBU metadata trailing-byte locating (`api::Decoder`) |
-| `rustc-hash` | `2` | `[]` | `rust-lang/rustc-hash` / Rust Compiler Team | Fast deterministic integer/tuple hashing (`FxBuildHasher`) for ISOBMFF `item_id` deduplication, shared grid tile caching (`avif`), and DSP dispatch setup (`dsp`) |
-| `indexmap` | `2` | `[]` | `Josh Stone (cuviper)` / Rust `libs-team` & `compiler-team` | Order-preserving $O(1)$ hash tables and sets (`IndexMap`, `IndexSet` over Miri-verified `hashbrown`) for ISOBMFF `iinf`, `ipma`, `iloc`, and `iref` item tables (`avif::boxes`, `avif::decode`, `dsp`) |
-| `smallvec` | `1` | `[]` | `servo/rust-smallvec` / Rust & Servo Core Teams | Stack-inlined small vectors (`SmallVec`) for ISOBMFF property/extent/reference lists (`avif::boxes`, `avif::decode`) and 8-slot reference frame eviction lists (`api::Decoder`) |
-| `flate2` | `1.1` | `["rust_backend"]` (`miniz_oxide`) | `rust-lang/flate2` / Rust `libs-team` | Pure-Rust bounded `deflate`/`zlib`/`gzip` decompression for HEIF compressed metadata items (`infe` `content_encoding`, `cmpC`) and `cmin` boxes (`avif::boxes`) |
+For low-level concurrency, memory layout, and decompression primitives, `av1oxide` uses only foundational crates maintained by the `rust-lang` organization and Rust Core Team members with `default-features = false`:
+
+| Crate | Version | License | Source | Features (`default-features = false`) | Purpose in `av1oxide` | Unsafe / Native Code |
+|---|---|---|---|---|---|---|
+| `crossbeam-utils` | `0.8` (`0.8.23`) | `MIT OR Apache-2.0` | [crossbeam-rs/crossbeam](https://github.com/crossbeam-rs/crossbeam) | `["std"]` | `CachePadded` cache-line isolation of shared atomic counters/slots (`thread::TaskBatch`, `thread::ScratchPool`, `frame::butce::Butce`) and `Backoff` in lock-free CAS loops | Pure Rust (internal atomic/alignment `unsafe`, `0` C code) |
+| `parking_lot` | `0.12` (`0.12.5`) | `MIT OR Apache-2.0` | [Amanieu/parking_lot](https://github.com/Amanieu/parking_lot) | `[]` (`not(target_arch = "wasm32")`) | Non-poisoning compact userspace `Mutex` and `Condvar` (`sync`) across `thread::WorkerPool`, `thread::FrameSlot`, `api::Decoder`, and `decode::intra` | Pure Rust + OS futex / `libc` syscall binding on non-Wasm (`0` compiled C files) |
+| `memchr` | `2` (`2.8.3`) | `Unlicense OR MIT` | [BurntSushi/memchr](https://github.com/BurntSushi/memchr) | `[]` | SIMD/SWAR byte scanning (`memchr`, `memrchr`) for ISOBMFF NUL-terminated string parsing (`avif::boxes`) and OBU metadata trailing-byte locating (`api::Decoder`) | Pure Rust (internal SIMD/pointer `unsafe`, `0` C code) |
+| `rustc-hash` | `2` (`2.1.3`) | `Apache-2.0 OR MIT` | [rust-lang/rustc-hash](https://github.com/rust-lang/rustc-hash) | `[]` | Fast deterministic integer/tuple hashing (`FxBuildHasher`) for ISOBMFF `item_id` tables (`avif`) and DSP dispatch setup (`dsp`) | Safe Rust (`0` `unsafe` blocks, `0` C code) |
+| `indexmap` | `2` (`2.14.2`) | `Apache-2.0 OR MIT` | [indexmap-rs/indexmap](https://github.com/indexmap-rs/indexmap) | `[]` | Order-preserving $O(1)$ hash tables and sets (`IndexMap`, `IndexSet` over Miri-verified `hashbrown`) as the single hash table engine (`avif::boxes`, `avif::decode`, `dsp`) | Pure Rust (`indexmap` `#![forbid(unsafe_code)]` over Miri-verified `hashbrown`, `0` C code) |
+| `smallvec` | `1` (`1.16.6`) | `MIT OR Apache-2.0` | [smallvec/smallvec](https://github.com/smallvec/smallvec) | `[]` | Stack-inlined small vectors (`SmallVec`) for ISOBMFF property/extent/reference lists (`avif::boxes`, `avif::decode`) and 8-slot reference frame eviction lists (`api::Decoder`) | Pure Rust (internal inline-buffer union/pointer `unsafe`, `0` C code) |
+| `flate2` | `1.1` (`1.1.11`) | `MIT OR Apache-2.0` | [rust-lang/flate2-rs](https://github.com/rust-lang/flate2-rs) | `["rust_backend"]` | Pure-Rust bounded `deflate`/`zlib`/`gzip` decompression for HEIF compressed metadata items (`infe` `content_encoding`, `cmpC`) and `cmin` boxes (`avif::boxes`) | Safe Rust (`miniz_oxide` `#![forbid(unsafe_code)]` backend + `crc32fast`, `0` C/`libz-sys` code) |
 
 ---
 

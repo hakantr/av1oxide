@@ -31,6 +31,8 @@ const EMBEDDED_OBU_PACKETS: &[&[u8]] = &[
 ];
 
 fn main() {
+    // SAFETY: C-ABI örnek çağrılarındaki tüm işaretçiler yerel yığın değişkenlerinden
+    // veya statik OBU dilimlerinden üretilir ve yaşam süreleri bu blok içinde geçerlidir.
     unsafe {
         let ver_str = CStr::from_ptr(dav1d_version()).to_string_lossy();
         let api_ver = dav1d_version_api();

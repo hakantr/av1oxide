@@ -64,6 +64,8 @@ fn copy_c_picture_planes(pic: &Dav1dPicture) -> Vec<Vec<u8>> {
         let row_bytes = pw * bps;
         let mut buf = Vec::with_capacity(row_bytes * ph);
         for y in 0..ph {
+            // SAFETY: `base` null değildir ve `y * stride .. y * stride + row_bytes`
+            // çözülmüş `Dav1dPicture` düzlem sınırları içindedir.
             let row = unsafe {
                 core::slice::from_raw_parts(base.offset((y as isize) * stride), row_bytes)
             };
@@ -76,6 +78,8 @@ fn copy_c_picture_planes(pic: &Dav1dPicture) -> Vec<Vec<u8>> {
 
 #[test]
 fn capi_version_settings_and_sequence_header() {
+    // SAFETY: Test içindeki C-ABI çağrıları yerel yığın değişkenlerini ve statik
+    // OBU dilimlerini geçerli yaşam süreleriyle kullanır.
     unsafe {
         let v = CStr::from_ptr(dav1d_version()).to_str().unwrap();
         assert_eq!(v, "0.3.2");
@@ -140,12 +144,15 @@ fn capi_version_settings_and_sequence_header() {
 }
 
 extern "C" fn count_free_cb(_ptr: *const u8, cookie: *mut c_void) {
+    // SAFETY: `cookie`, çağıran test çerçevesindeki canlı `AtomicUsize` adresidir.
     let counter = unsafe { &*(cookie as *const AtomicUsize) };
     counter.fetch_add(1, Ordering::SeqCst);
 }
 
 #[test]
 fn capi_data_wrap_user_data_error_props_and_flush() {
+    // SAFETY: Test kapsamındaki tüm `Dav1dContext`, `Dav1dData` ve `Dav1dPicture`
+    // işaretçileri `dav1d_close` / `dav1d_*_unref` çağrılarına kadar geçerlidir.
     unsafe {
         let mut s = Dav1dSettings::default();
         dav1d_default_settings(&mut s);
@@ -285,6 +292,8 @@ struct CustomAllocTracker {
 }
 
 extern "C" fn custom_alloc_pic(pic: *mut Dav1dPicture, cookie: *mut c_void) -> c_int {
+    // SAFETY: `pic` ve `cookie` (`CustomAllocTracker`) çözücü tarafından geçerli
+    // adreslerle iletilir; ayrılan kutu `custom_release_pic` içinde serbest bırakılır.
     unsafe {
         let tracker = &*(cookie as *const CustomAllocTracker);
         tracker.allocs.fetch_add(1, Ordering::SeqCst);
@@ -316,6 +325,8 @@ extern "C" fn custom_alloc_pic(pic: *mut Dav1dPicture, cookie: *mut c_void) -> c
 }
 
 extern "C" fn custom_release_pic(pic: *mut Dav1dPicture, cookie: *mut c_void) {
+    // SAFETY: `p.allocator_data`, `custom_alloc_pic` tarafından `Box::into_raw`
+    // ile aynı `total` boyutta oluşturulmuş tekil tahsistir.
     unsafe {
         let tracker = &*(cookie as *const CustomAllocTracker);
         tracker.releases.fetch_add(1, Ordering::SeqCst);
@@ -380,6 +391,8 @@ fn capi_ivf_single_and_multithread_parity_and_custom_allocator() {
 
     // 1. Tek-thread (`1, 1`) ve çok-thread (`4, 2`) varsayılan ayırıcı ile doğrulama
     for (n_threads, max_frame_delay) in [(1, 1), (4, 2)] {
+        // SAFETY: Her tur kendi bağımsız `Dav1dContext` örneğini açıp kapatır ve
+        // paket yüklerini `dav1d_data_create` tamponuna kopyalar.
         unsafe {
             let mut s = Dav1dSettings::default();
             dav1d_default_settings(&mut s);
@@ -435,6 +448,7 @@ fn capi_ivf_single_and_multithread_parity_and_custom_allocator() {
     }
 
     // 2. Özel `Dav1dPicAllocator` ile doğrulama
+    // SAFETY: `tracker` yerel yığında `dav1d_close` tamamlanana dek canlı kalır.
     unsafe {
         let tracker = CustomAllocTracker {
             allocs: AtomicUsize::new(0),

@@ -96,11 +96,28 @@
 //!   Video akış kapsayıcıları (IVF/MP4/Matroska), GPU yüklemesi ve AV1 kodlama bu kütüphanenin
 //!   kapsamı dışındadır.
 //! - Üretim kaynaklarında haricî `.asm` / `.S` veya satır içi `asm!` / `global_asm!` kullanılmaz.
-//! - `crates/av1oxide/src` altındaki `203` kaynak dosyadan `114`'ü `#![forbid(unsafe_code)]`
+//! - `crates/av1oxide/src` altındaki `204` kaynak dosyadan `115`'i `#![forbid(unsafe_code)]`
 //!   taşır; yalnız [`audit::UNSAFE_EXEMPTIONS`] içindeki `88` `x86_64`/`aarch64` SIMD dosyası
 //!   ve `1` C-ABI sınır dosyası (`capi/ffi.rs`) dar kapsamlı işlemler için muaf tutulur
 //!   (`0` güvensiz işlev imzası, `389` blok).
+//!
+//! ## Bağımlılık Politikası
+//!
+//! `av1oxide` hiçbir üçüncü taraf medya, kodek, görüntü işleme veya C medya kütüphanesine
+//! bağımlı değildir; kullanılan tüm çekirdek sistem ve veri yapısı kütüphaneleri iç uygulama
+//! ayrıntısı (`pub(crate)` / özel) olarak yalıtılmıştır ve genel (`pub`) API imzalarına sızdırılmaz:
+//!
+//! | Crate | Sürüm | Lisans | Kaynak | Özellikler (`default-features = false`) | Görev | Unsafe / Yerel Kod |
+//! |---|---|---|---|---|---|---|
+//! | `crossbeam-utils` | `0.8` | `MIT OR Apache-2.0` | `crossbeam-rs/crossbeam` | `["std"]` | `CachePadded` önbellek satırı izolasyonu ve CAS `Backoff` (`thread`, `frame::butce`) | Pure Rust (iç atomik/hizalama `unsafe`, `0` C kodu) |
+//! | `parking_lot` | `0.12` | `MIT OR Apache-2.0` | `Amanieu/parking_lot` | `[]` (`not(wasm32)`) | Zehirlenmesiz kompakt kullanıcı uzayı `Mutex` ve `Condvar` (`sync`) | Pure Rust + işletim sistemi futex / `libc` bağlaması (`0` C dosyası) |
+//! | `memchr` | `2` | `Unlicense OR MIT` | `BurntSushi/memchr` | `[]` | SIMD/SWAR NUL-dize ve OBU kuyruk baytı taraması (`avif::boxes`, `api::Decoder`) | Pure Rust (iç SIMD/işaretçi `unsafe`, `0` C kodu) |
+//! | `rustc-hash` | `2` | `Apache-2.0 OR MIT` | `rust-lang/rustc-hash` | `[]` | Deterministik tamsayı karması (`FxBuildHasher`, `avif`, `dsp`) | Safe Rust (`0` `unsafe` blok, `0` C kodu) |
+//! | `indexmap` | `2` | `Apache-2.0 OR MIT` | `indexmap-rs/indexmap` | `[]` | Ekleme sırasını koruyan $O(1)$ tekil tablo/küme motoru (`avif::boxes`, `avif::decode`, `dsp`) | Pure Rust (`indexmap` `#![forbid(unsafe_code)]` + Miri onaylı `hashbrown`, `0` C kodu) |
+//! | `smallvec` | `1` | `MIT OR Apache-2.0` | `smallvec/smallvec` | `[]` | Küçük ISOBMFF ve referans tahliye vektörlerinin stack üzerinde tutulması (`avif`, `api`) | Pure Rust (iç satır içi tampon `unsafe`, `0` C kodu) |
+//! | `flate2` | `1.1` | `MIT OR Apache-2.0` | `rust-lang/flate2-rs` | `["rust_backend"]` | Sınırlı `deflate`/`zlib`/`gzip` HEIF metaveri ve `cmin` açıcısı (`avif::boxes`) | Safe Rust (`miniz_oxide` `#![forbid(unsafe_code)]` arka ucu, `0` C kodu) |
 
+#![deny(unused_crate_dependencies)]
 #![warn(clippy::all)]
 
 pub mod api;
