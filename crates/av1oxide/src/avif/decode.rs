@@ -934,6 +934,20 @@ fn decode_grid_tiles_into_canvas(
         ));
     }
 
+    let mut unique_ids = Vec::with_capacity(num_tiles);
+    let mut tile_to_unique = Vec::with_capacity(num_tiles);
+    let mut id_map =
+        std::collections::HashMap::with_capacity_and_hasher(num_tiles, rustc_hash::FxBuildHasher);
+    for &tid in tile_ids {
+        let u_idx = *id_map.entry(tid).or_insert_with(|| {
+            let idx = unique_ids.len();
+            unique_ids.push(tid);
+            idx
+        });
+        tile_to_unique.push(u_idx);
+    }
+    let num_unique = unique_ids.len();
+
     let total_threads = if config.n_threads == 0 {
         std::thread::available_parallelism()
             .map(core::num::NonZeroUsize::get)
@@ -942,13 +956,13 @@ fn decode_grid_tiles_into_canvas(
         config.n_threads
     };
 
-    let decoded_tiles: Vec<PlanarBuffer> = if total_threads > 1 && num_tiles > 1 {
-        let worker_count = total_threads.min(num_tiles);
-        let chunk_size = num_tiles.div_ceil(worker_count);
+    let decoded_tiles: Vec<PlanarBuffer> = if total_threads > 1 && num_unique > 1 {
+        let worker_count = total_threads.min(num_unique);
+        let chunk_size = num_unique.div_ceil(worker_count);
         let mut results: Vec<Result<Vec<PlanarBuffer>>> = Vec::with_capacity(worker_count);
         std::thread::scope(|s| {
             let mut handles = Vec::with_capacity(worker_count);
-            for chunk in tile_ids.chunks(chunk_size) {
+            for chunk in unique_ids.chunks(chunk_size) {
                 handles.push(s.spawn(move || {
                     let mut out = Vec::with_capacity(chunk.len());
                     for &tid in chunk {
@@ -972,14 +986,14 @@ fn decode_grid_tiles_into_canvas(
             }
             Ok::<(), Error>(())
         })?;
-        let mut flat = Vec::with_capacity(num_tiles);
+        let mut flat = Vec::with_capacity(num_unique);
         for group in results {
             flat.extend(group?);
         }
         flat
     } else {
-        let mut flat = Vec::with_capacity(num_tiles);
-        for &tid in tile_ids {
+        let mut flat = Vec::with_capacity(num_unique);
+        for &tid in &unique_ids {
             flat.push(decode_item_planar(
                 container,
                 tid,
@@ -1065,7 +1079,7 @@ fn decode_grid_tiles_into_canvas(
         };
 
         for c in 0..cols {
-            let tile = &decoded_tiles[r * cols + c];
+            let tile = &decoded_tiles[tile_to_unique[r * cols + c]];
             let dst_x0 = c * tile_w;
             if dst_x0 >= out_w {
                 continue;

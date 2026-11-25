@@ -27,6 +27,7 @@
 | `crossbeam-utils` | `0.8` | `["std"]` | `crossbeam-rs` / Rust Eşzamanlılık Ekibi | Paylaşılan atomik sayaçların ve işçi yuvalarının (`thread::TaskBatch`, `thread::ScratchPool`, `frame::butce::Butce`) `CachePadded` ile önbellek satırı izolasyonu ve kilitsiz CAS döngülerinde `Backoff` bekleme kontrolü |
 | `parking_lot` | `0.12` | `[]` (`not(target_arch = "wasm32")`) | `Amanieu d'Antras` / Rust `libs-team` | `thread::WorkerPool`, `thread::FrameSlot`, `api::Decoder` ve `decode::intra` içinde zehirlenmesiz (`non-poisoning`) kompakt kullanıcı uzayı `Mutex` ve `Condvar` (`sync`) |
 | `memchr` | `2` | `[]` | `Andrew Gallant (BurntSushi)` / Rust `libs-team` | ISOBMFF NUL-sonlu dize ayrıştırma (`avif::boxes`) ve OBU metaveri kuyruk baytı taramasında (`api::Decoder`) SIMD/SWAR hızlandırmalı bayt arama (`memchr`, `memrchr`) |
+| `rustc-hash` | `2` | `[]` | `rust-lang/rustc-hash` / Rust Derleyici Ekibi | ISOBMFF `item_id` tekillik denetimi, paylaşımlı `grid` karo önbelleklemesi (`avif`) ve DSP tablo kurulumunda (`dsp`) hızlı deterministik tamsayı karması (`FxBuildHasher`) |
 
 ---
 

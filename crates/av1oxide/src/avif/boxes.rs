@@ -920,6 +920,15 @@ fn parse_iref(payload: &[u8], references: &mut Vec<ItemReference>) -> Result<()>
             as usize;
         pos += 2;
 
+        let is_dimg = &ref_box.box_type == b"dimg";
+        let mut seen_dimg = if is_dimg && ref_count > 8 {
+            Some(std::collections::HashSet::with_capacity_and_hasher(
+                ref_count,
+                rustc_hash::FxBuildHasher,
+            ))
+        } else {
+            None
+        };
         let mut to_item_ids = Vec::with_capacity(ref_count);
         for _ in 0..ref_count {
             let to_id = if ver == 0 {
@@ -933,10 +942,17 @@ fn parse_iref(payload: &[u8], references: &mut Vec<ItemReference>) -> Result<()>
                 pos += 4;
                 id
             };
-            if &ref_box.box_type == b"dimg" && to_item_ids.contains(&to_id) {
-                return Err(Error::InvalidData(
-                    "dimg referans dizisinde yinelenen hedef öğe kimliği",
-                ));
+            if is_dimg {
+                let is_dup = if let Some(ref mut set) = seen_dimg {
+                    !set.insert(to_id)
+                } else {
+                    to_item_ids.contains(&to_id)
+                };
+                if is_dup {
+                    return Err(Error::InvalidData(
+                        "dimg referans dizisinde yinelenen hedef öğe kimliği",
+                    ));
+                }
             }
             to_item_ids.push(to_id);
         }
