@@ -14,7 +14,7 @@
   - İkincil mimariler (`arm32`, `riscv64`, `loongarch64`, `powerpc64le`): `%100` güvenli skaler geri-düşüş
 - **Çok-Thread ve Bellek Bütçesi:** Kare içi (`Tile`, süperblok satırı, halka içi filtre) ve kareler arası (`FrameSlot`) paralellik (`Config::n_threads`, `Config::max_frame_delay`); tahsis öncesi piksel ve bellek tavanı (`Config::frame_size_limit`, `Config::allocation_limit`).
 - **`libdav1d` (`7.0.0`) Uyumlu C-ABI (`capi`):** 19 resmî `DAV1D_API` fonksiyonunun tamamını (`dav1d_open`, `dav1d_send_data`, `dav1d_get_picture`, `dav1d_apply_grain`, `dav1d_parse_sequence_header`, vb.) ve resmî `include/dav1d/*.h` C başlıklarını içerir.
-- **Saf Rust `.avif` Görüntü Okuyucu (`avif`):** `%100 #![forbid(unsafe_code)]` ISOBMFF/HEIF/MIAF/AVIF kapsayıcı ayrıştırıcısı; tekil `av01`, çok-thread `grid` karo birleştirme, `iden` türetilmiş görüntüler, yardımcı alfa (`auxl`/`auxC`) kanalı, `clap`/`irot`/`imir` dönüşümleri, `ICC`/`Exif`/`XMP` metaverisi ve ITU-T H.273 renk dönüşümleri (`RGB8`/`RGBA8`/`RGB16`/`RGBA16`) — lisans denetimli `AOMediaCodec/av1-avif` ve `AOMediaCodec/libavif` test korpusundaki `156 / 156` geçerli `.avif` görüntüsünde referans C `libavif` ile düzlemsel (`Y`, `U`, `V`, `Alpha`), `RGBA8` ve `RGBA16` çıktılarında `%100` MD5 bit-birebir eşitlik.
+- **Saf Rust `.avif` Görüntü Okuyucu (`avif`):** `%100 #![forbid(unsafe_code)]` ISOBMFF/HEIF/MIAF/AVIF kapsayıcı ayrıştırıcısı; tekil `av01`, çok-thread `grid` karo birleştirme, `iden` türetilmiş görüntüler, yardımcı alfa (`auxl`/`auxC`) kanalı, `clap`/`irot`/`imir` dönüşümleri, `ICC`/`Exif`/`XMP` metaverisi (bütçe ve oran korumalı `defl`/`zlib`/`gzip` sıkıştırılmış HEIF metaveri öğeleri ve `cmin` kutuları dahil) ve ITU-T H.273 renk dönüşümleri (`RGB8`/`RGBA8`/`RGB16`/`RGBA16`) — lisans denetimli `AOMediaCodec/av1-avif` ve `AOMediaCodec/libavif` test korpusundaki `156 / 156` geçerli `.avif` görüntüsünde referans C `libavif` ile düzlemsel (`Y`, `U`, `V`, `Alpha`), `RGBA8` ve `RGBA16` çıktılarında `%100` MD5 bit-birebir eşitlik.
 
 ---
 
@@ -30,6 +30,7 @@
 | `rustc-hash` | `2` | `[]` | `rust-lang/rustc-hash` / Rust Derleyici Ekibi | ISOBMFF `item_id` tekillik denetimi, paylaşımlı `grid` karo önbelleklemesi (`avif`) ve DSP tablo kurulumunda (`dsp`) hızlı deterministik tamsayı karması (`FxBuildHasher`) |
 | `indexmap` | `2` | `[]` | `Josh Stone (cuviper)` / Rust `libs-team` & `compiler-team` | ISOBMFF `iinf`, `ipma`, `iloc` ve `iref` öğe tablolarında (`avif::boxes`, `avif::decode`, `dsp`) ekleme sırasını koruyan $O(1)$ tablo ve küme yapıları (`IndexMap`, `IndexSet` — Miri onaylı `hashbrown` çekirdekli) |
 | `smallvec` | `1` | `[]` | `servo/rust-smallvec` / Rust & Servo Çekirdek Ekipleri | ISOBMFF özellik, veri parçası (`extent`), referans ve karo listeleri (`avif::boxes`, `avif::decode`) ile 8 yuvalı referans kare tahliye listelerinin (`api::Decoder`) yığın (stack) üzerinde tutulması (`SmallVec`) |
+| `flate2` | `1.1` | `["rust_backend"]` (`miniz_oxide`) | `rust-lang/flate2` / Rust `libs-team` | Sıkıştırılmış HEIF metaveri öğeleri (`infe` `content_encoding`, `cmpC`) ve `cmin` kutuları (`avif::boxes`) için `%100` güvenli saf Rust sınırlı `deflate`/`zlib`/`gzip` açıcısı |
 
 ---
 

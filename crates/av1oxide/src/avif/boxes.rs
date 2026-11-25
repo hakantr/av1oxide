@@ -4,7 +4,9 @@
 #![forbid(unsafe_code)]
 
 use std::borrow::Cow;
+use std::io::Read;
 
+use flate2::read::{DeflateDecoder, GzDecoder, ZlibDecoder};
 use smallvec::SmallVec;
 
 use crate::avif::image::{
@@ -79,6 +81,8 @@ pub(crate) enum ItemProperty {
         aux_type: String,
         subtype: SmallVec<[u8; 16]>,
     },
+    /// `cmpC`: ISO/IEC 23008-12 sıkıştırma yapılandırma özelliği (`defl`, `zlib`, `gzip`).
+    CmpC { compression_type: [u8; 4] },
     /// Tanınmayan özellik kutusu.
     Unknown([u8; 4]),
 }
@@ -100,6 +104,7 @@ pub(crate) struct ItemInfoEntry {
     pub(crate) item_type: [u8; 4],
     pub(crate) item_name: String,
     pub(crate) content_type: String,
+    pub(crate) content_encoding: String,
     pub(crate) hidden: bool,
 }
 
@@ -147,7 +152,107 @@ pub(crate) struct AvifContainer<'a> {
     pub(crate) associations: FxIndexMap<u32, SmallVec<[PropertyAssoc; 8]>>,
     pub(crate) locations: FxIndexMap<u32, IlocItem>,
     pub(crate) references: SmallVec<[ItemReference; 8]>,
-    pub(crate) idat: &'a [u8],
+    pub(crate) idat: Cow<'a, [u8]>,
+}
+
+/// Tek bir sıkıştırılmış HEIF öğesi veya `cmin` kutusu için azami açılmış boyut (`64 MiB`).
+const MAX_DECOMPRESSED_BYTES: usize = 64 * 1024 * 1024;
+/// Sıkıştırma oranı denetiminin devreye girdiği alt eşik (`64 KiB`).
+const ZIP_BOMB_THRESHOLD_BYTES: usize = 64 * 1024;
+/// `ZIP_BOMB_THRESHOLD_BYTES` üzerinde izin verilen azami genişleme oranı (`1024:1`).
+const MAX_EXPANSION_RATIO: usize = 1024;
+
+fn decompress_bounded<R: Read>(
+    mut reader: R,
+    compressed_len: usize,
+    allocation_limit: Option<usize>,
+) -> Result<Vec<u8>> {
+    let ratio_limit = compressed_len
+        .saturating_mul(MAX_EXPANSION_RATIO)
+        .max(ZIP_BOMB_THRESHOLD_BYTES);
+    let max_bytes = allocation_limit
+        .unwrap_or(MAX_DECOMPRESSED_BYTES)
+        .min(MAX_DECOMPRESSED_BYTES)
+        .min(ratio_limit);
+    let mut out = Vec::new();
+    let mut chunk = [0u8; 8192];
+
+    loop {
+        if out.len() == max_bytes {
+            let mut probe = [0u8; 1];
+            let extra = reader.read(&mut probe).map_err(|_| {
+                Error::InvalidData("sıkıştırılmış HEIF verisi bozuk veya sağlama özeti hatalı")
+            })?;
+            if extra > 0 {
+                return Err(Error::BudgetExceeded {
+                    requested: max_bytes.saturating_add(1),
+                    limit: max_bytes,
+                });
+            }
+            break;
+        }
+
+        let to_read = chunk.len().min(max_bytes - out.len());
+        let n = reader.read(&mut chunk[..to_read]).map_err(|_| {
+            Error::InvalidData("sıkıştırılmış HEIF verisi bozuk veya sağlama özeti hatalı")
+        })?;
+        if n == 0 {
+            break;
+        }
+        let new_len = out.len().saturating_add(n);
+        out.try_reserve(n)
+            .map_err(|_| Error::AllocationFailed { requested: new_len })?;
+        out.extend_from_slice(&chunk[..n]);
+    }
+    Ok(out)
+}
+
+fn decompress_zlib(
+    data: &[u8],
+    orig_compressed_len: usize,
+    allocation_limit: Option<usize>,
+) -> Result<Vec<u8>> {
+    decompress_bounded(
+        ZlibDecoder::new(data),
+        orig_compressed_len,
+        allocation_limit,
+    )
+}
+
+fn decompress_deflate(
+    data: &[u8],
+    orig_compressed_len: usize,
+    allocation_limit: Option<usize>,
+) -> Result<Vec<u8>> {
+    decompress_bounded(
+        DeflateDecoder::new(data),
+        orig_compressed_len,
+        allocation_limit,
+    )
+}
+
+fn decompress_gzip(
+    data: &[u8],
+    orig_compressed_len: usize,
+    allocation_limit: Option<usize>,
+) -> Result<Vec<u8>> {
+    decompress_bounded(GzDecoder::new(data), orig_compressed_len, allocation_limit)
+}
+
+fn decompress_by_fourcc(
+    compression_type: &[u8; 4],
+    data: &[u8],
+    orig_compressed_len: usize,
+    allocation_limit: Option<usize>,
+) -> Result<Vec<u8>> {
+    match compression_type {
+        b"defl" => decompress_deflate(data, orig_compressed_len, allocation_limit),
+        b"zlib" => decompress_zlib(data, orig_compressed_len, allocation_limit),
+        b"gzip" => decompress_gzip(data, orig_compressed_len, allocation_limit),
+        _ => Err(Error::Unsupported(
+            "desteklenmeyen cmpC sıkıştırma algoritması",
+        )),
+    }
 }
 
 fn read_u16_be(buf: &[u8], offset: usize) -> Option<u16> {
@@ -304,7 +409,7 @@ pub(crate) fn parse_container(data: &[u8]) -> Result<AvifContainer<'_>> {
     let mut offset = 0usize;
     let mut major_brand: Option<[u8; 4]> = None;
     let mut has_avif_brand = false;
-    let mut meta_payload: Option<&[u8]> = None;
+    let mut meta_payload: Option<Cow<'_, [u8]>> = None;
 
     while let Some(raw_box) = read_box_header(data, offset)? {
         offset = raw_box.next_offset;
@@ -333,7 +438,21 @@ pub(crate) fn parse_container(data: &[u8]) -> Result<AvifContainer<'_>> {
                 if meta_payload.is_some() {
                     return Err(Error::InvalidData("birden fazla üst düzey meta kutusu"));
                 }
-                meta_payload = Some(raw_box.payload);
+                meta_payload = Some(Cow::Borrowed(raw_box.payload));
+            }
+            b"cmin" => {
+                if meta_payload.is_some() {
+                    return Err(Error::InvalidData("birden fazla üst düzey meta kutusu"));
+                }
+                let (ver, _flags, body) = read_full_box(raw_box.payload)?;
+                if ver != 0 || body.len() < 4 {
+                    return Err(Error::InvalidData("geçersiz cmin kutusu"));
+                }
+                let comp_type = [body[0], body[1], body[2], body[3]];
+                let payload_slice = &body[4..];
+                let decompressed =
+                    decompress_by_fourcc(&comp_type, payload_slice, payload_slice.len(), None)?;
+                meta_payload = Some(Cow::Owned(decompressed));
             }
             _ => {}
         }
@@ -346,7 +465,7 @@ pub(crate) fn parse_container(data: &[u8]) -> Result<AvifContainer<'_>> {
         ));
     }
     let meta_raw = meta_payload.ok_or(Error::InvalidData("AVIF dosyasında meta kutusu yok"))?;
-    let (meta_version, _meta_flags, meta_children) = read_full_box(meta_raw)?;
+    let (meta_version, _meta_flags, meta_children) = read_full_box(&meta_raw)?;
     if meta_version != 0 {
         return Err(Error::Unsupported(
             "meta kutusu sürümü 0 dışında desteklenmiyor",
@@ -362,7 +481,7 @@ pub(crate) fn parse_container(data: &[u8]) -> Result<AvifContainer<'_>> {
     let mut locations: FxIndexMap<u32, IlocItem> =
         FxIndexMap::with_hasher(rustc_hash::FxBuildHasher);
     let mut references: SmallVec<[ItemReference; 8]> = SmallVec::new();
-    let mut idat: &[u8] = &[];
+    let mut idat: Cow<'_, [u8]> = Cow::Borrowed(&[]);
     let mut has_hdlr = false;
 
     let mut m_off = 0usize;
@@ -404,7 +523,15 @@ pub(crate) fn parse_container(data: &[u8]) -> Result<AvifContainer<'_>> {
                 parse_iref(child.payload, &mut references)?;
             }
             b"idat" => {
-                idat = child.payload;
+                idat = match &meta_raw {
+                    Cow::Borrowed(_) => {
+                        let base_ptr = data.as_ptr() as usize;
+                        let child_ptr = child.payload.as_ptr() as usize;
+                        let off = child_ptr - base_ptr;
+                        Cow::Borrowed(&data[off..off + child.payload.len()])
+                    }
+                    Cow::Owned(_) => Cow::Owned(child.payload.to_vec()),
+                };
             }
             _ => {}
         }
@@ -495,11 +622,17 @@ fn parse_infe(payload: &[u8]) -> Result<ItemInfoEntry> {
     };
     pos = next_pos;
 
-    let content_type = if item_type == *b"mime" && pos < body.len() {
-        let (ct, _) = read_cstring(body, pos)?;
-        ct
+    let (content_type, content_encoding) = if item_type == *b"mime" && pos < body.len() {
+        let (ct, next_pos) = read_cstring(body, pos)?;
+        let ce = if next_pos < body.len() {
+            let (enc, _) = read_cstring(body, next_pos)?;
+            enc
+        } else {
+            String::new()
+        };
+        (ct, ce)
     } else {
-        String::new()
+        (String::new(), String::new())
     };
 
     Ok(ItemInfoEntry {
@@ -507,6 +640,7 @@ fn parse_infe(payload: &[u8]) -> Result<ItemInfoEntry> {
         item_type,
         item_name,
         content_type,
+        content_encoding,
         hidden,
     })
 }
@@ -741,6 +875,14 @@ fn parse_ipco(payload: &[u8], properties: &mut SmallVec<[ItemProperty; 16]>) -> 
                 let (aux_type, next_pos) = read_cstring(body, 0)?;
                 let subtype = SmallVec::from_slice(body.get(next_pos..).unwrap_or(&[]));
                 ItemProperty::AuxC { aux_type, subtype }
+            }
+            b"cmpC" => {
+                let (ver, _flags, body) = read_full_box(prop_box.payload)?;
+                if ver != 0 || body.len() < 4 {
+                    return Err(Error::InvalidData("geçersiz cmpC kutusu"));
+                }
+                let compression_type = [body[0], body[1], body[2], body[3]];
+                ItemProperty::CmpC { compression_type }
             }
             other => ItemProperty::Unknown(*other),
         };
@@ -1012,6 +1154,14 @@ impl<'a> AvifContainer<'a> {
                     "öğede desteklenmeyen zorunlu (essential) ipco özelliği bulunuyor",
                 ));
             }
+            if let ItemProperty::CmpC { compression_type } = prop
+                && !matches!(compression_type, b"defl" | b"zlib" | b"gzip")
+                && assoc.essential
+            {
+                return Err(Error::Unsupported(
+                    "desteklenmeyen zorunlu (essential) cmpC sıkıştırma algoritması",
+                ));
+            }
             if !assoc.essential
                 && matches!(
                     prop,
@@ -1086,13 +1236,8 @@ impl<'a> AvifContainer<'a> {
             return Err(Error::InvalidData("iloc kaydında extent bulunmuyor"));
         }
 
-        match loc.construction_method {
+        let raw = match loc.construction_method {
             0 | 1 => {
-                let source = if loc.construction_method == 0 {
-                    self.file_data
-                } else {
-                    self.idat
-                };
                 if loc.extents.len() == 1 {
                     let ext = &loc.extents[0];
                     let start64 = loc
@@ -1106,11 +1251,33 @@ impl<'a> AvifContainer<'a> {
                     let end = start
                         .checked_add(len)
                         .ok_or(Error::InvalidData("iloc bitiş ofseti taşması"))?;
-                    let slice = source.get(start..end).ok_or(Error::InvalidData(
-                        "iloc extent dosya/idat sınırları dışında",
-                    ))?;
-                    Ok(Cow::Borrowed(slice))
+                    if loc.construction_method == 0 {
+                        let slice = self.file_data.get(start..end).ok_or(Error::InvalidData(
+                            "iloc extent dosya/idat sınırları dışında",
+                        ))?;
+                        Cow::Borrowed(slice)
+                    } else {
+                        match &self.idat {
+                            Cow::Borrowed(s) => {
+                                let slice = s.get(start..end).ok_or(Error::InvalidData(
+                                    "iloc extent dosya/idat sınırları dışında",
+                                ))?;
+                                Cow::Borrowed(slice)
+                            }
+                            Cow::Owned(v) => {
+                                let slice = v.get(start..end).ok_or(Error::InvalidData(
+                                    "iloc extent dosya/idat sınırları dışında",
+                                ))?;
+                                Cow::Owned(slice.to_vec())
+                            }
+                        }
+                    }
                 } else {
+                    let source: &[u8] = if loc.construction_method == 0 {
+                        self.file_data
+                    } else {
+                        &self.idat
+                    };
                     let mut total_len = 0usize;
                     for ext in &loc.extents {
                         let len = usize::try_from(ext.extent_length).map_err(|_| {
@@ -1151,7 +1318,7 @@ impl<'a> AvifContainer<'a> {
                         ))?;
                         buf.extend_from_slice(slice);
                     }
-                    Ok(Cow::Owned(buf))
+                    Cow::Owned(buf)
                 }
             }
             2 => {
@@ -1206,11 +1373,59 @@ impl<'a> AvifContainer<'a> {
                     ))?;
                     buf.extend_from_slice(slice);
                 }
-                Ok(Cow::Owned(buf))
+                Cow::Owned(buf)
             }
-            _ => Err(Error::Unsupported(
-                "desteklenmeyen iloc construction_method değeri",
-            )),
+            _ => {
+                return Err(Error::Unsupported(
+                    "desteklenmeyen iloc construction_method değeri",
+                ));
+            }
+        };
+
+        self.decompress_item_if_needed(item_id, raw, allocation_limit)
+    }
+
+    fn decompress_item_if_needed(
+        &self,
+        item_id: u32,
+        mut data: Cow<'a, [u8]>,
+        allocation_limit: Option<usize>,
+    ) -> Result<Cow<'a, [u8]>> {
+        let orig_compressed_len = data.len();
+        if let Some(info) = self.items.get(&item_id)
+            && !info.content_encoding.is_empty()
+            && info.content_encoding != "identity"
+        {
+            let decoded = match info.content_encoding.as_str() {
+                "deflate" | "zlib" => {
+                    decompress_zlib(&data, orig_compressed_len, allocation_limit)?
+                }
+                "gzip" | "x-gzip" => decompress_gzip(&data, orig_compressed_len, allocation_limit)?,
+                _ => {
+                    return Err(Error::Unsupported(
+                        "desteklenmeyen infe content_encoding algoritması",
+                    ));
+                }
+            };
+            data = Cow::Owned(decoded);
         }
+        if let Some(assocs) = self.associations.get(&item_id) {
+            for assoc in assocs {
+                if assoc.property_index == 0 {
+                    continue;
+                }
+                let idx = (assoc.property_index as usize) - 1;
+                if let Some(ItemProperty::CmpC { compression_type }) = self.properties.get(idx) {
+                    let decoded = decompress_by_fourcc(
+                        compression_type,
+                        &data,
+                        orig_compressed_len,
+                        allocation_limit,
+                    )?;
+                    data = Cow::Owned(decoded);
+                }
+            }
+        }
+        Ok(data)
     }
 }

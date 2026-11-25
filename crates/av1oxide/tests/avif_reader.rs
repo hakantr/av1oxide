@@ -863,3 +863,319 @@ fn avif_ffmpeg_cross_validation_if_available() {
 
     let _ = fs::remove_dir_all(&work_dir);
 }
+
+fn make_infe_v2_with_encoding(
+    item_id: u16,
+    item_type: &[u8; 4],
+    content_type: Option<&str>,
+    content_encoding: Option<&str>,
+) -> Vec<u8> {
+    let mut body = Vec::new();
+    body.extend_from_slice(&item_id.to_be_bytes());
+    body.extend_from_slice(&0u16.to_be_bytes());
+    body.extend_from_slice(item_type);
+    body.push(0); // item_name = ""
+    if let Some(ct) = content_type {
+        body.extend_from_slice(ct.as_bytes());
+        body.push(0);
+        if let Some(ce) = content_encoding {
+            body.extend_from_slice(ce.as_bytes());
+            body.push(0);
+        }
+    }
+    make_full_box(b"infe", 2, 0, &body)
+}
+
+fn build_compressed_meta_avif(
+    xmp_bytes: &[u8],
+    xmp_encoding: Option<&str>,
+    exif_bytes: &[u8],
+    exif_cmpc: Option<&[u8; 4]>,
+    use_cmin: bool,
+) -> Vec<u8> {
+    let ftyp = make_ftyp(b"avif", &[*b"mif1", *b"miaf"]);
+    let hdlr = make_hdlr_pict();
+    let pitm = make_full_box(b"pitm", 0, 0, &1u16.to_be_bytes());
+
+    let infe1 = make_infe_v2(1, b"av01", None);
+    let infe2 = make_infe_v2(2, b"Exif", None);
+    let infe3 = make_infe_v2_with_encoding(3, b"mime", Some("application/rdf+xml"), xmp_encoding);
+    let mut iinf_body = Vec::new();
+    iinf_body.extend_from_slice(&3u16.to_be_bytes());
+    iinf_body.extend_from_slice(&infe1);
+    iinf_body.extend_from_slice(&infe2);
+    iinf_body.extend_from_slice(&infe3);
+    let iinf = make_full_box(b"iinf", 0, 0, &iinf_body);
+
+    let ispe = make_ispe(1, 1);
+    let av1c = make_box(b"av1C", &[0x81, 0x00, 0x0C, 0x00]);
+    let mut ipco_body = Vec::new();
+    ipco_body.extend_from_slice(&ispe);
+    ipco_body.extend_from_slice(&av1c);
+    if let Some(comp_fourcc) = exif_cmpc {
+        let cmpc = make_full_box(b"cmpC", 0, 0, comp_fourcc);
+        ipco_body.extend_from_slice(&cmpc);
+    }
+    let ipco = make_box(b"ipco", &ipco_body);
+
+    let mut ipma_body = Vec::new();
+    let entry_count: u32 = if exif_cmpc.is_some() { 2 } else { 1 };
+    ipma_body.extend_from_slice(&entry_count.to_be_bytes());
+    ipma_body.extend_from_slice(&1u16.to_be_bytes());
+    ipma_body.push(2);
+    ipma_body.push(0x81); // prop 1 essential
+    ipma_body.push(0x82); // prop 2 essential
+    if exif_cmpc.is_some() {
+        ipma_body.extend_from_slice(&2u16.to_be_bytes());
+        ipma_body.push(1);
+        ipma_body.push(0x83); // prop 3 (cmpC) essential
+    }
+    let ipma = make_full_box(b"ipma", 0, 0, &ipma_body);
+
+    let mut iprp_body = Vec::new();
+    iprp_body.extend_from_slice(&ipco);
+    iprp_body.extend_from_slice(&ipma);
+    let iprp = make_box(b"iprp", &iprp_body);
+
+    let mut cdsc_exif = Vec::new();
+    cdsc_exif.extend_from_slice(&2u16.to_be_bytes());
+    cdsc_exif.extend_from_slice(&1u16.to_be_bytes());
+    cdsc_exif.extend_from_slice(&1u16.to_be_bytes());
+    let mut cdsc_xmp = Vec::new();
+    cdsc_xmp.extend_from_slice(&3u16.to_be_bytes());
+    cdsc_xmp.extend_from_slice(&1u16.to_be_bytes());
+    cdsc_xmp.extend_from_slice(&1u16.to_be_bytes());
+    let mut iref_body = Vec::new();
+    iref_body.extend_from_slice(&make_box(b"cdsc", &cdsc_exif));
+    iref_body.extend_from_slice(&make_box(b"cdsc", &cdsc_xmp));
+    let iref = make_full_box(b"iref", 0, 0, &iref_body);
+
+    let mut idat_payload = Vec::new();
+    idat_payload.extend_from_slice(SAMPLE_1X1_AV1_OBU);
+    let exif_off = idat_payload.len() as u32;
+    idat_payload.extend_from_slice(exif_bytes);
+    let xmp_off = idat_payload.len() as u32;
+    idat_payload.extend_from_slice(xmp_bytes);
+    let idat = make_box(b"idat", &idat_payload);
+
+    let mut iloc_body = Vec::new();
+    iloc_body.push(0x44);
+    iloc_body.push(0x00);
+    iloc_body.extend_from_slice(&3u16.to_be_bytes());
+    for (id, off, len) in [
+        (1u16, 0u32, SAMPLE_1X1_AV1_OBU.len() as u32),
+        (2u16, exif_off, exif_bytes.len() as u32),
+        (3u16, xmp_off, xmp_bytes.len() as u32),
+    ] {
+        iloc_body.extend_from_slice(&id.to_be_bytes());
+        iloc_body.extend_from_slice(&1u16.to_be_bytes()); // construction_method = 1 (idat)
+        iloc_body.extend_from_slice(&0u16.to_be_bytes());
+        iloc_body.extend_from_slice(&1u16.to_be_bytes());
+        iloc_body.extend_from_slice(&off.to_be_bytes());
+        iloc_body.extend_from_slice(&len.to_be_bytes());
+    }
+    let iloc = make_full_box(b"iloc", 1, 0, &iloc_body);
+
+    let mut meta_children = Vec::new();
+    for b in [&hdlr, &pitm, &iinf, &iprp, &iref, &iloc, &idat] {
+        meta_children.extend_from_slice(b);
+    }
+    let meta = make_full_box(b"meta", 0, 0, &meta_children);
+
+    let mut file = Vec::new();
+    file.extend_from_slice(&ftyp);
+    if use_cmin {
+        use std::io::Write as _;
+        let mut enc = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        enc.write_all(&meta[8..]).unwrap();
+        let comp_meta = enc.finish().unwrap();
+        let mut cmin_body = Vec::with_capacity(4 + comp_meta.len());
+        cmin_body.extend_from_slice(b"zlib");
+        cmin_body.extend_from_slice(&comp_meta);
+        file.extend_from_slice(&make_full_box(b"cmin", 0, 0, &cmin_body));
+    } else {
+        file.extend_from_slice(&meta);
+    }
+    file
+}
+
+#[test]
+fn avif_compressed_heif_metadata_cmin_and_security_limits() {
+    use flate2::Compression;
+    use flate2::write::{DeflateEncoder, GzEncoder, ZlibEncoder};
+    use std::io::Write as _;
+
+    let orig_xmp = b"<x:xmpmeta xmlns:x=\"adobe:ns:meta/\">COMPRESSED_HEIF_XMP</x:xmpmeta>";
+    let orig_exif_block = b"\x00\x00\x00\x00II*\x00EXIF_COMPRESSED_TIFF_BODY";
+
+    // 1. content_encoding = "deflate" (RFC 1950 Zlib) + cmpC = "defl" (RFC 1951 raw deflate) + cmin
+    let mut zlib_enc = ZlibEncoder::new(Vec::new(), Compression::default());
+    zlib_enc.write_all(orig_xmp).unwrap();
+    let xmp_zlib = zlib_enc.finish().unwrap();
+
+    let mut defl_enc = DeflateEncoder::new(Vec::new(), Compression::default());
+    defl_enc.write_all(orig_exif_block).unwrap();
+    let exif_defl = defl_enc.finish().unwrap();
+
+    let avif_zlib_defl =
+        build_compressed_meta_avif(&xmp_zlib, Some("deflate"), &exif_defl, Some(b"defl"), true);
+    let img1 = decode(&avif_zlib_defl).expect("cmin + deflate XMP + cmpC defl Exif çözülmeli");
+    assert_eq!(img1.xmp(), Some(orig_xmp.as_slice()));
+    assert_eq!(img1.exif(), Some(&orig_exif_block[4..]));
+
+    // 2. content_encoding = "gzip" (RFC 1952) + cmpC = "zlib" (RFC 1950)
+    let mut gz_enc = GzEncoder::new(Vec::new(), Compression::default());
+    gz_enc.write_all(orig_xmp).unwrap();
+    let xmp_gz = gz_enc.finish().unwrap();
+
+    let mut exif_z_enc = ZlibEncoder::new(Vec::new(), Compression::default());
+    exif_z_enc.write_all(orig_exif_block).unwrap();
+    let exif_zlib = exif_z_enc.finish().unwrap();
+
+    let avif_gz_zlib =
+        build_compressed_meta_avif(&xmp_gz, Some("gzip"), &exif_zlib, Some(b"zlib"), false);
+    let info2 = parse_info(&avif_gz_zlib).expect("gzip XMP + cmpC zlib Exif parse_info");
+    assert_eq!(info2.xmp.as_deref(), Some(orig_xmp.as_slice()));
+    assert_eq!(info2.exif.as_deref(), Some(&orig_exif_block[4..]));
+
+    // 3. Bölüm 10.3: Tam allocation_limit sınırında kabul (600_000 bayt) vs limit + 1 (600_001 bayt) reddi
+    let exact_limit = 600_000usize;
+    let payload_exact: Vec<u8> = (0..exact_limit)
+        .map(|i| ((i.wrapping_mul(73) ^ (i >> 5)) & 0xFF) as u8)
+        .collect();
+    let mut enc_exact = ZlibEncoder::new(Vec::new(), Compression::fast());
+    enc_exact.write_all(&payload_exact).unwrap();
+    let comp_exact = enc_exact.finish().unwrap();
+    let avif_exact =
+        build_compressed_meta_avif(&comp_exact, Some("deflate"), orig_exif_block, None, false);
+    let img_exact = decode_with(
+        &avif_exact,
+        &AvifDecodeConfig {
+            allocation_limit: Some(exact_limit),
+            ..AvifDecodeConfig::default()
+        },
+    )
+    .expect("tam allocation_limit sınırındaki sıkıştırılmış öğe kabul edilmeli");
+    assert_eq!(img_exact.xmp(), Some(payload_exact.as_slice()));
+
+    let mut payload_plus_one = payload_exact;
+    payload_plus_one.push(0x42);
+    let mut enc_over = ZlibEncoder::new(Vec::new(), Compression::fast());
+    enc_over.write_all(&payload_plus_one).unwrap();
+    let comp_over = enc_over.finish().unwrap();
+    let avif_over =
+        build_compressed_meta_avif(&comp_over, Some("deflate"), orig_exif_block, None, false);
+    let res_over = decode_with(
+        &avif_over,
+        &AvifDecodeConfig {
+            allocation_limit: Some(exact_limit),
+            ..AvifDecodeConfig::default()
+        },
+    );
+    assert_eq!(
+        res_over.unwrap_err(),
+        Error::BudgetExceeded {
+            requested: exact_limit + 1,
+            limit: exact_limit,
+        }
+    );
+
+    // 4. Bölüm 10.3: Yüksek oranlı (> 1024:1 ve > 64 KiB) zip-bombası reddi
+    let zip_bomb_uncompressed = vec![0u8; 300 * 1024];
+    let mut enc_bomb_inner = DeflateEncoder::new(Vec::new(), Compression::best());
+    enc_bomb_inner.write_all(&zip_bomb_uncompressed).unwrap();
+    let bomb_stage1 = enc_bomb_inner.finish().unwrap();
+    let mut enc_bomb_outer = ZlibEncoder::new(Vec::new(), Compression::best());
+    enc_bomb_outer.write_all(&bomb_stage1).unwrap();
+    let comp_bomb = enc_bomb_outer.finish().unwrap();
+    let avif_bomb = build_compressed_meta_avif(orig_xmp, None, &comp_bomb, Some(b"zlib"), false);
+    // Aynı Exif öğesine ikinci cmpC ("defl") özelliğini bağlayan veya XMP öğesine
+    // content_encoding="deflate" + cmpC="defl" bağlayan >1024:1 zip-bombası:
+    let ftyp = make_ftyp(b"avif", &[*b"mif1", *b"miaf"]);
+    let hdlr = make_hdlr_pict();
+    let pitm = make_full_box(b"pitm", 0, 0, &1u16.to_be_bytes());
+    let infe1 = make_infe_v2(1, b"av01", None);
+    let infe3 =
+        make_infe_v2_with_encoding(3, b"mime", Some("application/rdf+xml"), Some("deflate"));
+    let mut iinf_body = Vec::new();
+    iinf_body.extend_from_slice(&2u16.to_be_bytes());
+    iinf_body.extend_from_slice(&infe1);
+    iinf_body.extend_from_slice(&infe3);
+    let iinf = make_full_box(b"iinf", 0, 0, &iinf_body);
+    let ispe = make_ispe(1, 1);
+    let av1c = make_box(b"av1C", &[0x81, 0x00, 0x0C, 0x00]);
+    let cmpc = make_full_box(b"cmpC", 0, 0, b"defl");
+    let mut ipco_body = Vec::new();
+    ipco_body.extend_from_slice(&ispe);
+    ipco_body.extend_from_slice(&av1c);
+    ipco_body.extend_from_slice(&cmpc);
+    let ipco = make_box(b"ipco", &ipco_body);
+    let mut ipma_body = Vec::new();
+    ipma_body.extend_from_slice(&2u32.to_be_bytes());
+    ipma_body.extend_from_slice(&1u16.to_be_bytes());
+    ipma_body.push(2);
+    ipma_body.push(0x81);
+    ipma_body.push(0x82);
+    ipma_body.extend_from_slice(&3u16.to_be_bytes());
+    ipma_body.push(1);
+    ipma_body.push(0x83);
+    let ipma = make_full_box(b"ipma", 0, 0, &ipma_body);
+    let mut iprp_body = Vec::new();
+    iprp_body.extend_from_slice(&ipco);
+    iprp_body.extend_from_slice(&ipma);
+    let iprp = make_box(b"iprp", &iprp_body);
+    let mut cdsc_xmp = Vec::new();
+    cdsc_xmp.extend_from_slice(&3u16.to_be_bytes());
+    cdsc_xmp.extend_from_slice(&1u16.to_be_bytes());
+    cdsc_xmp.extend_from_slice(&1u16.to_be_bytes());
+    let iref = make_full_box(b"iref", 0, 0, &make_box(b"cdsc", &cdsc_xmp));
+    let mut idat_payload = Vec::new();
+    idat_payload.extend_from_slice(SAMPLE_1X1_AV1_OBU);
+    let bomb_off = idat_payload.len() as u32;
+    idat_payload.extend_from_slice(&comp_bomb);
+    let idat = make_box(b"idat", &idat_payload);
+    let mut iloc_body = Vec::new();
+    iloc_body.push(0x44);
+    iloc_body.push(0x00);
+    iloc_body.extend_from_slice(&2u16.to_be_bytes());
+    for (id, off, len) in [
+        (1u16, 0u32, SAMPLE_1X1_AV1_OBU.len() as u32),
+        (3u16, bomb_off, comp_bomb.len() as u32),
+    ] {
+        iloc_body.extend_from_slice(&id.to_be_bytes());
+        iloc_body.extend_from_slice(&1u16.to_be_bytes());
+        iloc_body.extend_from_slice(&0u16.to_be_bytes());
+        iloc_body.extend_from_slice(&1u16.to_be_bytes());
+        iloc_body.extend_from_slice(&off.to_be_bytes());
+        iloc_body.extend_from_slice(&len.to_be_bytes());
+    }
+    let iloc = make_full_box(b"iloc", 1, 0, &iloc_body);
+    let mut meta_children = Vec::new();
+    for b in [&hdlr, &pitm, &iinf, &iprp, &iref, &iloc, &idat] {
+        meta_children.extend_from_slice(b);
+    }
+    let mut avif_layered_bomb = Vec::new();
+    avif_layered_bomb.extend_from_slice(&ftyp);
+    avif_layered_bomb.extend_from_slice(&make_full_box(b"meta", 0, 0, &meta_children));
+    let _ = avif_bomb;
+    assert!(matches!(
+        parse_info(&avif_layered_bomb),
+        Err(Error::BudgetExceeded { .. })
+    ));
+
+    // 5. Bozuk Adler-32 kuyruğu -> Error::InvalidData
+    let mut corrupted_zlib = xmp_zlib;
+    let last_idx = corrupted_zlib.len() - 1;
+    corrupted_zlib[last_idx] ^= 0xFF;
+    let avif_corrupt = build_compressed_meta_avif(
+        &corrupted_zlib,
+        Some("deflate"),
+        orig_exif_block,
+        None,
+        false,
+    );
+    assert!(matches!(
+        parse_info(&avif_corrupt),
+        Err(Error::InvalidData(_))
+    ));
+}
