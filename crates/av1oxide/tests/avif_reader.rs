@@ -499,10 +499,11 @@ fn avif_grid_2x2_single_and_multithread_parity_and_alpha() {
     assert_eq!(img_t1, img_t4);
     assert!(img_t1.has_alpha());
     assert!(img_t1.premultiplied_alpha());
-    assert_eq!(img_t1.alpha_plane(), Some(&[190u16][..]));
-    assert_eq!(img_t1.alpha_row(0), Some(&[190u16][..]));
+    // SAMPLE_1X1_AV1_OBU limited-range (color_range=0) Y=190 -> tam aralık alfa = 203
+    assert_eq!(img_t1.alpha_plane(), Some(&[203u16][..]));
+    assert_eq!(img_t1.alpha_row(0), Some(&[203u16][..]));
     let rgba = img_t1.to_rgba8().unwrap();
-    assert_eq!(rgba.pixels[3], 190);
+    assert_eq!(rgba.pixels[3], 203);
 
     // 64x63 gerçek AV1 anahtar karesinden 2x2 grid (128x126 -> 120x110 kırpılmış tuval)
     let odd_obu = read_oddheight_keyframe_obu();

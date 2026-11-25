@@ -1,4 +1,4 @@
-# av1oxide (`v0.3.0`)
+# av1oxide (`v0.3.1`)
 
 **English** | [Türkçe](README.tr.md)
 
@@ -14,7 +14,7 @@
   - Secondary architectures (`arm32`, `riscv64`, `loongarch64`, `powerpc64le`): `100%` safe bit-exact scalar fallback
 - **Multithreading & Memory Budgets:** Intra-frame (`Tile`, superblock row, in-loop filter) and inter-frame (`FrameSlot`) parallelism (`Config::n_threads`, `Config::max_frame_delay`); pre-allocation pixel and memory limits (`Config::frame_size_limit`, `Config::allocation_limit`).
 - **`libdav1d` (`7.0.0`) Compatible C-ABI (`capi`):** Implements all 19 official `DAV1D_API` functions (`dav1d_open`, `dav1d_send_data`, `dav1d_get_picture`, `dav1d_apply_grain`, `dav1d_parse_sequence_header`, etc.) and ships the official `include/dav1d/*.h` C headers.
-- **Zero-Dependency `.avif` Image Reader (`avif`):** `100% #![forbid(unsafe_code)]` ISOBMFF/HEIF/MIAF/AVIF container parser supporting single `av01` items, multithreaded `grid` tile stitching, `iden` derived chains, auxiliary alpha (`auxl`/`auxC`), `clap`/`irot`/`imir` transforms, `ICC`/`Exif`/`XMP` metadata, and ITU-T H.273 conversions (`RGB8`/`RGBA8`/`RGB16`/`RGBA16`).
+- **Zero-Dependency `.avif` Image Reader (`avif`):** `100% #![forbid(unsafe_code)]` ISOBMFF/HEIF/MIAF/AVIF container parser supporting single `av01` items, multithreaded `grid` tile stitching, `iden` derived chains, auxiliary alpha (`auxl`/`auxC`), `clap`/`irot`/`imir` transforms, `ICC`/`Exif`/`XMP` metadata, and ITU-T H.273 conversions (`RGB8`/`RGBA8`/`RGB16`/`RGBA16`) — verified `100%` MD5 bit-exact parity (`156 / 156` valid `.avif` images across planar `Y`, `U`, `V`, `Alpha`, `RGBA8`, and `RGBA16`) against reference C `libavif` on the license-audited `AOMediaCodec/av1-avif` and `AOMediaCodec/libavif` corpora.
 
 ---
 

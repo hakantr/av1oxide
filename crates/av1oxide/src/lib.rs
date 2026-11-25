@@ -1,4 +1,4 @@
-//! # av1oxide — %100 Kararlı Rust AV1 Video ve AVIF Görüntü Çözücüsü (`v0.3.0`)
+//! # av1oxide — %100 Kararlı Rust AV1 Video ve AVIF Görüntü Çözücüsü (`v0.3.1`)
 //!
 //! `av1oxide`, VideoLAN [`dav1d`](https://code.videolan.org/videolan/dav1d) (`1.5.4`)
 //! AV1 video çözücüsünün **%100 kararlı Rust** (`rustc 1.100.0`, Edition 2024) ve
@@ -32,7 +32,10 @@
 //! - **Sıfır Bağımlılıklı `.avif` Görüntü Okuyucu Katmanı ([`avif`]):** `%100 #![forbid(unsafe_code)]`
 //!   ISOBMFF/HEIF/MIAF/AVIF kutu ayrıştırıcısı, tekil `av01`, `grid` karo birleştirme, `iden`,
 //!   yardımcı alfa (`auxl`/`auxC`) kanalı, `clap`/`irot`/`imir` dönüşümleri, `ICC`/`Exif`/`XMP`
-//!   metaverisi ve ITU-T H.273 renk dönüşümleri (`RGB8`/`RGBA8`/`RGB16`/`RGBA16`).
+//!   metaverisi ve ITU-T H.273 renk dönüşümleri (`RGB8`/`RGBA8`/`RGB16`/`RGBA16`); resmî
+//!   `AOMediaCodec/av1-avif` ve `AOMediaCodec/libavif` test korpusundaki `156 / 156` geçerli
+//!   `.avif` dosyasında referans C `libavif` ile düzlemsel (`Y`, `U`, `V`, `Alpha`) ve
+//!   `RGBA8`/`RGBA16` çıktılarında `%100` MD5 bit-birebir eşitlik.
 //!
 //! ## Hızlı Başlangıç Örneği
 //!

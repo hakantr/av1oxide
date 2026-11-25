@@ -935,6 +935,11 @@ fn parse_iref(payload: &[u8], references: &mut Vec<ItemReference>) -> Result<()>
                 pos += 4;
                 id
             };
+            if &ref_box.box_type == b"dimg" && to_item_ids.contains(&to_id) {
+                return Err(Error::InvalidData(
+                    "dimg referans dizisinde yinelenen hedef öğe kimliği",
+                ));
+            }
             to_item_ids.push(to_id);
         }
         references.push(ItemReference {
@@ -969,6 +974,16 @@ impl<'a> AvifContainer<'a> {
             if assoc.essential && matches!(prop, ItemProperty::Unknown(_)) {
                 return Err(Error::Unsupported(
                     "öğede desteklenmeyen zorunlu (essential) ipco özelliği bulunuyor",
+                ));
+            }
+            if !assoc.essential
+                && matches!(
+                    prop,
+                    ItemProperty::Clap(_) | ItemProperty::Irot(_) | ItemProperty::Imir(_)
+                )
+            {
+                return Err(Error::InvalidData(
+                    "dönüşüm özellikleri (clap, irot, imir) ipma içinde zorunlu (essential) olmalıdır",
                 ));
             }
             out.push((prop, assoc.essential));

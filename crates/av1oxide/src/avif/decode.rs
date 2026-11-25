@@ -39,6 +39,18 @@ struct GridDescriptor {
     output_height: u32,
 }
 
+/// Yardımcı alfa kanalının kapsayıcı içindeki temsil biçimi.
+#[derive(Clone, Debug)]
+enum AlphaSource {
+    /// Birincil öğeye doğrudan `auxl` ile bağlı tekil (`av01` veya `grid`) alfa öğesi.
+    Direct(u32),
+    /// Renk `grid` öğesinin her bir karosuna ayrı `auxl` ile bağlı alfa karolarından oluşan sentetik ızgara.
+    GridTiles {
+        grid_item_id: u32,
+        alpha_tile_ids: Vec<u32>,
+    },
+}
+
 fn parse_grid_descriptor(data: &[u8]) -> Result<GridDescriptor> {
     if data.len() < 8 {
         return Err(Error::InvalidData("kesik grid tanımlayıcısı (< 8 bayt)"));
@@ -102,6 +114,11 @@ fn compute_clap_rect(w: u32, h: u32, clap: &CleanAperture) -> Result<(u32, u32, 
     if clap.width_d == 0 || clap.height_d == 0 || clap.horiz_off_d == 0 || clap.vert_off_d == 0 {
         return Err(Error::InvalidData("clap paydası sıfır olamaz"));
     }
+    if !clap.width_n.is_multiple_of(clap.width_d) || !clap.height_n.is_multiple_of(clap.height_d) {
+        return Err(Error::InvalidData(
+            "clap genişlik veya yüksekliği tam sayı değil",
+        ));
+    }
     let crop_w = clap.width_n / clap.width_d;
     let crop_h = clap.height_n / clap.height_d;
     if crop_w == 0 || crop_h == 0 || crop_w > w || crop_h > h {
@@ -109,10 +126,23 @@ fn compute_clap_rect(w: u32, h: u32, clap: &CleanAperture) -> Result<(u32, u32, 
             "clap kırpma boyutları görüntü sınırları dışında",
         ));
     }
-    let pc_x2 = i64::from(w) + (2 * i64::from(clap.horiz_off_n)) / i64::from(clap.horiz_off_d);
-    let pc_y2 = i64::from(h) + (2 * i64::from(clap.vert_off_n)) / i64::from(clap.vert_off_d);
-    let x0_i64 = (pc_x2 - i64::from(crop_w)) / 2;
-    let y0_i64 = (pc_y2 - i64::from(crop_h)) / 2;
+
+    // cropX = w/2 + horizOffN/horizOffD - cropW/2
+    //       = ((w - cropW) * horizOffD + 2 * horizOffN) / (2 * horizOffD)
+    let hd = i64::from(clap.horiz_off_d);
+    let vd = i64::from(clap.vert_off_d);
+    let num_x = (i64::from(w) - i64::from(crop_w)) * hd + 2 * i64::from(clap.horiz_off_n);
+    let den_x = 2 * hd;
+    let num_y = (i64::from(h) - i64::from(crop_h)) * vd + 2 * i64::from(clap.vert_off_n);
+    let den_y = 2 * vd;
+
+    if (num_x % den_x) != 0 || (num_y % den_y) != 0 {
+        return Err(Error::InvalidData(
+            "clap sol-üst kırpma ofseti tam sayı değil",
+        ));
+    }
+    let x0_i64 = num_x / den_x;
+    let y0_i64 = num_y / den_y;
     if x0_i64 < 0
         || y0_i64 < 0
         || x0_i64 + i64::from(crop_w) > i64::from(w)
@@ -145,6 +175,8 @@ fn inspect_item_dimensions(
     let mut bit_depth: Option<BitDepth> = None;
     let mut chroma_format: Option<ChromaFormat> = None;
     let mut seq_color: Option<ColorInfo> = None;
+    let mut clap_opt: Option<&CleanAperture> = None;
+    let mut irot_opt: Option<u8> = None;
 
     for (p, _) in &props {
         match p {
@@ -176,6 +208,8 @@ fn inspect_item_dimensions(
                     bit_depth = BitDepth::from_bits(u32::from(first_bpc));
                 }
             }
+            ItemProperty::Clap(c) => clap_opt = Some(c),
+            ItemProperty::Irot(a) => irot_opt = Some(*a),
             _ => {}
         }
     }
@@ -261,34 +295,69 @@ fn inspect_item_dimensions(
         _ => return Err(Error::Unsupported("desteklenmeyen birincil AVIF öğe türü")),
     };
 
-    for (p, _) in &props {
-        match p {
-            ItemProperty::Clap(clap) => {
-                let (_, _, cw, ch) = compute_clap_rect(w, h, clap)?;
-                w = cw;
-                h = ch;
-            }
-            ItemProperty::Irot(angle) if (angle & 1) != 0 => {
-                core::mem::swap(&mut w, &mut h);
-            }
-            _ => {}
-        }
+    // MIAF dönüşüm sırası: önce clap, sonra irot, sonra imir.
+    if let Some(clap) = clap_opt {
+        let (_, _, cw, ch) = compute_clap_rect(w, h, clap)?;
+        w = cw;
+        h = ch;
+    }
+    if let Some(angle) = irot_opt
+        && (angle & 1) != 0
+    {
+        core::mem::swap(&mut w, &mut h);
     }
 
     Ok((w, h, bd, cf, seq_color))
 }
 
-fn find_alpha_item(container: &AvifContainer<'_>, primary_id: u32) -> Result<Option<u32>> {
-    let aux_candidates = container.references_to(primary_id, b"auxl");
+fn find_direct_alpha_item(container: &AvifContainer<'_>, target_id: u32) -> Result<Option<u32>> {
+    let aux_candidates = container.references_to(target_id, b"auxl");
+    let mut found: Option<u32> = None;
     for aux_id in aux_candidates {
         let props = container.item_properties(aux_id)?;
         for (p, _) in props {
             if let ItemProperty::AuxC { aux_type, .. } = p
                 && (aux_type == ALPHA_AUX_URN_CICP || aux_type == ALPHA_AUX_URN_HEVC)
             {
-                return Ok(Some(aux_id));
+                if found.is_some() {
+                    return Err(Error::InvalidData(
+                        "bir öğeye birden fazla yardımcı alfa öğesi bağlanamaz",
+                    ));
+                }
+                found = Some(aux_id);
             }
         }
+    }
+    Ok(found)
+}
+
+fn find_alpha_source(
+    container: &AvifContainer<'_>,
+    primary_id: u32,
+) -> Result<Option<AlphaSource>> {
+    if let Some(aid) = find_direct_alpha_item(container, primary_id)? {
+        return Ok(Some(AlphaSource::Direct(aid)));
+    }
+    let Some(info) = container.item_info(primary_id) else {
+        return Ok(None);
+    };
+    if &info.item_type == b"grid" {
+        let tile_ids = container.references_from(primary_id, b"dimg");
+        if tile_ids.is_empty() {
+            return Ok(None);
+        }
+        let mut alpha_tiles = Vec::with_capacity(tile_ids.len());
+        for &tid in &tile_ids {
+            if let Some(aid) = find_direct_alpha_item(container, tid)? {
+                alpha_tiles.push(aid);
+            } else {
+                return Ok(None);
+            }
+        }
+        return Ok(Some(AlphaSource::GridTiles {
+            grid_item_id: primary_id,
+            alpha_tile_ids: alpha_tiles,
+        }));
     }
     Ok(None)
 }
@@ -296,10 +365,19 @@ fn find_alpha_item(container: &AvifContainer<'_>, primary_id: u32) -> Result<Opt
 fn is_premultiplied_alpha(
     container: &AvifContainer<'_>,
     primary_id: u32,
-    alpha_id: Option<u32>,
+    alpha_src: Option<&AlphaSource>,
 ) -> bool {
-    let Some(alpha_id) = alpha_id else {
+    let Some(alpha_src) = alpha_src else {
         return false;
+    };
+    let alpha_id = match alpha_src {
+        AlphaSource::Direct(id) => *id,
+        AlphaSource::GridTiles { alpha_tile_ids, .. } => {
+            let Some(&first) = alpha_tile_ids.first() else {
+                return false;
+            };
+            first
+        }
     };
     let from_primary = container.references_from(primary_id, b"prem");
     if from_primary.contains(&alpha_id) {
@@ -373,8 +451,8 @@ pub fn parse_info(data: &[u8]) -> Result<AvifInfo> {
         }
     }
 
-    let alpha_id = find_alpha_item(&container, primary_id)?;
-    let premultiplied_alpha = is_premultiplied_alpha(&container, primary_id, alpha_id);
+    let alpha_src = find_alpha_source(&container, primary_id)?;
+    let premultiplied_alpha = is_premultiplied_alpha(&container, primary_id, alpha_src.as_ref());
     let (exif, xmp) = extract_metadata_items(&container, primary_id, None)?;
 
     Ok(AvifInfo {
@@ -382,7 +460,7 @@ pub fn parse_info(data: &[u8]) -> Result<AvifInfo> {
         height,
         bit_depth,
         chroma_format,
-        has_alpha: alpha_id.is_some(),
+        has_alpha: alpha_src.is_some(),
         premultiplied_alpha,
         color,
         icc_profile,
@@ -418,6 +496,18 @@ fn check_pixel_and_byte_budget(
         });
     }
     Ok(())
+}
+
+#[inline]
+fn limited_to_full_y(bit_depth: BitDepth, v: u16) -> u16 {
+    let (min_y, max_y, full_y): (i32, i32, i32) = match bit_depth {
+        BitDepth::Eight => (16, 235, 255),
+        BitDepth::Ten => (64, 940, 1023),
+        BitDepth::Twelve => (256, 3760, 4095),
+    };
+    let span = max_y - min_y;
+    let expanded = (((i32::from(v) - min_y) * full_y) + (span / 2)) / span;
+    expanded.clamp(0, full_y) as u16
 }
 
 fn extract_plane_u16(
@@ -487,11 +577,13 @@ fn decode_av01_item(
     item_id: u32,
     config: &AvifDecodeConfig,
     threads_for_item: usize,
+    is_alpha: bool,
 ) -> Result<PlanarBuffer> {
     let props = container.item_properties(item_id)?;
     let mut av1c_opt: Option<&Av1CProperty> = None;
     let mut operating_point: u8 = 0;
     let mut layer_sel: Option<u16> = None;
+    let mut has_ispe = false;
 
     for (p, _) in &props {
         match p {
@@ -499,10 +591,16 @@ fn decode_av01_item(
             ItemProperty::A1op(op) => operating_point = *op,
             ItemProperty::Lsel(ls) => layer_sel = Some(*ls),
             ItemProperty::Ispe { width, height } => {
+                has_ispe = true;
                 check_pixel_and_byte_budget(*width, *height, 0, config)?;
             }
             _ => {}
         }
+    }
+    if config.strict && !has_ispe {
+        return Err(Error::InvalidData(
+            "katı kipte (strict) görüntü öğesinde ispe özelliği zorunludur",
+        ));
     }
 
     let payload = container.resolve_item_data(item_id, config.allocation_limit)?;
@@ -550,9 +648,18 @@ fn decode_av01_item(
         full_range: seq.color_range != 0,
     });
 
-    let (w, h, y_plane) = extract_plane_u16(&frame, PlaneType::Y, config.allocation_limit)?;
+    let (w, h, mut y_plane) = extract_plane_u16(&frame, PlaneType::Y, config.allocation_limit)?;
     let (cw, ch, u_plane) = extract_plane_u16(&frame, PlaneType::U, config.allocation_limit)?;
     let (_, _, v_plane) = extract_plane_u16(&frame, PlaneType::V, config.allocation_limit)?;
+
+    // AVIF v1.0.0 geriye dönük uyumluluğu (`libavif` `avifImageLimitedToFullAlpha`):
+    // Alfa düzlemi sınırlı aralıkta (`color_range == 0`) kodlanmışsa tam aralığa genişletilir.
+    if is_alpha && seq_color.is_some_and(|c| !c.full_range) {
+        let bd = frame.bit_depth();
+        for sample in &mut y_plane {
+            *sample = limited_to_full_y(bd, *sample);
+        }
+    }
 
     Ok(PlanarBuffer {
         width: w,
@@ -645,7 +752,6 @@ fn crop_planar(
 fn rotate_plane_ccw(src: &[u16], w: usize, h: usize, angle: u8) -> (usize, usize, Vec<u16>) {
     match angle & 3 {
         1 => {
-            // 90° CCW: yeni boyut (h, w), dst(nx, ny) = src(w - 1 - ny, nx)
             let mut dst = vec![0u16; w * h];
             for ny in 0..w {
                 let sx = w - 1 - ny;
@@ -657,7 +763,6 @@ fn rotate_plane_ccw(src: &[u16], w: usize, h: usize, angle: u8) -> (usize, usize
             (h, w, dst)
         }
         2 => {
-            // 180° CCW: yeni boyut (w, h), dst(nx, ny) = src(w - 1 - nx, h - 1 - ny)
             let mut dst = vec![0u16; w * h];
             for ny in 0..h {
                 let sy = h - 1 - ny;
@@ -669,7 +774,6 @@ fn rotate_plane_ccw(src: &[u16], w: usize, h: usize, angle: u8) -> (usize, usize
             (w, h, dst)
         }
         3 => {
-            // 270° CCW: yeni boyut (h, w), dst(nx, ny) = src(ny, h - 1 - nx)
             let mut dst = vec![0u16; w * h];
             for ny in 0..w {
                 let sx = ny;
@@ -746,7 +850,6 @@ fn mirror_plane(plane: &mut [u16], w: usize, h: usize, axis: u8) {
         return;
     }
     if (axis & 1) == 0 {
-        // axis == 0: dikey eksen (üst-alt aynalama)
         for y in 0..(h / 2) {
             let top_start = y * w;
             let bot_start = (h - 1 - y) * w;
@@ -755,7 +858,6 @@ fn mirror_plane(plane: &mut [u16], w: usize, h: usize, axis: u8) {
             }
         }
     } else {
-        // axis == 1: yatay eksen (sol-sağ aynalama)
         for y in 0..h {
             let row = &mut plane[y * w..(y + 1) * w];
             row.reverse();
@@ -778,6 +880,8 @@ fn apply_imir(buf: &mut PlanarBuffer, axis: u8) {
     }
 }
 
+/// MIAF (`ISO/IEC 23000-22 §7.3.6.7`) normatif sırasıyla (`clap` → `irot` → `imir`)
+/// öğe dönüşümlerini uygular.
 fn apply_item_transforms(
     container: &AvifContainer<'_>,
     item_id: u32,
@@ -785,31 +889,40 @@ fn apply_item_transforms(
     allocation_limit: Option<usize>,
 ) -> Result<()> {
     let props = container.item_properties(item_id)?;
+    let mut clap_opt: Option<&CleanAperture> = None;
+    let mut irot_opt: Option<u8> = None;
+    let mut imir_opt: Option<u8> = None;
+
     for (p, _) in props {
         match p {
-            ItemProperty::Clap(clap) => {
-                let (x0, y0, cw, ch) = compute_clap_rect(buf.width, buf.height, clap)?;
-                crop_planar(buf, x0, y0, cw, ch, allocation_limit)?;
-            }
-            ItemProperty::Irot(angle) => apply_irot(buf, *angle),
-            ItemProperty::Imir(axis) => apply_imir(buf, *axis),
+            ItemProperty::Clap(c) => clap_opt = Some(c),
+            ItemProperty::Irot(a) => irot_opt = Some(*a),
+            ItemProperty::Imir(m) => imir_opt = Some(*m),
             _ => {}
         }
+    }
+    if let Some(clap) = clap_opt {
+        let (x0, y0, cw, ch) = compute_clap_rect(buf.width, buf.height, clap)?;
+        crop_planar(buf, x0, y0, cw, ch, allocation_limit)?;
+    }
+    if let Some(angle) = irot_opt {
+        apply_irot(buf, angle);
+    }
+    if let Some(axis) = imir_opt {
+        apply_imir(buf, axis);
     }
     Ok(())
 }
 
-fn decode_grid_item(
+fn decode_grid_tiles_into_canvas(
     container: &AvifContainer<'_>,
-    item_id: u32,
+    grid: GridDescriptor,
+    tile_ids: &[u32],
     config: &AvifDecodeConfig,
+    is_alpha: bool,
     depth: usize,
 ) -> Result<PlanarBuffer> {
-    let grid_bytes = container.resolve_item_data(item_id, config.allocation_limit)?;
-    let grid = parse_grid_descriptor(&grid_bytes)?;
     check_pixel_and_byte_budget(grid.output_width, grid.output_height, 0, config)?;
-
-    let tile_ids = container.references_from(item_id, b"dimg");
     let rows = grid.rows as usize;
     let cols = grid.cols as usize;
     let num_tiles = rows
@@ -839,7 +952,14 @@ fn decode_grid_item(
                 handles.push(s.spawn(move || {
                     let mut out = Vec::with_capacity(chunk.len());
                     for &tid in chunk {
-                        out.push(decode_item_planar(container, tid, config, 1, depth + 1)?);
+                        out.push(decode_item_planar(
+                            container,
+                            tid,
+                            config,
+                            1,
+                            is_alpha,
+                            depth + 1,
+                        )?);
                     }
                     Ok(out)
                 }));
@@ -859,12 +979,13 @@ fn decode_grid_item(
         flat
     } else {
         let mut flat = Vec::with_capacity(num_tiles);
-        for &tid in &tile_ids {
+        for &tid in tile_ids {
             flat.push(decode_item_planar(
                 container,
                 tid,
                 config,
                 total_threads,
+                is_alpha,
                 depth + 1,
             )?);
         }
@@ -887,7 +1008,7 @@ fn decode_grid_item(
         if t.width as usize != tile_w
             || t.height as usize != tile_h
             || t.bit_depth != bit_depth
-            || t.chroma_format != chroma_format
+            || (!is_alpha && t.chroma_format != chroma_format)
         {
             return Err(Error::InvalidData(
                 "grid karolarının boyut veya biçimleri uyumsuz",
@@ -905,9 +1026,13 @@ fn decode_grid_item(
         ));
     }
 
-    let (out_cw, out_ch) = chroma_format
-        .chroma_dimensions(out_w, out_h)?
-        .unwrap_or((0, 0));
+    let (out_cw, out_ch) = if is_alpha {
+        (0, 0)
+    } else {
+        chroma_format
+            .chroma_dimensions(out_w, out_h)?
+            .unwrap_or((0, 0))
+    };
     let y_samples = out_w.checked_mul(out_h).ok_or(Error::SizeOverflow {
         stage: SizeStage::PlaneArea,
         lhs: out_w,
@@ -954,7 +1079,7 @@ fn decode_grid_item(
                     .copy_from_slice(&tile.y_plane[src_off..src_off + copy_w]);
             }
 
-            if chroma_format != ChromaFormat::Monochrome && copy_ch > 0 {
+            if !is_alpha && chroma_format != ChromaFormat::Monochrome && copy_ch > 0 {
                 let dst_cx0 = c * tile_cw;
                 if dst_cx0 < out_cw {
                     let copy_cw = tile_cw.min(out_cw - dst_cx0);
@@ -977,7 +1102,11 @@ fn decode_grid_item(
         chroma_width: out_cw as u32,
         chroma_height: out_ch as u32,
         bit_depth,
-        chroma_format,
+        chroma_format: if is_alpha {
+            ChromaFormat::Monochrome
+        } else {
+            chroma_format
+        },
         y_plane: y_canvas,
         u_plane: u_canvas,
         v_plane: v_canvas,
@@ -985,11 +1114,25 @@ fn decode_grid_item(
     })
 }
 
+fn decode_grid_item(
+    container: &AvifContainer<'_>,
+    item_id: u32,
+    config: &AvifDecodeConfig,
+    is_alpha: bool,
+    depth: usize,
+) -> Result<PlanarBuffer> {
+    let grid_bytes = container.resolve_item_data(item_id, config.allocation_limit)?;
+    let grid = parse_grid_descriptor(&grid_bytes)?;
+    let tile_ids = container.references_from(item_id, b"dimg");
+    decode_grid_tiles_into_canvas(container, grid, &tile_ids, config, is_alpha, depth)
+}
+
 fn decode_item_planar(
     container: &AvifContainer<'_>,
     item_id: u32,
     config: &AvifDecodeConfig,
     threads_for_item: usize,
+    is_alpha: bool,
     depth: usize,
 ) -> Result<PlanarBuffer> {
     if depth > 8 {
@@ -1002,8 +1145,8 @@ fn decode_item_planar(
         .ok_or(Error::InvalidData("AVIF öğesi iinf içinde bulunamadı"))?;
 
     let mut buf = match &info.item_type {
-        b"av01" => decode_av01_item(container, item_id, config, threads_for_item)?,
-        b"grid" => decode_grid_item(container, item_id, config, depth)?,
+        b"av01" => decode_av01_item(container, item_id, config, threads_for_item, is_alpha)?,
+        b"grid" => decode_grid_item(container, item_id, config, is_alpha, depth)?,
         b"iden" => {
             let targets = container.references_from(item_id, b"dimg");
             if targets.len() != 1 {
@@ -1011,12 +1154,18 @@ fn decode_item_planar(
                     "iden öğesi tek bir dimg referansı içermelidir",
                 ));
             }
-            decode_item_planar(container, targets[0], config, threads_for_item, depth + 1)?
+            decode_item_planar(
+                container,
+                targets[0],
+                config,
+                threads_for_item,
+                is_alpha,
+                depth + 1,
+            )?
         }
         _ => return Err(Error::Unsupported("desteklenmeyen AVIF görüntü öğesi türü")),
     };
 
-    // Öğenin ispe özelliği çözülenden küçükse kırp (grid / av01 ispe uyumu)
     let props = container.item_properties(item_id)?;
     for (p, _) in &props {
         if let ItemProperty::Ispe { width, height } = p
@@ -1042,7 +1191,8 @@ pub fn decode_with(data: &[u8], config: &AvifDecodeConfig) -> Result<AvifImage> 
     let container = parse_container(data)?;
     let primary_id = container.primary_item_id;
 
-    let mut color_buf = decode_item_planar(&container, primary_id, config, config.n_threads, 0)?;
+    let mut color_buf =
+        decode_item_planar(&container, primary_id, config, config.n_threads, false, 0)?;
 
     let props = container.item_properties(primary_id)?;
     let mut color = color_buf.seq_color.unwrap_or_default();
@@ -1062,28 +1212,51 @@ pub fn decode_with(data: &[u8], config: &AvifDecodeConfig) -> Result<AvifImage> 
         }
     }
 
-    let alpha_id = find_alpha_item(&container, primary_id)?;
-    let premultiplied_alpha = is_premultiplied_alpha(&container, primary_id, alpha_id);
+    let alpha_src = find_alpha_source(&container, primary_id)?;
+    let premultiplied_alpha = is_premultiplied_alpha(&container, primary_id, alpha_src.as_ref());
 
-    let alpha_plane = if let Some(aid) = alpha_id {
-        let mut alpha_buf = decode_item_planar(&container, aid, config, config.n_threads, 0)?;
-        // Alfa öğesinde kendi clap/irot/imir özellikleri tanımlanmamışsa birincil öğenin dönüşümlerini uygula
-        let alpha_has_transforms = container.item_properties(aid)?.iter().any(|(p, _)| {
-            matches!(
-                p,
-                ItemProperty::Clap(_) | ItemProperty::Irot(_) | ItemProperty::Imir(_)
-            )
-        });
-        if !alpha_has_transforms
-            && (alpha_buf.width != color_buf.width || alpha_buf.height != color_buf.height)
-        {
-            apply_item_transforms(
-                &container,
-                primary_id,
-                &mut alpha_buf,
-                config.allocation_limit,
-            )?;
-        }
+    let alpha_plane = if let Some(ref src) = alpha_src {
+        let mut alpha_buf = match src {
+            AlphaSource::Direct(aid) => {
+                let mut ab =
+                    decode_item_planar(&container, *aid, config, config.n_threads, true, 0)?;
+                // libavif uyumu: alfa öğesinin kendi irot/imir/clap dönüşümleri dikkate alınmaz,
+                // birincil öğenin dönüşümleri birincil görüntü ile birlikte alfa düzlemine de uygulanır.
+                let alpha_has_transforms = container.item_properties(*aid)?.iter().any(|(p, _)| {
+                    matches!(
+                        p,
+                        ItemProperty::Clap(_) | ItemProperty::Irot(_) | ItemProperty::Imir(_)
+                    )
+                });
+                if !alpha_has_transforms {
+                    apply_item_transforms(
+                        &container,
+                        primary_id,
+                        &mut ab,
+                        config.allocation_limit,
+                    )?;
+                }
+                ab
+            }
+            AlphaSource::GridTiles {
+                grid_item_id,
+                alpha_tile_ids,
+            } => {
+                let grid_bytes =
+                    container.resolve_item_data(*grid_item_id, config.allocation_limit)?;
+                let grid = parse_grid_descriptor(&grid_bytes)?;
+                let mut ab = decode_grid_tiles_into_canvas(
+                    &container,
+                    grid,
+                    alpha_tile_ids,
+                    config,
+                    true,
+                    0,
+                )?;
+                apply_item_transforms(&container, *grid_item_id, &mut ab, config.allocation_limit)?;
+                ab
+            }
+        };
         if alpha_buf.width != color_buf.width || alpha_buf.height != color_buf.height {
             return Err(Error::InvalidData(
                 "alfa düzlemi boyutları birincil görüntü boyutlarıyla eşleşmiyor",

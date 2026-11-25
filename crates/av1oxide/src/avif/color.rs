@@ -6,178 +6,214 @@ use crate::avif::image::{AvifImage, Rgb16Image, RgbImage, Rgba16Image, RgbaImage
 use crate::error::{Error, Result, SizeStage};
 use crate::frame::{BitDepth, ChromaFormat};
 
-/// `4:2:0` veya `4:2:2` kroma düzleminden `(x, y)` luma koordinatına karşılık gelen
-/// iki doğrusal (`bilinear`) enterpolasyonlu kroma örneğini okur.
+/// `matrix_coefficients` değerine karşılık gelen `(Kr, Kb)` katsayılarını döndürür (`ITU-T H.273`).
 #[inline]
-fn sample_chroma_bilinear(
-    plane: &[u16],
+fn matrix_kr_kb(matrix_coefficients: u16, color_primaries: u16) -> (f32, f32) {
+    match matrix_coefficients {
+        1 => (0.2126, 0.0722),      // BT.709
+        4 => (0.30, 0.11),          // FCC
+        5 | 6 => (0.299, 0.114),    // BT.470BG / BT.601
+        7 => (0.212, 0.087),        // SMPTE ST 240
+        9 | 10 => (0.2627, 0.0593), // BT.2020 NCL
+        12 => match color_primaries {
+            9 => (0.2627, 0.0593),
+            _ => (0.2126, 0.0722),
+        },
+        _ => (0.299, 0.114), // Varsayılan (2 = Unspecified -> BT.601)
+    }
+}
+
+/// Y ve UV örneklerini `[0.0, 1.0]` / `[-0.5, 0.5]` aralığına dönüştüren arama tablolarını oluşturur.
+fn build_unorm_tables(
+    bit_depth: BitDepth,
+    full_range: bool,
+    identity_mode: bool,
+) -> (Vec<f32>, Vec<f32>) {
+    let bits = bit_depth.bits();
+    let count = 1usize << bits;
+    let max_chan = ((1u32 << bits) - 1) as f32;
+    let shift = bits - 8;
+
+    let bias_y = if full_range {
+        0.0f32
+    } else {
+        (16u32 << shift) as f32
+    };
+    let range_y = if full_range {
+        max_chan
+    } else {
+        (219u32 << shift) as f32
+    };
+
+    let mut table_y = Vec::with_capacity(count);
+    for cp in 0..count {
+        table_y.push(((cp as f32) - bias_y) / range_y);
+    }
+
+    if identity_mode {
+        let table_uv = table_y.clone();
+        (table_y, table_uv)
+    } else {
+        let bias_uv = (1u32 << (bits - 1)) as f32;
+        let range_uv = if full_range {
+            max_chan
+        } else {
+            (224u32 << shift) as f32
+        };
+        let mut table_uv = Vec::with_capacity(count);
+        for cp in 0..count {
+            table_uv.push(((cp as f32) - bias_uv) / range_uv);
+        }
+        (table_y, table_uv)
+    }
+}
+
+/// `4:2:0`, `4:2:2` veya `4:4:4` kroma düzlemlerinden `(i, j)` luma koordinatına karşılık gelen
+/// iki doğrusal (`bilinear`) enterpolasyonlu `(Cb, Cr)` çiftini hesaplar (`libavif` `avifImageYUVAnyToRGBAnySlow` uyumlu).
+#[inline]
+#[allow(clippy::too_many_arguments)]
+fn sample_cb_cr_bilinear(
+    u_plane: &[u16],
+    v_plane: &[u16],
+    table_uv: &[f32],
+    w: usize,
+    h: usize,
     cw: usize,
     ch: usize,
-    x: usize,
-    y: usize,
-    sub_x: bool,
-    sub_y: bool,
-) -> i32 {
+    i: usize,
+    j: usize,
+    chroma_format: ChromaFormat,
+    max_val: usize,
+) -> (f32, f32) {
     if cw == 0 || ch == 0 {
-        return 0;
+        return (0.0, 0.0);
     }
-    if !sub_x && !sub_y {
-        let cx = x.min(cw - 1);
-        let cy = y.min(ch - 1);
-        return i32::from(plane[cy * cw + cx]);
+    let shift_x = usize::from(matches!(
+        chroma_format,
+        ChromaFormat::C420 | ChromaFormat::C422
+    ));
+    let shift_y = usize::from(matches!(chroma_format, ChromaFormat::C420));
+    let uv_i = (i >> shift_x).min(cw - 1);
+    let uv_j = (j >> shift_y).min(ch - 1);
+
+    if chroma_format == ChromaFormat::C444 {
+        let idx = uv_j * cw + uv_i;
+        let u0 = usize::from(u_plane[idx]).min(max_val);
+        let v0 = usize::from(v_plane[idx]).min(max_val);
+        return (table_uv[u0], table_uv[v0]);
     }
 
-    // Merkez hizalı 2x alt örnekleme için (2*x - 1) / 4 ağırlıklı komşuluk.
-    let (cx0, cx1, wx) = if sub_x {
-        if x == 0 {
-            (0, 0, 0)
-        } else {
-            let base = (x - 1) / 2;
-            let c0 = base.min(cw - 1);
-            let c1 = (base + 1).min(cw - 1);
-            let w = if ((x - 1) & 1) == 0 { 1 } else { 3 };
-            (c0, c1, w)
-        }
+    let adj_col: isize = if i == 0 || (i == w - 1 && (i & 1) != 0) {
+        0
+    } else if (i & 1) != 0 {
+        if uv_i + 1 < cw { 1 } else { 0 }
+    } else if uv_i > 0 {
+        -1
     } else {
-        let c = x.min(cw - 1);
-        (c, c, 0)
+        0
     };
 
-    let (cy0, cy1, wy) = if sub_y {
-        if y == 0 {
-            (0, 0, 0)
+    let adj_row: isize =
+        if j == 0 || (j == h - 1 && (j & 1) != 0) || chroma_format == ChromaFormat::C422 {
+            0
+        } else if (j & 1) != 0 {
+            if uv_j + 1 < ch { 1 } else { 0 }
+        } else if uv_j > 0 {
+            -1
         } else {
-            let base = (y - 1) / 2;
-            let c0 = base.min(ch - 1);
-            let c1 = (base + 1).min(ch - 1);
-            let w = if ((y - 1) & 1) == 0 { 1 } else { 3 };
-            (c0, c1, w)
-        }
-    } else {
-        let c = y.min(ch - 1);
-        (c, c, 0)
-    };
-
-    let p00 = i32::from(plane[cy0 * cw + cx0]);
-    let p10 = i32::from(plane[cy0 * cw + cx1]);
-    let p01 = i32::from(plane[cy1 * cw + cx0]);
-    let p11 = i32::from(plane[cy1 * cw + cx1]);
-
-    let top = p00 * (4 - wx) + p10 * wx;
-    let bot = p01 * (4 - wx) + p11 * wx;
-    (top * (4 - wy) + bot * wy + 8) >> 4
-}
-
-/// Tek bir `(Y, U, V)` örneğini H.273 `matrix_coefficients` ve `full_range` değerine göre
-/// `[0, max_val]` aralığında `(R, G, B)` üçlüsüne dönüştürür.
-#[inline]
-fn yuv_to_rgb_sample(
-    y_val: i32,
-    u_val: i32,
-    v_val: i32,
-    bit_depth: BitDepth,
-    matrix_coefficients: u16,
-    full_range: bool,
-    monochrome: bool,
-) -> (u16, u16, u16) {
-    let bits = bit_depth.bits();
-    let max_val = (1i32 << bits) - 1;
-    let shift = bits - 8;
-    let uv_bias = 128i32 << shift;
-
-    if monochrome {
-        let luma = if full_range {
-            y_val.clamp(0, max_val)
-        } else {
-            let y_min = 16i32 << shift;
-            let y_span = 219i32 << shift;
-            (((y_val - y_min) * max_val + (y_span / 2)) / y_span).clamp(0, max_val)
-        } as u16;
-        return (luma, luma, luma);
-    }
-
-    // matrix_coefficients == 0: Identity (GBR)
-    // H.273 §8.3: G = Y, B = Cb (U), R = Cr (V).
-    if matrix_coefficients == 0 {
-        if full_range {
-            let g = y_val.clamp(0, max_val) as u16;
-            let b = u_val.clamp(0, max_val) as u16;
-            let r = v_val.clamp(0, max_val) as u16;
-            return (r, g, b);
-        }
-        let y_min = 16i32 << shift;
-        let y_span = 219i32 << shift;
-        let g = (((y_val - y_min) * max_val + (y_span / 2)) / y_span).clamp(0, max_val) as u16;
-        let b = (((u_val - y_min) * max_val + (y_span / 2)) / y_span).clamp(0, max_val) as u16;
-        let r = (((v_val - y_min) * max_val + (y_span / 2)) / y_span).clamp(0, max_val) as u16;
-        return (r, g, b);
-    }
-
-    // matrix_coefficients == 8: YCgCo
-    if matrix_coefficients == 8 {
-        let (yy, cg, co) = if full_range {
-            (y_val, u_val - uv_bias, v_val - uv_bias)
-        } else {
-            let y_min = 16i32 << shift;
-            let y_span = 219i32 << shift;
-            let c_span = 224i32 << shift;
-            (
-                ((y_val - y_min) * max_val + (y_span / 2)) / y_span,
-                ((u_val - uv_bias) * max_val + (c_span / 2)) / c_span,
-                ((v_val - uv_bias) * max_val + (c_span / 2)) / c_span,
-            )
+            0
         };
-        let t = yy - cg;
-        let g = (yy + cg).clamp(0, max_val) as u16;
-        let b = (t - co).clamp(0, max_val) as u16;
-        let r = (t + co).clamp(0, max_val) as u16;
-        return (r, g, b);
-    }
 
-    // H.273 Kr, Kb sabitleri (16384 ölçekli sabit nokta):
-    // - BT.709 (1): Kr = 0.2126, Kb = 0.0722
-    // - BT.601 (5, 6) ve varsayılan: Kr = 0.299, Kb = 0.114
-    // - BT.2020 NCL (9, 10): Kr = 0.2627, Kb = 0.0593
-    // R = Y + c_rv * Cr
-    // G = Y - c_gu * Cb - c_gv * Cr
-    // B = Y + c_bu * Cb
-    let (c_rv, c_gu, c_gv, c_bu): (i64, i64, i64, i64) = match matrix_coefficients {
-        1 => (25_802, 3_069, 7_669, 30_402),      // BT.709
-        9 | 10 => (24_160, 2_696, 9_361, 30_828), // BT.2020
-        _ => (22_970, 5_638, 11_700, 29_032),     // BT.601 (5, 6, 2)
-    };
+    let c0 = uv_i;
+    let c1 = ((uv_i as isize) + adj_col) as usize;
+    let r0 = uv_j;
+    let r1 = ((uv_j as isize) + adj_row) as usize;
 
-    let (y_norm, cb_norm, cr_norm): (i64, i64, i64) = if full_range {
-        (
-            i64::from(y_val) * 16_384,
-            i64::from(u_val - uv_bias),
-            i64::from(v_val - uv_bias),
-        )
-    } else {
-        let y_min = 16i32 << shift;
-        let y_span = i64::from(219i32 << shift);
-        let c_span = i64::from(224i32 << shift);
-        let max_i64 = i64::from(max_val);
-        (
-            (i64::from(y_val - y_min) * max_i64 * 16_384 + (y_span / 2)) / y_span,
-            (i64::from(u_val - uv_bias) * max_i64 + (c_span / 2)) / c_span,
-            (i64::from(v_val - uv_bias) * max_i64 + (c_span / 2)) / c_span,
-        )
-    };
+    let i00 = r0 * cw + c0;
+    let i10 = r0 * cw + c1;
+    let i01 = r1 * cw + c0;
+    let i11 = r1 * cw + c1;
 
-    let r = ((y_norm + c_rv * cr_norm + 8_192) >> 14).clamp(0, i64::from(max_val)) as u16;
-    let g = ((y_norm - c_gu * cb_norm - c_gv * cr_norm + 8_192) >> 14).clamp(0, i64::from(max_val))
-        as u16;
-    let b = ((y_norm + c_bu * cb_norm + 8_192) >> 14).clamp(0, i64::from(max_val)) as u16;
-    (r, g, b)
+    let u00 = usize::from(u_plane[i00]).min(max_val);
+    let u10 = usize::from(u_plane[i10]).min(max_val);
+    let u01 = usize::from(u_plane[i01]).min(max_val);
+    let u11 = usize::from(u_plane[i11]).min(max_val);
+
+    let v00 = usize::from(v_plane[i00]).min(max_val);
+    let v10 = usize::from(v_plane[i10]).min(max_val);
+    let v01 = usize::from(v_plane[i01]).min(max_val);
+    let v11 = usize::from(v_plane[i11]).min(max_val);
+
+    let cb = (table_uv[u00] * (9.0 / 16.0))
+        + (table_uv[u10] * (3.0 / 16.0))
+        + (table_uv[u01] * (3.0 / 16.0))
+        + (table_uv[u11] * (1.0 / 16.0));
+    let cr = (table_uv[v00] * (9.0 / 16.0))
+        + (table_uv[v10] * (3.0 / 16.0))
+        + (table_uv[v01] * (3.0 / 16.0))
+        + (table_uv[v11] * (1.0 / 16.0));
+    (cb, cr)
 }
 
 #[inline]
-fn sample_to_u8(val: u16, bit_depth: BitDepth) -> u8 {
+#[allow(clippy::too_many_arguments)]
+fn convert_pixel_f32(
+    unorm_y: u16,
+    y_norm: f32,
+    cb: f32,
+    cr: f32,
+    monochrome: bool,
+    matrix_coefficients: u16,
+    kr: f32,
+    kg: f32,
+    kb: f32,
+    yuv_max_f: f32,
+    rgb_max_f: f32,
+) -> (f32, f32, f32) {
+    if monochrome {
+        let g = y_norm.clamp(0.0, 1.0);
+        return (g, g, g);
+    }
+    let (r, g, b) = if matrix_coefficients == 0 {
+        // Identity (GBR)
+        (cr, y_norm, cb)
+    } else if matrix_coefficients == 8 {
+        // YCgCo
+        let t = y_norm - cb;
+        (t + cr, y_norm + cb, t - cr)
+    } else if matrix_coefficients == 16 || matrix_coefficients == 17 {
+        // YCgCo-Re / YCgCo-Ro
+        let yy = i32::from(unorm_y);
+        let cg = (cb * yuv_max_f).round() as i32;
+        let co = (cr * yuv_max_f).round() as i32;
+        let t = yy - (cg >> 1);
+        let max_rgb = rgb_max_f as i32;
+        let g_i = (t + cg).clamp(0, max_rgb);
+        let b_i = (t - (co >> 1)).clamp(0, max_rgb);
+        let r_i = (b_i + co).clamp(0, max_rgb);
+        (
+            (r_i as f32) / rgb_max_f,
+            (g_i as f32) / rgb_max_f,
+            (b_i as f32) / rgb_max_f,
+        )
+    } else {
+        let r = y_norm + (2.0 * (1.0 - kr)) * cr;
+        let b = y_norm + (2.0 * (1.0 - kb)) * cb;
+        let g = y_norm - ((2.0 * ((kr * (1.0 - kr) * cr) + (kb * (1.0 - kb) * cb))) / kg);
+        (r, g, b)
+    };
+    (r.clamp(0.0, 1.0), g.clamp(0.0, 1.0), b.clamp(0.0, 1.0))
+}
+
+#[inline]
+fn rescale_alpha_u8(src_alpha: u16, bit_depth: BitDepth) -> u8 {
     match bit_depth {
-        BitDepth::Eight => (val & 0xFF) as u8,
-        BitDepth::Ten => (((u32::from(val) * 255) + 511) / 1023).min(255) as u8,
-        BitDepth::Twelve => (((u32::from(val) * 255) + 2047) / 4095).min(255) as u8,
+        BitDepth::Eight => (src_alpha & 0xFF) as u8,
+        BitDepth::Ten | BitDepth::Twelve => {
+            let src_max_f = (bit_depth.max_sample() as u16) as f32;
+            let alpha_f = (src_alpha.min(bit_depth.max_sample() as u16) as f32) / src_max_f;
+            ((0.5f32 + (alpha_f * 255.0f32)) as i32).clamp(0, 255) as u8
+        }
     }
 }
 
@@ -205,33 +241,41 @@ pub(crate) fn image_to_rgb16(img: &AvifImage) -> Result<Rgb16Image> {
         })?;
 
     let monochrome = img.chroma_format == ChromaFormat::Monochrome;
-    let sub_x = matches!(img.chroma_format, ChromaFormat::C420 | ChromaFormat::C422);
-    let sub_y = matches!(img.chroma_format, ChromaFormat::C420);
+    let mtrx = img.color.matrix_coefficients;
+    let (kr, kb) = matrix_kr_kb(mtrx, img.color.color_primaries);
+    let kg = 1.0f32 - kr - kb;
+    let (table_y, table_uv) = build_unorm_tables(img.bit_depth, img.color.full_range, mtrx == 0);
+    let max_val = img.bit_depth.max_sample() as usize;
+    let max_f = max_val as f32;
 
-    for y in 0..h {
-        let y_row_off = y * w;
-        for x in 0..w {
-            let y_val = i32::from(img.y_plane[y_row_off + x]);
-            let (u_val, v_val) = if monochrome {
-                (0, 0)
+    for j in 0..h {
+        let y_row_off = j * w;
+        for i in 0..w {
+            let unorm_y = img.y_plane[y_row_off + i].min(max_val as u16);
+            let y_norm = table_y[usize::from(unorm_y)];
+            let (cb, cr) = if monochrome {
+                (0.0, 0.0)
             } else {
-                (
-                    sample_chroma_bilinear(&img.u_plane, cw, ch, x, y, sub_x, sub_y),
-                    sample_chroma_bilinear(&img.v_plane, cw, ch, x, y, sub_x, sub_y),
+                sample_cb_cr_bilinear(
+                    &img.u_plane,
+                    &img.v_plane,
+                    &table_uv,
+                    w,
+                    h,
+                    cw,
+                    ch,
+                    i,
+                    j,
+                    img.chroma_format,
+                    max_val,
                 )
             };
-            let (r, g, b) = yuv_to_rgb_sample(
-                y_val,
-                u_val,
-                v_val,
-                img.bit_depth,
-                img.color.matrix_coefficients,
-                img.color.full_range,
-                monochrome,
+            let (rc, gc, bc) = convert_pixel_f32(
+                unorm_y, y_norm, cb, cr, monochrome, mtrx, kr, kg, kb, max_f, max_f,
             );
-            pixels.push(r);
-            pixels.push(g);
-            pixels.push(b);
+            pixels.push((0.5f32 + (rc * max_f)) as u16);
+            pixels.push((0.5f32 + (gc * max_f)) as u16);
+            pixels.push((0.5f32 + (bc * max_f)) as u16);
         }
     }
 
@@ -267,39 +311,47 @@ pub(crate) fn image_to_rgba16(img: &AvifImage) -> Result<Rgba16Image> {
         })?;
 
     let monochrome = img.chroma_format == ChromaFormat::Monochrome;
-    let sub_x = matches!(img.chroma_format, ChromaFormat::C420 | ChromaFormat::C422);
-    let sub_y = matches!(img.chroma_format, ChromaFormat::C420);
-    let opaque_alpha = img.bit_depth.max_sample() as u16;
+    let mtrx = img.color.matrix_coefficients;
+    let (kr, kb) = matrix_kr_kb(mtrx, img.color.color_primaries);
+    let kg = 1.0f32 - kr - kb;
+    let (table_y, table_uv) = build_unorm_tables(img.bit_depth, img.color.full_range, mtrx == 0);
+    let max_val = img.bit_depth.max_sample() as usize;
+    let max_f = max_val as f32;
+    let opaque_alpha = max_val as u16;
 
-    for y in 0..h {
-        let y_row_off = y * w;
-        for x in 0..w {
-            let idx = y_row_off + x;
-            let y_val = i32::from(img.y_plane[idx]);
-            let (u_val, v_val) = if monochrome {
-                (0, 0)
+    for j in 0..h {
+        let y_row_off = j * w;
+        for i in 0..w {
+            let idx = y_row_off + i;
+            let unorm_y = img.y_plane[idx].min(opaque_alpha);
+            let y_norm = table_y[usize::from(unorm_y)];
+            let (cb, cr) = if monochrome {
+                (0.0, 0.0)
             } else {
-                (
-                    sample_chroma_bilinear(&img.u_plane, cw, ch, x, y, sub_x, sub_y),
-                    sample_chroma_bilinear(&img.v_plane, cw, ch, x, y, sub_x, sub_y),
+                sample_cb_cr_bilinear(
+                    &img.u_plane,
+                    &img.v_plane,
+                    &table_uv,
+                    w,
+                    h,
+                    cw,
+                    ch,
+                    i,
+                    j,
+                    img.chroma_format,
+                    max_val,
                 )
             };
-            let (r, g, b) = yuv_to_rgb_sample(
-                y_val,
-                u_val,
-                v_val,
-                img.bit_depth,
-                img.color.matrix_coefficients,
-                img.color.full_range,
-                monochrome,
+            let (rc, gc, bc) = convert_pixel_f32(
+                unorm_y, y_norm, cb, cr, monochrome, mtrx, kr, kg, kb, max_f, max_f,
             );
             let a = img
                 .alpha_plane
                 .as_ref()
                 .map_or(opaque_alpha, |ap| ap[idx].min(opaque_alpha));
-            pixels.push(r);
-            pixels.push(g);
-            pixels.push(b);
+            pixels.push((0.5f32 + (rc * max_f)) as u16);
+            pixels.push((0.5f32 + (gc * max_f)) as u16);
+            pixels.push((0.5f32 + (bc * max_f)) as u16);
             pixels.push(a);
         }
     }
@@ -336,33 +388,41 @@ pub(crate) fn image_to_rgb8(img: &AvifImage) -> Result<RgbImage> {
         })?;
 
     let monochrome = img.chroma_format == ChromaFormat::Monochrome;
-    let sub_x = matches!(img.chroma_format, ChromaFormat::C420 | ChromaFormat::C422);
-    let sub_y = matches!(img.chroma_format, ChromaFormat::C420);
+    let mtrx = img.color.matrix_coefficients;
+    let (kr, kb) = matrix_kr_kb(mtrx, img.color.color_primaries);
+    let kg = 1.0f32 - kr - kb;
+    let (table_y, table_uv) = build_unorm_tables(img.bit_depth, img.color.full_range, mtrx == 0);
+    let max_val = img.bit_depth.max_sample() as usize;
+    let yuv_max_f = max_val as f32;
 
-    for y in 0..h {
-        let y_row_off = y * w;
-        for x in 0..w {
-            let y_val = i32::from(img.y_plane[y_row_off + x]);
-            let (u_val, v_val) = if monochrome {
-                (0, 0)
+    for j in 0..h {
+        let y_row_off = j * w;
+        for i in 0..w {
+            let unorm_y = img.y_plane[y_row_off + i].min(max_val as u16);
+            let y_norm = table_y[usize::from(unorm_y)];
+            let (cb, cr) = if monochrome {
+                (0.0, 0.0)
             } else {
-                (
-                    sample_chroma_bilinear(&img.u_plane, cw, ch, x, y, sub_x, sub_y),
-                    sample_chroma_bilinear(&img.v_plane, cw, ch, x, y, sub_x, sub_y),
+                sample_cb_cr_bilinear(
+                    &img.u_plane,
+                    &img.v_plane,
+                    &table_uv,
+                    w,
+                    h,
+                    cw,
+                    ch,
+                    i,
+                    j,
+                    img.chroma_format,
+                    max_val,
                 )
             };
-            let (r, g, b) = yuv_to_rgb_sample(
-                y_val,
-                u_val,
-                v_val,
-                img.bit_depth,
-                img.color.matrix_coefficients,
-                img.color.full_range,
-                monochrome,
+            let (rc, gc, bc) = convert_pixel_f32(
+                unorm_y, y_norm, cb, cr, monochrome, mtrx, kr, kg, kb, yuv_max_f, 255.0,
             );
-            pixels.push(sample_to_u8(r, img.bit_depth));
-            pixels.push(sample_to_u8(g, img.bit_depth));
-            pixels.push(sample_to_u8(b, img.bit_depth));
+            pixels.push((0.5f32 + (rc * 255.0f32)) as u8);
+            pixels.push((0.5f32 + (gc * 255.0f32)) as u8);
+            pixels.push((0.5f32 + (bc * 255.0f32)) as u8);
         }
     }
 
@@ -397,40 +457,48 @@ pub(crate) fn image_to_rgba8(img: &AvifImage) -> Result<RgbaImage> {
         })?;
 
     let monochrome = img.chroma_format == ChromaFormat::Monochrome;
-    let sub_x = matches!(img.chroma_format, ChromaFormat::C420 | ChromaFormat::C422);
-    let sub_y = matches!(img.chroma_format, ChromaFormat::C420);
-    let opaque_alpha = img.bit_depth.max_sample() as u16;
+    let mtrx = img.color.matrix_coefficients;
+    let (kr, kb) = matrix_kr_kb(mtrx, img.color.color_primaries);
+    let kg = 1.0f32 - kr - kb;
+    let (table_y, table_uv) = build_unorm_tables(img.bit_depth, img.color.full_range, mtrx == 0);
+    let max_val = img.bit_depth.max_sample() as usize;
+    let yuv_max_f = max_val as f32;
+    let opaque_alpha = max_val as u16;
 
-    for y in 0..h {
-        let y_row_off = y * w;
-        for x in 0..w {
-            let idx = y_row_off + x;
-            let y_val = i32::from(img.y_plane[idx]);
-            let (u_val, v_val) = if monochrome {
-                (0, 0)
+    for j in 0..h {
+        let y_row_off = j * w;
+        for i in 0..w {
+            let idx = y_row_off + i;
+            let unorm_y = img.y_plane[idx].min(opaque_alpha);
+            let y_norm = table_y[usize::from(unorm_y)];
+            let (cb, cr) = if monochrome {
+                (0.0, 0.0)
             } else {
-                (
-                    sample_chroma_bilinear(&img.u_plane, cw, ch, x, y, sub_x, sub_y),
-                    sample_chroma_bilinear(&img.v_plane, cw, ch, x, y, sub_x, sub_y),
+                sample_cb_cr_bilinear(
+                    &img.u_plane,
+                    &img.v_plane,
+                    &table_uv,
+                    w,
+                    h,
+                    cw,
+                    ch,
+                    i,
+                    j,
+                    img.chroma_format,
+                    max_val,
                 )
             };
-            let (r, g, b) = yuv_to_rgb_sample(
-                y_val,
-                u_val,
-                v_val,
-                img.bit_depth,
-                img.color.matrix_coefficients,
-                img.color.full_range,
-                monochrome,
+            let (rc, gc, bc) = convert_pixel_f32(
+                unorm_y, y_norm, cb, cr, monochrome, mtrx, kr, kg, kb, yuv_max_f, 255.0,
             );
             let a16 = img
                 .alpha_plane
                 .as_ref()
                 .map_or(opaque_alpha, |ap| ap[idx].min(opaque_alpha));
-            pixels.push(sample_to_u8(r, img.bit_depth));
-            pixels.push(sample_to_u8(g, img.bit_depth));
-            pixels.push(sample_to_u8(b, img.bit_depth));
-            pixels.push(sample_to_u8(a16, img.bit_depth));
+            pixels.push((0.5f32 + (rc * 255.0f32)) as u8);
+            pixels.push((0.5f32 + (gc * 255.0f32)) as u8);
+            pixels.push((0.5f32 + (bc * 255.0f32)) as u8);
+            pixels.push(rescale_alpha_u8(a16, img.bit_depth));
         }
     }
 
