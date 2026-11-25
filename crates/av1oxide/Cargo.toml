@@ -1,9 +1,9 @@
-# av1oxide — AV1 video çözücü kütüphanesi (v0.1.0)
+# av1oxide — AV1 video çözücü kütüphanesi (v0.2.0)
 # Sıfır dış bağımlılık: `[dependencies]` bilinçli olarak boştur.
 
 [package]
 name = "av1oxide"
-description = "100% stable-Rust AV1 video decoder reimplementing dav1d (8/10/12-bit, x86_64/aarch64/wasm32 SIMD, multithreaded, zero dependencies)"
+description = "100% stable-Rust AV1 video decoder reimplementing dav1d, with libdav1d-compatible C-ABI (8/10/12-bit, SIMD, multithreaded, zero dependencies)"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -13,7 +13,7 @@ documentation = "https://docs.rs/av1oxide"
 readme = "../../README.md"
 keywords = ["av1", "video", "decoder", "codec", "dav1d"]
 categories = ["multimedia::video", "multimedia::encoding"]
-include = ["src/**", "examples/**", "Cargo.toml", "LICENSE"]
+include = ["src/**", "examples/**", "include/**", "Cargo.toml", "LICENSE"]
 
 [lib]
 name = "av1oxide"
@@ -24,7 +24,8 @@ workspace = true
 
 [dependencies]
 
-# İsteğe bağlı derleme zamanı tanılama özellikleri (varsayılan kapalıdır).
+# İsteğe bağlı derleme zamanı özellikleri (varsayılan kapalıdır).
 [features]
+capi = []
 msac-trace = []
 profil = []

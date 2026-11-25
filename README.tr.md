@@ -1,8 +1,8 @@
-# av1oxide (`v0.1.0`)
+# av1oxide (`v0.2.0`)
 
 [English](README.md) | **Türkçe**
 
-`av1oxide`, VideoLAN [`dav1d`](https://code.videolan.org/videolan/dav1d) (`1.5.4`) AV1 video çözücüsünün **%100 kararlı Rust** (`rustc 1.100.0`, Edition 2024) ve **sıfır çalışma zamanı dış bağımlılığı** ile yeniden gerçekleştirimidir.
+`av1oxide`, VideoLAN [`dav1d`](https://code.videolan.org/videolan/dav1d) (`1.5.4`) AV1 video çözücüsünün **%100 kararlı Rust** (`rustc 1.100.0`, Edition 2024), **sıfır çalışma zamanı dış bağımlılığı** ve **`libdav1d` (`7.0.0`) ikili uyumlu C-ABI katmanı** ile yeniden gerçekleştirimidir.
 
 - **Profiller ve Bit Derinlikleri:** Main (`0`), High (`1`), Professional (`2`); `8-bit`, `10-bit`, `12-bit`; `4:2:0`, `4:2:2`, `4:4:4` ve `Monochrome` (`4:0:0`).
 - **AV1 Hattı:** OBU ayrıştırma, Sequence/Frame Header, MSAC aritmetik entropi çözücü, ters dönüşümler (`ITX`), intra tahmin (`IPRED`, CfL, Palette), hareket telafisi (`MC`, Warp, Superres/Resize, IntraBC, `REFMVS`), halka içi filtreler (`LF`, `CDEF`, `LR` Wiener/SGR) ve Film Grain (`FG`) sentezi.
@@ -13,6 +13,7 @@
   - `wasm32` (`+simd128`): `%100 #![forbid(unsafe_code)]` ile `31 / 767` SIMD yuvası
   - İkincil mimariler (`arm32`, `riscv64`, `loongarch64`, `powerpc64le`): `%100` güvenli skaler geri-düşüş
 - **Çok-Thread ve Bellek Bütçesi:** Kare içi (`Tile`, süperblok satırı, halka içi filtre) ve kareler arası (`FrameSlot`) paralellik (`Config::n_threads`, `Config::max_frame_delay`); tahsis öncesi piksel ve bellek tavanı (`Config::frame_size_limit`, `Config::allocation_limit`).
+- **`libdav1d` (`7.0.0`) Uyumlu C-ABI (`capi`):** 19 resmî `DAV1D_API` fonksiyonunun tamamını (`dav1d_open`, `dav1d_send_data`, `dav1d_get_picture`, `dav1d_apply_grain`, `dav1d_parse_sequence_header`, vb.) ve resmî `include/dav1d/*.h` C başlıklarını içerir.
 
 ---
 
@@ -22,7 +23,7 @@
 
 ```toml
 [dependencies]
-av1oxide = "0.1"
+av1oxide = "0.2"
 ```
 
 Kütüphane API belgelerini (`rustdoc`) yerel olarak üretmek için:
@@ -126,9 +127,51 @@ fn decode_untrusted(payload: &[u8]) -> Result<()> {
 }
 ```
 
-### 3. Çalıştırılabilir Örnekler (`examples/`)
+### 3. `libdav1d` Uyumlu C-ABI Kullanımı (`--features capi`)
 
-Depoda doğrudan çalıştırılabilen üç kullanım örneği bulunur:
+19 `dav1d_*` C sembolünü dışa aktaran paylaşımlı (`libav1oxide.so` / `.dylib` / `.dll`) ve statik (`libav1oxide.a`) kütüphaneleri üretmek için:
+
+```bash
+cargo rustc --release -p av1oxide --features capi --crate-type cdylib,staticlib
+```
+
+Herhangi bir C/C++ programını `crates/av1oxide/include` (`#include <dav1d/dav1d.h>`) ve `libav1oxide.a` / `libav1oxide.so` ile doğrudan bağlayabilirsiniz:
+
+```c
+#include <dav1d/dav1d.h>
+
+int decode_obu_c(const uint8_t *obu_buf, size_t obu_len) {
+    Dav1dSettings s;
+    dav1d_default_settings(&s);
+    s.n_threads = 4;
+
+    Dav1dContext *c = NULL;
+    if (dav1d_open(&c, &s) < 0) return -1;
+
+    Dav1dData data = { 0 };
+    uint8_t *dst = dav1d_data_create(&data, obu_len);
+    memcpy(dst, obu_buf, obu_len);
+
+    if (dav1d_send_data(c, &data) < 0) {
+        dav1d_data_unref(&data);
+        dav1d_close(&c);
+        return -1;
+    }
+
+    Dav1dPicture pic = { 0 };
+    while (dav1d_get_picture(c, &pic) == 0) {
+        /* pic.data[0..3], pic.stride[0..2], pic.p.w, pic.p.h, pic.p.bpc */
+        dav1d_picture_unref(&pic);
+    }
+
+    dav1d_close(&c);
+    return 0;
+}
+```
+
+### 4. Çalıştırılabilir Örnekler (`examples/`)
+
+Depoda doğrudan çalıştırılabilen dört kullanım örneği bulunur:
 
 - **[`examples/decode_obu.rs`](crates/av1oxide/examples/decode_obu.rs):** Ham AV1 OBU paketlerini zaman damgasıyla (`Packet::with_timestamp`) çözme, kare metaverisini ve düzlem satırlarını okuma:
   ```bash
@@ -144,12 +187,16 @@ Depoda doğrudan çalıştırılabilen üç kullanım örneği bulunur:
   ```bash
   cargo run --release -p av1oxide --example bounded_decoder
   ```
+- **[`examples/c_abi_decode.rs`](crates/av1oxide/examples/c_abi_decode.rs):** `libdav1d` (`7.0.0`) C-ABI üzerinden uçtan uca çözme (`dav1d_default_settings` → `dav1d_open` → `dav1d_data_create` → `dav1d_send_data` → `dav1d_get_picture` → `dav1d_picture_unref` → `dav1d_close`):
+  ```bash
+  cargo run --release -p av1oxide --example c_abi_decode
+  ```
 
 ---
 
 ## `dav1d 1.5.4` ile Son Performans Karşılaştırma Tabloları
 
-Tüm ölçümler `%100` MD5 bit-birebir eşitlik altında `av1oxide v0.1.0` (`rustc 1.100.0 --release`) ile referans C/ASM `dav1d 1.5.4` (`99f3354ed0b9b4bf3c7c9347318dbcc522c94af5`) arasında gerçekleştirilmiştir.
+Tüm ölçümler `%100` MD5 bit-birebir eşitlik altında `av1oxide` (`rustc 1.100.0 --release`) ile referans C/ASM `dav1d 1.5.4` (`99f3354ed0b9b4bf3c7c9347318dbcc522c94af5`) arasında gerçekleştirilmiştir.
 
 ### 1. `x86_64` — AMD Ryzen 9 9950X3D (Zen 5, `16C / 32T`, `AVX-512ICL`)
 
@@ -203,6 +250,20 @@ Tüm ölçümler `%100` MD5 bit-birebir eşitlik altında `av1oxide v0.1.0` (`ru
 | `test10103_coklu_tile` (`1024×1024`, `10b`, `16` tile) | `mfd=0, t=14` | `1 558,9 ms` | `236,2 ms` | **`6,60×`** | `135,7 ms` | **`1,74×`** |
 | `test25_8k_444_fg` (`7680×4320`, `8b` `4:4:4`, `120` tile + FG) | `mfd=0, t=14` | `1 410,1 ms` | `149,6 ms` | **`9,43×`** | `68,0 ms` | **`2,20×`** |
 | `test25_8k_120_tile` (`7680×4320`, `12b`, `120` tile) | `mfd=0, t=14` | `1 687,5 ms` | `233,0 ms` | **`7,24×`** | `95,0 ms` | **`2,45×`** |
+
+---
+
+### 3. Süre Farkının Teknik Analizi
+
+#### Çalışma Zamanı Hızını Etkilemeyen Kontroller (`~%0` Etki)
+
+- Bellek bütçesi ve kare boyutu kontrolleri (`Config::allocation_limit`, `Config::frame_size_limit`) piksel veya blok döngülerinin içinde değil, yalnızca kare ve tampon tahsisi sırasında çalıştırılır; kare çözme hızı üzerinde ölçülebilir bir etkisi yoktur.
+
+#### `dav1d` ile Süre Farkının Ölçülmüş Teknik Nedenleri (`~1,50×–1,70×`)
+
+- **Dizi Sınır Kontrolleri (Çözme süresinin `%23–%50`'si):** Yüksek çözünürlüklü karelerde milyonlarca `4×4` / `8×8` blok ve komşuluk tablosu gezilir. C `dav1d` bu yapılara sınır kontrolsüz ham işaretçi aritmetiğiyle (`ptr += offset`) erişirken, `av1oxide` içinde DSP dışındaki tüm çözücü çekirdeği `#![forbid(unsafe_code)]` altında derlenir ve her dilim erişiminde (`slice[i]`) çalışma zamanı sınır kontrolü yürütülür (iki tarafta da SIMD kapatıldığında saf C ile saf Rust arasında ölçülen `~1,65×–1,71×` oranının temel kaynağıdır).
+- **SIMD Giriş Doğrulaması ve Sıfır Taşan Okuma (`~2–5 ns` / çağrı):** C `dav1d` Assembly rutinleri girişte uzunluk kontrolü yapmaz ve tampon sonundan dışarı 16–64 bayt dolgu bölgesine taşan okuma (over-read) gerçekleştirir. `av1oxide` içindeki her SIMD fonksiyonu girişte dilim boyutu önkoşullarını doğrular ve dilim sınırlarının dışına okuma yapmamak için kenarlarda maskeli/sınırlı yükleme kullanır; `10–20 ns` süren küçük (`4×4`) blok çağrılarında bu doğrulama `%15–%25` ek süre oluşturur.
+- **El Yazısı Assembly ve Derleyici (`LLVM`) Kod Üretimi:** `dav1d` yaklaşık `265 bin` satır el yazısı NASM/GAS Assembly kullanarak standart fonksiyon çağrı kurallarını (ABI) atlayıp CPU bayrak yazmaçlarını ve 32 adet `zmm` yazmacını doğrudan yönetir; `av1oxide` ise kararlı Rust `core::arch` intrinsiklerini standart LLVM ABI çerçevesi üzerinden derler.
 
 ---
 

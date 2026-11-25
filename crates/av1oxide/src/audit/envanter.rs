@@ -73,8 +73,8 @@ fn envanter_bloklari_kaynakla_uyumlu() {
     let bloklar = kaynak_kumesi(Tur::Blok);
     assert_eq!(
         bloklar.len(),
-        362,
-        "beklenen SIMD sınır bloğu sayısı 362 olmalı"
+        389,
+        "beklenen SIMD + C-ABI sınır bloğu sayısı 389 olmalı"
     );
 }
 

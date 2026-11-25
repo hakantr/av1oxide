@@ -74,12 +74,55 @@ pub enum DecoderState {
     Draining,
 }
 
+/// HDR Mastering Display Color Volume metaverisi (`OBU_META_HDR_MDCV`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct MasteringDisplayMeta {
+    pub primaries: [[u16; 2]; 3],
+    pub white_point: [u16; 2],
+    pub max_luminance: u32,
+    pub min_luminance: u32,
+}
+
+/// ITU-T T.35 metaverisi (`OBU_META_ITUT_T35`).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ItutT35Meta {
+    pub country_code: u8,
+    pub country_code_extension_byte: u8,
+    pub payload: Vec<u8>,
+}
+
+/// C-ABI (`Dav1dPicture`) çıktı karesi için eşlik eden başlık, metaveri ve olay bayrakları.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct OutputCapiMeta {
+    pub seq_hdr: Option<Arc<SequenceHeader>>,
+    pub frame_hdr: Option<Arc<FrameHeader>>,
+    pub content_light: Option<(u16, u16)>,
+    pub mastering_display: Option<MasteringDisplayMeta>,
+    pub itut_t35: Vec<ItutT35Meta>,
+    pub event_flags: u32,
+    pub packet_tag: u64,
+}
+
 /// Paketler arasında taşınan ayrıştırma durumu (dav1d `Dav1dContext` başlık
 /// alanları; OBU başına güncellenir).
 #[derive(Clone, Debug, Default)]
 struct ParseState {
     /// Etkin sequence header (son başarıyla ayrıştırılan).
     sequence_header: Option<SequenceHeader>,
+    /// Etkin sequence header'ın paylaşılan referansı (C-ABI `seq_hdr_ref` için).
+    sequence_header_arc: Option<Arc<SequenceHeader>>,
+    /// Sonraki çıktı karesine aktarılacak olay bayrakları (`1 = NEW_SEQUENCE`, `2 = NEW_OP_PARAMS_INFO`).
+    pending_event_flags: u32,
+    /// Etkin HDR Content Light Level metaverisi.
+    content_light: Option<(u16, u16)>,
+    /// Etkin HDR Mastering Display metaverisi.
+    mastering_display: Option<MasteringDisplayMeta>,
+    /// Bir sonraki kareye iliştirilecek ITU-T T.35 metaverileri.
+    itut_t35: Vec<ItutT35Meta>,
+    /// Şu an işlenen paketin C-ABI kimlik etiketi.
+    current_packet_tag: u64,
+    /// Şu an işlenen paketin zaman damgası.
+    current_packet_timestamp: Option<i64>,
     /// Seçili operating point'in `operating_point_idc` maskesi.
     operating_point_idc: u16,
     /// Seçili operating point'in en büyük spatial katman kimliği.
@@ -132,13 +175,14 @@ enum OutputEntry {
 struct CompletedFrame {
     ref_frame: Arc<RefFrame>,
     decoded_tools: ToolCounts,
-    output: Option<(Frame, ToolCounts)>,
+    output: Option<(Frame, ToolCounts, OutputCapiMeta)>,
     _butce_tutucu: Vec<ButceTutucu>,
 }
 
 /// Uçuşta (`in_flight`) çözülen tek bir karenin eşzamanlı görev durumu (`F7b`).
 struct InFlightDecodeTask {
     refresh_frame_flags: u8,
+    packet_tag: u64,
     out_slot: Arc<FrameSlot>,
     started: AtomicBool,
     result: Mutex<Option<Result<CompletedFrame>>>,
@@ -164,6 +208,8 @@ enum InFlightEntry {
         promise: Arc<FrameSlot>,
         output_seq: u64,
         refresh_all_key: bool,
+        capi_meta: OutputCapiMeta,
+        packet_timestamp: Option<i64>,
     },
 }
 
@@ -216,6 +262,10 @@ pub struct Decoder {
     /// `outputs` ile hizalı araç sayaçları: **çıktı karesinin kendi**
     /// çözülen karesi (`show_existing` için sıfır).
     output_tools: VecDeque<Option<crate::decode::intra::ToolCounts>>,
+    /// `outputs` ile hizalı C-ABI metaveri kayıtları.
+    output_capi_meta: VecDeque<OutputCapiMeta>,
+    /// Son çözme hatasını üreten paketin C-ABI kimlik etiketi.
+    last_error_packet_tag: Option<u64>,
     /// Piksel düzeyi referans yuvaları (piksel + CDF + segment + tmvs).
     pixel_refs: [Option<Arc<RefFrame>>; 8],
     /// Kareler arası boru hattı (`n_fc >= 2`) için referans yuvası vaatleri.
@@ -271,6 +321,8 @@ impl Clone for Decoder {
             outputs: self.outputs.clone(),
             output_errors: self.output_errors.clone(),
             output_tools: self.output_tools.clone(),
+            output_capi_meta: self.output_capi_meta.clone(),
+            last_error_packet_tag: self.last_error_packet_tag,
             pixel_refs: self.pixel_refs.clone(),
             slot_promises: [None, None, None, None, None, None, None, None],
             in_flight: VecDeque::new(),
@@ -292,6 +344,8 @@ impl Clone for Decoder {
                     promise,
                     output_seq,
                     refresh_all_key,
+                    capi_meta,
+                    packet_timestamp,
                 } => {
                     while !promise.is_done_nonblocking() {
                         if let Some(work) = self.pool.try_pop_async_task() {
@@ -308,7 +362,7 @@ impl Clone for Decoder {
                         }
                         let out_butce = Butce::alt_defter(&cloned.pipeline_butce);
                         let mut tools = ToolCounts::default();
-                        if let Ok(frame) = build_output_frame(
+                        if let Ok(mut frame) = build_output_frame(
                             cloned.config.apply_grain,
                             &cloned.dsp,
                             &cloned.pool,
@@ -319,9 +373,13 @@ impl Clone for Decoder {
                             &mut tools,
                             &out_butce,
                         ) {
+                            if packet_timestamp.is_some() {
+                                frame.metadata_mut().timestamp = *packet_timestamp;
+                            }
                             cloned.outputs.push_back(OutputEntry::Frame(frame));
                             cloned.output_errors.push_back(None);
                             cloned.output_tools.push_back(Some(tools));
+                            cloned.output_capi_meta.push_back(capi_meta.clone());
                         }
                     }
                 }
@@ -353,10 +411,11 @@ impl Clone for Decoder {
                                     *reference = Some(Arc::clone(&completed.ref_frame));
                                 }
                             }
-                            if let Some((frame, tools)) = &completed.output {
+                            if let Some((frame, tools, capi_meta)) = &completed.output {
                                 cloned.outputs.push_back(OutputEntry::Frame(frame.clone()));
                                 cloned.output_errors.push_back(None);
                                 cloned.output_tools.push_back(Some(*tools));
+                                cloned.output_capi_meta.push_back(capi_meta.clone());
                             }
                         }
                         Some(Err(err)) => {
@@ -371,6 +430,7 @@ impl Clone for Decoder {
                             }
                             cloned.unsupported_frames += 1;
                             cloned.last_decode_error = Some(format!("{err}"));
+                            cloned.last_error_packet_tag = Some(task.packet_tag);
                         }
                         None => {}
                     }
@@ -414,6 +474,8 @@ impl Decoder {
             outputs: VecDeque::new(),
             output_errors: VecDeque::new(),
             output_tools: VecDeque::new(),
+            output_capi_meta: VecDeque::new(),
+            last_error_packet_tag: None,
             pixel_refs: [None, None, None, None, None, None, None, None],
             slot_promises: [None, None, None, None, None, None, None, None],
             in_flight: VecDeque::new(),
@@ -522,11 +584,18 @@ impl Decoder {
     ///   paketin **kalanı atılır**, hatadan önceki OBU'ların etkisi (ve
     ///   çıktıları) kalır (`src/lib.c:416-431`).
     pub fn send_packet(&mut self, packet: &Packet<'_>) -> Result<()> {
+        self.send_packet_capi(packet, 0)
+    }
+
+    /// C-ABI (`dav1d_send_data`) için paket kimlik etiketiyle (`packet_tag`) paket işler.
+    pub(crate) fn send_packet_capi(&mut self, packet: &Packet<'_>, packet_tag: u64) -> Result<()> {
         if self.state != DecoderState::Ready {
             return Err(Error::InvalidState(
                 "flush sonrası send_packet: önce reset() çağrılmalı",
             ));
         }
+        self.parse.current_packet_tag = packet_tag;
+        self.parse.current_packet_timestamp = packet.timestamp();
         let data = packet.data();
         let opts = ParseOpts {
             frame_size_limit: self.config.frame_size_limit,
@@ -567,6 +636,7 @@ impl Decoder {
                         self.parse.header_state.clear_current();
                         self.parse.pending_groups.clear();
                         self.parse.dangling_show_existing = None;
+                        self.parse.pending_event_flags |= 1;
                     }
                     // dav1d `src/obu.c:1239-1252`: farklı dizi → bekleyen kare
                     // ve referans yuvaları (başlık + piksel) temizlenir.
@@ -582,10 +652,14 @@ impl Decoder {
                         self.parse.header_state.reset();
                         self.parse.pending_groups.clear();
                         self.parse.dangling_show_existing = None;
+                        self.parse.content_light = None;
+                        self.parse.mastering_display = None;
+                        self.parse.pending_event_flags |= 1;
                         self.pixel_refs = [None, None, None, None, None, None, None, None];
                         self.slot_promises = [None, None, None, None, None, None, None, None];
                         self.pool.clear_buf_pool();
                         self.pipeline_butce.taban_guncelle(self.kalici_bayt());
+                        self.parse.sequence_header_arc = Some(Arc::new(header.clone()));
                         self.parse.sequence_header = Some(header);
                         self.parse.sequence_header_updates += 1;
                         if let Some(e) = first_err {
@@ -593,8 +667,13 @@ impl Decoder {
                         }
                         return Ok(());
                     }
-                    Some(_) => {}
+                    Some(previous) => {
+                        if previous.operating_parameter_info != header.operating_parameter_info {
+                            self.parse.pending_event_flags |= 2;
+                        }
+                    }
                 }
+                self.parse.sequence_header_arc = Some(Arc::new(header.clone()));
                 self.parse.sequence_header = Some(header);
                 self.parse.sequence_header_updates += 1;
             }
@@ -620,7 +699,7 @@ impl Decoder {
                     ObuType::TileGroup => {
                         self.process_tile_group(obu.payload, obu.payload_offset_bits())?;
                     }
-                    ObuType::Metadata => validate_metadata(obu, opts.strict)?,
+                    ObuType::Metadata => self.process_metadata_obu(obu, opts.strict)?,
                     _ => {}
                 }
             }
@@ -831,6 +910,7 @@ impl Decoder {
             self.output_errors
                 .push_back(Some("yalnız ayrıştırma kipi".into()));
             self.output_tools.push_back(None);
+            self.output_capi_meta.push_back(OutputCapiMeta::default());
             return Ok(());
         }
         let Some(seq) = seq else {
@@ -847,6 +927,7 @@ impl Decoder {
                 .restore_slots(prev_slots, header.refresh_frame_flags);
             self.unsupported_frames += 1;
             self.last_decode_error = Some(format!("{err}"));
+            self.last_error_packet_tag = Some(self.parse.current_packet_tag);
             return Err(err);
         }
         #[cfg(feature = "msac-trace")]
@@ -907,6 +988,7 @@ impl Decoder {
                 }
                 self.unsupported_frames += 1;
                 self.last_decode_error = Some(format!("{err}"));
+                self.last_error_packet_tag = Some(self.parse.current_packet_tag);
                 return Err(err);
             }
         };
@@ -934,13 +1016,27 @@ impl Decoder {
                 self.pool.buf_pool().recycle_ref_frame(rf, has_limit);
             }
         }
+        let itut_t35 = core::mem::take(&mut self.parse.itut_t35);
         // dav1d `src/decode.c:3551`: görünmez kare (`show_frame = 0`) yalnız
         // `output_invisible_frames` ile çıktıdır (çıktı kopyası yukarıda).
-        if let Some((frame, tools)) = cikti {
+        if let Some((mut frame, tools)) = cikti {
+            if self.parse.current_packet_timestamp.is_some() {
+                frame.metadata_mut().timestamp = self.parse.current_packet_timestamp;
+            }
+            let capi_meta = OutputCapiMeta {
+                seq_hdr: self.parse.sequence_header_arc.clone(),
+                frame_hdr: Some(Arc::new(header)),
+                content_light: self.parse.content_light,
+                mastering_display: self.parse.mastering_display,
+                itut_t35,
+                event_flags: core::mem::take(&mut self.parse.pending_event_flags),
+                packet_tag: self.parse.current_packet_tag,
+            };
             self.outputs.push_back(OutputEntry::Frame(frame));
             self.outputs_pushed += 1;
             self.output_errors.push_back(None);
             self.output_tools.push_back(Some(tools));
+            self.output_capi_meta.push_back(capi_meta);
         }
         Ok(())
     }
@@ -1006,6 +1102,7 @@ impl Decoder {
                     .restore_slots(prev_slots, header.refresh_frame_flags);
                 self.unsupported_frames += 1;
                 self.last_decode_error = Some(format!("{err}"));
+                self.last_error_packet_tag = Some(self.parse.current_packet_tag);
                 return Err(err);
             }
         };
@@ -1021,6 +1118,7 @@ impl Decoder {
                 self.clear_slots_late_error(header.refresh_frame_flags);
                 self.unsupported_frames += 1;
                 self.last_decode_error = Some(format!("{err}"));
+                self.last_error_packet_tag = Some(self.parse.current_packet_tag);
                 return Err(err);
             }
         };
@@ -1030,6 +1128,7 @@ impl Decoder {
             self.clear_slots_late_error(header.refresh_frame_flags);
             self.unsupported_frames += 1;
             self.last_decode_error = Some(format!("{err}"));
+            self.last_error_packet_tag = Some(self.parse.current_packet_tag);
             return Err(err);
         }
 
@@ -1052,9 +1151,26 @@ impl Decoder {
         } else {
             0
         };
+        let itut_t35 = core::mem::take(&mut self.parse.itut_t35);
+        let packet_tag = self.parse.current_packet_tag;
+        let packet_timestamp = self.parse.current_packet_timestamp;
+        let capi_meta_w = if want_output {
+            Some(OutputCapiMeta {
+                seq_hdr: self.parse.sequence_header_arc.clone(),
+                frame_hdr: Some(Arc::new(header.clone())),
+                content_light: self.parse.content_light,
+                mastering_display: self.parse.mastering_display,
+                itut_t35,
+                event_flags: core::mem::take(&mut self.parse.pending_event_flags),
+                packet_tag,
+            })
+        } else {
+            None
+        };
 
         let task = Arc::new(InFlightDecodeTask {
             refresh_frame_flags: header.refresh_frame_flags,
+            packet_tag,
             out_slot: Arc::clone(&out_slot),
             started: AtomicBool::new(false),
             result: Mutex::new(None),
@@ -1164,7 +1280,7 @@ impl Decoder {
                     tutucular.push(t);
                 }
 
-                let output = if want_output {
+                let output = if let Some(capi_meta) = capi_meta_w {
                     let out_butce = Butce::alt_defter(&pipeline_butce_w);
                     let mut tools = decoded_tools;
                     // `n_fc >= 2` boru hattında `out_slot.publish_ready` sonrası
@@ -1173,7 +1289,7 @@ impl Decoder {
                     // yerinde (`single_thread_handle`, sıfır `FgRowJob` kopyası/çekişmesi)
                     // yürütülür.
                     let fg_pool = pool_w.single_thread_handle();
-                    let frame = build_output_frame(
+                    let mut frame = build_output_frame(
                         apply_grain_flag,
                         &dsp_w,
                         &fg_pool,
@@ -1184,11 +1300,14 @@ impl Decoder {
                         &mut tools,
                         &out_butce,
                     )?;
+                    if packet_timestamp.is_some() {
+                        frame.metadata_mut().timestamp = packet_timestamp;
+                    }
                     if let Some(t) = out_butce.devret(frame.allocation_bytes()) {
                         tutucular.push(t);
                     }
                     drop(out_butce);
-                    Some((frame, tools))
+                    Some((frame, tools, capi_meta))
                 } else {
                     None
                 };
@@ -1251,6 +1370,8 @@ impl Decoder {
                 promise,
                 output_seq,
                 refresh_all_key,
+                capi_meta,
+                packet_timestamp,
             } => {
                 while !promise.is_done_nonblocking() {
                     if let Some(work) = self.pool.try_pop_async_task() {
@@ -1260,6 +1381,7 @@ impl Decoder {
                     }
                 }
                 let Some(entry_rf) = promise.wait(&self.cancel_flag) else {
+                    self.last_error_packet_tag = Some(capi_meta.packet_tag);
                     return Err(BitstreamError::new(
                         BitstreamErrorKind::InvalidFrameHeader(
                             "show_existing_frame: referans resmi yok (obu.c 1544)",
@@ -1284,7 +1406,12 @@ impl Decoder {
                     &out_butce,
                 );
                 self.allocation_peak = self.allocation_peak.max(self.pipeline_butce.tepe());
-                let frame = frame_res?;
+                let mut frame = frame_res.inspect_err(|_| {
+                    self.last_error_packet_tag = Some(capi_meta.packet_tag);
+                })?;
+                if packet_timestamp.is_some() {
+                    frame.metadata_mut().timestamp = packet_timestamp;
+                }
                 drop(out_butce);
                 if refresh_all_key {
                     for reference in &mut self.pixel_refs {
@@ -1294,6 +1421,7 @@ impl Decoder {
                 self.outputs.push_back(OutputEntry::Frame(frame));
                 self.output_errors.push_back(None);
                 self.output_tools.push_back(Some(tools));
+                self.output_capi_meta.push_back(capi_meta);
                 self.pipeline_butce.taban_guncelle(self.kalici_bayt());
                 Ok(true)
             }
@@ -1356,10 +1484,11 @@ impl Decoder {
                                 self.pool.buf_pool().recycle_ref_frame(rf, has_limit);
                             }
                         }
-                        if let Some((frame, tools)) = completed.output {
+                        if let Some((frame, tools, capi_meta)) = completed.output {
                             self.outputs.push_back(OutputEntry::Frame(frame));
                             self.output_errors.push_back(None);
                             self.output_tools.push_back(Some(tools));
+                            self.output_capi_meta.push_back(capi_meta);
                         }
                         drop(completed._butce_tutucu);
                         self.pipeline_butce.taban_guncelle(self.kalici_bayt());
@@ -1381,6 +1510,7 @@ impl Decoder {
                         }
                         self.unsupported_frames += 1;
                         self.last_decode_error = Some(format!("{err}"));
+                        self.last_error_packet_tag = Some(task.packet_tag);
                         self.pipeline_butce.taban_guncelle(self.kalici_bayt());
                         Err(err)
                     }
@@ -1494,11 +1624,15 @@ impl Decoder {
             self.output_errors
                 .push_back(Some("yalnız ayrıştırma kipi".into()));
             self.output_tools.push_back(None);
+            self.output_capi_meta.push_back(OutputCapiMeta::default());
             return Ok(());
         }
-        let Some((entry, frame, tools)) = cikti else {
+        let Some((entry, mut frame, tools)) = cikti else {
             return fail("show_existing_frame: referans resmi yok (obu.c 1544)");
         };
+        if self.parse.current_packet_timestamp.is_some() {
+            frame.metadata_mut().timestamp = self.parse.current_packet_timestamp;
+        }
         // dav1d `src/obu.c:1619-1640`: gösterilen kare KEY ise diğer yedi yuva
         // da bu kareye yenilenir; piksel yuvaları başlık durumuyla
         // (`HeaderReferenceState::show_existing`) aynı kalmalıdır.
@@ -1510,10 +1644,20 @@ impl Decoder {
                 }
             }
         }
+        let capi_meta = OutputCapiMeta {
+            seq_hdr: self.parse.sequence_header_arc.clone(),
+            frame_hdr: Some(Arc::new(displayed)),
+            content_light: self.parse.content_light,
+            mastering_display: self.parse.mastering_display,
+            itut_t35: core::mem::take(&mut self.parse.itut_t35),
+            event_flags: core::mem::take(&mut self.parse.pending_event_flags),
+            packet_tag: self.parse.current_packet_tag,
+        };
         self.outputs.push_back(OutputEntry::Frame(frame));
         self.outputs_pushed += 1;
         self.output_errors.push_back(None);
         self.output_tools.push_back(Some(tools));
+        self.output_capi_meta.push_back(capi_meta);
         Ok(())
     }
 
@@ -1574,7 +1718,10 @@ impl Decoder {
                 &out_butce,
             );
             self.allocation_peak = self.allocation_peak.max(self.pipeline_butce.tepe());
-            let frame = frame_res?;
+            let mut frame = frame_res?;
+            if self.parse.current_packet_timestamp.is_some() {
+                frame.metadata_mut().timestamp = self.parse.current_packet_timestamp;
+            }
             drop(out_butce);
 
             self.parse.dangling_show_existing = None;
@@ -1597,6 +1744,16 @@ impl Decoder {
                 }
             }
 
+            let capi_meta = OutputCapiMeta {
+                seq_hdr: self.parse.sequence_header_arc.clone(),
+                frame_hdr: Some(Arc::new(displayed)),
+                content_light: self.parse.content_light,
+                mastering_display: self.parse.mastering_display,
+                itut_t35: core::mem::take(&mut self.parse.itut_t35),
+                event_flags: core::mem::take(&mut self.parse.pending_event_flags),
+                packet_tag: self.parse.current_packet_tag,
+            };
+
             if self.in_flight.is_empty() {
                 if refresh_all_key {
                     for reference in &mut self.pixel_refs {
@@ -1606,6 +1763,7 @@ impl Decoder {
                 self.outputs.push_back(OutputEntry::Frame(frame));
                 self.output_errors.push_back(None);
                 self.output_tools.push_back(Some(tools));
+                self.output_capi_meta.push_back(capi_meta);
                 self.pipeline_butce.taban_guncelle(self.kalici_bayt());
             } else {
                 drop(frame);
@@ -1613,6 +1771,8 @@ impl Decoder {
                     promise,
                     output_seq,
                     refresh_all_key,
+                    capi_meta,
+                    packet_timestamp: self.parse.current_packet_timestamp,
                 });
             }
             return Ok(());
@@ -1636,10 +1796,21 @@ impl Decoder {
                 }
             }
         }
+        let capi_meta = OutputCapiMeta {
+            seq_hdr: self.parse.sequence_header_arc.clone(),
+            frame_hdr: Some(Arc::new(displayed)),
+            content_light: self.parse.content_light,
+            mastering_display: self.parse.mastering_display,
+            itut_t35: core::mem::take(&mut self.parse.itut_t35),
+            event_flags: core::mem::take(&mut self.parse.pending_event_flags),
+            packet_tag: self.parse.current_packet_tag,
+        };
         self.in_flight.push_back(InFlightEntry::ShowExisting {
             promise,
             output_seq,
             refresh_all_key,
+            capi_meta,
+            packet_timestamp: self.parse.current_packet_timestamp,
         });
         Ok(())
     }
@@ -1685,15 +1856,26 @@ impl Decoder {
     /// [`Error::Unsupported`]: yalnız tanılama kipinde ([`Decoder::set_parse_only`])
     /// her kare için "yalnız ayrıştırma" girdisi veya uçuşta geç hata.
     pub fn receive_frame(&mut self) -> Result<Option<Frame>> {
+        let block = self.state == DecoderState::Draining;
+        Ok(self.receive_frame_capi(block)?.map(|(frame, _)| frame))
+    }
+
+    /// C-ABI (`dav1d_get_picture`) için sıradaki çıktı karesini ve eşlik eden
+    /// C-ABI metaverisini döndürür (`block == true` ise uçuş kuyruğunun başını bekler).
+    pub(crate) fn receive_frame_capi(
+        &mut self,
+        block: bool,
+    ) -> Result<Option<(Frame, OutputCapiMeta)>> {
         loop {
             if let Some(entry) = self.outputs.pop_front() {
+                let capi_meta = self.output_capi_meta.pop_front().unwrap_or_default();
                 return match entry {
                     OutputEntry::Frame(frame) => {
                         let _ = self.output_errors.pop_front();
                         // Tanılama kuralı: sayaçlar **bu çıktı karesinin
                         // kendi** çözülen karesine bağlıdır; `show_existing` sıfır alır.
                         self.last_output_tools = self.output_tools.pop_front().flatten();
-                        Ok(Some(frame))
+                        Ok(Some((frame, capi_meta)))
                     }
                     OutputEntry::Unsupported(reason) => {
                         if let Some(Some(detail)) = self.output_errors.pop_front() {
@@ -1701,15 +1883,51 @@ impl Decoder {
                         }
                         let _ = self.output_tools.pop_front();
                         self.last_output_tools = None;
+                        self.last_error_packet_tag = Some(capi_meta.packet_tag);
                         Err(Error::Unsupported(reason))
                     }
                 };
             }
-            let block = self.state == DecoderState::Draining;
             if !self.retire_front_in_flight(block)? {
                 return Ok(None);
             }
         }
+    }
+
+    /// Son çözme hatasını üreten paketin C-ABI kimlik etiketi.
+    pub(crate) const fn last_error_packet_tag(&self) -> Option<u64> {
+        self.last_error_packet_tag
+    }
+
+    /// Verilen C-ABI paket etiketine (`packet_tag`) sahip bekleyen çıktı veya uçuş görevi var mı?
+    pub(crate) fn has_pending_packet_tag(&self, tag: u64) -> bool {
+        self.output_capi_meta.iter().any(|m| m.packet_tag == tag)
+            || self.in_flight.iter().any(|e| match e {
+                InFlightEntry::Decode(t) => t.packet_tag == tag,
+                InFlightEntry::ShowExisting { capi_meta, .. } => capi_meta.packet_tag == tag,
+            })
+    }
+
+    /// C-ABI (`dav1d_apply_grain`) için verilen kareye film grain uygular.
+    pub(crate) fn apply_grain_capi(
+        &self,
+        frame: &Frame,
+        fg: &crate::bitstream::frame_header::FilmGrainHeader,
+        mc_identity: bool,
+    ) -> Result<Frame> {
+        let butce = self.butce_defteri(0);
+        let mut tools = ToolCounts::default();
+        build_output_frame(
+            true,
+            &self.dsp,
+            &self.pool,
+            frame,
+            fg,
+            mc_identity,
+            self.outputs_pushed,
+            &mut tools,
+            &butce,
+        )
     }
 
     /// Çıktı sırasıyla biriken kare başlıklarını **boşaltır**.
@@ -1817,6 +2035,8 @@ impl Decoder {
         self.outputs.clear();
         self.output_errors.clear();
         self.output_tools.clear();
+        self.output_capi_meta.clear();
+        self.last_error_packet_tag = None;
         self.last_output_tools = None;
         self.slot_promises = [None, None, None, None, None, None, None, None];
         let has_limit = self.config.allocation_limit.is_some();
@@ -1923,8 +2143,114 @@ impl Decoder {
     pub const fn dsp(&self) -> &DspDispatch {
         &self.dsp
     }
+    /// Metadata OBU ayrıştırma ve denetimi (`dav1d` `src/obu.c:1356-1515`):
+    /// `metadata_type` leb128 hatası; HDR CLL (32 bit), HDR MDCV (192 bit) ve
+    /// ITU-T T.35 yüklerini ayrıştırıp saklar.
+    fn process_metadata_obu(&mut self, obu: &Obu<'_>, strict: bool) -> Result<()> {
+        let base = obu.payload_offset_bits();
+        let mut reader = BitReader::new(obu.payload);
+        let meta_type = reader
+            .read_uleb128()
+            .map_err(|err| rebase_payload_error(err, base))?;
+        match meta_type {
+            1 => {
+                // OBU_META_HDR_CLL (32 bit)
+                let max_cll = reader
+                    .read_bits(16)
+                    .map_err(|err| rebase_payload_error(err, base))?
+                    as u16;
+                let max_fall = reader
+                    .read_bits(16)
+                    .map_err(|err| rebase_payload_error(err, base))?
+                    as u16;
+                reader
+                    .read_trailing_bits(strict)
+                    .map_err(|err| rebase_payload_error(err, base))?;
+                self.parse.content_light = Some((max_cll, max_fall));
+                Ok(())
+            }
+            2 => {
+                // OBU_META_HDR_MDCV (192 bit)
+                let mut primaries = [[0u16; 2]; 3];
+                for p in &mut primaries {
+                    p[0] = reader
+                        .read_bits(16)
+                        .map_err(|err| rebase_payload_error(err, base))?
+                        as u16;
+                    p[1] = reader
+                        .read_bits(16)
+                        .map_err(|err| rebase_payload_error(err, base))?
+                        as u16;
+                }
+                let wp0 = reader
+                    .read_bits(16)
+                    .map_err(|err| rebase_payload_error(err, base))?
+                    as u16;
+                let wp1 = reader
+                    .read_bits(16)
+                    .map_err(|err| rebase_payload_error(err, base))?
+                    as u16;
+                let max_hi = reader
+                    .read_bits(16)
+                    .map_err(|err| rebase_payload_error(err, base))?;
+                let max_lo = reader
+                    .read_bits(16)
+                    .map_err(|err| rebase_payload_error(err, base))?;
+                let min_hi = reader
+                    .read_bits(16)
+                    .map_err(|err| rebase_payload_error(err, base))?;
+                let min_lo = reader
+                    .read_bits(16)
+                    .map_err(|err| rebase_payload_error(err, base))?;
+                reader
+                    .read_trailing_bits(strict)
+                    .map_err(|err| rebase_payload_error(err, base))?;
+                self.parse.mastering_display = Some(MasteringDisplayMeta {
+                    primaries,
+                    white_point: [wp0, wp1],
+                    max_luminance: (max_hi << 16) | max_lo,
+                    min_luminance: (min_hi << 16) | min_lo,
+                });
+                Ok(())
+            }
+            4 => {
+                // OBU_META_ITUT_T35 (`src/obu.c:1445-1501`)
+                let start = reader.byte_position();
+                if let Some(rest) = obu.payload.get(start..) {
+                    let mut end = rest.len();
+                    while end > 0 && rest[end - 1] == 0 {
+                        end -= 1;
+                    }
+                    if end == 0 {
+                        return Ok(());
+                    }
+                    end -= 1; // trailing 0x80 baytı
+                    if rest.get(end) != Some(&0x80) || end == 0 {
+                        return Ok(());
+                    }
+                    let country_code = rest[0];
+                    let (ext, payload_start) = if country_code == 0xFF {
+                        if end < 2 {
+                            return Ok(());
+                        }
+                        (rest[1], 2usize)
+                    } else {
+                        (0u8, 1usize)
+                    };
+                    if payload_start < end {
+                        self.parse.itut_t35.push(ItutT35Meta {
+                            country_code,
+                            country_code_extension_byte: ext,
+                            payload: rest[payload_start..end].to_vec(),
+                        });
+                    }
+                }
+                Ok(())
+            }
+            _ => Ok(()),
+        }
+    }
 }
-
 /// `n_fc >= 2` boru hattı için referans yuvası vaatlerini (`FrameSlot`) başlık
 /// düzeyinde doğrular (`dav1d` `decode.c:3446-3478`).
 fn validate_frame_refs_slots(
@@ -2139,9 +2465,10 @@ fn split_tile_groups<'g>(
     Ok(tiles)
 }
 
-/// Metadata OBU denetimleri (dav1d `src/obu.c:1356-1515`; içerik saklanmaz):
+/// Metadata OBU denetimleri (birim test yardımcısı):
 /// `metadata_type` leb128 hatası; HDR CLL (32 bit) ve HDR MDCV (192 bit)
 /// yükünün taşması ya da trailing bits hatası.
+#[cfg(test)]
 fn validate_metadata(obu: &Obu<'_>, strict: bool) -> Result<()> {
     let base = obu.payload_offset_bits();
     let mut reader = BitReader::new(obu.payload);

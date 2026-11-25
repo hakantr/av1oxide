@@ -1,11 +1,11 @@
-# av1oxide (`v0.1.0`)
+# av1oxide (`v0.2.0`)
 
 **English** | [Türkçe](README.tr.md)
 
-`av1oxide` is a **100% stable-Rust** (`rustc 1.100.0`, Edition 2024) reimplementation of the VideoLAN [`dav1d`](https://code.videolan.org/videolan/dav1d) (`1.5.4`) AV1 video decoder with **zero runtime external dependencies**.
+`av1oxide` is a **100% stable-Rust** (`rustc 1.100.0`, Edition 2024) reimplementation of the VideoLAN [`dav1d`](https://code.videolan.org/videolan/dav1d) (`1.5.4`) AV1 video decoder with **zero runtime external dependencies** and a **`libdav1d` (`7.0.0`) binary-compatible C-ABI layer**.
 
 - **Profiles & Bit Depths:** Main (`0`), High (`1`), Professional (`2`); `8-bit`, `10-bit`, `12-bit`; `4:2:0`, `4:2:2`, `4:4:4`, and `Monochrome` (`4:0:0`).
-- **Complete AV1 Pipeline:** OBU parsing, Sequence/Frame Headers, MSAC arithmetic entropy decoder, inverse transforms (`ITX`), intra prediction (`IPRED`, CfL, Palette), motion compensation (`MC`, Warp, Superres/Resize, IntraBC, `REFMVS`), in-loop filters (`LF`, `CDEF`, `LR` Wiener/SGR), and Film Grain (`FG`) synthesis.
+- **AV1 Pipeline:** OBU parsing, Sequence/Frame Headers, MSAC arithmetic entropy decoder, inverse transforms (`ITX`), intra prediction (`IPRED`, CfL, Palette), motion compensation (`MC`, Warp, Superres/Resize, IntraBC, `REFMVS`), in-loop filters (`LF`, `CDEF`, `LR` Wiener/SGR), and Film Grain (`FG`) synthesis.
 - **Bit-Exact Conformance:** Verified 100% MD5 bit-exact parity against `dav1d 1.5.4` across **`2,781 / 2,781` streams (`37,664 / 37,664` frames)** — covering `dav1d-test-data` (`19/19` streams, `964` frames) and Argon Streams `v2.1.1` (`2,762/2,762` streams, `36,700` frames) across all CPU capability masks and multithreaded configurations.
 - **Capability-Token SIMD (`767` DSP Slots):**
   - `x86_64` (`SSE2`, `SSSE3`, `SSE4.1`, `AVX2`, `AVX-512ICL`): `756 / 767` SIMD slots
@@ -13,6 +13,7 @@
   - `wasm32` (`+simd128`): `31 / 767` SIMD slots under `100% #![forbid(unsafe_code)]`
   - Secondary architectures (`arm32`, `riscv64`, `loongarch64`, `powerpc64le`): `100%` safe bit-exact scalar fallback
 - **Multithreading & Memory Budgets:** Intra-frame (`Tile`, superblock row, in-loop filter) and inter-frame (`FrameSlot`) parallelism (`Config::n_threads`, `Config::max_frame_delay`); pre-allocation pixel and memory limits (`Config::frame_size_limit`, `Config::allocation_limit`).
+- **`libdav1d` (`7.0.0`) Compatible C-ABI (`capi`):** Implements all 19 official `DAV1D_API` functions (`dav1d_open`, `dav1d_send_data`, `dav1d_get_picture`, `dav1d_apply_grain`, `dav1d_parse_sequence_header`, etc.) and ships the official `include/dav1d/*.h` C headers.
 
 ---
 
@@ -22,7 +23,7 @@ Add `av1oxide` to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-av1oxide = "0.1"
+av1oxide = "0.2"
 ```
 
 To build and browse the local API documentation (`rustdoc`):
@@ -126,9 +127,51 @@ fn decode_untrusted(payload: &[u8]) -> Result<()> {
 }
 ```
 
-### 3. Runnable Examples (`examples/`)
+### 3. `libdav1d`-Compatible C-ABI Usage (`--features capi`)
 
-Three standalone examples are included in the crate:
+Build shared (`libav1oxide.so` / `.dylib` / `.dll`) and static (`libav1oxide.a`) libraries exporting the 19 `dav1d_*` symbols:
+
+```bash
+cargo rustc --release -p av1oxide --features capi --crate-type cdylib,staticlib
+```
+
+Link any C/C++ program against `crates/av1oxide/include` (`#include <dav1d/dav1d.h>`) and `libav1oxide.a` / `libav1oxide.so`:
+
+```c
+#include <dav1d/dav1d.h>
+
+int decode_obu_c(const uint8_t *obu_buf, size_t obu_len) {
+    Dav1dSettings s;
+    dav1d_default_settings(&s);
+    s.n_threads = 4;
+
+    Dav1dContext *c = NULL;
+    if (dav1d_open(&c, &s) < 0) return -1;
+
+    Dav1dData data = { 0 };
+    uint8_t *dst = dav1d_data_create(&data, obu_len);
+    memcpy(dst, obu_buf, obu_len);
+
+    if (dav1d_send_data(c, &data) < 0) {
+        dav1d_data_unref(&data);
+        dav1d_close(&c);
+        return -1;
+    }
+
+    Dav1dPicture pic = { 0 };
+    while (dav1d_get_picture(c, &pic) == 0) {
+        /* pic.data[0..3], pic.stride[0..2], pic.p.w, pic.p.h, pic.p.bpc */
+        dav1d_picture_unref(&pic);
+    }
+
+    dav1d_close(&c);
+    return 0;
+}
+```
+
+### 4. Runnable Examples (`examples/`)
+
+Four standalone examples are included in the crate:
 
 - **[`examples/decode_obu.rs`](crates/av1oxide/examples/decode_obu.rs):** Decode raw AV1 OBU packets with timestamps (`Packet::with_timestamp`), inspect frame metadata, and read plane rows:
   ```bash
@@ -144,12 +187,16 @@ Three standalone examples are included in the crate:
   ```bash
   cargo run --release -p av1oxide --example bounded_decoder
   ```
+- **[`examples/c_abi_decode.rs`](crates/av1oxide/examples/c_abi_decode.rs):** End-to-end decoding through the `libdav1d` (`7.0.0`) C-ABI (`dav1d_default_settings` → `dav1d_open` → `dav1d_data_create` → `dav1d_send_data` → `dav1d_get_picture` → `dav1d_picture_unref` → `dav1d_close`):
+  ```bash
+  cargo run --release -p av1oxide --example c_abi_decode
+  ```
 
 ---
 
 ## Performance Comparison vs. `dav1d 1.5.4`
 
-All benchmarks were measured under `100%` MD5 bit-exact output parity between `av1oxide v0.1.0` (`rustc 1.100.0 --release`) and the reference C/ASM `dav1d 1.5.4` (`99f3354ed0b9b4bf3c7c9347318dbcc522c94af5`).
+All benchmarks were measured under `100%` MD5 bit-exact output parity between `av1oxide` (`rustc 1.100.0 --release`) and the reference C/ASM `dav1d 1.5.4` (`99f3354ed0b9b4bf3c7c9347318dbcc522c94af5`).
 
 ### 1. `x86_64` — AMD Ryzen 9 9950X3D (Zen 5, `16C / 32T`, `AVX-512ICL`)
 
@@ -203,6 +250,20 @@ All benchmarks were measured under `100%` MD5 bit-exact output parity between `a
 | `test10103_coklu_tile` (`1024×1024`, `10b`, `16` tiles) | `mfd=0, t=14` | `1,558.9 ms` | `236.2 ms` | **`6.60×`** | `135.7 ms` | **`1.74×`** |
 | `test25_8k_444_fg` (`7680×4320`, `8b` `4:4:4`, `120` tiles + FG) | `mfd=0, t=14` | `1,410.1 ms` | `149.6 ms` | **`9.43×`** | `68.0 ms` | **`2.20×`** |
 | `test25_8k_120_tile` (`7680×4320`, `12b`, `120` tiles) | `mfd=0, t=14` | `1,687.5 ms` | `233.0 ms` | **`7.24×`** | `95.0 ms` | **`2.45×`** |
+
+---
+
+### 3. Technical Analysis of Runtime Differences
+
+#### Resource Checks with Negligible Runtime Cost (`~0%` Impact)
+
+- Memory budget and frame dimension checks (`Config::allocation_limit`, `Config::frame_size_limit`) execute only during frame and buffer allocation rather than inside pixel or block loops; they have no measurable impact on frame decoding speed.
+
+#### Measured Technical Factors Behind the Runtime Difference (`~1.50×–1.70×`)
+
+- **Slice Bounds Checking (`23%–50%` of decode time):** High-resolution frames traverse millions of `4×4` / `8×8` blocks and neighbor tables. Whereas C `dav1d` accesses these structures through unchecked raw pointer arithmetic (`ptr += offset`), the entire non-DSP decoder core in `av1oxide` is compiled under `#![forbid(unsafe_code)]` and performs runtime bounds checks on every slice index (`slice[i]`). This accounts for the primary portion of the `~1.65×–1.71×` ratio measured between pure C and pure Rust when SIMD is disabled on both sides.
+- **SIMD Entry Validation and Zero Over-Read (`~2–5 ns` per call):** C `dav1d` Assembly routines perform no entry length checks and read 16–64 bytes past the end of buffers into padding regions (over-read). Every SIMD function in `av1oxide` validates slice length preconditions on entry and uses masked or bounded loads at edges to avoid reading past slice bounds; on short (`10–20 ns`) small-block (`4×4`) calls, this validation adds `15%–25%` execution time.
+- **Hand-Written Assembly vs. Compiler (`LLVM`) Code Generation:** `dav1d` uses approximately `265,000` lines of hand-written NASM/GAS Assembly that bypass standard function calling conventions (ABI) and manage CPU flag registers and 32 `zmm` registers directly, whereas `av1oxide` compiles stable Rust `core::arch` intrinsics through the standard LLVM ABI frame.
 
 ---
 

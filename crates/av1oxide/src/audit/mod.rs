@@ -59,6 +59,15 @@ pub struct UnsafeExemption {
 /// `#![forbid(unsafe_code)]` (ya da `deny`) taşır.
 pub const UNSAFE_EXEMPTIONS: &[UnsafeExemption] = &[
     UnsafeExemption {
+        module: "capi/ffi.rs",
+        reason: "libdav1d (7.0.0) C-ABI uyumluluk katmanı FFI sınır dosyası: 19 `extern \"C\"` giriş noktasında \
+                 C çağıranı tarafından verilen ham işaretçilerin null/boyut doğrulaması sonrası okunması/yazılması ve \
+                 `Arc::into_raw`/`Arc::from_raw` tabanlı `Dav1dRef` referans sayımı; tüm FFI girişleri `catch_unwind` \
+                 ile sarılıdır ve kardeş modüller (`capi/mod.rs`, `capi/types.rs`, `capi/convert.rs`) `%100 #![forbid(unsafe_code)]` \
+                 altındadır.",
+        phase: "v0.2.0",
+    },
+    UnsafeExemption {
         module: "dsp/arm/mem.rs",
         reason: "ARM64 NEON (`aarch64`) sabit boyutlu dizi yükleme/saklama yardımcıları (`vld1*`/`vst1*` üzerinde `&[T; N]` / `&mut [T; N]`) \
                  ve `NeonToken`-kapılı `fn(...)` yuva giriş köprüleri (`cdef`, `cdef16`, `pal`, `refmvs` çekirdekleri `%100 #![forbid(unsafe_code)]` \
@@ -721,17 +730,18 @@ mod tests {
 
     #[test]
     fn muafiyet_defteri_kayitli_ve_gerekceli() {
-        // S15.4+P51: yalnız dsp/x86/ ve dsp/arm/ ISA backend'i muaf; her kayıt gerekçe + faz taşır.
+        // Yalnız capi/ffi.rs ile dsp/x86/ ve dsp/arm/ ISA backend'i muaf; her kayıt gerekçe + faz taşır.
         assert_eq!(
             UNSAFE_EXEMPTIONS.len(),
-            88,
-            "S15.4+S15.5+P25+P27+P30+P33+P34+P35+P36+P39+P41+P42+P43+P44+P45+P46+P47+P51+P52: seksen sekiz muafiyet beklenir (dsp/arm/mem + dsp/arm/giris + 86 dsp/x86/*)"
+            89,
+            "seksen dokuz muafiyet beklenir (capi/ffi.rs + dsp/arm/mem + dsp/arm/giris + 86 dsp/x86/*)"
         );
         for exemption in UNSAFE_EXEMPTIONS {
             assert!(
-                exemption.module.starts_with("dsp/x86/")
+                exemption.module == "capi/ffi.rs"
+                    || exemption.module.starts_with("dsp/x86/")
                     || exemption.module.starts_with("dsp/arm/"),
-                "unsafe yalnız dsp/<isa>/ altında: {}",
+                "unsafe yalnız capi/ffi.rs veya dsp/<isa>/ altında: {}",
                 exemption.module
             );
         }

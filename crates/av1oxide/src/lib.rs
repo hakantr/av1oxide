@@ -1,4 +1,4 @@
-//! # av1oxide — %100 Kararlı Rust AV1 Video Çözücüsü (`v0.1.0`)
+//! # av1oxide — %100 Kararlı Rust AV1 Video Çözücüsü (`v0.2.0`)
 //!
 //! `av1oxide`, VideoLAN [`dav1d`](https://code.videolan.org/videolan/dav1d) (`1.5.4`)
 //! AV1 video çözücüsünün **%100 kararlı Rust** (`rustc 1.100.0`, Edition 2024) ve
@@ -6,7 +6,7 @@
 //!
 //! ## Özellikler
 //!
-//! - **Tam AV1 Bit Akışı ve Profil Kapsamı:** Main (`0`), High (`1`) ve Professional (`2`)
+//! - **AV1 Bit Akışı ve Profil Kapsamı:** Main (`0`), High (`1`) ve Professional (`2`)
 //!   profilleri; `8`, `10` ve `12` bit derinliği (`4:2:0`, `4:2:2`, `4:4:4`, `Monochrome`);
 //!   OBU katmanı, Sequence/Frame Header, MSAC entropi, ters dönüşüm (`ITX`), intra tahmin
 //!   (`IPRED`, CfL, Palette), hareket telafisi (`MC`, Warp, Superres/Resize, IntraBC, `REFMVS`),
@@ -25,6 +25,10 @@
 //!   kalıcı `WorkerPool` (kare içi tile/SB-satırı/halka-içi filtre paralelliği + kareler arası
 //!   `FrameSlot` boru hattı), `DecodeBufPool` düzlem geri dönüşümü ve tahsis öncesi atomik
 //!   bellek bütçesi ([`Config::allocation_limit`], [`Config::frame_size_limit`]).
+//! - **`libdav1d` (`7.0.0`) Uyumlu C-ABI Katmanı ([`capi`]):** `include/dav1d/dav1d.h`
+//!   ile ikili uyumlu 19 C fonksiyonu (`dav1d_open`, `dav1d_send_data`, `dav1d_get_picture`,
+//!   `dav1d_apply_grain`, `dav1d_parse_sequence_header`, vb.); `--features capi` ile
+//!   doğrudan `cdylib` (`.so`/`.dylib`/`.dll`) veya `staticlib` (`.a`) olarak derlenebilir.
 //!
 //! ## Hızlı Başlangıç Örneği
 //!
@@ -65,6 +69,7 @@
 //! | Modül | İçerik |
 //! |---|---|
 //! | [`api`] | [`Config`], [`Packet`], [`Decoder`] ve [`DecoderState`] durum makinesi |
+//! | [`capi`] | `libdav1d` (`7.0.0`) uyumlu C-ABI fonksiyonları ve `#[repr(C)]` yapıları |
 //! | [`frame`] | [`Frame`], [`FramePlane`], [`PlaneLayout`], [`PlaneType`], [`BitDepth`], [`ChromaFormat`] |
 //! | [`error`] | [`Error`], [`Result`], [`SizeStage`] |
 //! | [`dsp`] | [`dsp::DspDispatch`] (`767` yuva; `scalar`, `x86`, `arm`, `wasm`) |
@@ -82,15 +87,17 @@
 //!   (IVF/MP4/Matroska/AVIF) ayrıştırma, YUV→RGB dönüşümü, GPU yüklemesi ve AV1 kodlama
 //!   bu kütüphanenin kapsamı dışındadır.
 //! - Üretim kaynaklarında haricî `.asm` / `.S` veya satır içi `asm!` / `global_asm!` kullanılmaz.
-//! - `crates/av1oxide/src` altındaki `194` kaynak dosyadan `107`'si `#![forbid(unsafe_code)]`
-//!   taşır; yalnız [`audit::UNSAFE_EXEMPTIONS`] içindeki `87` `x86_64`/`aarch64` SIMD dosyası
-//!   dar kapsamlı `core::arch` intrinsikleri için muaf tutulur (`0` güvensiz işlev imzası, `362` blok).
+//! - `crates/av1oxide/src` altındaki `198` kaynak dosyadan `109`'u `#![forbid(unsafe_code)]`
+//!   taşır; yalnız [`audit::UNSAFE_EXEMPTIONS`] içindeki `88` `x86_64`/`aarch64` SIMD dosyası
+//!   ve `1` C-ABI sınır dosyası (`capi/ffi.rs`) dar kapsamlı işlemler için muaf tutulur
+//!   (`0` güvensiz işlev imzası, `389` blok).
 
 #![warn(clippy::all)]
 
 pub mod api;
 pub mod audit;
 pub mod bitstream;
+pub mod capi;
 pub mod cpu;
 pub mod decode;
 pub mod dsp;
