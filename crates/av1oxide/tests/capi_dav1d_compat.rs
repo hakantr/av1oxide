@@ -707,10 +707,16 @@ int main(void) {
     );
 
     let staticlib_path = target_dir.join("release/libav1oxide.a");
-    let cdylib_path = target_dir.join("release/libav1oxide.so");
+    #[cfg(target_os = "macos")]
+    let (cdylib_name, nm_flag) = ("libav1oxide.dylib", "-gU");
+    #[cfg(not(target_os = "macos"))]
+    let (cdylib_name, nm_flag) = ("libav1oxide.so", "-D");
+    let cdylib_path = target_dir.join("release").join(cdylib_name);
     assert!(staticlib_path.exists(), "libav1oxide.a üretilmeli");
+    #[cfg(unix)]
+    assert!(cdylib_path.exists(), "{cdylib_name} üretilmeli");
     if cdylib_path.exists()
-        && let Ok(nm_out) = Command::new("nm").arg("-D").arg(&cdylib_path).output()
+        && let Ok(nm_out) = Command::new("nm").arg(nm_flag).arg(&cdylib_path).output()
         && nm_out.status.success()
     {
         let nm_text = String::from_utf8_lossy(&nm_out.stdout);
@@ -737,7 +743,7 @@ int main(void) {
         ] {
             assert!(
                 nm_text.contains(sym),
-                "libav1oxide.so içinde `{sym}` sembolü dışa aktarılmalı"
+                "{cdylib_name} içinde `{sym}` sembolü dışa aktarılmalı"
             );
         }
     }
