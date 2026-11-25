@@ -992,7 +992,7 @@ impl Decoder {
         // Referans yuvası grain'siz kareyi saklar
         // (`src/lib.c:311-330`).
         let entry = Arc::new(RefFrame::from_decoded(decoded, header.clone(), mc_identity));
-        let mut evicted: Vec<Arc<RefFrame>> = Vec::new();
+        let mut evicted: smallvec::SmallVec<[Arc<RefFrame>; 8]> = smallvec::SmallVec::new();
         for (slot, reference) in self.pixel_refs.iter_mut().enumerate() {
             if header.refresh_frame_flags & (1 << slot) != 0
                 && let Some(old) = reference.replace(Arc::clone(&entry))
@@ -1446,7 +1446,8 @@ impl Decoder {
                         self.decoded_frames += 1;
                         self.last_tools = Some(completed.decoded_tools);
                         self.decoded_tools.push(completed.decoded_tools);
-                        let mut evicted: Vec<Arc<RefFrame>> = Vec::new();
+                        let mut evicted: smallvec::SmallVec<[Arc<RefFrame>; 8]> =
+                            smallvec::SmallVec::new();
                         for (slot, reference) in self.pixel_refs.iter_mut().enumerate() {
                             if task.refresh_frame_flags & (1 << slot) != 0
                                 && let Some(old) =

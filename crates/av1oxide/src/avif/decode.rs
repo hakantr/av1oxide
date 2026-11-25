@@ -47,7 +47,7 @@ enum AlphaSource {
     /// Renk `grid` öğesinin her bir karosuna ayrı `auxl` ile bağlı alfa karolarından oluşan sentetik ızgara.
     GridTiles {
         grid_item_id: u32,
-        alpha_tile_ids: Vec<u32>,
+        alpha_tile_ids: smallvec::SmallVec<[u32; 8]>,
     },
 }
 
@@ -346,7 +346,8 @@ fn find_alpha_source(
         if tile_ids.is_empty() {
             return Ok(None);
         }
-        let mut alpha_tiles = Vec::with_capacity(tile_ids.len());
+        let mut alpha_tiles: smallvec::SmallVec<[u32; 8]> =
+            smallvec::SmallVec::with_capacity(tile_ids.len());
         for &tid in &tile_ids {
             if let Some(aid) = find_direct_alpha_item(container, tid)? {
                 alpha_tiles.push(aid);
@@ -934,16 +935,29 @@ fn decode_grid_tiles_into_canvas(
         ));
     }
 
-    let mut unique_set = crate::avif::boxes::FxIndexSet::with_capacity_and_hasher(
-        num_tiles,
-        rustc_hash::FxBuildHasher,
-    );
-    let mut tile_to_unique = Vec::with_capacity(num_tiles);
-    for &tid in tile_ids {
-        let (u_idx, _) = unique_set.insert_full(tid);
-        tile_to_unique.push(u_idx);
+    let has_dups = is_alpha && (1..tile_ids.len()).any(|i| tile_ids[..i].contains(&tile_ids[i]));
+    let mut unique_ids: smallvec::SmallVec<[u32; 16]> =
+        smallvec::SmallVec::with_capacity(num_tiles);
+    let mut tile_to_unique: smallvec::SmallVec<[usize; 16]> =
+        smallvec::SmallVec::with_capacity(num_tiles);
+    if has_dups {
+        let mut unique_set = crate::avif::boxes::FxIndexSet::with_capacity_and_hasher(
+            num_tiles,
+            rustc_hash::FxBuildHasher,
+        );
+        for &tid in tile_ids {
+            let (u_idx, inserted) = unique_set.insert_full(tid);
+            if inserted {
+                unique_ids.push(tid);
+            }
+            tile_to_unique.push(u_idx);
+        }
+    } else {
+        unique_ids.extend_from_slice(tile_ids);
+        for i in 0..num_tiles {
+            tile_to_unique.push(i);
+        }
     }
-    let unique_ids: Vec<u32> = unique_set.into_iter().collect();
     let num_unique = unique_ids.len();
 
     let total_threads = if config.n_threads == 0 {

@@ -29,6 +29,7 @@
 | `memchr` | `2` | `[]` | `Andrew Gallant (BurntSushi)` / Rust `libs-team` | ISOBMFF NUL-sonlu dize ayrıştırma (`avif::boxes`) ve OBU metaveri kuyruk baytı taramasında (`api::Decoder`) SIMD/SWAR hızlandırmalı bayt arama (`memchr`, `memrchr`) |
 | `rustc-hash` | `2` | `[]` | `rust-lang/rustc-hash` / Rust Derleyici Ekibi | ISOBMFF `item_id` tekillik denetimi, paylaşımlı `grid` karo önbelleklemesi (`avif`) ve DSP tablo kurulumunda (`dsp`) hızlı deterministik tamsayı karması (`FxBuildHasher`) |
 | `indexmap` | `2` | `[]` | `Josh Stone (cuviper)` / Rust `libs-team` & `compiler-team` | ISOBMFF `iinf`, `ipma`, `iloc` ve `iref` öğe tablolarında (`avif::boxes`, `avif::decode`, `dsp`) ekleme sırasını koruyan $O(1)$ tablo ve küme yapıları (`IndexMap`, `IndexSet` — Miri onaylı `hashbrown` çekirdekli) |
+| `smallvec` | `1` | `[]` | `servo/rust-smallvec` / Rust & Servo Çekirdek Ekipleri | ISOBMFF özellik, veri parçası (`extent`), referans ve karo listeleri (`avif::boxes`, `avif::decode`) ile 8 yuvalı referans kare tahliye listelerinin (`api::Decoder`) yığın (stack) üzerinde tutulması (`SmallVec`) |
 
 ---
 
