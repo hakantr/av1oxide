@@ -28,6 +28,7 @@
 | `parking_lot` | `0.12` | `[]` (`not(target_arch = "wasm32")`) | `Amanieu d'Antras` / Rust `libs-team` | `thread::WorkerPool`, `thread::FrameSlot`, `api::Decoder` ve `decode::intra` içinde zehirlenmesiz (`non-poisoning`) kompakt kullanıcı uzayı `Mutex` ve `Condvar` (`sync`) |
 | `memchr` | `2` | `[]` | `Andrew Gallant (BurntSushi)` / Rust `libs-team` | ISOBMFF NUL-sonlu dize ayrıştırma (`avif::boxes`) ve OBU metaveri kuyruk baytı taramasında (`api::Decoder`) SIMD/SWAR hızlandırmalı bayt arama (`memchr`, `memrchr`) |
 | `rustc-hash` | `2` | `[]` | `rust-lang/rustc-hash` / Rust Derleyici Ekibi | ISOBMFF `item_id` tekillik denetimi, paylaşımlı `grid` karo önbelleklemesi (`avif`) ve DSP tablo kurulumunda (`dsp`) hızlı deterministik tamsayı karması (`FxBuildHasher`) |
+| `indexmap` | `2` | `[]` | `Josh Stone (cuviper)` / Rust `libs-team` & `compiler-team` | ISOBMFF `iinf`, `ipma`, `iloc` ve `iref` öğe tablolarında (`avif::boxes`, `avif::decode`, `dsp`) ekleme sırasını koruyan $O(1)$ tablo ve küme yapıları (`IndexMap`, `IndexSet` — Miri onaylı `hashbrown` çekirdekli) |
 
 ---
 

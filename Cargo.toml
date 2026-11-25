@@ -16,6 +16,7 @@ repository = "https://github.com/hakantr/av1oxide"
 
 [workspace.dependencies]
 crossbeam-utils = { version = "0.8", default-features = false, features = ["std"] }
+indexmap = { version = "2", default-features = false }
 memchr = { version = "2", default-features = false }
 parking_lot = { version = "0.12", default-features = false }
 rustc-hash = { version = "2", default-features = false }

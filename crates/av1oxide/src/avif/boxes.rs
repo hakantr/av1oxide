@@ -124,6 +124,12 @@ pub(crate) struct ItemReference {
     pub(crate) to_item_ids: Vec<u32>,
 }
 
+/// Ekleme sırasını koruyan deterministik `FxBuildHasher` tabanlı harita.
+pub(crate) type FxIndexMap<K, V> = indexmap::IndexMap<K, V, rustc_hash::FxBuildHasher>;
+
+/// Ekleme sırasını koruyan deterministik `FxBuildHasher` tabanlı küme.
+pub(crate) type FxIndexSet<T> = indexmap::IndexSet<T, rustc_hash::FxBuildHasher>;
+
 /// Ayrıştırılmış AVIF / ISOBMFF kapsayıcı yapısı.
 #[allow(dead_code)]
 #[derive(Clone, Debug)]
@@ -131,10 +137,10 @@ pub(crate) struct AvifContainer<'a> {
     pub(crate) file_data: &'a [u8],
     pub(crate) major_brand: [u8; 4],
     pub(crate) primary_item_id: u32,
-    pub(crate) items: Vec<ItemInfoEntry>,
+    pub(crate) items: FxIndexMap<u32, ItemInfoEntry>,
     pub(crate) properties: Vec<ItemProperty>,
-    pub(crate) associations: Vec<(u32, Vec<PropertyAssoc>)>,
-    pub(crate) locations: Vec<IlocItem>,
+    pub(crate) associations: FxIndexMap<u32, Vec<PropertyAssoc>>,
+    pub(crate) locations: FxIndexMap<u32, IlocItem>,
     pub(crate) references: Vec<ItemReference>,
     pub(crate) idat: &'a [u8],
 }
@@ -343,10 +349,13 @@ pub(crate) fn parse_container(data: &[u8]) -> Result<AvifContainer<'_>> {
     }
 
     let mut primary_item_id: Option<u32> = None;
-    let mut items = Vec::new();
+    let mut items: FxIndexMap<u32, ItemInfoEntry> =
+        FxIndexMap::with_hasher(rustc_hash::FxBuildHasher);
     let mut properties = Vec::new();
-    let mut associations: Vec<(u32, Vec<PropertyAssoc>)> = Vec::new();
-    let mut locations = Vec::new();
+    let mut associations: FxIndexMap<u32, Vec<PropertyAssoc>> =
+        FxIndexMap::with_hasher(rustc_hash::FxBuildHasher);
+    let mut locations: FxIndexMap<u32, IlocItem> =
+        FxIndexMap::with_hasher(rustc_hash::FxBuildHasher);
     let mut references = Vec::new();
     let mut idat: &[u8] = &[];
     let mut has_hdlr = false;
@@ -415,7 +424,7 @@ pub(crate) fn parse_container(data: &[u8]) -> Result<AvifContainer<'_>> {
     })
 }
 
-fn parse_iinf(payload: &[u8], items: &mut Vec<ItemInfoEntry>) -> Result<()> {
+fn parse_iinf(payload: &[u8], items: &mut FxIndexMap<u32, ItemInfoEntry>) -> Result<()> {
     let (ver, _flags, body) = read_full_box(payload)?;
     let (entry_count, mut offset) = match ver {
         0 => (
@@ -431,12 +440,13 @@ fn parse_iinf(payload: &[u8], items: &mut Vec<ItemInfoEntry>) -> Result<()> {
         _ => return Err(Error::Unsupported("desteklenmeyen iinf sürümü")),
     };
 
+    items.reserve((entry_count as usize).min(256));
     let mut parsed = 0u32;
     while let Some(child) = read_box_header(body, offset)? {
         offset = child.next_offset;
         if &child.box_type == b"infe" {
             let entry = parse_infe(child.payload)?;
-            items.push(entry);
+            items.insert(entry.item_id, entry);
             parsed += 1;
         }
     }
@@ -499,7 +509,7 @@ fn parse_infe(payload: &[u8]) -> Result<ItemInfoEntry> {
 fn parse_iprp(
     payload: &[u8],
     properties: &mut Vec<ItemProperty>,
-    associations: &mut Vec<(u32, Vec<PropertyAssoc>)>,
+    associations: &mut FxIndexMap<u32, Vec<PropertyAssoc>>,
 ) -> Result<()> {
     let mut offset = 0usize;
     let mut seen_ipco = false;
@@ -734,12 +744,16 @@ fn parse_ipco(payload: &[u8], properties: &mut Vec<ItemProperty>) -> Result<()> 
     Ok(())
 }
 
-fn parse_ipma(payload: &[u8], associations: &mut Vec<(u32, Vec<PropertyAssoc>)>) -> Result<()> {
+fn parse_ipma(
+    payload: &[u8],
+    associations: &mut FxIndexMap<u32, Vec<PropertyAssoc>>,
+) -> Result<()> {
     let (ver, flags, body) = read_full_box(payload)?;
     if ver > 1 {
         return Err(Error::Unsupported("ipma sürümü > 1 desteklenmiyor"));
     }
     let entry_count = read_u32_be(body, 0).ok_or(Error::InvalidData("kesik ipma entry_count"))?;
+    associations.reserve((entry_count as usize).min(256));
     let mut pos = 4usize;
     let large_index = (flags & 1) != 0;
 
@@ -785,16 +799,12 @@ fn parse_ipma(payload: &[u8], associations: &mut Vec<(u32, Vec<PropertyAssoc>)>)
             }
         }
 
-        if let Some((_, existing)) = associations.iter_mut().find(|(id, _)| *id == item_id) {
-            existing.extend_from_slice(&list);
-        } else {
-            associations.push((item_id, list));
-        }
+        associations.entry(item_id).or_default().extend(list);
     }
     Ok(())
 }
 
-fn parse_iloc(payload: &[u8], locations: &mut Vec<IlocItem>) -> Result<()> {
+fn parse_iloc(payload: &[u8], locations: &mut FxIndexMap<u32, IlocItem>) -> Result<()> {
     let (ver, _flags, body) = read_full_box(payload)?;
     if ver > 2 || body.len() < 2 {
         return Err(Error::Unsupported(
@@ -829,6 +839,7 @@ fn parse_iloc(payload: &[u8], locations: &mut Vec<IlocItem>) -> Result<()> {
         )
     };
 
+    locations.reserve((item_count as usize).min(256));
     for _ in 0..item_count {
         let item_id = if ver < 2 {
             let id = read_u16_be(body, pos).ok_or(Error::InvalidData("kesik iloc item_id"))?;
@@ -883,13 +894,16 @@ fn parse_iloc(payload: &[u8], locations: &mut Vec<IlocItem>) -> Result<()> {
             });
         }
 
-        locations.push(IlocItem {
+        locations.insert(
             item_id,
-            construction_method,
-            data_reference_index,
-            base_offset,
-            extents,
-        });
+            IlocItem {
+                item_id,
+                construction_method,
+                data_reference_index,
+                base_offset,
+                extents,
+            },
+        );
     }
     Ok(())
 }
@@ -922,7 +936,7 @@ fn parse_iref(payload: &[u8], references: &mut Vec<ItemReference>) -> Result<()>
 
         let is_dimg = &ref_box.box_type == b"dimg";
         let mut seen_dimg = if is_dimg && ref_count > 8 {
-            Some(std::collections::HashSet::with_capacity_and_hasher(
+            Some(FxIndexSet::with_capacity_and_hasher(
                 ref_count,
                 rustc_hash::FxBuildHasher,
             ))
@@ -968,12 +982,12 @@ fn parse_iref(payload: &[u8], references: &mut Vec<ItemReference>) -> Result<()>
 impl<'a> AvifContainer<'a> {
     /// Belirtilen `item_id` için `infe` kaydını döndürür.
     pub(crate) fn item_info(&self, item_id: u32) -> Option<&ItemInfoEntry> {
-        self.items.iter().find(|i| i.item_id == item_id)
+        self.items.get(&item_id)
     }
 
     /// Belirtilen `item_id` ile ilişkilendirilmiş özellikleri (`ipma` sırasıyla) döndürür.
     pub(crate) fn item_properties(&self, item_id: u32) -> Result<Vec<(&ItemProperty, bool)>> {
-        let Some((_, assocs)) = self.associations.iter().find(|(id, _)| *id == item_id) else {
+        let Some(assocs) = self.associations.get(&item_id) else {
             return Ok(Vec::new());
         };
         let mut out = Vec::with_capacity(assocs.len());
@@ -1049,8 +1063,7 @@ impl<'a> AvifContainer<'a> {
         }
         let loc = self
             .locations
-            .iter()
-            .find(|l| l.item_id == item_id)
+            .get(&item_id)
             .ok_or(Error::InvalidData("öğe için iloc konum kaydı bulunamadı"))?;
         if loc.data_reference_index != 0 {
             return Err(Error::Unsupported(

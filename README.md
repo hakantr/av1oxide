@@ -28,6 +28,7 @@
 | `parking_lot` | `0.12` | `[]` (`not(target_arch = "wasm32")`) | `Amanieu d'Antras` / Rust `libs-team` | Non-poisoning compact userspace `Mutex` and `Condvar` (`sync`) across `thread::WorkerPool`, `thread::FrameSlot`, `api::Decoder`, and `decode::intra` |
 | `memchr` | `2` | `[]` | `Andrew Gallant (BurntSushi)` / Rust `libs-team` | SIMD/SWAR byte scanning (`memchr`, `memrchr`) for ISOBMFF NUL-terminated string parsing (`avif::boxes`) and OBU metadata trailing-byte locating (`api::Decoder`) |
 | `rustc-hash` | `2` | `[]` | `rust-lang/rustc-hash` / Rust Compiler Team | Fast deterministic integer/tuple hashing (`FxBuildHasher`) for ISOBMFF `item_id` deduplication, shared grid tile caching (`avif`), and DSP dispatch setup (`dsp`) |
+| `indexmap` | `2` | `[]` | `Josh Stone (cuviper)` / Rust `libs-team` & `compiler-team` | Order-preserving $O(1)$ hash tables and sets (`IndexMap`, `IndexSet` over Miri-verified `hashbrown`) for ISOBMFF `iinf`, `ipma`, `iloc`, and `iref` item tables (`avif::boxes`, `avif::decode`, `dsp`) |
 
 ---
 

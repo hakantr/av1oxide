@@ -353,7 +353,7 @@ pub const fn isa_rank(implementation: &str) -> u8 {
 fn kurulum_sirasi() -> &'static [(u8, u16, u16)] {
     static SIRA: std::sync::OnceLock<Vec<(u8, u16, u16)>> = std::sync::OnceLock::new();
     SIRA.get_or_init(|| {
-        let mut temsilci = std::collections::HashMap::with_hasher(rustc_hash::FxBuildHasher);
+        let mut temsilci = indexmap::IndexMap::with_hasher(rustc_hash::FxBuildHasher);
         let mut sira = Vec::new();
         for (i, c) in ISA_CANDIDATES.iter().enumerate() {
             let i = u16::try_from(i).expect("aday sayısı u16'ya sığar");

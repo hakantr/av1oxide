@@ -934,18 +934,16 @@ fn decode_grid_tiles_into_canvas(
         ));
     }
 
-    let mut unique_ids = Vec::with_capacity(num_tiles);
+    let mut unique_set = crate::avif::boxes::FxIndexSet::with_capacity_and_hasher(
+        num_tiles,
+        rustc_hash::FxBuildHasher,
+    );
     let mut tile_to_unique = Vec::with_capacity(num_tiles);
-    let mut id_map =
-        std::collections::HashMap::with_capacity_and_hasher(num_tiles, rustc_hash::FxBuildHasher);
     for &tid in tile_ids {
-        let u_idx = *id_map.entry(tid).or_insert_with(|| {
-            let idx = unique_ids.len();
-            unique_ids.push(tid);
-            idx
-        });
+        let (u_idx, _) = unique_set.insert_full(tid);
         tile_to_unique.push(u_idx);
     }
+    let unique_ids: Vec<u32> = unique_set.into_iter().collect();
     let num_unique = unique_ids.len();
 
     let total_threads = if config.n_threads == 0 {
