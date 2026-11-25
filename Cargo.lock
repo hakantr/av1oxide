@@ -18,7 +18,6 @@ dependencies = [
  "memchr",
  "parking_lot",
  "rustc-hash",
- "smallvec",
 ]
 
 [[package]]

@@ -992,18 +992,18 @@ impl Decoder {
         // Referans yuvası grain'siz kareyi saklar
         // (`src/lib.c:311-330`).
         let entry = Arc::new(RefFrame::from_decoded(decoded, header.clone(), mc_identity));
-        let mut evicted: smallvec::SmallVec<[Arc<RefFrame>; 8]> = smallvec::SmallVec::new();
+        let mut evicted: [Option<Arc<RefFrame>>; 8] = [const { None }; 8];
         for (slot, reference) in self.pixel_refs.iter_mut().enumerate() {
             if header.refresh_frame_flags & (1 << slot) != 0
                 && let Some(old) = reference.replace(Arc::clone(&entry))
             {
-                evicted.push(old);
+                evicted[slot] = Some(old);
             }
         }
         if let Ok(rf) = Arc::try_unwrap(entry) {
             self.pool.buf_pool().recycle_ref_frame(rf, has_limit);
         }
-        for old in evicted {
+        for old in evicted.into_iter().flatten() {
             if let Ok(rf) = Arc::try_unwrap(old) {
                 self.pool.buf_pool().recycle_ref_frame(rf, has_limit);
             }
@@ -1446,14 +1446,13 @@ impl Decoder {
                         self.decoded_frames += 1;
                         self.last_tools = Some(completed.decoded_tools);
                         self.decoded_tools.push(completed.decoded_tools);
-                        let mut evicted: smallvec::SmallVec<[Arc<RefFrame>; 8]> =
-                            smallvec::SmallVec::new();
+                        let mut evicted: [Option<Arc<RefFrame>>; 8] = [const { None }; 8];
                         for (slot, reference) in self.pixel_refs.iter_mut().enumerate() {
                             if task.refresh_frame_flags & (1 << slot) != 0
                                 && let Some(old) =
                                     reference.replace(Arc::clone(&completed.ref_frame))
                             {
-                                evicted.push(old);
+                                evicted[slot] = Some(old);
                             }
                         }
                         if task.refresh_frame_flags == 0 {
@@ -1462,7 +1461,7 @@ impl Decoder {
                         if let Ok(rf) = Arc::try_unwrap(completed.ref_frame) {
                             self.pool.buf_pool().recycle_ref_frame(rf, has_limit);
                         }
-                        for old in evicted {
+                        for old in evicted.into_iter().flatten() {
                             if let Ok(rf) = Arc::try_unwrap(old) {
                                 self.pool.buf_pool().recycle_ref_frame(rf, has_limit);
                             }

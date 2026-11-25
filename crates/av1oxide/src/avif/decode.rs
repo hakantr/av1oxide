@@ -47,7 +47,7 @@ enum AlphaSource {
     /// Renk `grid` öğesinin her bir karosuna ayrı `auxl` ile bağlı alfa karolarından oluşan sentetik ızgara.
     GridTiles {
         grid_item_id: u32,
-        alpha_tile_ids: smallvec::SmallVec<[u32; 8]>,
+        alpha_tile_ids: Vec<u32>,
     },
 }
 
@@ -346,8 +346,7 @@ fn find_alpha_source(
         if tile_ids.is_empty() {
             return Ok(None);
         }
-        let mut alpha_tiles: smallvec::SmallVec<[u32; 8]> =
-            smallvec::SmallVec::with_capacity(tile_ids.len());
+        let mut alpha_tiles: Vec<u32> = Vec::with_capacity(tile_ids.len());
         for &tid in &tile_ids {
             if let Some(aid) = find_direct_alpha_item(container, tid)? {
                 alpha_tiles.push(aid);
@@ -936,10 +935,8 @@ fn decode_grid_tiles_into_canvas(
     }
 
     let has_dups = is_alpha && (1..tile_ids.len()).any(|i| tile_ids[..i].contains(&tile_ids[i]));
-    let mut unique_ids: smallvec::SmallVec<[u32; 16]> =
-        smallvec::SmallVec::with_capacity(num_tiles);
-    let mut tile_to_unique: smallvec::SmallVec<[usize; 16]> =
-        smallvec::SmallVec::with_capacity(num_tiles);
+    let mut unique_ids: Vec<u32> = Vec::with_capacity(num_tiles);
+    let mut tile_to_unique: Vec<usize> = Vec::with_capacity(num_tiles);
     if has_dups {
         let mut unique_set = crate::avif::boxes::FxIndexSet::with_capacity_and_hasher(
             num_tiles,

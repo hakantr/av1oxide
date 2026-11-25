@@ -21,7 +21,6 @@ indexmap = { version = "2", default-features = false }
 memchr = { version = "2", default-features = false }
 parking_lot = { version = "0.12", default-features = false }
 rustc-hash = { version = "2", default-features = false }
-smallvec = { version = "1", default-features = false }
 
 [workspace.lints.cargo]
 unused_dependencies = "deny"

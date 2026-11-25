@@ -7,7 +7,6 @@ use std::borrow::Cow;
 use std::io::Read;
 
 use flate2::read::{DeflateDecoder, GzDecoder, ZlibDecoder};
-use smallvec::SmallVec;
 
 use crate::avif::image::{
     CleanAperture, ColorInfo, ContentLightLevel, MasteringDisplay, PixelAspectRatio,
@@ -44,7 +43,7 @@ pub(crate) struct Av1CProperty {
     pub(crate) chroma_subsampling_x: u8,
     pub(crate) chroma_subsampling_y: u8,
     pub(crate) chroma_sample_position: u8,
-    pub(crate) config_obus: SmallVec<[u8; 32]>,
+    pub(crate) config_obus: Vec<u8>,
 }
 
 /// `ipco` kutusu içindeki tekil özellik girişi.
@@ -53,7 +52,7 @@ pub(crate) enum ItemProperty {
     /// `ispe`: görüntü genişliği ve yüksekliği.
     Ispe { width: u32, height: u32 },
     /// `pixi`: kanal başına bit derinlikleri.
-    Pixi { bits_per_channel: SmallVec<[u8; 4]> },
+    Pixi { bits_per_channel: Vec<u8> },
     /// `av1C`: AV1 codec yapılandırma kaydı.
     Av1C(Av1CProperty),
     /// `colr` (`nclx`): CICP / H.273 renk tanımlayıcıları.
@@ -77,10 +76,7 @@ pub(crate) enum ItemProperty {
     /// `lsel`: AV1 uzamsal katman (`layer_id`) seçimi.
     Lsel(u16),
     /// `auxC`: yardımcı görüntü türü URN dizesi ve alt tür verisi.
-    AuxC {
-        aux_type: String,
-        subtype: SmallVec<[u8; 16]>,
-    },
+    AuxC { aux_type: String, subtype: Vec<u8> },
     /// `cmpC`: ISO/IEC 23008-12 sıkıştırma yapılandırma özelliği (`defl`, `zlib`, `gzip`).
     CmpC { compression_type: [u8; 4] },
     /// Tanınmayan özellik kutusu.
@@ -123,7 +119,7 @@ pub(crate) struct IlocItem {
     pub(crate) construction_method: u8,
     pub(crate) data_reference_index: u16,
     pub(crate) base_offset: u64,
-    pub(crate) extents: SmallVec<[IlocExtent; 2]>,
+    pub(crate) extents: Vec<IlocExtent>,
 }
 
 /// `iref` öğe referans kaydı.
@@ -131,7 +127,7 @@ pub(crate) struct IlocItem {
 pub(crate) struct ItemReference {
     pub(crate) ref_type: [u8; 4],
     pub(crate) from_item_id: u32,
-    pub(crate) to_item_ids: SmallVec<[u32; 4]>,
+    pub(crate) to_item_ids: Vec<u32>,
 }
 
 /// Ekleme sırasını koruyan deterministik `FxBuildHasher` tabanlı harita.
@@ -148,10 +144,10 @@ pub(crate) struct AvifContainer<'a> {
     pub(crate) major_brand: [u8; 4],
     pub(crate) primary_item_id: u32,
     pub(crate) items: FxIndexMap<u32, ItemInfoEntry>,
-    pub(crate) properties: SmallVec<[ItemProperty; 16]>,
-    pub(crate) associations: FxIndexMap<u32, SmallVec<[PropertyAssoc; 8]>>,
+    pub(crate) properties: Vec<ItemProperty>,
+    pub(crate) associations: FxIndexMap<u32, Vec<PropertyAssoc>>,
     pub(crate) locations: FxIndexMap<u32, IlocItem>,
-    pub(crate) references: SmallVec<[ItemReference; 8]>,
+    pub(crate) references: Vec<ItemReference>,
     pub(crate) idat: Cow<'a, [u8]>,
 }
 
@@ -475,12 +471,12 @@ pub(crate) fn parse_container(data: &[u8]) -> Result<AvifContainer<'_>> {
     let mut primary_item_id: Option<u32> = None;
     let mut items: FxIndexMap<u32, ItemInfoEntry> =
         FxIndexMap::with_hasher(rustc_hash::FxBuildHasher);
-    let mut properties: SmallVec<[ItemProperty; 16]> = SmallVec::new();
-    let mut associations: FxIndexMap<u32, SmallVec<[PropertyAssoc; 8]>> =
+    let mut properties: Vec<ItemProperty> = Vec::new();
+    let mut associations: FxIndexMap<u32, Vec<PropertyAssoc>> =
         FxIndexMap::with_hasher(rustc_hash::FxBuildHasher);
     let mut locations: FxIndexMap<u32, IlocItem> =
         FxIndexMap::with_hasher(rustc_hash::FxBuildHasher);
-    let mut references: SmallVec<[ItemReference; 8]> = SmallVec::new();
+    let mut references: Vec<ItemReference> = Vec::new();
     let mut idat: Cow<'_, [u8]> = Cow::Borrowed(&[]);
     let mut has_hdlr = false;
 
@@ -647,8 +643,8 @@ fn parse_infe(payload: &[u8]) -> Result<ItemInfoEntry> {
 
 fn parse_iprp(
     payload: &[u8],
-    properties: &mut SmallVec<[ItemProperty; 16]>,
-    associations: &mut FxIndexMap<u32, SmallVec<[PropertyAssoc; 8]>>,
+    properties: &mut Vec<ItemProperty>,
+    associations: &mut FxIndexMap<u32, Vec<PropertyAssoc>>,
 ) -> Result<()> {
     let mut offset = 0usize;
     let mut seen_ipco = false;
@@ -671,7 +667,7 @@ fn parse_iprp(
     Ok(())
 }
 
-fn parse_ipco(payload: &[u8], properties: &mut SmallVec<[ItemProperty; 16]>) -> Result<()> {
+fn parse_ipco(payload: &[u8], properties: &mut Vec<ItemProperty>) -> Result<()> {
     let mut offset = 0usize;
     while let Some(prop_box) = read_box_header(payload, offset)? {
         offset = prop_box.next_offset;
@@ -695,7 +691,7 @@ fn parse_ipco(payload: &[u8], properties: &mut SmallVec<[ItemProperty; 16]>) -> 
                     return Err(Error::InvalidData("kesik pixi kanal listesi"));
                 }
                 ItemProperty::Pixi {
-                    bits_per_channel: SmallVec::from_slice(&body[1..1 + num_channels]),
+                    bits_per_channel: body[1..1 + num_channels].to_vec(),
                 }
             }
             b"av1C" => {
@@ -717,7 +713,7 @@ fn parse_ipco(payload: &[u8], properties: &mut SmallVec<[ItemProperty; 16]>) -> 
                 let chroma_subsampling_x = (b2 >> 3) & 0x01;
                 let chroma_subsampling_y = (b2 >> 2) & 0x01;
                 let chroma_sample_position = b2 & 0x03;
-                let config_obus = SmallVec::from_slice(&prop_box.payload[4..]);
+                let config_obus = prop_box.payload[4..].to_vec();
                 ItemProperty::Av1C(Av1CProperty {
                     seq_profile,
                     seq_level_idx_0,
@@ -873,7 +869,7 @@ fn parse_ipco(payload: &[u8], properties: &mut SmallVec<[ItemProperty; 16]>) -> 
                     return Err(Error::Unsupported("auxC sürümü 0 dışında desteklenmiyor"));
                 }
                 let (aux_type, next_pos) = read_cstring(body, 0)?;
-                let subtype = SmallVec::from_slice(body.get(next_pos..).unwrap_or(&[]));
+                let subtype = body.get(next_pos..).unwrap_or(&[]).to_vec();
                 ItemProperty::AuxC { aux_type, subtype }
             }
             b"cmpC" => {
@@ -893,7 +889,7 @@ fn parse_ipco(payload: &[u8], properties: &mut SmallVec<[ItemProperty; 16]>) -> 
 
 fn parse_ipma(
     payload: &[u8],
-    associations: &mut FxIndexMap<u32, SmallVec<[PropertyAssoc; 8]>>,
+    associations: &mut FxIndexMap<u32, Vec<PropertyAssoc>>,
 ) -> Result<()> {
     let (ver, flags, body) = read_full_box(payload)?;
     if ver > 1 {
@@ -920,7 +916,7 @@ fn parse_ipma(
             as usize;
         pos += 1;
 
-        let mut list: SmallVec<[PropertyAssoc; 8]> = SmallVec::with_capacity(assoc_count);
+        let mut list: Vec<PropertyAssoc> = Vec::with_capacity(assoc_count);
         for _ in 0..assoc_count {
             if large_index {
                 let raw =
@@ -1018,7 +1014,7 @@ fn parse_iloc(payload: &[u8], locations: &mut FxIndexMap<u32, IlocItem>) -> Resu
             read_u16_be(body, pos).ok_or(Error::InvalidData("kesik iloc extent_count"))? as usize;
         pos += 2;
 
-        let mut extents: SmallVec<[IlocExtent; 2]> = SmallVec::with_capacity(extent_count);
+        let mut extents: Vec<IlocExtent> = Vec::with_capacity(extent_count);
         for _ in 0..extent_count {
             let extent_index = if (ver == 1 || ver == 2) && index_size > 0 {
                 let idx = read_uint_n(body, pos, index_size)
@@ -1055,7 +1051,7 @@ fn parse_iloc(payload: &[u8], locations: &mut FxIndexMap<u32, IlocItem>) -> Resu
     Ok(())
 }
 
-fn parse_iref(payload: &[u8], references: &mut SmallVec<[ItemReference; 8]>) -> Result<()> {
+fn parse_iref(payload: &[u8], references: &mut Vec<ItemReference>) -> Result<()> {
     let (ver, _flags, body) = read_full_box(payload)?;
     if ver > 1 {
         return Err(Error::Unsupported("iref sürümü > 1 desteklenmiyor"));
@@ -1090,7 +1086,7 @@ fn parse_iref(payload: &[u8], references: &mut SmallVec<[ItemReference; 8]>) -> 
         } else {
             None
         };
-        let mut to_item_ids: SmallVec<[u32; 4]> = SmallVec::with_capacity(ref_count);
+        let mut to_item_ids: Vec<u32> = Vec::with_capacity(ref_count);
         for _ in 0..ref_count {
             let to_id = if ver == 0 {
                 let id = read_u16_be(rbody, pos)
@@ -1133,14 +1129,11 @@ impl<'a> AvifContainer<'a> {
     }
 
     /// Belirtilen `item_id` ile ilişkilendirilmiş özellikleri (`ipma` sırasıyla) döndürür.
-    pub(crate) fn item_properties(
-        &self,
-        item_id: u32,
-    ) -> Result<SmallVec<[(&ItemProperty, bool); 8]>> {
+    pub(crate) fn item_properties(&self, item_id: u32) -> Result<Vec<(&ItemProperty, bool)>> {
         let Some(assocs) = self.associations.get(&item_id) else {
-            return Ok(SmallVec::new());
+            return Ok(Vec::new());
         };
-        let mut out = SmallVec::with_capacity(assocs.len());
+        let mut out = Vec::with_capacity(assocs.len());
         for assoc in assocs {
             if assoc.property_index == 0 {
                 continue;
@@ -1178,12 +1171,8 @@ impl<'a> AvifContainer<'a> {
     }
 
     /// Belirtilen `from_item_id` ve `ref_type` için hedef öğe kimliklerini döndürür.
-    pub(crate) fn references_from(
-        &self,
-        from_item_id: u32,
-        ref_type: &[u8; 4],
-    ) -> SmallVec<[u32; 4]> {
-        let mut targets = SmallVec::new();
+    pub(crate) fn references_from(&self, from_item_id: u32, ref_type: &[u8; 4]) -> Vec<u32> {
+        let mut targets = Vec::new();
         for r in &self.references {
             if r.from_item_id == from_item_id && &r.ref_type == ref_type {
                 targets.extend_from_slice(&r.to_item_ids);
@@ -1193,8 +1182,8 @@ impl<'a> AvifContainer<'a> {
     }
 
     /// Belirtilen `to_item_id` ve `ref_type` için kaynak öğe kimliklerini döndürür.
-    pub(crate) fn references_to(&self, to_item_id: u32, ref_type: &[u8; 4]) -> SmallVec<[u32; 4]> {
-        let mut sources = SmallVec::new();
+    pub(crate) fn references_to(&self, to_item_id: u32, ref_type: &[u8; 4]) -> Vec<u32> {
+        let mut sources = Vec::new();
         for r in &self.references {
             if &r.ref_type == ref_type && r.to_item_ids.contains(&to_item_id) {
                 sources.push(r.from_item_id);

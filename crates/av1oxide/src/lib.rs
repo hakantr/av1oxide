@@ -114,7 +114,6 @@
 //! | `memchr` | `2` | `Unlicense OR MIT` | `BurntSushi/memchr` | `[]` | SIMD/SWAR NUL-dize ve OBU kuyruk baytı taraması (`avif::boxes`, `api::Decoder`) | Pure Rust (iç SIMD/işaretçi `unsafe`, `0` C kodu) |
 //! | `rustc-hash` | `2` | `Apache-2.0 OR MIT` | `rust-lang/rustc-hash` | `[]` | Deterministik tamsayı karması (`FxBuildHasher`, `avif`, `dsp`) | Safe Rust (`0` `unsafe` blok, `0` C kodu) |
 //! | `indexmap` | `2` | `Apache-2.0 OR MIT` | `indexmap-rs/indexmap` | `[]` | Ekleme sırasını koruyan $O(1)$ tekil tablo/küme motoru (`avif::boxes`, `avif::decode`, `dsp`) | Pure Rust (`indexmap` `#![forbid(unsafe_code)]` + Miri onaylı `hashbrown`, `0` C kodu) |
-//! | `smallvec` | `1` | `MIT OR Apache-2.0` | `smallvec/smallvec` | `[]` | Küçük ISOBMFF ve referans tahliye vektörlerinin stack üzerinde tutulması (`avif`, `api`) | Pure Rust (iç satır içi tampon `unsafe`, `0` C kodu) |
 //! | `flate2` | `1.1` | `MIT OR Apache-2.0` | `rust-lang/flate2-rs` | `["rust_backend"]` | Sınırlı `deflate`/`zlib`/`gzip` HEIF metaveri ve `cmin` açıcısı (`avif::boxes`) | Safe Rust (`miniz_oxide` `#![forbid(unsafe_code)]` arka ucu, `0` C kodu) |
 
 #![deny(unused_crate_dependencies)]
