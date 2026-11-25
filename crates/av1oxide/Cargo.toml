@@ -1,9 +1,9 @@
-# av1oxide — AV1 video çözücü kütüphanesi (v0.2.0)
+# av1oxide — AV1 video ve AVIF görüntü çözücü kütüphanesi (v0.3.0)
 # Sıfır dış bağımlılık: `[dependencies]` bilinçli olarak boştur.
 
 [package]
 name = "av1oxide"
-description = "100% stable-Rust AV1 video decoder reimplementing dav1d, with libdav1d-compatible C-ABI (8/10/12-bit, SIMD, multithreaded, zero dependencies)"
+description = "100% stable-Rust AV1 video and AVIF image decoder reimplementing dav1d, with libdav1d C-ABI (8/10/12-bit, SIMD, multithreaded, zero dependencies)"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -11,8 +11,8 @@ license.workspace = true
 repository.workspace = true
 documentation = "https://docs.rs/av1oxide"
 readme = "../../README.md"
-keywords = ["av1", "video", "decoder", "codec", "dav1d"]
-categories = ["multimedia::video", "multimedia::encoding"]
+keywords = ["av1", "avif", "video", "decoder", "dav1d"]
+categories = ["multimedia::video", "multimedia::images", "multimedia::encoding"]
 include = ["src/**", "examples/**", "include/**", "Cargo.toml", "LICENSE"]
 
 [lib]

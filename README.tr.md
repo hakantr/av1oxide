@@ -1,8 +1,8 @@
-# av1oxide (`v0.2.0`)
+# av1oxide (`v0.3.0`)
 
 [English](README.md) | **Türkçe**
 
-`av1oxide`, VideoLAN [`dav1d`](https://code.videolan.org/videolan/dav1d) (`1.5.4`) AV1 video çözücüsünün **%100 kararlı Rust** (`rustc 1.100.0`, Edition 2024), **sıfır çalışma zamanı dış bağımlılığı** ve **`libdav1d` (`7.0.0`) ikili uyumlu C-ABI katmanı** ile yeniden gerçekleştirimidir.
+`av1oxide`, VideoLAN [`dav1d`](https://code.videolan.org/videolan/dav1d) (`1.5.4`) AV1 video çözücüsünün **%100 kararlı Rust** (`rustc 1.100.0`, Edition 2024), **sıfır çalışma zamanı dış bağımlılığı**, **`libdav1d` (`7.0.0`) ikili uyumlu C-ABI katmanı** ve **saf Rust `.avif` görüntü çözücü katmanı** ile yeniden gerçekleştirimidir.
 
 - **Profiller ve Bit Derinlikleri:** Main (`0`), High (`1`), Professional (`2`); `8-bit`, `10-bit`, `12-bit`; `4:2:0`, `4:2:2`, `4:4:4` ve `Monochrome` (`4:0:0`).
 - **AV1 Hattı:** OBU ayrıştırma, Sequence/Frame Header, MSAC aritmetik entropi çözücü, ters dönüşümler (`ITX`), intra tahmin (`IPRED`, CfL, Palette), hareket telafisi (`MC`, Warp, Superres/Resize, IntraBC, `REFMVS`), halka içi filtreler (`LF`, `CDEF`, `LR` Wiener/SGR) ve Film Grain (`FG`) sentezi.
@@ -14,6 +14,7 @@
   - İkincil mimariler (`arm32`, `riscv64`, `loongarch64`, `powerpc64le`): `%100` güvenli skaler geri-düşüş
 - **Çok-Thread ve Bellek Bütçesi:** Kare içi (`Tile`, süperblok satırı, halka içi filtre) ve kareler arası (`FrameSlot`) paralellik (`Config::n_threads`, `Config::max_frame_delay`); tahsis öncesi piksel ve bellek tavanı (`Config::frame_size_limit`, `Config::allocation_limit`).
 - **`libdav1d` (`7.0.0`) Uyumlu C-ABI (`capi`):** 19 resmî `DAV1D_API` fonksiyonunun tamamını (`dav1d_open`, `dav1d_send_data`, `dav1d_get_picture`, `dav1d_apply_grain`, `dav1d_parse_sequence_header`, vb.) ve resmî `include/dav1d/*.h` C başlıklarını içerir.
+- **Sıfır Bağımlılıklı `.avif` Görüntü Okuyucu (`avif`):** `%100 #![forbid(unsafe_code)]` ISOBMFF/HEIF/MIAF/AVIF kapsayıcı ayrıştırıcısı; tekil `av01`, çok-thread `grid` karo birleştirme, `iden` türetilmiş görüntüler, yardımcı alfa (`auxl`/`auxC`) kanalı, `clap`/`irot`/`imir` dönüşümleri, `ICC`/`Exif`/`XMP` metaverisi ve ITU-T H.273 renk dönüşümleri (`RGB8`/`RGBA8`/`RGB16`/`RGBA16`).
 
 ---
 
@@ -23,7 +24,7 @@
 
 ```toml
 [dependencies]
-av1oxide = "0.2"
+av1oxide = "0.3"
 ```
 
 Kütüphane API belgelerini (`rustdoc`) yerel olarak üretmek için:
@@ -169,9 +170,44 @@ int decode_obu_c(const uint8_t *obu_buf, size_t obu_len) {
 }
 ```
 
-### 4. Çalıştırılabilir Örnekler (`examples/`)
+### 4. `.avif` Görüntü Çözme (`av1oxide::avif`)
 
-Depoda doğrudan çalıştırılabilen dört kullanım örneği bulunur:
+```rust
+use av1oxide::Result;
+use av1oxide::avif::{AvifDecodeConfig, decode_rgba8, decode_with, parse_info, probe};
+
+fn avif_coz(avif_baytlari: &[u8]) -> Result<()> {
+    if !probe(avif_baytlari) {
+        return Ok(());
+    }
+
+    // Piksel çözmeden görüntü boyutlarını, renk tanımlayıcılarını, alfa ve metaveriyi incele.
+    let info = parse_info(avif_baytlari)?;
+    println!(
+        "AVIF başlığı: {}x{}, {:?}, {:?}, alfa={}",
+        info.width, info.height, info.bit_depth, info.chroma_format, info.has_alpha
+    );
+
+    // Doğrudan sıkı paketlenmiş 8-bit RGBA ([R, G, B, A, ...]) tamponuna çöz.
+    let rgba = decode_rgba8(avif_baytlari)?;
+    assert_eq!(rgba.pixels.len(), (rgba.width as usize) * (rgba.height as usize) * 4);
+
+    // Veya açık iş parçacığı ve bellek bütçesiyle 8/10/12-bit düzlemsel örneklere çöz.
+    let cfg = AvifDecodeConfig {
+        n_threads: 4,
+        max_pixels: 8192 * 8192,
+        allocation_limit: Some(256 * 1024 * 1024),
+        ..AvifDecodeConfig::default()
+    };
+    let planar = decode_with(avif_baytlari, &cfg)?;
+    let _rgb16 = planar.to_rgb16()?;
+    Ok(())
+}
+```
+
+### 5. Çalıştırılabilir Örnekler (`examples/`)
+
+Depoda doğrudan çalıştırılabilen beş kullanım örneği bulunur:
 
 - **[`examples/decode_obu.rs`](crates/av1oxide/examples/decode_obu.rs):** Ham AV1 OBU paketlerini zaman damgasıyla (`Packet::with_timestamp`) çözme, kare metaverisini ve düzlem satırlarını okuma:
   ```bash
@@ -190,6 +226,11 @@ Depoda doğrudan çalıştırılabilen dört kullanım örneği bulunur:
 - **[`examples/c_abi_decode.rs`](crates/av1oxide/examples/c_abi_decode.rs):** `libdav1d` (`7.0.0`) C-ABI üzerinden uçtan uca çözme (`dav1d_default_settings` → `dav1d_open` → `dav1d_data_create` → `dav1d_send_data` → `dav1d_get_picture` → `dav1d_picture_unref` → `dav1d_close`):
   ```bash
   cargo run --release -p av1oxide --example c_abi_decode
+  ```
+- **[`examples/decode_avif.rs`](crates/av1oxide/examples/decode_avif.rs):** `avif::parse_info` ile `.avif` başlıklarını inceleme ve `avif::decode` / `avif::decode_rgba8` ile düzlemsel ve 8-bit RGBA pikselleri çözme:
+  ```bash
+  cargo run --release -p av1oxide --example decode_avif
+  cargo run --release -p av1oxide --example decode_avif -- <girdi.avif>
   ```
 
 ---

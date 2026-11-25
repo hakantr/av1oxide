@@ -1,4 +1,4 @@
-//! # av1oxide — %100 Kararlı Rust AV1 Video Çözücüsü (`v0.2.0`)
+//! # av1oxide — %100 Kararlı Rust AV1 Video ve AVIF Görüntü Çözücüsü (`v0.3.0`)
 //!
 //! `av1oxide`, VideoLAN [`dav1d`](https://code.videolan.org/videolan/dav1d) (`1.5.4`)
 //! AV1 video çözücüsünün **%100 kararlı Rust** (`rustc 1.100.0`, Edition 2024) ve
@@ -29,6 +29,10 @@
 //!   ile ikili uyumlu 19 C fonksiyonu (`dav1d_open`, `dav1d_send_data`, `dav1d_get_picture`,
 //!   `dav1d_apply_grain`, `dav1d_parse_sequence_header`, vb.); `--features capi` ile
 //!   doğrudan `cdylib` (`.so`/`.dylib`/`.dll`) veya `staticlib` (`.a`) olarak derlenebilir.
+//! - **Sıfır Bağımlılıklı `.avif` Görüntü Okuyucu Katmanı ([`avif`]):** `%100 #![forbid(unsafe_code)]`
+//!   ISOBMFF/HEIF/MIAF/AVIF kutu ayrıştırıcısı, tekil `av01`, `grid` karo birleştirme, `iden`,
+//!   yardımcı alfa (`auxl`/`auxC`) kanalı, `clap`/`irot`/`imir` dönüşümleri, `ICC`/`Exif`/`XMP`
+//!   metaverisi ve ITU-T H.273 renk dönüşümleri (`RGB8`/`RGBA8`/`RGB16`/`RGBA16`).
 //!
 //! ## Hızlı Başlangıç Örneği
 //!
@@ -69,6 +73,7 @@
 //! | Modül | İçerik |
 //! |---|---|
 //! | [`api`] | [`Config`], [`Packet`], [`Decoder`] ve [`DecoderState`] durum makinesi |
+//! | [`avif`] | `.avif` (ISOBMFF/HEIF/MIAF) okuyucu, `grid` karo birleştirme ve RGB/RGBA dönüşümleri |
 //! | [`capi`] | `libdav1d` (`7.0.0`) uyumlu C-ABI fonksiyonları ve `#[repr(C)]` yapıları |
 //! | [`frame`] | [`Frame`], [`FramePlane`], [`PlaneLayout`], [`PlaneType`], [`BitDepth`], [`ChromaFormat`] |
 //! | [`error`] | [`Error`], [`Result`], [`SizeStage`] |
@@ -83,11 +88,12 @@
 //!
 //! ## Kapsam ve Güvenlik Modeli
 //!
-//! - Çözücü çekirdeği **yalnızca** AV1 bit akışı → YUV düzlemleri + metaveri üretir; kapsayıcı
-//!   (IVF/MP4/Matroska/AVIF) ayrıştırma, YUV→RGB dönüşümü, GPU yüklemesi ve AV1 kodlama
-//!   bu kütüphanenin kapsamı dışındadır.
+//! - Çözücü çekirdeği ([`api`]) AV1 bit akışı → YUV düzlemleri + metaveri üretir; [`avif`]
+//!   modülü ise `.avif` görüntü kapsayıcısı ayrıştırma ve H.273 RGB/RGBA dönüşümünü sağlar.
+//!   Video akış kapsayıcıları (IVF/MP4/Matroska), GPU yüklemesi ve AV1 kodlama bu kütüphanenin
+//!   kapsamı dışındadır.
 //! - Üretim kaynaklarında haricî `.asm` / `.S` veya satır içi `asm!` / `global_asm!` kullanılmaz.
-//! - `crates/av1oxide/src` altındaki `198` kaynak dosyadan `109`'u `#![forbid(unsafe_code)]`
+//! - `crates/av1oxide/src` altındaki `203` kaynak dosyadan `114`'ü `#![forbid(unsafe_code)]`
 //!   taşır; yalnız [`audit::UNSAFE_EXEMPTIONS`] içindeki `88` `x86_64`/`aarch64` SIMD dosyası
 //!   ve `1` C-ABI sınır dosyası (`capi/ffi.rs`) dar kapsamlı işlemler için muaf tutulur
 //!   (`0` güvensiz işlev imzası, `389` blok).
@@ -96,6 +102,7 @@
 
 pub mod api;
 pub mod audit;
+pub mod avif;
 pub mod bitstream;
 pub mod capi;
 pub mod cpu;

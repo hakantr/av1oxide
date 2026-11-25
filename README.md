@@ -1,8 +1,8 @@
-# av1oxide (`v0.2.0`)
+# av1oxide (`v0.3.0`)
 
 **English** | [Türkçe](README.tr.md)
 
-`av1oxide` is a **100% stable-Rust** (`rustc 1.100.0`, Edition 2024) reimplementation of the VideoLAN [`dav1d`](https://code.videolan.org/videolan/dav1d) (`1.5.4`) AV1 video decoder with **zero runtime external dependencies** and a **`libdav1d` (`7.0.0`) binary-compatible C-ABI layer**.
+`av1oxide` is a **100% stable-Rust** (`rustc 1.100.0`, Edition 2024) reimplementation of the VideoLAN [`dav1d`](https://code.videolan.org/videolan/dav1d) (`1.5.4`) AV1 video decoder with **zero runtime external dependencies**, a **`libdav1d` (`7.0.0`) binary-compatible C-ABI layer**, and a **pure-Rust `.avif` image decoder layer**.
 
 - **Profiles & Bit Depths:** Main (`0`), High (`1`), Professional (`2`); `8-bit`, `10-bit`, `12-bit`; `4:2:0`, `4:2:2`, `4:4:4`, and `Monochrome` (`4:0:0`).
 - **AV1 Pipeline:** OBU parsing, Sequence/Frame Headers, MSAC arithmetic entropy decoder, inverse transforms (`ITX`), intra prediction (`IPRED`, CfL, Palette), motion compensation (`MC`, Warp, Superres/Resize, IntraBC, `REFMVS`), in-loop filters (`LF`, `CDEF`, `LR` Wiener/SGR), and Film Grain (`FG`) synthesis.
@@ -14,6 +14,7 @@
   - Secondary architectures (`arm32`, `riscv64`, `loongarch64`, `powerpc64le`): `100%` safe bit-exact scalar fallback
 - **Multithreading & Memory Budgets:** Intra-frame (`Tile`, superblock row, in-loop filter) and inter-frame (`FrameSlot`) parallelism (`Config::n_threads`, `Config::max_frame_delay`); pre-allocation pixel and memory limits (`Config::frame_size_limit`, `Config::allocation_limit`).
 - **`libdav1d` (`7.0.0`) Compatible C-ABI (`capi`):** Implements all 19 official `DAV1D_API` functions (`dav1d_open`, `dav1d_send_data`, `dav1d_get_picture`, `dav1d_apply_grain`, `dav1d_parse_sequence_header`, etc.) and ships the official `include/dav1d/*.h` C headers.
+- **Zero-Dependency `.avif` Image Reader (`avif`):** `100% #![forbid(unsafe_code)]` ISOBMFF/HEIF/MIAF/AVIF container parser supporting single `av01` items, multithreaded `grid` tile stitching, `iden` derived chains, auxiliary alpha (`auxl`/`auxC`), `clap`/`irot`/`imir` transforms, `ICC`/`Exif`/`XMP` metadata, and ITU-T H.273 conversions (`RGB8`/`RGBA8`/`RGB16`/`RGBA16`).
 
 ---
 
@@ -23,7 +24,7 @@ Add `av1oxide` to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-av1oxide = "0.2"
+av1oxide = "0.3"
 ```
 
 To build and browse the local API documentation (`rustdoc`):
@@ -169,9 +170,44 @@ int decode_obu_c(const uint8_t *obu_buf, size_t obu_len) {
 }
 ```
 
-### 4. Runnable Examples (`examples/`)
+### 4. `.avif` Image Decoding (`av1oxide::avif`)
 
-Four standalone examples are included in the crate:
+```rust
+use av1oxide::Result;
+use av1oxide::avif::{AvifDecodeConfig, decode_rgba8, decode_with, parse_info, probe};
+
+fn read_avif(avif_bytes: &[u8]) -> Result<()> {
+    if !probe(avif_bytes) {
+        return Ok(());
+    }
+
+    // Inspect image dimensions, color descriptors, alpha, and metadata without decoding pixels.
+    let info = parse_info(avif_bytes)?;
+    println!(
+        "AVIF header: {}x{}, {:?}, {:?}, alpha={}",
+        info.width, info.height, info.bit_depth, info.chroma_format, info.has_alpha
+    );
+
+    // Decode directly to tightly packed 8-bit RGBA ([R, G, B, A, ...]).
+    let rgba = decode_rgba8(avif_bytes)?;
+    assert_eq!(rgba.pixels.len(), (rgba.width as usize) * (rgba.height as usize) * 4);
+
+    // Or decode with explicit thread and memory limits to planar 8/10/12-bit samples.
+    let cfg = AvifDecodeConfig {
+        n_threads: 4,
+        max_pixels: 8192 * 8192,
+        allocation_limit: Some(256 * 1024 * 1024),
+        ..AvifDecodeConfig::default()
+    };
+    let planar = decode_with(avif_bytes, &cfg)?;
+    let _rgb16 = planar.to_rgb16()?;
+    Ok(())
+}
+```
+
+### 5. Runnable Examples (`examples/`)
+
+Five standalone examples are included in the crate:
 
 - **[`examples/decode_obu.rs`](crates/av1oxide/examples/decode_obu.rs):** Decode raw AV1 OBU packets with timestamps (`Packet::with_timestamp`), inspect frame metadata, and read plane rows:
   ```bash
@@ -190,6 +226,11 @@ Four standalone examples are included in the crate:
 - **[`examples/c_abi_decode.rs`](crates/av1oxide/examples/c_abi_decode.rs):** End-to-end decoding through the `libdav1d` (`7.0.0`) C-ABI (`dav1d_default_settings` → `dav1d_open` → `dav1d_data_create` → `dav1d_send_data` → `dav1d_get_picture` → `dav1d_picture_unref` → `dav1d_close`):
   ```bash
   cargo run --release -p av1oxide --example c_abi_decode
+  ```
+- **[`examples/decode_avif.rs`](crates/av1oxide/examples/decode_avif.rs):** Inspect `.avif` headers via `avif::parse_info` and decode planar and 8-bit RGBA pixels via `avif::decode` / `avif::decode_rgba8`:
+  ```bash
+  cargo run --release -p av1oxide --example decode_avif
+  cargo run --release -p av1oxide --example decode_avif -- <input.avif>
   ```
 
 ---
