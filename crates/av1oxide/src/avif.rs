@@ -22,6 +22,6 @@ pub mod image;
 pub use boxes::probe;
 pub use decode::{decode, decode_rgb8, decode_rgba8, decode_with, parse_info};
 pub use image::{
-    AvifDecodeConfig, AvifImage, AvifInfo, CleanAperture, ColorInfo, ContentLightLevel,
+    AvifDecodeConfig, AvifImage, AvifInfo, AvifPlane, CleanAperture, ColorInfo, ContentLightLevel,
     MasteringDisplay, PixelAspectRatio, Rgb16Image, RgbImage, Rgba16Image, RgbaImage,
 };

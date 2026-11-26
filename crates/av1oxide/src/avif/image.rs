@@ -189,8 +189,123 @@ pub struct Rgba16Image {
     pub pixels: Vec<u16>,
 }
 
-/// Çözülmüş ve dönüşümleri (`clap`, `irot`, `imir`) uygulanmış düzlemsel AVIF görüntüsü.
+/// Bir AVIF düzleminin veya düzlem satırının bit derinliğine özgü doğal dilim görünümü.
+///
+/// `BitDepth::Eight` görüntülerde [`AvifPlane::U8`], `BitDepth::Ten` ve `BitDepth::Twelve`
+/// görüntülerde ise [`AvifPlane::U16`] varyantı döndürülür.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AvifPlane<'a> {
+    /// 8-bit doğal örnek dilimi (`1` bayt/örnek).
+    U8(&'a [u8]),
+    /// 10-bit veya 12-bit doğal örnek dilimi (`2` bayt/örnek).
+    U16(&'a [u16]),
+}
+
+impl<'a> AvifPlane<'a> {
+    /// Dilimdeki toplam örnek sayısı.
+    #[must_use]
+    pub const fn len(&self) -> usize {
+        match self {
+            Self::U8(s) => s.len(),
+            Self::U16(s) => s.len(),
+        }
+    }
+
+    /// Dilimin boş olup olmadığı.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Düzlem 8-bit ise ham `&[u8]` dilimini döndürür.
+    #[must_use]
+    pub const fn as_u8(self) -> Option<&'a [u8]> {
+        match self {
+            Self::U8(s) => Some(s),
+            Self::U16(_) => None,
+        }
+    }
+
+    /// Düzlem 10/12-bit ise ham `&[u16]` dilimini döndürür.
+    #[must_use]
+    pub const fn as_u16(self) -> Option<&'a [u16]> {
+        match self {
+            Self::U8(_) => None,
+            Self::U16(s) => Some(s),
+        }
+    }
+
+    /// Belirtilen indeksteki örneği `u16` olarak döndürür (sınır dışıysa `None`).
+    #[must_use]
+    pub fn get(&self, index: usize) -> Option<u16> {
+        match self {
+            Self::U8(s) => s.get(index).copied().map(u16::from),
+            Self::U16(s) => s.get(index).copied(),
+        }
+    }
+}
+
+/// Düzlem örneklerinin iç depolama biçimi (`8-bit` için `Vec<u8>`, `10/12-bit` için `Vec<u16>`).
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum PlaneStorage {
+    U8(Vec<u8>),
+    U16(Vec<u16>),
+}
+
+impl PlaneStorage {
+    #[inline]
+    pub(crate) const fn bytes_per_sample(bit_depth: BitDepth) -> usize {
+        match bit_depth {
+            BitDepth::Eight => 1,
+            BitDepth::Ten | BitDepth::Twelve => 2,
+        }
+    }
+
+    #[inline]
+    pub(crate) const fn empty_for(bit_depth: BitDepth) -> Self {
+        match bit_depth {
+            BitDepth::Eight => Self::U8(Vec::new()),
+            BitDepth::Ten | BitDepth::Twelve => Self::U16(Vec::new()),
+        }
+    }
+
+    #[inline]
+    pub(crate) fn as_plane(&self) -> AvifPlane<'_> {
+        match self {
+            Self::U8(v) => AvifPlane::U8(v),
+            Self::U16(v) => AvifPlane::U16(v),
+        }
+    }
+
+    #[inline]
+    pub(crate) fn as_u8(&self) -> Option<&[u8]> {
+        match self {
+            Self::U8(v) => Some(v),
+            Self::U16(_) => None,
+        }
+    }
+
+    #[inline]
+    pub(crate) fn as_u16(&self) -> Option<&[u16]> {
+        match self {
+            Self::U8(_) => None,
+            Self::U16(v) => Some(v),
+        }
+    }
+
+    #[inline]
+    pub(crate) fn row(&self, y: usize, width: usize) -> Option<AvifPlane<'_>> {
+        let start = y.checked_mul(width)?;
+        let end = start.checked_add(width)?;
+        match self {
+            Self::U8(v) => v.get(start..end).map(AvifPlane::U8),
+            Self::U16(v) => v.get(start..end).map(AvifPlane::U16),
+        }
+    }
+}
+
+/// Çözülmüş ve dönüşümleri (`clap`, `irot`, `imir`) uygulanmış düzlemsel AVIF görüntüsü.
+#[derive(Clone, Debug)]
 pub struct AvifImage {
     pub(crate) width: u32,
     pub(crate) height: u32,
@@ -198,10 +313,10 @@ pub struct AvifImage {
     pub(crate) chroma_height: u32,
     pub(crate) bit_depth: BitDepth,
     pub(crate) chroma_format: ChromaFormat,
-    pub(crate) y_plane: Vec<u16>,
-    pub(crate) u_plane: Vec<u16>,
-    pub(crate) v_plane: Vec<u16>,
-    pub(crate) alpha_plane: Option<Vec<u16>>,
+    pub(crate) y_plane: PlaneStorage,
+    pub(crate) u_plane: PlaneStorage,
+    pub(crate) v_plane: PlaneStorage,
+    pub(crate) alpha_plane: Option<PlaneStorage>,
     pub(crate) premultiplied_alpha: bool,
     pub(crate) color: ColorInfo,
     pub(crate) icc_profile: Option<Vec<u8>>,
@@ -210,7 +325,33 @@ pub struct AvifImage {
     pub(crate) clli: Option<ContentLightLevel>,
     pub(crate) mdcv: Option<MasteringDisplay>,
     pub(crate) pasp: Option<PixelAspectRatio>,
+    pub(crate) effective_threads: usize,
 }
+
+impl PartialEq for AvifImage {
+    fn eq(&self, other: &Self) -> bool {
+        self.width == other.width
+            && self.height == other.height
+            && self.chroma_width == other.chroma_width
+            && self.chroma_height == other.chroma_height
+            && self.bit_depth == other.bit_depth
+            && self.chroma_format == other.chroma_format
+            && self.y_plane == other.y_plane
+            && self.u_plane == other.u_plane
+            && self.v_plane == other.v_plane
+            && self.alpha_plane == other.alpha_plane
+            && self.premultiplied_alpha == other.premultiplied_alpha
+            && self.color == other.color
+            && self.icc_profile == other.icc_profile
+            && self.exif == other.exif
+            && self.xmp == other.xmp
+            && self.clli == other.clli
+            && self.mdcv == other.mdcv
+            && self.pasp == other.pasp
+    }
+}
+
+impl Eq for AvifImage {}
 
 impl AvifImage {
     /// Luma (ve alfa) düzleminin piksel cinsinden genişliği.
@@ -257,67 +398,163 @@ impl AvifImage {
         self.premultiplied_alpha
     }
 
-    /// Sıkı paketlenmiş (`width * height`) Y (veya Identity GBR kipinde G) düzlemi örnekleri.
+    /// Sıkı paketlenmiş (`width * height`) Y (veya Identity GBR kipinde G) düzlemi görünümü.
     #[must_use]
-    pub fn y_plane(&self) -> &[u16] {
-        &self.y_plane
+    pub fn y_plane(&self) -> AvifPlane<'_> {
+        self.y_plane.as_plane()
     }
 
-    /// Sıkı paketlenmiş (`chroma_width * chroma_height`) U (veya Identity GBR kipinde B) düzlemi örnekleri.
+    /// Sıkı paketlenmiş (`chroma_width * chroma_height`) U (veya Identity GBR kipinde B) düzlemi görünümü.
     #[must_use]
-    pub fn u_plane(&self) -> &[u16] {
-        &self.u_plane
+    pub fn u_plane(&self) -> AvifPlane<'_> {
+        self.u_plane.as_plane()
     }
 
-    /// Sıkı paketlenmiş (`chroma_width * chroma_height`) V (veya Identity GBR kipinde R) düzlemi örnekleri.
+    /// Sıkı paketlenmiş (`chroma_width * chroma_height`) V (veya Identity GBR kipinde R) düzlemi görünümü.
     #[must_use]
-    pub fn v_plane(&self) -> &[u16] {
-        &self.v_plane
+    pub fn v_plane(&self) -> AvifPlane<'_> {
+        self.v_plane.as_plane()
     }
 
-    /// Varsa sıkı paketlenmiş (`width * height`) alfa düzlemi örnekleri.
+    /// Varsa sıkı paketlenmiş (`width * height`) alfa düzlemi görünümü.
     #[must_use]
-    pub fn alpha_plane(&self) -> Option<&[u16]> {
-        self.alpha_plane.as_deref()
+    pub fn alpha_plane(&self) -> Option<AvifPlane<'_>> {
+        self.alpha_plane.as_ref().map(PlaneStorage::as_plane)
     }
 
-    /// Y düzleminin `y` indeksli satır dilimini döndürür.
+    /// Görüntü 8-bit ise sıkı paketlenmiş Y düzlemi `&[u8]` dilimini döndürür.
     #[must_use]
-    pub fn y_row(&self, y: usize) -> Option<&[u16]> {
-        let w = self.width as usize;
-        let start = y.checked_mul(w)?;
-        self.y_plane.get(start..start.checked_add(w)?)
+    pub fn y_plane_u8(&self) -> Option<&[u8]> {
+        self.y_plane.as_u8()
     }
 
-    /// U düzleminin `y` indeksli satır dilimini döndürür.
+    /// Görüntü 10/12-bit ise sıkı paketlenmiş Y düzlemi `&[u16]` dilimini döndürür.
     #[must_use]
-    pub fn u_row(&self, y: usize) -> Option<&[u16]> {
-        let cw = self.chroma_width as usize;
-        if cw == 0 {
+    pub fn y_plane_u16(&self) -> Option<&[u16]> {
+        self.y_plane.as_u16()
+    }
+
+    /// Görüntü 8-bit ise sıkı paketlenmiş U düzlemi `&[u8]` dilimini döndürür.
+    #[must_use]
+    pub fn u_plane_u8(&self) -> Option<&[u8]> {
+        self.u_plane.as_u8()
+    }
+
+    /// Görüntü 10/12-bit ise sıkı paketlenmiş U düzlemi `&[u16]` dilimini döndürür.
+    #[must_use]
+    pub fn u_plane_u16(&self) -> Option<&[u16]> {
+        self.u_plane.as_u16()
+    }
+
+    /// Görüntü 8-bit ise sıkı paketlenmiş V düzlemi `&[u8]` dilimini döndürür.
+    #[must_use]
+    pub fn v_plane_u8(&self) -> Option<&[u8]> {
+        self.v_plane.as_u8()
+    }
+
+    /// Görüntü 10/12-bit ise sıkı paketlenmiş V düzlemi `&[u16]` dilimini döndürür.
+    #[must_use]
+    pub fn v_plane_u16(&self) -> Option<&[u16]> {
+        self.v_plane.as_u16()
+    }
+
+    /// Görüntü 8-bit ve alfa düzlemli ise sıkı paketlenmiş alfa `&[u8]` dilimini döndürür.
+    #[must_use]
+    pub fn alpha_plane_u8(&self) -> Option<&[u8]> {
+        self.alpha_plane.as_ref().and_then(PlaneStorage::as_u8)
+    }
+
+    /// Görüntü 10/12-bit ve alfa düzlemli ise sıkı paketlenmiş alfa `&[u16]` dilimini döndürür.
+    #[must_use]
+    pub fn alpha_plane_u16(&self) -> Option<&[u16]> {
+        self.alpha_plane.as_ref().and_then(PlaneStorage::as_u16)
+    }
+
+    /// Y düzleminin `y` indeksli satır görünümünü döndürür.
+    #[must_use]
+    pub fn y_row(&self, y: usize) -> Option<AvifPlane<'_>> {
+        if y >= self.height as usize {
             return None;
         }
-        let start = y.checked_mul(cw)?;
-        self.u_plane.get(start..start.checked_add(cw)?)
+        self.y_plane.row(y, self.width as usize)
     }
 
-    /// V düzleminin `y` indeksli satır dilimini döndürür.
+    /// U düzleminin `y` indeksli satır görünümünü döndürür.
     #[must_use]
-    pub fn v_row(&self, y: usize) -> Option<&[u16]> {
+    pub fn u_row(&self, y: usize) -> Option<AvifPlane<'_>> {
         let cw = self.chroma_width as usize;
-        if cw == 0 {
+        if cw == 0 || y >= self.chroma_height as usize {
             return None;
         }
-        let start = y.checked_mul(cw)?;
-        self.v_plane.get(start..start.checked_add(cw)?)
+        self.u_plane.row(y, cw)
     }
 
-    /// Alfa düzleminin `y` indeksli satır dilimini döndürür.
+    /// V düzleminin `y` indeksli satır görünümünü döndürür.
     #[must_use]
-    pub fn alpha_row(&self, y: usize) -> Option<&[u16]> {
+    pub fn v_row(&self, y: usize) -> Option<AvifPlane<'_>> {
+        let cw = self.chroma_width as usize;
+        if cw == 0 || y >= self.chroma_height as usize {
+            return None;
+        }
+        self.v_plane.row(y, cw)
+    }
+
+    /// Alfa düzleminin `y` indeksli satır görünümünü döndürür.
+    #[must_use]
+    pub fn alpha_row(&self, y: usize) -> Option<AvifPlane<'_>> {
+        if y >= self.height as usize {
+            return None;
+        }
         let alpha = self.alpha_plane.as_ref()?;
-        let w = self.width as usize;
-        let start = y.checked_mul(w)?;
-        alpha.get(start..start.checked_add(w)?)
+        alpha.row(y, self.width as usize)
+    }
+
+    /// Görüntü 8-bit ise Y düzleminin `y` indeksli `&[u8]` satır dilimini döndürür.
+    #[must_use]
+    pub fn y_row_u8(&self, y: usize) -> Option<&[u8]> {
+        self.y_row(y).and_then(AvifPlane::as_u8)
+    }
+
+    /// Görüntü 10/12-bit ise Y düzleminin `y` indeksli `&[u16]` satır dilimini döndürür.
+    #[must_use]
+    pub fn y_row_u16(&self, y: usize) -> Option<&[u16]> {
+        self.y_row(y).and_then(AvifPlane::as_u16)
+    }
+
+    /// Görüntü 8-bit ise U düzleminin `y` indeksli `&[u8]` satır dilimini döndürür.
+    #[must_use]
+    pub fn u_row_u8(&self, y: usize) -> Option<&[u8]> {
+        self.u_row(y).and_then(AvifPlane::as_u8)
+    }
+
+    /// Görüntü 10/12-bit ise U düzleminin `y` indeksli `&[u16]` satır dilimini döndürür.
+    #[must_use]
+    pub fn u_row_u16(&self, y: usize) -> Option<&[u16]> {
+        self.u_row(y).and_then(AvifPlane::as_u16)
+    }
+
+    /// Görüntü 8-bit ise V düzleminin `y` indeksli `&[u8]` satır dilimini döndürür.
+    #[must_use]
+    pub fn v_row_u8(&self, y: usize) -> Option<&[u8]> {
+        self.v_row(y).and_then(AvifPlane::as_u8)
+    }
+
+    /// Görüntü 10/12-bit ise V düzleminin `y` indeksli `&[u16]` satır dilimini döndürür.
+    #[must_use]
+    pub fn v_row_u16(&self, y: usize) -> Option<&[u16]> {
+        self.v_row(y).and_then(AvifPlane::as_u16)
+    }
+
+    /// Görüntü 8-bit ve alfa düzlemli ise alfa düzleminin `y` indeksli `&[u8]` satır dilimini döndürür.
+    #[must_use]
+    pub fn alpha_row_u8(&self, y: usize) -> Option<&[u8]> {
+        self.alpha_row(y).and_then(AvifPlane::as_u8)
+    }
+
+    /// Görüntü 10/12-bit ve alfa düzlemli ise alfa düzleminin `y` indeksli `&[u16]` satır dilimini döndürür.
+    #[must_use]
+    pub fn alpha_row_u16(&self, y: usize) -> Option<&[u16]> {
+        self.alpha_row(y).and_then(AvifPlane::as_u16)
     }
 
     /// CICP / H.273 renk tanımlayıcıları.

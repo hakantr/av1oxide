@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use std::process::Command;
 
 use av1oxide::avif::{
-    AvifDecodeConfig, CleanAperture, ColorInfo, ContentLightLevel, MasteringDisplay,
+    AvifDecodeConfig, AvifPlane, CleanAperture, ColorInfo, ContentLightLevel, MasteringDisplay,
     PixelAspectRatio, decode, decode_rgb8, decode_rgba8, decode_with, parse_info, probe,
 };
 use av1oxide::{BitDepth, ChromaFormat, Error};
@@ -305,21 +305,27 @@ fn avif_single_item_metadata_and_color_matrices() {
 
     // Identity (matrix_coefficients == 0): R = V, G = Y, B = U
     let img = decode(&avif_file).expect("decode başarılı olmalı");
-    assert_eq!(img.y_plane(), &[190]);
-    let u0 = img.u_plane()[0];
-    let v0 = img.v_plane()[0];
+    assert_eq!(img.y_plane(), AvifPlane::U8(&[190]));
+    assert_eq!(img.y_plane_u8(), Some(&[190u8][..]));
+    assert_eq!(img.y_plane_u16(), None);
+    let u0 = img.u_plane_u8().unwrap()[0];
+    let v0 = img.v_plane_u8().unwrap()[0];
     assert_eq!(u0, 1);
     let rgb8 = img.to_rgb8().unwrap();
-    assert_eq!(rgb8.pixels, vec![v0 as u8, 190, u0 as u8]);
+    assert_eq!(rgb8.pixels, vec![v0, 190, u0]);
     let rgba8 = img.to_rgba8().unwrap();
-    assert_eq!(rgba8.pixels, vec![v0 as u8, 190, u0 as u8, 255]);
+    assert_eq!(rgba8.pixels, vec![v0, 190, u0, 255]);
     let rgb16 = img.to_rgb16().unwrap();
-    assert_eq!(rgb16.pixels, vec![v0, 190, u0]);
+    assert_eq!(rgb16.pixels, vec![u16::from(v0), 190, u16::from(u0)]);
     let rgba16 = img.to_rgba16().unwrap();
-    assert_eq!(rgba16.pixels, vec![v0, 190, u0, 255]);
-    assert_eq!(img.y_row(0), Some(&[190u16][..]));
-    assert_eq!(img.u_row(0), Some(&[u0][..]));
-    assert_eq!(img.v_row(0), Some(&[v0][..]));
+    assert_eq!(rgba16.pixels, vec![u16::from(v0), 190, u16::from(u0), 255]);
+    assert_eq!(img.y_row(0), Some(AvifPlane::U8(&[190u8][..])));
+    assert_eq!(img.y_row_u8(0), Some(&[190u8][..]));
+    assert_eq!(img.y_row_u16(0), None);
+    assert_eq!(img.u_row(0), Some(AvifPlane::U8(&[u0][..])));
+    assert_eq!(img.u_row_u8(0), Some(&[u0][..]));
+    assert_eq!(img.v_row(0), Some(AvifPlane::U8(&[v0][..])));
+    assert_eq!(img.v_row_u8(0), Some(&[v0][..]));
 }
 
 /// `2×2` `grid` karolu + yardımcı alfa (`auxl`/`auxC` + `prem`) kanallı `.avif` oluşturur.
@@ -500,10 +506,15 @@ fn avif_grid_2x2_single_and_multithread_parity_and_alpha() {
     assert!(img_t1.has_alpha());
     assert!(img_t1.premultiplied_alpha());
     // SAMPLE_1X1_AV1_OBU limited-range (color_range=0) Y=190 -> tam aralık alfa = 203
-    assert_eq!(img_t1.alpha_plane(), Some(&[203u16][..]));
-    assert_eq!(img_t1.alpha_row(0), Some(&[203u16][..]));
+    assert_eq!(img_t1.alpha_plane(), Some(AvifPlane::U8(&[203u8][..])));
+    assert_eq!(img_t1.alpha_plane_u8(), Some(&[203u8][..]));
+    assert_eq!(img_t1.alpha_plane_u16(), None);
+    assert_eq!(img_t1.alpha_row(0), Some(AvifPlane::U8(&[203u8][..])));
+    assert_eq!(img_t1.alpha_row_u8(0), Some(&[203u8][..]));
+    assert_eq!(img_t1.alpha_row_u16(0), None);
     let rgba = img_t1.to_rgba8().unwrap();
     assert_eq!(rgba.pixels[3], 203);
+    assert_eq!(rgba, img_t4.to_rgba8().unwrap());
 
     // 64x63 gerçek AV1 anahtar karesinden 2x2 grid (128x126 -> 120x110 kırpılmış tuval)
     let odd_obu = read_oddheight_keyframe_obu();
@@ -734,39 +745,39 @@ fn avif_transforms_clap_irot_imir_and_budget_rejection() {
     let rot90_img = decode(&rot90_avif).unwrap();
     assert_eq!((rot90_img.width(), rot90_img.height()), (base_h, base_w));
     assert_eq!(
-        rot90_img.y_row(0).unwrap()[0],
-        base_img.y_row(0).unwrap()[(base_w - 1) as usize]
+        rot90_img.y_row_u8(0).unwrap()[0],
+        base_img.y_row_u8(0).unwrap()[(base_w - 1) as usize]
     );
 
     // 2. irot = 2 (180° CCW): boyut (base_w, base_h), dst(0, 0) == src(base_w - 1, base_h - 1)
     let rot180_avif = build_transformed_avif(&odd_obu, base_w, base_h, None, Some(2), None, false);
     let rot180_img = decode(&rot180_avif).unwrap();
     assert_eq!(
-        rot180_img.y_row(0).unwrap()[0],
-        base_img.y_row((base_h - 1) as usize).unwrap()[(base_w - 1) as usize]
+        rot180_img.y_row_u8(0).unwrap()[0],
+        base_img.y_row_u8((base_h - 1) as usize).unwrap()[(base_w - 1) as usize]
     );
 
     // 3. irot = 3 (270° CCW): boyut (base_h, base_w), dst(0, 0) == src(0, base_h - 1)
     let rot270_avif = build_transformed_avif(&odd_obu, base_w, base_h, None, Some(3), None, false);
     let rot270_img = decode(&rot270_avif).unwrap();
     assert_eq!(
-        rot270_img.y_row(0).unwrap()[0],
-        base_img.y_row((base_h - 1) as usize).unwrap()[0]
+        rot270_img.y_row_u8(0).unwrap()[0],
+        base_img.y_row_u8((base_h - 1) as usize).unwrap()[0]
     );
 
     // 4. imir axis = 0 (üst-alt) ve axis = 1 (sol-sağ)
     let imir0_avif = build_transformed_avif(&odd_obu, base_w, base_h, None, None, Some(0), false);
     let imir0_img = decode(&imir0_avif).unwrap();
     assert_eq!(
-        imir0_img.y_row(0).unwrap()[0],
-        base_img.y_row((base_h - 1) as usize).unwrap()[0]
+        imir0_img.y_row_u8(0).unwrap()[0],
+        base_img.y_row_u8((base_h - 1) as usize).unwrap()[0]
     );
 
     let imir1_avif = build_transformed_avif(&odd_obu, base_w, base_h, None, None, Some(1), false);
     let imir1_img = decode(&imir1_avif).unwrap();
     assert_eq!(
-        imir1_img.y_row(0).unwrap()[0],
-        base_img.y_row(0).unwrap()[(base_w - 1) as usize]
+        imir1_img.y_row_u8(0).unwrap()[0],
+        base_img.y_row_u8(0).unwrap()[(base_w - 1) as usize]
     );
 
     // 5. clap kırpma (merkez 32x31 veya 1x1)

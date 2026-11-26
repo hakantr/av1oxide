@@ -157,18 +157,20 @@ fn main() {
 
     let img = decode(&avif_bytes).expect("AVIF düzlemsel görüntü çözülmeli");
     let rgba = decode_rgba8(&avif_bytes).expect("AVIF RGBA8 görüntü çözülmeli");
+    let first_y = img.y_plane().get(0).unwrap_or(0);
     println!(
         "Çözülen AVIF: {}x{}, Y[0]={}, RGBA[0..4]={:?}",
         rgba.width,
         rgba.height,
-        img.y_plane()[0],
+        first_y,
         &rgba.pixels[0..4]
     );
 
     if is_embedded {
         assert_eq!((info.width, info.height), (1, 1));
         assert_eq!(info.bit_depth, BitDepth::Eight);
-        assert_eq!(img.y_plane()[0], 190);
+        assert_eq!(img.y_plane_u8(), Some(&[190u8][..]));
+        assert_eq!(first_y, 190);
         assert_eq!(rgba.pixels.len(), 4);
         assert_eq!(rgba.pixels[3], 255);
     }
