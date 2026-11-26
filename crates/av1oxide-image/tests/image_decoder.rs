@@ -2,8 +2,11 @@
 
 #![forbid(unsafe_code)]
 
-use std::io::Cursor;
+use std::io::{self, Cursor, Read};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
+use av1oxide::avif::AvifDecodeConfig;
 use av1oxide_image::{AvifDecoder, decode_avif_bytes, register_decoding_hook};
 use image::error::{ImageError, LimitErrorKind};
 use image::{ColorType, DynamicImage, ImageDecoder, Limits};
@@ -359,4 +362,136 @@ fn real_10bit_and_12bit_avif_scale_to_full_u16_range_when_corpus_present() {
         tested += 1;
     }
     assert!(tested >= 1, "en az bir 10/12-bit AVIF test edilmeli");
+}
+
+#[derive(Debug)]
+struct CountingReader<R> {
+    inner: R,
+    bytes_read: Arc<AtomicUsize>,
+}
+
+impl<R: Read> Read for CountingReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        self.bytes_read.fetch_add(n, Ordering::Relaxed);
+        Ok(n)
+    }
+}
+
+#[test]
+fn allocation_limit_enforced_before_full_read_and_across_header_and_decode() {
+    let big_icc = vec![0x5Au8; 12 * 1024];
+    let mut big_exif = b"MM\x00\x2a\x00\x00\x00\x08".to_vec();
+    big_exif.resize(12 * 1024, 0xA5);
+    let avif = build_synthetic_avif(AV1_1X1_8BIT, None, 1, 1, 8, Some(&big_icc), Some(&big_exif));
+    assert!(avif.len() > 24 * 1024);
+
+    // 1. allocation_limit = 1 bayt: akış tamamen okunmadan en fazla limit + 1 = 2 baytta reddedilmeli.
+    let read_1 = Arc::new(AtomicUsize::new(0));
+    let err_1 = AvifDecoder::with_config(
+        CountingReader {
+            inner: Cursor::new(&avif),
+            bytes_read: Arc::clone(&read_1),
+        },
+        AvifDecodeConfig {
+            allocation_limit: Some(1),
+            ..AvifDecodeConfig::default()
+        },
+    )
+    .expect_err("allocation_limit=1 tam okumadan önce reddedilmeli");
+    assert!(matches!(
+        err_1,
+        ImageError::Limits(ref e) if e.kind() == LimitErrorKind::InsufficientMemory
+    ));
+    assert!(
+        read_1.load(Ordering::Relaxed) <= 2,
+        "en fazla limit+1 bayt okunmalıydı, okunan: {}",
+        read_1.load(Ordering::Relaxed)
+    );
+
+    // 2. allocation_limit = avif.len() - 1: tam ham dosya sınırı 1 bayt aşıldığında reddedilmeli.
+    let read_edge = Arc::new(AtomicUsize::new(0));
+    let err_edge = AvifDecoder::with_config(
+        CountingReader {
+            inner: Cursor::new(&avif),
+            bytes_read: Arc::clone(&read_edge),
+        },
+        AvifDecodeConfig {
+            allocation_limit: Some(avif.len() - 1),
+            ..AvifDecodeConfig::default()
+        },
+    )
+    .expect_err("avif.len() - 1 sınırı reddedilmeli");
+    assert!(matches!(
+        err_edge,
+        ImageError::Limits(ref e) if e.kind() == LimitErrorKind::InsufficientMemory
+    ));
+    assert_eq!(read_edge.load(Ordering::Relaxed), avif.len());
+
+    // 3. Ham dosya sığar ancak raw_bytes + ICC (12 KiB) + Exif (12 KiB) üst bilgi kopyaları sığmaz:
+    //    parse_info_with kalan bütçe (limit - raw_bytes.len()) üzerinden reddetmeli.
+    let err_hdr = AvifDecoder::with_config(
+        Cursor::new(&avif),
+        AvifDecodeConfig {
+            allocation_limit: Some(avif.len() + 1024),
+            ..AvifDecodeConfig::default()
+        },
+    )
+    .expect_err("raw_bytes + ICC/Exif üst bilgi tahsisleri bütçeyi aşmalı");
+    assert!(matches!(
+        err_hdr,
+        ImageError::Limits(ref e) if e.kind() == LimitErrorKind::InsufficientMemory
+    ));
+
+    // 4. set_limits(max_alloc) halihazırda bellekte tutulan raw_bytes + ICC + Exif toplamından
+    //    küçükse doğrudan InsufficientMemory döndürmeli.
+    let mut dec_limits = AvifDecoder::new(Cursor::new(&avif)).expect("sınırsız kurulum");
+    let mut lim = Limits::no_limits();
+    lim.max_alloc = Some(avif.len() as u64);
+    let err_lim = dec_limits
+        .set_limits(lim)
+        .expect_err("tutulan üst bilgi + ham bayt toplamı max_alloc'u aşmalı");
+    assert!(matches!(
+        err_lim,
+        ImageError::Limits(ref e) if e.kind() == LimitErrorKind::InsufficientMemory
+    ));
+
+    // 5. Yeterli bütçede uçtan uca çözümleme başarılı ve `decode_avif_bytes` ile birebir aynı olmalı.
+    let dec_ok = AvifDecoder::with_config(
+        Cursor::new(&avif),
+        AvifDecodeConfig {
+            allocation_limit: Some(512 * 1024),
+            ..AvifDecodeConfig::default()
+        },
+    )
+    .expect("yeterli bütçe ile decoder kurulmalı");
+    let img_ok = DynamicImage::from_decoder(dec_ok).expect("DynamicImage çözülmeli");
+    let ref_img = decode_avif_bytes(&avif).expect("decode_avif_bytes");
+    assert_eq!(img_ok.to_rgb8(), ref_img.to_rgb8());
+
+    // 6. Gerçek lisans-onaylı korpus dosyası (>21 KiB) mevcutsa allocation_limit=1 anında reddetmeli.
+    let fox_path = std::path::Path::new(
+        "/home/hakan/github/av1oxide_planlar/avif_dogrulama/kaynaklar/av1-avif/testFiles/Link-U/fox.profile0.10bpc.yuv420.avif",
+    );
+    if fox_path.exists() {
+        let fox_bytes = std::fs::read(fox_path).expect("fox avif okunmalı");
+        assert!(fox_bytes.len() > 21 * 1024);
+        let fox_read = Arc::new(AtomicUsize::new(0));
+        let fox_err = AvifDecoder::with_config(
+            CountingReader {
+                inner: Cursor::new(&fox_bytes),
+                bytes_read: Arc::clone(&fox_read),
+            },
+            AvifDecodeConfig {
+                allocation_limit: Some(1),
+                ..AvifDecodeConfig::default()
+            },
+        )
+        .expect_err("gerçek >21 KiB AVIF allocation_limit=1 ile okunmadan reddedilmeli");
+        assert!(matches!(
+            fox_err,
+            ImageError::Limits(ref e) if e.kind() == LimitErrorKind::InsufficientMemory
+        ));
+        assert!(fox_read.load(Ordering::Relaxed) <= 2);
+    }
 }

@@ -2,11 +2,13 @@
 
 #![forbid(unsafe_code)]
 
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use crate::avif::color;
 use crate::avif::gainmap::{GainMap, GainMapMetadata};
 use crate::error::Result;
+use crate::frame::butce::{Butce, ButceTutucu};
 use crate::frame::{BitDepth, ChromaFormat};
 
 /// AVIF çözme yapılandırması.
@@ -16,7 +18,15 @@ pub struct AvifDecodeConfig {
     pub n_threads: usize,
     /// Tahsis öncesi izin verilen en büyük piksel alanı (`genişlik × yükseklik`).
     pub max_pixels: u64,
-    /// İsteğe bağlı toplam bellek bütçesi üst sınırı (bayt).
+    /// İsteğe bağlı eşzamanlı toplam canlı bellek bütçesi üst sınırı (bayt).
+    ///
+    /// Bu tavan; kapsayıcı ve başlık ayrıştırma (`cmin`/`infe` sıkıştırma açma, `idat`,
+    /// `ICC`/`Exif`/`XMP`), eşzamanlı `grid` karo tamponları, renk/alfa/`gain_map` alt AV1
+    /// çözücüleri ve kütüphanenin ayırdığı düzlem/RGB çıktı vektörlerinin **eşzamanlı toplam
+    /// canlı belleğini** tek bir paylaşımlı bütçe defteri üzerinden sınırlar.
+    ///
+    /// Çağıranın kütüphane dışında ayırıp `&[u8]` girdi dilimi veya `&mut [u8]` çıktı dilimi
+    /// olarak geçirdiği dış tamponlar bu iç tahsis sayacına dâhil değildir.
     pub allocation_limit: Option<usize>,
     /// AV1 akışında bulunan Film Grain parametrelerinin uygulanıp uygulanmayacağı.
     pub apply_grain: bool,
@@ -341,6 +351,8 @@ pub struct AvifImage {
     pub(crate) gain_map_metadata: Option<GainMapMetadata>,
     pub(crate) gain_map: Option<GainMap>,
     pub(crate) effective_threads: usize,
+    pub(crate) butce: Option<Arc<Butce>>,
+    pub(crate) _butce_tutucu: Option<Arc<ButceTutucu>>,
 }
 
 impl PartialEq for AvifImage {

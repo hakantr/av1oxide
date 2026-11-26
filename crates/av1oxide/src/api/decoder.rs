@@ -277,6 +277,8 @@ pub struct Decoder {
     in_flight: VecDeque<InFlightEntry>,
     /// Kareler arası boru hattında paylaşılan atomik bütçe defteri.
     pipeline_butce: Arc<Butce>,
+    /// Varsa üst katmandan (ör. `avif`) enjekte edilen ortak bütçe defteri.
+    shared_butce: Option<Arc<Butce>>,
     /// `reset()` ve `drop()` için uçuş iptal bayrağı.
     cancel_flag: Arc<AtomicBool>,
     /// Başarıyla çözülen kare sayısı.
@@ -329,7 +331,11 @@ impl Clone for Decoder {
             pixel_refs: self.pixel_refs.clone(),
             slot_promises: [None, None, None, None, None, None, None, None],
             in_flight: VecDeque::new(),
-            pipeline_butce: Arc::new(Butce::yeni(self.config.allocation_limit, 0)),
+            pipeline_butce: match self.shared_butce {
+                Some(ref ust) => Arc::new(Butce::alt_defter(ust)),
+                None => Arc::new(Butce::yeni(self.config.allocation_limit, 0)),
+            },
+            shared_butce: self.shared_butce.clone(),
             cancel_flag: Arc::new(AtomicBool::new(false)),
             decoded_frames: self.decoded_frames,
             unsupported_frames: self.unsupported_frames,
@@ -455,10 +461,28 @@ impl Decoder {
     ///
     /// [`Error::InvalidArgument`]: bkz. [`Config::validate`].
     pub fn new(config: Config) -> Result<Self> {
+        Self::new_inner(config, None)
+    }
+
+    /// Dış katmanla (ör. `avif` kapsayıcı/karo/renk hattı) tek bir atomik `Arc<Butce>`
+    /// defterini paylaşan çözücü oluşturur.
+    pub(crate) fn new_with_shared_budget(
+        mut config: Config,
+        shared_butce: Arc<Butce>,
+    ) -> Result<Self> {
+        config.allocation_limit = shared_butce.sinir();
+        Self::new_inner(config, Some(shared_butce))
+    }
+
+    fn new_inner(config: Config, shared_butce: Option<Arc<Butce>>) -> Result<Self> {
         config.validate()?;
         let detected = CpuFlags::detect();
         let effective = detected.difference(config.cpu_mask);
         let pool = WorkerPool::new(config.effective_threads());
+        let pipeline_butce = match shared_butce {
+            Some(ref ust) => Arc::new(Butce::alt_defter(ust)),
+            None => Arc::new(Butce::yeni(config.allocation_limit, 0)),
+        };
         Ok(Self {
             config,
             state: DecoderState::Ready,
@@ -476,7 +500,8 @@ impl Decoder {
             pixel_refs: [None, None, None, None, None, None, None, None],
             slot_promises: [None, None, None, None, None, None, None, None],
             in_flight: VecDeque::new(),
-            pipeline_butce: Arc::new(Butce::yeni(config.allocation_limit, 0)),
+            pipeline_butce,
+            shared_butce,
             cancel_flag: Arc::new(AtomicBool::new(false)),
             decoded_frames: 0,
             unsupported_frames: 0,
@@ -525,10 +550,22 @@ impl Decoder {
 
     /// `ek` bayt daha canlıyken yeni bütçe defteri.
     fn butce_defteri(&self, ek: usize) -> Butce {
-        Butce::yeni(
-            self.config.allocation_limit,
-            self.kalici_bayt().saturating_add(ek),
-        )
+        if self.shared_butce.is_some() {
+            self.pipeline_butce.taban_guncelle(self.kalici_bayt());
+            Butce::alt_defter_tabanla(&self.pipeline_butce, ek)
+        } else {
+            Butce::yeni(
+                self.config.allocation_limit,
+                self.kalici_bayt().saturating_add(ek),
+            )
+        }
+    }
+
+    #[inline]
+    fn sync_shared_kalici(&self) {
+        if self.shared_butce.is_some() {
+            self.pipeline_butce.taban_guncelle(self.kalici_bayt());
+        }
     }
 
     /// Defterin tepesini çözücünün tepesine katar.
@@ -599,10 +636,19 @@ impl Decoder {
             strict: self.config.strict_std_compliance,
         };
         let mut offset = 0usize;
-        while let Some(obu) = split_next_with(data, &mut offset, opts.strict)? {
-            self.process_obu(&obu, opts)?;
-        }
-        Ok(())
+        let res = loop {
+            match split_next_with(data, &mut offset, opts.strict) {
+                Ok(Some(obu)) => {
+                    if let Err(err) = self.process_obu(&obu, opts) {
+                        break Err(err);
+                    }
+                }
+                Ok(None) => break Ok(()),
+                Err(err) => break Err(err),
+            }
+        };
+        self.sync_shared_kalici();
+        res
     }
 
     /// Tek OBU (dav1d `dav1d_parse_obus`, `src/obu.c:1169-1694`).
@@ -1976,7 +2022,7 @@ impl Decoder {
         loop {
             if let Some(entry) = self.outputs.pop_front() {
                 let capi_meta = self.output_capi_meta.pop_front().unwrap_or_default();
-                return match entry {
+                let out = match entry {
                     OutputEntry::Frame(frame) => {
                         let _ = self.output_errors.pop_front();
                         // Tanılama kuralı: sayaçlar **bu çıktı karesinin
@@ -1994,6 +2040,8 @@ impl Decoder {
                         Err(Error::Unsupported(reason))
                     }
                 };
+                self.sync_shared_kalici();
+                return out;
             }
             if !self.retire_front_in_flight(block)? {
                 return Ok(None);
@@ -2157,7 +2205,10 @@ impl Decoder {
                 self.pool.buf_pool().recycle_ref_frame(rf, has_limit);
             }
         }
-        self.pipeline_butce = Arc::new(Butce::yeni(self.config.allocation_limit, 0));
+        self.pipeline_butce = match self.shared_butce {
+            Some(ref ust) => Arc::new(Butce::alt_defter(ust)),
+            None => Arc::new(Butce::yeni(self.config.allocation_limit, 0)),
+        };
         self.decoded_frames = 0;
         self.unsupported_frames = 0;
         self.last_decode_error = None;

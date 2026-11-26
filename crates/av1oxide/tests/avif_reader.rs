@@ -9,7 +9,7 @@ use std::process::Command;
 use av1oxide::avif::{
     AvifDecodeConfig, AvifPlane, AvifSequenceDecoder, CleanAperture, ColorInfo, ContentLightLevel,
     LoopCount, MasteringDisplay, PixelAspectRatio, decode, decode_rgb8, decode_rgba8, decode_with,
-    parse_info, parse_sequence_info, probe,
+    parse_info, parse_info_with, parse_sequence_info, parse_sequence_info_with, probe,
 };
 use av1oxide::{BitDepth, ChromaFormat, Error};
 
@@ -1050,9 +1050,13 @@ fn avif_compressed_heif_metadata_cmin_and_security_limits() {
     assert_eq!(info2.xmp.as_deref(), Some(orig_xmp.as_slice()));
     assert_eq!(info2.exif.as_deref(), Some(&orig_exif_block[4..]));
 
-    // 3. Bölüm 10.3: Tam allocation_limit sınırında kabul (600_000 bayt) vs limit + 1 (600_001 bayt) reddi
-    let exact_limit = 600_000usize;
-    let payload_exact: Vec<u8> = (0..exact_limit)
+    // 3. Bölüm 10.3 + 5.A.1: Ortak Arc<Butce> altında canlı düzlemler (1x1 YUV420 = 3 bayt) +
+    //    Exif (27 bayt) + sıkıştırılmış XMP (600_000 bayt) toplamının tam sınırında kabul vs
+    //    limit - 1 / XMP + 1 reddi.
+    let exact_xmp_len = 600_000usize;
+    let live_planes_and_exif = 3usize + (orig_exif_block.len() - 4);
+    let exact_total_limit = exact_xmp_len + live_planes_and_exif;
+    let payload_exact: Vec<u8> = (0..exact_xmp_len)
         .map(|i| ((i.wrapping_mul(73) ^ (i >> 5)) & 0xFF) as u8)
         .collect();
     let mut enc_exact = ZlibEncoder::new(Vec::new(), Compression::fast());
@@ -1063,12 +1067,27 @@ fn avif_compressed_heif_metadata_cmin_and_security_limits() {
     let img_exact = decode_with(
         &avif_exact,
         &AvifDecodeConfig {
-            allocation_limit: Some(exact_limit),
+            allocation_limit: Some(exact_total_limit),
             ..AvifDecodeConfig::default()
         },
     )
-    .expect("tam allocation_limit sınırındaki sıkıştırılmış öğe kabul edilmeli");
+    .expect("tam canlı toplam allocation_limit sınırındaki sıkıştırılmış öğe kabul edilmeli");
     assert_eq!(img_exact.xmp(), Some(payload_exact.as_slice()));
+
+    let res_under_by_one = decode_with(
+        &avif_exact,
+        &AvifDecodeConfig {
+            allocation_limit: Some(exact_total_limit - 1),
+            ..AvifDecodeConfig::default()
+        },
+    );
+    assert_eq!(
+        res_under_by_one.unwrap_err(),
+        Error::BudgetExceeded {
+            requested: exact_total_limit,
+            limit: exact_total_limit - 1,
+        }
+    );
 
     let mut payload_plus_one = payload_exact;
     payload_plus_one.push(0x42);
@@ -1080,15 +1099,15 @@ fn avif_compressed_heif_metadata_cmin_and_security_limits() {
     let res_over = decode_with(
         &avif_over,
         &AvifDecodeConfig {
-            allocation_limit: Some(exact_limit),
+            allocation_limit: Some(exact_total_limit),
             ..AvifDecodeConfig::default()
         },
     );
     assert_eq!(
         res_over.unwrap_err(),
         Error::BudgetExceeded {
-            requested: exact_limit + 1,
-            limit: exact_limit,
+            requested: exact_total_limit + 1,
+            limit: exact_total_limit,
         }
     );
 
@@ -1691,4 +1710,251 @@ fn avif_sequence_avis_streaming_alpha_loop_and_seek() {
     assert_eq!(sf.index, 0);
     assert_eq!(sf.image.y_plane_u8(), Some(&[190u8][..]));
     assert!(still_seq.next_frame().unwrap().is_none());
+}
+
+/// `5.A.1`: Ortak uçtan uca `Arc<Butce>` denetiminin `cmin`, çoklu karo `grid` + `alpha`
+/// (`t=1` ve `t=4`), `tmap` kazanç haritası, `AvifImage::to_rgba8` renk dönüşümü ve
+/// `parse_sequence_info_with` / `AvifSequenceDecoder::with_config` üzerinde işlediğini doğrular.
+#[test]
+fn avif_shared_budget_cmin_grid_alpha_gainmap_color_and_sequence() {
+    // 1. `cmin` sıkıştırılmış meta kutusu: hem `parse_info_with` hem `decode_with` dar bütçede reddetmeli.
+    let big_xmp: Vec<u8> = (0usize..48 * 1024)
+        .map(|i| b'A' + ((i.wrapping_mul(31) ^ (i >> 3)) % 26) as u8)
+        .collect();
+    let exif_block = b"\x00\x00\x00\x00II*\x00EXIF_CMIN_BUDGET";
+    let avif_cmin = build_compressed_meta_avif(&big_xmp, None, exif_block, None, true);
+
+    let tight_cmin_cfg = AvifDecodeConfig {
+        allocation_limit: Some(8 * 1024),
+        ..AvifDecodeConfig::default()
+    };
+    assert!(matches!(
+        parse_info_with(&avif_cmin, &tight_cmin_cfg),
+        Err(Error::BudgetExceeded { .. })
+    ));
+    assert!(matches!(
+        decode_with(&avif_cmin, &tight_cmin_cfg),
+        Err(Error::BudgetExceeded { .. })
+    ));
+
+    let generous_cmin_cfg = AvifDecodeConfig {
+        allocation_limit: Some(512 * 1024),
+        ..AvifDecodeConfig::default()
+    };
+    let cmin_info = parse_info_with(&avif_cmin, &generous_cmin_cfg)
+        .expect("yeterli bütçe ile cmin parse_info_with");
+    assert_eq!(cmin_info.xmp.as_deref(), Some(big_xmp.as_slice()));
+    let cmin_img =
+        decode_with(&avif_cmin, &generous_cmin_cfg).expect("yeterli bütçe ile cmin decode_with");
+    assert_eq!(cmin_img.xmp(), Some(big_xmp.as_slice()));
+
+    // 2. Çoklu karo `2x2` `grid` + `alpha`:
+    //    Tekil bir karo çözümü minimum bütçeye sığarken, 2x2 grid + tuval + alfa toplamı
+    //    hem tek iş parçacıklı (`n_threads = 1`) hem paralel (`n_threads = 4`) kipte `BudgetExceeded`
+    //    döndürmelidir.
+    let tile_obu = read_oddheight_keyframe_obu();
+    let (tile_w, tile_h) = if tile_obu.len() > SAMPLE_1X1_AV1_OBU.len() {
+        (64u32, 63u32)
+    } else {
+        (1u32, 1u32)
+    };
+    let single_tile_avif =
+        build_transformed_avif(&tile_obu, tile_w, tile_h, None, None, None, false);
+    let grid_alpha_avif = build_grid_and_alpha_avif(&tile_obu, tile_w, tile_h, tile_w, tile_h);
+
+    // Tekil karo için minimum başarılı bütçeyi ikili aramayla tam belirle.
+    let mut lo = 1usize;
+    let mut hi = 4 * 1024 * 1024usize;
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        let cfg = AvifDecodeConfig {
+            n_threads: 1,
+            allocation_limit: Some(mid),
+            ..AvifDecodeConfig::default()
+        };
+        if decode_with(&single_tile_avif, &cfg).is_ok() {
+            hi = mid;
+        } else {
+            lo = mid + 1;
+        }
+    }
+    let single_tile_min = lo;
+    // Tekil karo tam bu bütçeyle çözülür, ancak 2x2 grid + tuval + alfa toplamı sığmaz.
+    assert!(
+        decode_with(
+            &single_tile_avif,
+            &AvifDecodeConfig {
+                n_threads: 1,
+                allocation_limit: Some(single_tile_min),
+                ..AvifDecodeConfig::default()
+            }
+        )
+        .is_ok()
+    );
+    for threads in [1usize, 4usize] {
+        let res = decode_with(
+            &grid_alpha_avif,
+            &AvifDecodeConfig {
+                n_threads: threads,
+                allocation_limit: Some(single_tile_min),
+                ..AvifDecodeConfig::default()
+            },
+        );
+        assert!(
+            matches!(res, Err(Error::BudgetExceeded { .. })),
+            "grid+alpha (t={threads}) tekil karo bütçesini ({single_tile_min}) aşmalı, sonuç: {res:?}"
+        );
+    }
+
+    let grid_img_ok = decode_with(
+        &grid_alpha_avif,
+        &AvifDecodeConfig {
+            n_threads: 4,
+            allocation_limit: Some(single_tile_min * 8 + 512 * 1024),
+            ..AvifDecodeConfig::default()
+        },
+    )
+    .expect("geniş bütçede t=4 grid+alpha çözülmeli");
+    let rgba = grid_img_ok.to_rgba8().expect("geniş bütçede to_rgba8");
+    assert_eq!((rgba.width, rgba.height), (tile_w, tile_h));
+    assert_eq!(rgba.pixels.len(), (tile_w * tile_h * 4) as usize);
+
+    // 3. `AvifImage` canlıyken `to_rgb8()` / `to_rgba8()` renk dönüşümü ortak `Arc<Butce>` paylaşır:
+    //    512 KiB XMP + 1x1 YUV420 (3 bayt) + Exif (exif_block.len() - 4) toplamında tek bayt hassasiyeti.
+    let color_xmp: Vec<u8> = (0usize..512 * 1024)
+        .map(|i| b'a' + ((i.wrapping_mul(17) ^ (i >> 4)) % 26) as u8)
+        .collect();
+    let avif_color_budget = build_compressed_meta_avif(&color_xmp, None, exif_block, None, false);
+    let live_img_bytes = 3usize + (exif_block.len() - 4) + color_xmp.len();
+
+    let img_exact_only = decode_with(
+        &avif_color_budget,
+        &AvifDecodeConfig {
+            allocation_limit: Some(live_img_bytes),
+            ..AvifDecodeConfig::default()
+        },
+    )
+    .expect("tam canlı görüntü bütçesinde decode_with geçmeli");
+    assert_eq!(
+        img_exact_only.to_rgb8().unwrap_err(),
+        Error::BudgetExceeded {
+            requested: live_img_bytes + 3,
+            limit: live_img_bytes,
+        }
+    );
+
+    let img_rgb_exact = decode_with(
+        &avif_color_budget,
+        &AvifDecodeConfig {
+            allocation_limit: Some(live_img_bytes + 3),
+            ..AvifDecodeConfig::default()
+        },
+    )
+    .expect("canlı görüntü + RGB8 (3 bayt) bütçesinde decode_with geçmeli");
+    assert_eq!(
+        img_rgb_exact
+            .to_rgb8()
+            .expect("to_rgb8 tam sınırda geçmeli")
+            .pixels
+            .len(),
+        3
+    );
+    assert_eq!(
+        img_rgb_exact.to_rgba8().unwrap_err(),
+        Error::BudgetExceeded {
+            requested: live_img_bytes + 4,
+            limit: live_img_bytes + 3,
+        }
+    );
+
+    let img_rgba_exact = decode_with(
+        &avif_color_budget,
+        &AvifDecodeConfig {
+            allocation_limit: Some(live_img_bytes + 4),
+            ..AvifDecodeConfig::default()
+        },
+    )
+    .expect("canlı görüntü + RGBA8 (4 bayt) bütçesinde decode_with geçmeli");
+    assert_eq!(
+        img_rgba_exact
+            .to_rgba8()
+            .expect("to_rgba8 tam sınırda geçmeli")
+            .pixels
+            .len(),
+        4
+    );
+
+    // 4. `tmap` kazanç haritası ortak bütçesi (`decode_gain_map = false` vs `true`):
+    let tmap_avif = build_tmap_gainmap_avif(true, &[3, 1], 0, 0, 0, 1, &[], 9, 13);
+    let mut tlo = 1usize;
+    let mut thi = 2 * 1024 * 1024usize;
+    while tlo < thi {
+        let mid = tlo + (thi - tlo) / 2;
+        let cfg = AvifDecodeConfig {
+            n_threads: 1,
+            decode_gain_map: false,
+            allocation_limit: Some(mid),
+            ..AvifDecodeConfig::default()
+        };
+        if decode_with(&tmap_avif, &cfg).is_ok() {
+            thi = mid;
+        } else {
+            tlo = mid + 1;
+        }
+    }
+    let base_only_min = tlo;
+    // `decode_gain_map = true` olduğunda taban düzlemler + alt_icc canlıyken kazanç haritası
+    // çözücüsü aynı `Arc<Butce>` üzerinde çalışır ve ek bellek gerektirir.
+    let gm_tight = decode_with(
+        &tmap_avif,
+        &AvifDecodeConfig {
+            n_threads: 1,
+            decode_gain_map: true,
+            allocation_limit: Some(base_only_min),
+            ..AvifDecodeConfig::default()
+        },
+    );
+    assert!(
+        matches!(gm_tight, Err(Error::BudgetExceeded { .. })),
+        "taban minimum bütçesinde decode_gain_map=true BudgetExceeded dönmeli, sonuç: {gm_tight:?}"
+    );
+    let gm_ok = decode_with(
+        &tmap_avif,
+        &AvifDecodeConfig {
+            n_threads: 1,
+            decode_gain_map: true,
+            allocation_limit: Some(base_only_min + 256 * 1024),
+            ..AvifDecodeConfig::default()
+        },
+    )
+    .expect("yeterli bütçede tmap + gain_map çözülmeli");
+    assert!(gm_ok.gain_map().is_some());
+
+    // 5. `parse_sequence_info_with` ve `AvifSequenceDecoder::with_config` ortak bütçesi:
+    let samples = [SAMPLE_1X1_AV1_OBU, SAMPLE_1X1_AV1_OBU, SAMPLE_1X1_AV1_OBU];
+    let avis = build_synthetic_avis_with_alpha(&samples, Some(&samples), true);
+    let tiny_seq_cfg = AvifDecodeConfig {
+        allocation_limit: Some(16),
+        ..AvifDecodeConfig::default()
+    };
+    assert!(matches!(
+        parse_sequence_info_with(&avis, &tiny_seq_cfg),
+        Err(Error::BudgetExceeded { .. })
+    ));
+    assert!(matches!(
+        AvifSequenceDecoder::with_config(&avis, tiny_seq_cfg),
+        Err(Error::BudgetExceeded { .. })
+    ));
+    let ok_seq_cfg = AvifDecodeConfig {
+        allocation_limit: Some(512 * 1024),
+        ..AvifDecodeConfig::default()
+    };
+    let sinfo = parse_sequence_info_with(&avis, &ok_seq_cfg)
+        .expect("yeterli bütçede parse_sequence_info_with");
+    assert_eq!(sinfo.frame_count, 3);
+    let mut seq = AvifSequenceDecoder::with_config(&avis, ok_seq_cfg)
+        .expect("yeterli bütçede sequence decoder");
+    let frame0 = seq.next_frame().expect("ilk kare").expect("Some");
+    assert_eq!(frame0.image.y_plane_u8(), Some(&[190u8][..]));
+    assert_eq!(frame0.image.alpha_plane_u8(), Some(&[203u8][..]));
 }

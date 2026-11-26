@@ -4,6 +4,7 @@
 #![forbid(unsafe_code)]
 
 use alloc::borrow::Cow;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use crate::avif::boxes::{
@@ -12,6 +13,7 @@ use crate::avif::boxes::{
     read_u32_be, read_u64_be,
 };
 use crate::error::{Error, Result};
+use crate::frame::butce::{Butce, ButceTutucu};
 
 /// `VisualSampleEntry` sabit başlık uzunluğu (ISO/IEC 14496-12 §12.1.3.2).
 const VISUAL_SAMPLE_ENTRY_SIZE: usize = 78;
@@ -93,6 +95,7 @@ pub(crate) struct ParsedTrack<'a> {
     pub(crate) references: Vec<TrackReference>,
     pub(crate) samples: Vec<TrackSample>,
     pub(crate) meta: Option<AvifContainer<'a>>,
+    pub(crate) _guard: Arc<ButceTutucu>,
 }
 
 impl ParsedTrack<'_> {
@@ -170,16 +173,14 @@ impl<'a> ParsedMovie<'a> {
 }
 
 /// Üst düzey `ftyp`, `moov` ve varsa `meta`/`cmin` kutularını ayrıştırır.
-pub(crate) fn parse_movie<'a>(
-    data: &'a [u8],
-    allocation_limit: Option<usize>,
-) -> Result<ParsedMovie<'a>> {
+pub(crate) fn parse_movie<'a>(data: &'a [u8], butce: &Arc<Butce>) -> Result<ParsedMovie<'a>> {
     let mut offset = 0usize;
     let mut major_brand: Option<[u8; 4]> = None;
     let mut compatible_brands: Vec<[u8; 4]> = Vec::new();
     let mut has_supported_brand = false;
     let mut moov_payload: Option<&'a [u8]> = None;
     let mut meta_payload: Option<Cow<'a, [u8]>> = None;
+    let mut _cmin_guard: Option<ButceTutucu> = None;
 
     while let Some(raw_box) = read_box_header(data, offset)? {
         offset = raw_box.next_offset;
@@ -227,13 +228,10 @@ pub(crate) fn parse_movie<'a>(
                 }
                 let comp_type = [body[0], body[1], body[2], body[3]];
                 let payload_slice = &body[4..];
-                let decompressed = decompress_by_fourcc(
-                    &comp_type,
-                    payload_slice,
-                    payload_slice.len(),
-                    allocation_limit,
-                )?;
+                let (decompressed, guard) =
+                    decompress_by_fourcc(&comp_type, payload_slice, payload_slice.len(), butce)?;
                 meta_payload = Some(Cow::Owned(decompressed));
+                _cmin_guard = Some(guard);
             }
             _ => {}
         }
@@ -247,13 +245,16 @@ pub(crate) fn parse_movie<'a>(
     }
 
     let top_meta = if let Some(mraw) = meta_payload {
-        Some(parse_meta_box(
+        let parsed = parse_meta_box(
             data,
             mraw,
             major_brand,
             compatible_brands.clone(),
             false,
-        )?)
+            butce,
+        )?;
+        _cmin_guard = None;
+        Some(parsed)
     } else {
         None
     };
@@ -265,7 +266,7 @@ pub(crate) fn parse_movie<'a>(
             moov,
             major_brand,
             &compatible_brands,
-            allocation_limit,
+            butce,
             &mut tracks,
         )?;
     }
@@ -283,7 +284,7 @@ fn parse_moov<'a>(
     moov_payload: &'a [u8],
     major_brand: [u8; 4],
     compatible_brands: &[[u8; 4]],
-    allocation_limit: Option<usize>,
+    butce: &Arc<Butce>,
     tracks: &mut Vec<ParsedTrack<'a>>,
 ) -> Result<()> {
     let mut offset = 0usize;
@@ -304,7 +305,7 @@ fn parse_moov<'a>(
                     child.payload,
                     major_brand,
                     compatible_brands,
-                    allocation_limit,
+                    butce,
                 )?;
                 if matches!(&track.handler_type, b"pict" | b"vide" | b"auxv")
                     && (track.width == 0 || track.height == 0)
@@ -337,7 +338,7 @@ fn parse_trak<'a>(
     trak_payload: &'a [u8],
     major_brand: [u8; 4],
     compatible_brands: &[[u8; 4]],
-    allocation_limit: Option<usize>,
+    butce: &Arc<Butce>,
 ) -> Result<ParsedTrack<'a>> {
     let mut offset = 0usize;
     let mut tkhd_seen = false;
@@ -352,7 +353,7 @@ fn parse_trak<'a>(
     let mut is_repeating = false;
     let mut segment_duration = 0u64;
     let mut references = Vec::new();
-    let mut raw_stbl: Option<RawSampleTable> = None;
+    let mut raw_stbl: Option<(RawSampleTable, ButceTutucu, ButceTutucu)> = None;
     let mut track_meta: Option<AvifContainer<'a>> = None;
 
     while let Some(child) = read_box_header(trak_payload, offset)? {
@@ -388,6 +389,7 @@ fn parse_trak<'a>(
                     major_brand,
                     compatible_brands.to_vec(),
                     false,
+                    butce,
                 )?);
             }
             b"mdia" => {
@@ -397,7 +399,7 @@ fn parse_trak<'a>(
                     &mut media_timescale,
                     &mut media_duration,
                     &mut raw_stbl,
-                    allocation_limit,
+                    butce,
                 )?;
             }
             _ => {}
@@ -430,17 +432,19 @@ fn parse_trak<'a>(
         LoopCount::Count(0)
     };
 
-    let (is_av01, properties, samples) = if let Some(stbl) = raw_stbl {
-        let is_av01 = stbl.is_av01;
-        let samples = if is_av01 {
-            build_track_samples(&stbl, file_data.len(), allocation_limit)?
+    let (is_av01, properties, samples, track_guard) =
+        if let Some((stbl, mut prop_guard, _table_guard)) = raw_stbl {
+            let is_av01 = stbl.is_av01;
+            let (samples, sample_guard) = if is_av01 {
+                build_track_samples(&stbl, file_data.len(), butce)?
+            } else {
+                (Vec::new(), ButceTutucu::bos(butce))
+            };
+            prop_guard.birlestir(sample_guard);
+            (is_av01, stbl.properties, samples, prop_guard)
         } else {
-            Vec::new()
+            (false, Vec::new(), Vec::new(), ButceTutucu::bos(butce))
         };
-        (is_av01, stbl.properties, samples)
-    } else {
-        (false, Vec::new(), Vec::new())
-    };
 
     Ok(ParsedTrack {
         track_id,
@@ -455,6 +459,7 @@ fn parse_trak<'a>(
         references,
         samples,
         meta: track_meta,
+        _guard: Arc::new(track_guard),
     })
 }
 
@@ -554,8 +559,8 @@ fn parse_mdia(
     handler_type: &mut [u8; 4],
     media_timescale: &mut u64,
     media_duration: &mut u64,
-    raw_stbl: &mut Option<RawSampleTable>,
-    allocation_limit: Option<usize>,
+    raw_stbl: &mut Option<(RawSampleTable, ButceTutucu, ButceTutucu)>,
+    butce: &Arc<Butce>,
 ) -> Result<()> {
     let mut offset = 0usize;
     while let Some(child) = read_box_header(payload, offset)? {
@@ -574,7 +579,7 @@ fn parse_mdia(
                 *handler_type = [body[4], body[5], body[6], body[7]];
             }
             b"minf" => {
-                parse_minf(child.payload, raw_stbl, allocation_limit)?;
+                parse_minf(child.payload, raw_stbl, butce)?;
             }
             _ => {}
         }
@@ -601,8 +606,8 @@ fn parse_mdhd(payload: &[u8]) -> Result<(u64, u64)> {
 
 fn parse_minf(
     payload: &[u8],
-    raw_stbl: &mut Option<RawSampleTable>,
-    allocation_limit: Option<usize>,
+    raw_stbl: &mut Option<(RawSampleTable, ButceTutucu, ButceTutucu)>,
+    butce: &Arc<Butce>,
 ) -> Result<()> {
     let mut offset = 0usize;
     while let Some(child) = read_box_header(payload, offset)? {
@@ -611,17 +616,13 @@ fn parse_minf(
             if raw_stbl.is_some() {
                 return Err(Error::InvalidData("minf içinde birden fazla stbl kutusu"));
             }
-            *raw_stbl = Some(parse_stbl(child.payload, allocation_limit)?);
+            *raw_stbl = Some(parse_stbl(child.payload, butce)?);
         }
     }
     Ok(())
 }
 
-fn check_table_budget(
-    entries: usize,
-    entry_bytes: usize,
-    allocation_limit: Option<usize>,
-) -> Result<()> {
+fn reserve_table_budget(entries: usize, entry_bytes: usize, guard: &mut ButceTutucu) -> Result<()> {
     if entries > MAX_TRACK_SAMPLES {
         return Err(Error::BudgetExceeded {
             requested: entries,
@@ -629,37 +630,38 @@ fn check_table_budget(
         });
     }
     let bytes = entries.saturating_mul(entry_bytes);
-    if let Some(limit) = allocation_limit
-        && bytes > limit
-    {
-        return Err(Error::BudgetExceeded {
-            requested: bytes,
-            limit,
-        });
-    }
-    Ok(())
+    guard.ekle(bytes)
 }
 
-fn parse_stbl(payload: &[u8], allocation_limit: Option<usize>) -> Result<RawSampleTable> {
+fn parse_stbl(
+    payload: &[u8],
+    butce: &Arc<Butce>,
+) -> Result<(RawSampleTable, ButceTutucu, ButceTutucu)> {
     let mut stbl = RawSampleTable::default();
+    let mut prop_guard = ButceTutucu::bos(butce);
+    let mut table_guard = ButceTutucu::bos(butce);
     let mut offset = 0usize;
     while let Some(child) = read_box_header(payload, offset)? {
         offset = child.next_offset;
         match &child.box_type {
-            b"stsd" => parse_stsd(child.payload, &mut stbl)?,
-            b"stco" => parse_chunk_offsets(child.payload, false, &mut stbl, allocation_limit)?,
-            b"co64" => parse_chunk_offsets(child.payload, true, &mut stbl, allocation_limit)?,
-            b"stsc" => parse_stsc(child.payload, &mut stbl, allocation_limit)?,
-            b"stsz" => parse_stsz(child.payload, &mut stbl, allocation_limit)?,
-            b"stts" => parse_stts(child.payload, &mut stbl, allocation_limit)?,
-            b"stss" => parse_stss(child.payload, &mut stbl, allocation_limit)?,
+            b"stsd" => parse_stsd(child.payload, &mut stbl, &mut prop_guard)?,
+            b"stco" => parse_chunk_offsets(child.payload, false, &mut stbl, &mut table_guard)?,
+            b"co64" => parse_chunk_offsets(child.payload, true, &mut stbl, &mut table_guard)?,
+            b"stsc" => parse_stsc(child.payload, &mut stbl, &mut table_guard)?,
+            b"stsz" => parse_stsz(child.payload, &mut stbl, &mut table_guard)?,
+            b"stts" => parse_stts(child.payload, &mut stbl, &mut table_guard)?,
+            b"stss" => parse_stss(child.payload, &mut stbl, &mut table_guard)?,
             _ => {}
         }
     }
-    Ok(stbl)
+    Ok((stbl, prop_guard, table_guard))
 }
 
-fn parse_stsd(payload: &[u8], stbl: &mut RawSampleTable) -> Result<()> {
+fn parse_stsd(
+    payload: &[u8],
+    stbl: &mut RawSampleTable,
+    prop_guard: &mut ButceTutucu,
+) -> Result<()> {
     let (ver, _flags, body) = read_full_box(payload)?;
     if ver > 1 {
         return Err(Error::InvalidData("stsd sürümü 0 veya 1 olmalıdır"));
@@ -680,6 +682,7 @@ fn parse_stsd(payload: &[u8], stbl: &mut RawSampleTable) -> Result<()> {
                 &entry.payload[VISUAL_SAMPLE_ENTRY_SIZE..],
                 &mut stbl.properties,
                 true,
+                prop_guard,
             )?;
         }
     }
@@ -690,7 +693,7 @@ fn parse_chunk_offsets(
     payload: &[u8],
     large: bool,
     stbl: &mut RawSampleTable,
-    allocation_limit: Option<usize>,
+    guard: &mut ButceTutucu,
 ) -> Result<()> {
     let (ver, _flags, body) = read_full_box(payload)?;
     if ver != 0 {
@@ -705,7 +708,7 @@ fn parse_chunk_offsets(
     if needed > body.len().saturating_sub(4) {
         return Err(Error::InvalidData("kesik stco/co64 ofset dizisi"));
     }
-    check_table_budget(count, core::mem::size_of::<u64>(), allocation_limit)?;
+    reserve_table_budget(count, core::mem::size_of::<u64>(), guard)?;
     stbl.chunks.reserve(count);
     for i in 0..count {
         let off = if large {
@@ -718,11 +721,7 @@ fn parse_chunk_offsets(
     Ok(())
 }
 
-fn parse_stsc(
-    payload: &[u8],
-    stbl: &mut RawSampleTable,
-    allocation_limit: Option<usize>,
-) -> Result<()> {
+fn parse_stsc(payload: &[u8], stbl: &mut RawSampleTable, guard: &mut ButceTutucu) -> Result<()> {
     let (ver, _flags, body) = read_full_box(payload)?;
     if ver != 0 {
         return Err(Error::InvalidData("stsc sürümü 0 olmalıdır"));
@@ -734,11 +733,7 @@ fn parse_stsc(
     if needed > body.len().saturating_sub(4) {
         return Err(Error::InvalidData("kesik stsc giriş dizisi"));
     }
-    check_table_budget(
-        count,
-        core::mem::size_of::<SampleToChunk>(),
-        allocation_limit,
-    )?;
+    reserve_table_budget(count, core::mem::size_of::<SampleToChunk>(), guard)?;
     stbl.sample_to_chunks.reserve(count);
     let mut prev_first = 0u32;
     for i in 0..count {
@@ -765,11 +760,7 @@ fn parse_stsc(
     Ok(())
 }
 
-fn parse_stsz(
-    payload: &[u8],
-    stbl: &mut RawSampleTable,
-    allocation_limit: Option<usize>,
-) -> Result<()> {
+fn parse_stsz(payload: &[u8], stbl: &mut RawSampleTable, guard: &mut ButceTutucu) -> Result<()> {
     let (ver, _flags, body) = read_full_box(payload)?;
     if ver != 0 {
         return Err(Error::InvalidData("stsz sürümü 0 olmalıdır"));
@@ -786,7 +777,7 @@ fn parse_stsz(
         if needed > body.len().saturating_sub(8) {
             return Err(Error::InvalidData("kesik stsz örnek boyut dizisi"));
         }
-        check_table_budget(sample_count, core::mem::size_of::<u32>(), allocation_limit)?;
+        reserve_table_budget(sample_count, core::mem::size_of::<u32>(), guard)?;
         stbl.sample_sizes.reserve(sample_count);
         for i in 0..sample_count {
             let sz = read_u32_be(body, 8 + i * 4).ok_or(Error::InvalidData("kesik stsz"))?;
@@ -796,11 +787,7 @@ fn parse_stsz(
     Ok(())
 }
 
-fn parse_stts(
-    payload: &[u8],
-    stbl: &mut RawSampleTable,
-    allocation_limit: Option<usize>,
-) -> Result<()> {
+fn parse_stts(payload: &[u8], stbl: &mut RawSampleTable, guard: &mut ButceTutucu) -> Result<()> {
     let (ver, _flags, body) = read_full_box(payload)?;
     if ver != 0 {
         return Err(Error::InvalidData("stts sürümü 0 olmalıdır"));
@@ -812,11 +799,7 @@ fn parse_stts(
     if needed > body.len().saturating_sub(4) {
         return Err(Error::InvalidData("kesik stts giriş dizisi"));
     }
-    check_table_budget(
-        count,
-        core::mem::size_of::<TimeToSample>(),
-        allocation_limit,
-    )?;
+    reserve_table_budget(count, core::mem::size_of::<TimeToSample>(), guard)?;
     stbl.time_to_samples.reserve(count);
     for i in 0..count {
         let base = 4 + i * 8;
@@ -830,11 +813,7 @@ fn parse_stts(
     Ok(())
 }
 
-fn parse_stss(
-    payload: &[u8],
-    stbl: &mut RawSampleTable,
-    allocation_limit: Option<usize>,
-) -> Result<()> {
+fn parse_stss(payload: &[u8], stbl: &mut RawSampleTable, guard: &mut ButceTutucu) -> Result<()> {
     let (ver, _flags, body) = read_full_box(payload)?;
     if ver != 0 {
         return Err(Error::InvalidData("stss sürümü 0 olmalıdır"));
@@ -846,7 +825,7 @@ fn parse_stss(
     if needed > body.len().saturating_sub(4) {
         return Err(Error::InvalidData("kesik stss senkron örnek dizisi"));
     }
-    check_table_budget(count, core::mem::size_of::<u32>(), allocation_limit)?;
+    reserve_table_budget(count, core::mem::size_of::<u32>(), guard)?;
     stbl.has_stss = true;
     stbl.sync_samples.reserve(count);
     for i in 0..count {
@@ -881,10 +860,11 @@ fn sample_delta_at(stts: &[TimeToSample], index: usize) -> u64 {
 fn build_track_samples(
     stbl: &RawSampleTable,
     file_len: usize,
-    allocation_limit: Option<usize>,
-) -> Result<Vec<TrackSample>> {
+    butce: &Arc<Butce>,
+) -> Result<(Vec<TrackSample>, ButceTutucu)> {
+    let mut sample_guard = ButceTutucu::bos(butce);
     if stbl.chunks.is_empty() {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), sample_guard));
     }
     let mut total_samples = 0usize;
     for chunk_idx in 0..stbl.chunks.len() {
@@ -902,10 +882,10 @@ fn build_track_samples(
             });
         }
     }
-    check_table_budget(
+    reserve_table_budget(
         total_samples,
         core::mem::size_of::<TrackSample>(),
-        allocation_limit,
+        &mut sample_guard,
     )?;
 
     let mut samples = Vec::with_capacity(total_samples);
@@ -969,5 +949,5 @@ fn build_track_samples(
         first.is_keyframe = true;
     }
 
-    Ok(samples)
+    Ok((samples, sample_guard))
 }

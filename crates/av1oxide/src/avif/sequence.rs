@@ -3,15 +3,16 @@
 #![forbid(unsafe_code)]
 
 use alloc::boxed::Box;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use crate::api::{Config, Decoder, Packet};
 use crate::avif::boxes::{Av1CProperty, ItemProperty};
 use crate::avif::decode::{
     LIMITED_TO_FULL_Y_8BIT, PlanarBuffer, apply_imir, apply_irot, av1c_to_format,
-    check_pixel_and_byte_budget, compute_clap_rect, crop_planar, decode_with,
-    extract_metadata_items, extract_plane, extract_track_metadata_items, limited_to_full_y_u16,
-    parse_info, resolve_effective_threads,
+    check_pixel_and_byte_budget, compute_clap_rect, copy_bytes_budgeted, crop_planar,
+    decode_with_budget, extract_metadata_items, extract_plane, extract_track_metadata_items,
+    limited_to_full_y_u16, parse_info_with_budget, resolve_effective_threads,
 };
 use crate::avif::image::{
     AvifDecodeConfig, AvifImage, CleanAperture, ColorInfo, ContentLightLevel, MasteringDisplay,
@@ -20,7 +21,8 @@ use crate::avif::image::{
 use crate::avif::tracks::{LoopCount, ParsedTrack, TrackSample, parse_movie};
 use crate::bitstream::obu::parse_sequence_header_obus;
 use crate::bitstream::seq_header::PixelLayout;
-use crate::error::{Error, Result, SizeStage};
+use crate::error::{Error, Result};
+use crate::frame::butce::{Butce, ButceTutucu};
 use crate::frame::{BitDepth, ChromaFormat, Frame, PlaneType};
 
 /// Animasyonlu AVIF (`.avis`) veya tek karelik `.avif` dizisinin üst bilgisi.
@@ -100,12 +102,18 @@ struct TrackMetadataBundle {
     mdcv: Option<MasteringDisplay>,
     pasp: Option<PixelAspectRatio>,
     transforms: TrackTransforms,
+    guard: ButceTutucu,
 }
 
-fn extract_track_properties(track: &ParsedTrack<'_>, data: &[u8]) -> Result<TrackMetadataBundle> {
+fn extract_track_properties(
+    track: &ParsedTrack<'_>,
+    data: &[u8],
+    butce: &Arc<Butce>,
+) -> Result<TrackMetadataBundle> {
     let mut av1c_opt: Option<&Av1CProperty> = None;
     let mut color: Option<ColorInfo> = None;
     let mut icc_profile: Option<Vec<u8>> = None;
+    let mut guard = ButceTutucu::bos(butce);
     let mut clli: Option<ContentLightLevel> = None;
     let mut mdcv: Option<MasteringDisplay> = None;
     let mut pasp: Option<PixelAspectRatio> = None;
@@ -115,7 +123,14 @@ fn extract_track_properties(track: &ParsedTrack<'_>, data: &[u8]) -> Result<Trac
         match prop {
             ItemProperty::Av1C(av1c) => av1c_opt = Some(av1c),
             ItemProperty::ColrNclx(c) => color = Some(*c),
-            ItemProperty::ColrIcc(icc) => icc_profile = Some(icc.clone()),
+            ItemProperty::ColrIcc(icc) => {
+                if let Some(ref prev) = icc_profile {
+                    guard.dusur(prev.len());
+                }
+                let (v, g) = copy_bytes_budgeted(icc, butce)?;
+                guard.birlestir(g);
+                icc_profile = Some(v);
+            }
             ItemProperty::Clli(c) => clli = Some(*c),
             ItemProperty::Mdcv(m) => mdcv = Some(*m),
             ItemProperty::Pasp(pa) => pasp = Some(*pa),
@@ -135,7 +150,9 @@ fn extract_track_properties(track: &ParsedTrack<'_>, data: &[u8]) -> Result<Trac
         let (bd, cf) = av1c_to_format(av1c)?;
         bit_depth = Some(bd);
         chroma_format = Some(cf);
-        av1c_config_obus = av1c.config_obus.clone();
+        let (v, g) = copy_bytes_budgeted(&av1c.config_obus, butce)?;
+        guard.birlestir(g);
+        av1c_config_obus = v;
         if !av1c.config_obus.is_empty()
             && let Ok(Some(seq)) = parse_sequence_header_obus(&av1c.config_obus)
         {
@@ -191,20 +208,21 @@ fn extract_track_properties(track: &ParsedTrack<'_>, data: &[u8]) -> Result<Trac
         mdcv,
         pasp,
         transforms,
+        guard,
     })
 }
 
 fn apply_track_transforms(
     buf: &mut PlanarBuffer,
     transforms: TrackTransforms,
-    allocation_limit: Option<usize>,
+    butce: &Arc<Butce>,
 ) -> Result<()> {
     if let Some(clap) = transforms.clap {
         let (x0, y0, cw, ch) = compute_clap_rect(buf.width, buf.height, &clap)?;
-        crop_planar(buf, x0, y0, cw, ch, allocation_limit)?;
+        crop_planar(buf, x0, y0, cw, ch, butce)?;
     }
     if let Some(angle) = transforms.irot {
-        apply_irot(buf, angle);
+        apply_irot(buf, angle, butce)?;
     }
     if let Some(axis) = transforms.imir {
         apply_imir(buf, axis);
@@ -271,13 +289,25 @@ pub struct AvifSequenceDecoder<'a> {
     data: &'a [u8],
     config: AvifDecodeConfig,
     info: AvifSequenceInfo,
+    butce: Arc<Butce>,
+    _state_guard: ButceTutucu,
     backend: SequenceBackend,
 }
 
 /// Piksel çözme işlemi yapmadan animasyonlu (`.avis`) veya tek karelik `.avif` dizisinin
 /// başlık, zamanlama, döngü sayısı ve metaveri bilgilerini ayrıştırır.
 pub fn parse_sequence_info(data: &[u8]) -> Result<AvifSequenceInfo> {
-    let decoder = AvifSequenceDecoder::new(data)?;
+    parse_sequence_info_with(data, &AvifDecodeConfig::default())
+}
+
+/// Belirtilen [`AvifDecodeConfig`] bütçe sınırları (`allocation_limit`) altında piksel çözme
+/// yapmadan animasyonlu (`.avis`) veya tek karelik `.avif` dizisinin başlık, zamanlama,
+/// döngü sayısı ve metaveri bilgilerini ayrıştırır.
+pub fn parse_sequence_info_with(
+    data: &[u8],
+    config: &AvifDecodeConfig,
+) -> Result<AvifSequenceInfo> {
+    let decoder = AvifSequenceDecoder::with_config(data, config.clone())?;
     Ok(decoder.info)
 }
 
@@ -289,7 +319,9 @@ impl<'a> AvifSequenceDecoder<'a> {
 
     /// Belirtilen [`AvifDecodeConfig`] ile bir `.avis` / `.avif` dizi çözücüsü oluşturur.
     pub fn with_config(data: &'a [u8], config: AvifDecodeConfig) -> Result<Self> {
-        let movie = parse_movie(data, config.allocation_limit)?;
+        let butce = Arc::new(Butce::yeni(config.allocation_limit, 0));
+        let mut state_guard = ButceTutucu::bos(&butce);
+        let movie = parse_movie(data, &butce)?;
 
         if movie.prefers_tracks() {
             let (color_idx, alpha_idx) = movie.select_color_and_alpha_tracks()?;
@@ -297,14 +329,21 @@ impl<'a> AvifSequenceDecoder<'a> {
             let alpha_track = alpha_idx.map(|i| &movie.tracks[i]);
 
             check_pixel_and_byte_budget(color_track.width, color_track.height, 0, &config)?;
-            let color_bundle = extract_track_properties(color_track, data)?;
+            let color_bundle = extract_track_properties(color_track, data, &butce)?;
+            state_guard.birlestir(color_bundle.guard);
             let (alpha_config_obus, alpha_samples) = if let Some(at) = alpha_track {
                 check_pixel_and_byte_budget(at.width, at.height, 0, &config)?;
-                let alpha_bundle = extract_track_properties(at, data)?;
+                let alpha_bundle = extract_track_properties(at, data, &butce)?;
+                state_guard.birlestir(alpha_bundle.guard);
                 check_alpha_track_transform_compat(
                     color_bundle.transforms,
                     alpha_bundle.transforms,
                 )?;
+                let sample_bytes = at
+                    .samples
+                    .len()
+                    .saturating_mul(core::mem::size_of::<TrackSample>());
+                state_guard.ekle(sample_bytes)?;
                 (alpha_bundle.av1c_config_obus, Some(at.samples.clone()))
             } else {
                 (Vec::new(), None)
@@ -318,23 +357,27 @@ impl<'a> AvifSequenceDecoder<'a> {
 
             // Exif/XMP önceliği: önce `trak/meta` (libavif `colorTrack->meta`), yoksa üst düzey `meta`.
             let (mut exif, mut xmp) = if let Some(ref tmeta) = color_track.meta {
-                extract_track_metadata_items(tmeta, config.allocation_limit)?
+                let (e, x, g) = extract_track_metadata_items(tmeta, &butce)?;
+                state_guard.birlestir(g);
+                (e, x)
             } else {
                 (None, None)
             };
             let mut icc_profile = color_bundle.icc_profile;
             if let Some(ref top_meta) = movie.top_meta {
                 if (exif.is_none() || xmp.is_none()) && top_meta.primary_item_id != 0 {
-                    let (top_exif, top_xmp) = extract_metadata_items(
-                        top_meta,
-                        top_meta.primary_item_id,
-                        config.allocation_limit,
-                    )?;
+                    let (top_exif, top_xmp, top_g) =
+                        extract_metadata_items(top_meta, top_meta.primary_item_id, &butce)?;
+                    state_guard.birlestir(top_g);
                     if exif.is_none() {
                         exif = top_exif;
+                    } else if let Some(ref unused) = top_exif {
+                        state_guard.dusur(unused.len());
                     }
                     if xmp.is_none() {
                         xmp = top_xmp;
+                    } else if let Some(ref unused) = top_xmp {
+                        state_guard.dusur(unused.len());
                     }
                 }
                 if icc_profile.is_none()
@@ -343,7 +386,9 @@ impl<'a> AvifSequenceDecoder<'a> {
                 {
                     for (p, _) in props {
                         if let ItemProperty::ColrIcc(icc) = p {
-                            icc_profile = Some(icc.clone());
+                            let (v, g) = copy_bytes_budgeted(icc, &butce)?;
+                            state_guard.birlestir(g);
+                            icc_profile = Some(v);
                             break;
                         }
                     }
@@ -363,6 +408,13 @@ impl<'a> AvifSequenceDecoder<'a> {
                     || at.references_track(b"prem", color_track.track_id)
             });
 
+            let color_sample_bytes = color_track
+                .samples
+                .len()
+                .saturating_mul(core::mem::size_of::<TrackSample>());
+            state_guard.ekle(color_sample_bytes)?;
+            let color_samples = color_track.samples.clone();
+
             let info = AvifSequenceInfo {
                 width: post_w,
                 height: post_h,
@@ -370,7 +422,7 @@ impl<'a> AvifSequenceDecoder<'a> {
                 chroma_format: color_bundle.chroma_format,
                 has_alpha: alpha_track.is_some(),
                 premultiplied_alpha,
-                frame_count: color_track.samples.len(),
+                frame_count: color_samples.len(),
                 timescale,
                 duration_in_timescale,
                 duration_sec,
@@ -385,7 +437,7 @@ impl<'a> AvifSequenceDecoder<'a> {
             };
 
             let state = TrackSequenceState {
-                color_samples: color_track.samples.clone(),
+                color_samples,
                 alpha_samples,
                 color_config_obus: color_bundle.av1c_config_obus,
                 alpha_config_obus,
@@ -399,11 +451,18 @@ impl<'a> AvifSequenceDecoder<'a> {
                 data,
                 config,
                 info,
+                butce,
+                _state_guard: state_guard,
                 backend: SequenceBackend::Track(Box::new(state)),
             })
         } else {
+            drop(movie);
             // Hareketsiz AVIF dosyası: tek karelik dizi olarak şeffaf destek.
-            let still = parse_info(data)?;
+            let still = parse_info_with_budget(data, &butce)?;
+            let meta_bytes = still.icc_profile.as_ref().map_or(0, Vec::len)
+                + still.exif.as_ref().map_or(0, Vec::len)
+                + still.xmp.as_ref().map_or(0, Vec::len);
+            state_guard.ekle(meta_bytes)?;
             let info = AvifSequenceInfo {
                 width: still.width,
                 height: still.height,
@@ -428,6 +487,8 @@ impl<'a> AvifSequenceDecoder<'a> {
                 data,
                 config,
                 info,
+                butce,
+                _state_guard: state_guard,
                 backend: SequenceBackend::Still { yielded: false },
             })
         }
@@ -506,7 +567,7 @@ impl<'a> AvifSequenceDecoder<'a> {
                 if *yielded {
                     return Ok(None);
                 }
-                let image = decode_with(self.data, &self.config)?;
+                let image = decode_with_budget(self.data, &self.config, Arc::clone(&self.butce))?;
                 *yielded = true;
                 Ok(Some(AvifFrame {
                     image,
@@ -608,11 +669,16 @@ impl<'a> AvifSequenceDecoder<'a> {
             None => None,
         };
 
-        let color_dec =
-            get_or_init_decoder(&mut st.color_decoder, &self.config, &st.color_config_obus)?;
-        let color_frame = decode_single_sample_frame(
+        let color_dec = get_or_init_decoder(
+            &mut st.color_decoder,
+            &self.config,
+            &st.color_config_obus,
+            &self.butce,
+        )?;
+        let (color_frame, _color_frame_guard) = decode_single_sample_frame(
             color_dec,
             &self.data[color_sample.offset..color_sample.offset + color_sample.size],
+            &self.butce,
         )?;
         let color_seq_color = color_dec.sequence_header().map(|seq| ColorInfo {
             color_primaries: u16::from(seq.pri),
@@ -622,16 +688,21 @@ impl<'a> AvifSequenceDecoder<'a> {
         });
 
         let alpha_decoded = if let Some(asamp) = alpha_sample {
-            let alpha_dec =
-                get_or_init_decoder(&mut st.alpha_decoder, &self.config, &st.alpha_config_obus)?;
-            let aframe = decode_single_sample_frame(
+            let alpha_dec = get_or_init_decoder(
+                &mut st.alpha_decoder,
+                &self.config,
+                &st.alpha_config_obus,
+                &self.butce,
+            )?;
+            let (aframe, aframe_guard) = decode_single_sample_frame(
                 alpha_dec,
                 &self.data[asamp.offset..asamp.offset + asamp.size],
+                &self.butce,
             )?;
             let a_full_range = alpha_dec
                 .sequence_header()
                 .is_none_or(|seq| seq.color_range != 0);
-            Some((aframe, a_full_range))
+            Some((aframe, aframe_guard, a_full_range))
         } else {
             None
         };
@@ -642,13 +713,16 @@ impl<'a> AvifSequenceDecoder<'a> {
         }
 
         let mut color_buf =
-            frame_to_planar_buffer(&color_frame, false, true, color_seq_color, &self.config)?;
-        apply_track_transforms(&mut color_buf, st.transforms, self.config.allocation_limit)?;
+            frame_to_planar_buffer(&color_frame, false, true, color_seq_color, &self.butce)?;
+        drop((color_frame, _color_frame_guard));
+        apply_track_transforms(&mut color_buf, st.transforms, &self.butce)?;
+        let mut frame_img_guard = color_buf.budget_guard;
 
-        let alpha_plane = if let Some((aframe, a_full_range)) = alpha_decoded {
+        let alpha_plane = if let Some((aframe, aframe_guard, a_full_range)) = alpha_decoded {
             let mut alpha_buf =
-                frame_to_planar_buffer(&aframe, true, a_full_range, None, &self.config)?;
-            apply_track_transforms(&mut alpha_buf, st.transforms, self.config.allocation_limit)?;
+                frame_to_planar_buffer(&aframe, true, a_full_range, None, &self.butce)?;
+            drop((aframe, aframe_guard));
+            apply_track_transforms(&mut alpha_buf, st.transforms, &self.butce)?;
             if alpha_buf.width != color_buf.width || alpha_buf.height != color_buf.height {
                 return Err(Error::InvalidData(
                     "alfa düzlemi boyutları renk karesi boyutlarıyla eşleşmiyor",
@@ -659,7 +733,30 @@ impl<'a> AvifSequenceDecoder<'a> {
                     "alfa düzlemi bit derinliği renk karesi bit derinliğiyle eşleşmiyor",
                 ));
             }
+            frame_img_guard.birlestir(alpha_buf.budget_guard);
             Some(alpha_buf.y_plane)
+        } else {
+            None
+        };
+
+        let icc_profile = if let Some(ref icc) = self.info.icc_profile {
+            let (v, g) = copy_bytes_budgeted(icc, &self.butce)?;
+            frame_img_guard.birlestir(g);
+            Some(v)
+        } else {
+            None
+        };
+        let exif = if let Some(ref ex) = self.info.exif {
+            let (v, g) = copy_bytes_budgeted(ex, &self.butce)?;
+            frame_img_guard.birlestir(g);
+            Some(v)
+        } else {
+            None
+        };
+        let xmp = if let Some(ref xm) = self.info.xmp {
+            let (v, g) = copy_bytes_budgeted(xm, &self.butce)?;
+            frame_img_guard.birlestir(g);
+            Some(v)
         } else {
             None
         };
@@ -678,15 +775,17 @@ impl<'a> AvifSequenceDecoder<'a> {
             alpha_plane,
             premultiplied_alpha: self.info.premultiplied_alpha,
             color: self.info.color,
-            icc_profile: self.info.icc_profile.clone(),
-            exif: self.info.exif.clone(),
-            xmp: self.info.xmp.clone(),
+            icc_profile,
+            exif,
+            xmp,
             clli: self.info.clli,
             mdcv: self.info.mdcv,
             pasp: self.info.pasp,
             gain_map_metadata: None,
             gain_map: None,
             effective_threads,
+            butce: Some(Arc::clone(&self.butce)),
+            _butce_tutucu: Some(Arc::new(frame_img_guard)),
         };
 
         let ts = self.info.timescale;
@@ -717,6 +816,7 @@ fn get_or_init_decoder<'d>(
     slot: &'d mut Option<Decoder>,
     config: &AvifDecodeConfig,
     config_obus: &[u8],
+    butce: &Arc<Butce>,
 ) -> Result<&'d mut Decoder> {
     if slot.is_none() {
         let dec_cfg = Config {
@@ -729,7 +829,7 @@ fn get_or_init_decoder<'d>(
             operating_point: 0,
             ..Config::default()
         };
-        let mut dec = Decoder::new(dec_cfg)?;
+        let mut dec = Decoder::new_with_shared_budget(dec_cfg, Arc::clone(butce))?;
         if !config_obus.is_empty() {
             dec.send_packet(&Packet::new(config_obus))?;
         }
@@ -740,13 +840,18 @@ fn get_or_init_decoder<'d>(
 
 /// Tek bir ISOBMFF örneğini (`sample`) kalıcı AV1 çözücüsüne besler, ilk görünür kareyi alır
 /// ve aynı örnekten kalan olası tamponlu kareleri tüketir (`libavif` `codec_dav1d` uyumlu).
-fn decode_single_sample_frame(decoder: &mut Decoder, sample_bytes: &[u8]) -> Result<Frame> {
+fn decode_single_sample_frame(
+    decoder: &mut Decoder,
+    sample_bytes: &[u8],
+    butce: &Arc<Butce>,
+) -> Result<(Frame, ButceTutucu)> {
     decoder.send_packet(&Packet::new(sample_bytes))?;
     let first = decoder
         .receive_frame()?
         .ok_or(Error::InvalidData("AV1 dizi örneği görünür kare üretmedi"))?;
+    let guard = Butce::tut(butce, first.allocation_bytes())?;
     while decoder.receive_frame()?.is_some() {}
-    Ok(first)
+    Ok((first, guard))
 }
 
 fn frame_to_planar_buffer(
@@ -754,44 +859,10 @@ fn frame_to_planar_buffer(
     is_alpha: bool,
     alpha_full_range: bool,
     seq_color: Option<ColorInfo>,
-    config: &AvifDecodeConfig,
+    butce: &Arc<Butce>,
 ) -> Result<PlanarBuffer> {
     let bit_depth = frame.bit_depth();
-    let bps = PlaneStorage::bytes_per_sample(bit_depth);
-    let y_samples = frame
-        .plane(PlaneType::Y)
-        .map_or(0usize, |p| p.width().saturating_mul(p.height()));
-    let c_samples = if is_alpha {
-        0usize
-    } else {
-        frame
-            .plane(PlaneType::U)
-            .map_or(0usize, |p| p.width().saturating_mul(p.height()))
-            .saturating_add(
-                frame
-                    .plane(PlaneType::V)
-                    .map_or(0usize, |p| p.width().saturating_mul(p.height())),
-            )
-    };
-    let total_bytes =
-        y_samples
-            .saturating_add(c_samples)
-            .checked_mul(bps)
-            .ok_or(Error::SizeOverflow {
-                stage: SizeStage::TotalAllocation,
-                lhs: y_samples.saturating_add(c_samples),
-                rhs: bps,
-            })?;
-    if let Some(limit) = config.allocation_limit
-        && total_bytes > limit
-    {
-        return Err(Error::BudgetExceeded {
-            requested: total_bytes,
-            limit,
-        });
-    }
-
-    let (w, h, mut y_plane) = extract_plane(frame, PlaneType::Y, config.allocation_limit)?;
+    let (w, h, mut y_plane, mut budget_guard) = extract_plane(frame, PlaneType::Y, butce)?;
     let (cw, ch, u_plane, v_plane, chroma_format) = if is_alpha {
         (
             0,
@@ -801,8 +872,10 @@ fn frame_to_planar_buffer(
             ChromaFormat::Monochrome,
         )
     } else {
-        let (cw, ch, u) = extract_plane(frame, PlaneType::U, config.allocation_limit)?;
-        let (_, _, v) = extract_plane(frame, PlaneType::V, config.allocation_limit)?;
+        let (cw, ch, u, ug) = extract_plane(frame, PlaneType::U, butce)?;
+        budget_guard.birlestir(ug);
+        let (_, _, v, vg) = extract_plane(frame, PlaneType::V, butce)?;
+        budget_guard.birlestir(vg);
         (cw, ch, u, v, frame.chroma_format())
     };
 
@@ -832,5 +905,6 @@ fn frame_to_planar_buffer(
         u_plane,
         v_plane,
         seq_color,
+        budget_guard,
     })
 }

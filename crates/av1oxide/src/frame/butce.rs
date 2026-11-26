@@ -50,6 +50,48 @@ pub(crate) struct ButceTutucu {
     bayt: usize,
 }
 
+impl ButceTutucu {
+    /// `0` bayt tutan boş bekçi oluşturur.
+    pub(crate) fn bos(ust: &Arc<Butce>) -> Self {
+        Self {
+            ust: Arc::clone(ust),
+            bayt: 0,
+        }
+    }
+
+    /// Bekçiye ek `ek_bayt` bütçe ayırıp ekler; aşımda mevcut durum değişmez.
+    pub(crate) fn ekle(&mut self, ek_bayt: usize) -> Result<()> {
+        if ek_bayt > 0 {
+            self.ust.ayir(ek_bayt)?;
+            self.bayt = self.bayt.saturating_add(ek_bayt);
+        }
+        Ok(())
+    }
+
+    /// Bekçiden `dusulen` baytı serbest bırakır.
+    pub(crate) fn dusur(&mut self, dusulen: usize) {
+        let d = dusulen.min(self.bayt);
+        if d > 0 {
+            self.bayt -= d;
+            self.ust.birak(d);
+        }
+    }
+
+    /// Aynı kök `Arc<Butce>` üzerindeki başka bir bekçinin sahipliğini devralır.
+    pub(crate) fn birlestir(&mut self, mut diger: Self) {
+        if Arc::ptr_eq(&self.ust, &diger.ust) {
+            self.bayt = self.bayt.saturating_add(diger.bayt);
+            diger.bayt = 0;
+        }
+    }
+
+    /// Bu bekçinin şu an tuttuğu bayt miktarı.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) const fn bayt(&self) -> usize {
+        self.bayt
+    }
+}
+
 impl Drop for ButceTutucu {
     fn drop(&mut self) {
         if self.bayt > 0 {
@@ -99,21 +141,69 @@ impl Butce {
         }
     }
 
+    /// `ust` defterine `ek_taban` baytlık geçici taban ekleyerek alt defter oluşturur.
+    ///
+    /// Alt defter düşürüldüğünde `ek_taban` dâhil tüm kalan baytlar `ust` deftere iade edilir.
+    pub(crate) fn alt_defter_tabanla(ust: &Arc<Self>, ek_taban: usize) -> Self {
+        if ek_taban > 0 {
+            ust.ekle_taban(ek_taban);
+        }
+        Self {
+            sinir: ust.sinir,
+            canli: CachePadded::new(AtomicUsize::new(ek_taban)),
+            tepe: AtomicUsize::new(ek_taban),
+            taban: AtomicUsize::new(0),
+            ust: Some(Arc::clone(ust)),
+        }
+    }
+
+    /// `fark` baytlık taban artışını bu deftere ve varsa üst defter zincirine atomik ekler.
+    fn ekle_taban(&self, fark: usize) {
+        if fark == 0 {
+            return;
+        }
+        if let Some(ref ust) = self.ust {
+            ust.ekle_taban(fark);
+        }
+        // ORDERING: Taban artışını canlı toplama atomik ekler.
+        let yeni_canli = self
+            .canli
+            .fetch_add(fark, Ordering::AcqRel)
+            .saturating_add(fark);
+        self.tepe.fetch_max(yeni_canli, Ordering::Relaxed);
+    }
+
     /// Kök defterin kalıcı taban baytını (`Decoder::kalici_bayt`) günceller (`F7b`).
     pub(crate) fn taban_guncelle(&self, yeni_taban: usize) {
         // ORDERING: Ana iş parçacığı tarafından kalıcı referans/çıktı kuyruğu
         // değiştiğinde çağrılır.
         let eski = self.taban.swap(yeni_taban, Ordering::AcqRel);
         if yeni_taban > eski {
-            let fark = yeni_taban - eski;
-            // ORDERING: Taban artışını canlı toplama atomik ekler.
-            let yeni_canli = self
-                .canli
-                .fetch_add(fark, Ordering::AcqRel)
-                .saturating_add(fark);
-            self.tepe.fetch_max(yeni_canli, Ordering::Relaxed);
+            self.ekle_taban(yeni_taban - eski);
         } else if eski > yeni_taban {
             self.birak(eski - yeni_taban);
+        }
+    }
+
+    /// Defterin üst sınırı (bayt).
+    #[inline]
+    pub(crate) fn sinir(&self) -> Option<usize> {
+        if let Some(ref ust) = self.ust {
+            ust.sinir()
+        } else {
+            self.sinir
+        }
+    }
+
+    /// Etkin sınır altında şu an kalan kullanılabilir bayt (`None` = sınırsız).
+    #[cfg(feature = "std")]
+    #[inline]
+    pub(crate) fn kalan(&self) -> Option<usize> {
+        if let Some(ref ust) = self.ust {
+            ust.kalan()
+        } else {
+            self.sinir
+                .map(|lim| lim.saturating_sub(self.canli.load(Ordering::Acquire)))
         }
     }
 

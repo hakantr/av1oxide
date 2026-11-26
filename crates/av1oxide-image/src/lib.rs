@@ -11,7 +11,7 @@
 use core::marker::PhantomData;
 use std::io::{Cursor, Read};
 
-use av1oxide::avif::{AvifDecodeConfig, AvifInfo, decode_with, parse_info};
+use av1oxide::avif::{AvifDecodeConfig, AvifInfo, decode_with, parse_info_with};
 use av1oxide::{BitDepth, Error};
 use image::error::{DecodingError, ImageFormatHint, LimitError, LimitErrorKind};
 use image::{
@@ -25,6 +25,18 @@ use image::{
 /// ve `12-bit` AVIF görüntüleri ise `image` sözleşmesi uyarınca tam `[0..=65535]`
 /// dinamik aralığına ölçeklenerek `ColorType::Rgb16` / `ColorType::Rgba16` (yerel
 /// bayt sırası) biçiminde döndürülür.
+///
+/// ## Bellek Bütçesi Kapsamı (`allocation_limit` ve `Limits::max_alloc`)
+///
+/// - [`AvifDecoder::with_config`] akıştan okuduğu iç `raw_bytes` tamponunu okuma başlamadan
+///   önce `Read::take(limit + 1)` ile sınırlar; ardından kalan bütçeyi (`limit - raw_bytes.len()`)
+///   [`parse_info_with`] çağrısına aktararak `cmin`/`infe` açma ve `ICC`/`Exif`/`XMP` başlık
+///   tahsislerini aynı tavan içinde tutar.
+/// - [`ImageDecoder::set_limits`] çağrısı hem çıktı boyutunu (`total_bytes()`) hem de adaptörün
+///   halihazırda tuttuğu girdi + üst veri belleğini `limits.max_alloc` tavanına karşı denetler.
+/// - [`ImageDecoder::read_image`] aşamasında iç çözücü ve RGB dönüşüm tamponları toplam tavan
+///   içinden `raw_bytes.len()` düşülerek sınırlandırılır; çağıranın dışarıda ayırıp `read_image`
+///   çağrısına geçirdiği `&mut [u8]` çıktı dilimi kütüphanenin iç tahsis sayacına dâhil değildir.
 #[derive(Clone, Debug)]
 pub struct AvifDecoder<R: Read> {
     raw_bytes: Vec<u8>,
@@ -38,17 +50,37 @@ impl<R: Read> AvifDecoder<R> {
     /// Varsayılan [`AvifDecodeConfig`] ile yeni bir [`AvifDecoder`] oluşturur.
     ///
     /// Akış baytları okunur ve piksel çözümüne geçilmeden önce yalnızca başlık
-    /// ([`parse_info`]) ayrıştırılır; böylece `dimensions`, `color_type`, metaveri
+    /// ([`parse_info_with`]) ayrıştırılır; böylece `dimensions`, `color_type`, metaveri
     /// ve `set_limits` kontrolleri piksel tahsisi yapılmadan yürütülebilir.
     pub fn new(reader: R) -> ImageResult<Self> {
         Self::with_config(reader, AvifDecodeConfig::default())
     }
 
     /// Özel [`AvifDecodeConfig`] yapılandırmasıyla yeni bir [`AvifDecoder`] oluşturur.
+    ///
+    /// `config.allocation_limit` tanımlıysa okuma başlamadan önce `Read::take(limit + 1)` ile
+    /// girdi boyutu sınırlandırılır; girdi `limit` bayttan büyükse başlık ayrıştırılmadan
+    /// `LimitErrorKind::InsufficientMemory` döndürülür. Kalan bütçe (`limit - raw_bytes.len()`)
+    /// [`parse_info_with`] çağrısına iletilir.
     pub fn with_config(mut reader: R, config: AvifDecodeConfig) -> ImageResult<Self> {
         let mut raw_bytes = Vec::new();
-        reader.read_to_end(&mut raw_bytes)?;
-        let info = parse_info(&raw_bytes).map_err(map_av1oxide_error)?;
+        let header_cfg = if let Some(limit) = config.allocation_limit {
+            let max_read = (limit as u64).saturating_add(1);
+            (&mut reader).take(max_read).read_to_end(&mut raw_bytes)?;
+            if raw_bytes.len() > limit {
+                return Err(ImageError::Limits(LimitError::from_kind(
+                    LimitErrorKind::InsufficientMemory,
+                )));
+            }
+            AvifDecodeConfig {
+                allocation_limit: Some(limit - raw_bytes.len()),
+                ..config.clone()
+            }
+        } else {
+            reader.read_to_end(&mut raw_bytes)?;
+            config.clone()
+        };
+        let info = parse_info_with(&raw_bytes, &header_cfg).map_err(map_av1oxide_error)?;
         Ok(Self {
             raw_bytes,
             info,
@@ -62,6 +94,21 @@ impl<R: Read> AvifDecoder<R> {
     #[must_use]
     pub const fn info(&self) -> &AvifInfo {
         &self.info
+    }
+
+    fn held_header_bytes(&self) -> usize {
+        self.raw_bytes
+            .len()
+            .saturating_add(self.info.icc_profile.as_ref().map_or(0, Vec::len))
+            .saturating_add(self.info.exif.as_ref().map_or(0, Vec::len))
+            .saturating_add(self.info.xmp.as_ref().map_or(0, Vec::len))
+            .saturating_add(
+                self.info
+                    .gain_map_metadata
+                    .as_ref()
+                    .and_then(|g| g.alt_icc_profile.as_ref())
+                    .map_or(0, Vec::len),
+            )
     }
 
     fn effective_allocation_limit(&self) -> Option<usize> {
@@ -112,12 +159,13 @@ impl<R: Read> ImageDecoder for AvifDecoder<R> {
         limits.check_support(&image::LimitSupport::default())?;
         let (width, height) = self.dimensions();
         limits.check_dimensions(width, height)?;
-        if let Some(max_alloc) = limits.max_alloc
-            && self.total_bytes() > max_alloc
-        {
-            return Err(ImageError::Limits(LimitError::from_kind(
-                LimitErrorKind::InsufficientMemory,
-            )));
+        if let Some(max_alloc) = limits.max_alloc {
+            let held = self.held_header_bytes() as u64;
+            if self.total_bytes() > max_alloc || held > max_alloc {
+                return Err(ImageError::Limits(LimitError::from_kind(
+                    LimitErrorKind::InsufficientMemory,
+                )));
+            }
         }
         self.limits = limits;
         Ok(())
@@ -136,16 +184,19 @@ impl<R: Read> ImageDecoder for AvifDecoder<R> {
 
         let (w, h) = self.dimensions();
         self.limits.check_dimensions(w, h)?;
+        let held_total = self.held_header_bytes() as u64;
         if let Some(max_alloc) = self.limits.max_alloc
-            && expected_bytes > max_alloc
+            && (expected_bytes > max_alloc || held_total > max_alloc)
         {
             return Err(ImageError::Limits(LimitError::from_kind(
                 LimitErrorKind::InsufficientMemory,
             )));
         }
 
-        let mut cfg = self.config.clone();
-        cfg.allocation_limit = self.effective_allocation_limit();
+        let effective_limit = self.effective_allocation_limit();
+        let bit_depth = self.info.bit_depth;
+        let has_alpha = self.info.has_alpha;
+        let mut cfg = self.config;
         if let Some(max_w) = self.limits.max_image_width
             && let Some(max_h) = self.limits.max_image_height
         {
@@ -153,9 +204,25 @@ impl<R: Read> ImageDecoder for AvifDecoder<R> {
             cfg.max_pixels = cfg.max_pixels.min(pixel_limit);
         }
 
-        let img = decode_with(&self.raw_bytes, &cfg).map_err(map_av1oxide_error)?;
+        // Üst veri kopyalarını (`ICC`/`Exif`/`XMP`) piksel çözümünden önce serbest bırak;
+        // `raw_bytes` tamponunu ise toplam bütçeden düşerek iç çözücüye geçir.
+        drop(self.info);
+        let raw_bytes = self.raw_bytes;
+        if let Some(limit) = effective_limit {
+            if raw_bytes.len() > limit {
+                return Err(ImageError::Limits(LimitError::from_kind(
+                    LimitErrorKind::InsufficientMemory,
+                )));
+            }
+            cfg.allocation_limit = Some(limit - raw_bytes.len());
+        } else {
+            cfg.allocation_limit = None;
+        }
 
-        match (self.info.bit_depth, self.info.has_alpha) {
+        let img = decode_with(&raw_bytes, &cfg).map_err(map_av1oxide_error)?;
+        drop(raw_bytes);
+
+        match (bit_depth, has_alpha) {
             (BitDepth::Eight, false) => {
                 let rgb = img.to_rgb8().map_err(map_av1oxide_error)?;
                 buf.copy_from_slice(&rgb.pixels);

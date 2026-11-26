@@ -2,10 +2,12 @@
 
 #![forbid(unsafe_code)]
 
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use crate::avif::image::{AvifImage, PlaneStorage, Rgb16Image, RgbImage, Rgba16Image, RgbaImage};
 use crate::error::{Error, Result, SizeStage};
+use crate::frame::butce::{Butce, ButceTutucu};
 use crate::frame::{BitDepth, ChromaFormat};
 
 /// `std::thread::scope` şerit paralelliği için minimum piksel eşiği (`512 × 512`).
@@ -1814,7 +1816,10 @@ fn dispatch_matrix<S: SampleSource, O: PixelSink>(
     }
 }
 
-fn alloc_output_vec<T: Copy + Default>(count: usize) -> Result<Vec<T>> {
+fn alloc_output_vec<T: Copy + Default>(
+    count: usize,
+    butce: Option<&Arc<Butce>>,
+) -> Result<(Vec<T>, Option<ButceTutucu>)> {
     let byte_len = count
         .checked_mul(core::mem::size_of::<T>())
         .ok_or(Error::SizeOverflow {
@@ -1822,6 +1827,7 @@ fn alloc_output_vec<T: Copy + Default>(count: usize) -> Result<Vec<T>> {
             lhs: count,
             rhs: core::mem::size_of::<T>(),
         })?;
+    let guard = butce.map(|b| Butce::tut(b, byte_len)).transpose()?;
     let mut pixels = Vec::new();
     pixels
         .try_reserve_exact(count)
@@ -1829,7 +1835,31 @@ fn alloc_output_vec<T: Copy + Default>(count: usize) -> Result<Vec<T>> {
             requested: byte_len,
         })?;
     pixels.resize(count, T::default());
-    Ok(pixels)
+    Ok((pixels, guard))
+}
+
+fn build_unorm_tables_budgeted(
+    bit_depth: BitDepth,
+    full_range: bool,
+    identity_mode: bool,
+    butce: Option<&Arc<Butce>>,
+) -> Result<(Vec<f32>, Vec<f32>, Option<ButceTutucu>)> {
+    let count = 1usize << bit_depth.bits();
+    let table_bytes = count
+        .saturating_mul(core::mem::size_of::<f32>())
+        .saturating_mul(2);
+    let guard = butce.map(|b| Butce::tut(b, table_bytes)).transpose()?;
+    let (ty, tuv) = build_unorm_tables(bit_depth, full_range, identity_mode);
+    Ok((ty, tuv, guard))
+}
+
+fn build_alpha_u8_lut_budgeted(
+    bit_depth: BitDepth,
+    butce: Option<&Arc<Butce>>,
+) -> Result<(Vec<u8>, Option<ButceTutucu>)> {
+    let len = (bit_depth.max_sample() as usize) + 1;
+    let guard = butce.map(|b| Butce::tut(b, len)).transpose()?;
+    Ok((build_alpha_u8_lut(bit_depth), guard))
 }
 
 /// [`AvifImage`] düzlemlerini 16-bit RGB tamponuna dönüştürür.
@@ -1847,7 +1877,8 @@ pub(crate) fn image_to_rgb16(img: &AvifImage) -> Result<Rgb16Image> {
         lhs: num_pixels,
         rhs: 3,
     })?;
-    let mut pixels: Vec<u16> = alloc_output_vec(total_samples)?;
+    let (mut pixels, _out_guard): (Vec<u16>, _) =
+        alloc_output_vec(total_samples, img.butce.as_ref())?;
     let max_val = img.bit_depth.max_sample() as usize;
     let max_f = max_val as f32;
     let sink = Rgb16Sink { max_f };
@@ -1863,7 +1894,12 @@ pub(crate) fn image_to_rgb16(img: &AvifImage) -> Result<Rgb16Image> {
             dispatch_matrix(yp, up, vp, &mut pixels, img, max_f, max_f, src, sink);
         }
         (PlaneStorage::U16(yp), PlaneStorage::U16(up), PlaneStorage::U16(vp)) => {
-            let (ty, tuv) = build_unorm_tables(img.bit_depth, img.color.full_range, identity);
+            let (ty, tuv, _tbl_guard) = build_unorm_tables_budgeted(
+                img.bit_depth,
+                img.color.full_range,
+                identity,
+                img.butce.as_ref(),
+            )?;
             let src = TablesU16 {
                 table_y: &ty,
                 table_uv: &tuv,
@@ -1901,7 +1937,8 @@ pub(crate) fn image_to_rgba16(img: &AvifImage) -> Result<Rgba16Image> {
         lhs: num_pixels,
         rhs: 4,
     })?;
-    let mut pixels: Vec<u16> = alloc_output_vec(total_samples)?;
+    let (mut pixels, _out_guard): (Vec<u16>, _) =
+        alloc_output_vec(total_samples, img.butce.as_ref())?;
     let max_val = img.bit_depth.max_sample() as usize;
     let max_f = max_val as f32;
     let opaque_alpha = max_val as u16;
@@ -1938,7 +1975,12 @@ pub(crate) fn image_to_rgba16(img: &AvifImage) -> Result<Rgba16Image> {
             }
         }
         (PlaneStorage::U16(yp), PlaneStorage::U16(up), PlaneStorage::U16(vp)) => {
-            let (ty, tuv) = build_unorm_tables(img.bit_depth, img.color.full_range, identity);
+            let (ty, tuv, _tbl_guard) = build_unorm_tables_budgeted(
+                img.bit_depth,
+                img.color.full_range,
+                identity,
+                img.butce.as_ref(),
+            )?;
             let src = TablesU16 {
                 table_y: &ty,
                 table_uv: &tuv,
@@ -1998,7 +2040,7 @@ pub(crate) fn image_to_rgb8(img: &AvifImage) -> Result<RgbImage> {
         lhs: num_pixels,
         rhs: 3,
     })?;
-    let mut pixels: Vec<u8> = alloc_output_vec(total_bytes)?;
+    let (mut pixels, _out_guard): (Vec<u8>, _) = alloc_output_vec(total_bytes, img.butce.as_ref())?;
     let max_val = img.bit_depth.max_sample() as usize;
     let yuv_max_f = max_val as f32;
     let identity = img.color.matrix_coefficients == 0;
@@ -2023,7 +2065,12 @@ pub(crate) fn image_to_rgb8(img: &AvifImage) -> Result<RgbImage> {
             );
         }
         (PlaneStorage::U16(yp), PlaneStorage::U16(up), PlaneStorage::U16(vp)) => {
-            let (ty, tuv) = build_unorm_tables(img.bit_depth, img.color.full_range, identity);
+            let (ty, tuv, _tbl_guard) = build_unorm_tables_budgeted(
+                img.bit_depth,
+                img.color.full_range,
+                identity,
+                img.butce.as_ref(),
+            )?;
             let src = TablesU16 {
                 table_y: &ty,
                 table_uv: &tuv,
@@ -2070,7 +2117,7 @@ pub(crate) fn image_to_rgba8(img: &AvifImage) -> Result<RgbaImage> {
         lhs: num_pixels,
         rhs: 4,
     })?;
-    let mut pixels: Vec<u8> = alloc_output_vec(total_bytes)?;
+    let (mut pixels, _out_guard): (Vec<u8>, _) = alloc_output_vec(total_bytes, img.butce.as_ref())?;
     let max_val = img.bit_depth.max_sample() as usize;
     let yuv_max_f = max_val as f32;
     let identity = img.color.matrix_coefficients == 0;
@@ -2111,7 +2158,12 @@ pub(crate) fn image_to_rgba8(img: &AvifImage) -> Result<RgbaImage> {
             }
         }
         (PlaneStorage::U16(yp), PlaneStorage::U16(up), PlaneStorage::U16(vp)) => {
-            let (ty, tuv) = build_unorm_tables(img.bit_depth, img.color.full_range, identity);
+            let (ty, tuv, _tbl_guard) = build_unorm_tables_budgeted(
+                img.bit_depth,
+                img.color.full_range,
+                identity,
+                img.butce.as_ref(),
+            )?;
             let src = TablesU16 {
                 table_y: &ty,
                 table_uv: &tuv,
@@ -2119,7 +2171,8 @@ pub(crate) fn image_to_rgba8(img: &AvifImage) -> Result<RgbaImage> {
             };
             match img.alpha_plane.as_ref() {
                 Some(PlaneStorage::U16(ap)) => {
-                    let lut = build_alpha_u8_lut(img.bit_depth);
+                    let (lut, _lut_guard) =
+                        build_alpha_u8_lut_budgeted(img.bit_depth, img.butce.as_ref())?;
                     let sink = Rgba8AlphaU16Sink {
                         alpha: ap,
                         stride: w,
@@ -2342,6 +2395,8 @@ mod tests {
                 gain_map_metadata: None,
                 gain_map: None,
                 effective_threads: threads,
+                butce: None,
+                _butce_tutucu: None,
             }
         };
 

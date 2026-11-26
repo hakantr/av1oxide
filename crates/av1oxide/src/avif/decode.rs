@@ -2,8 +2,9 @@
 
 #![forbid(unsafe_code)]
 
+use alloc::borrow::Cow;
 use alloc::boxed::Box;
-use alloc::vec;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use crate::api::{Config, Decoder, Packet};
@@ -21,10 +22,11 @@ use crate::avif::image::{
 use crate::bitstream::obu::parse_sequence_header_obus;
 use crate::bitstream::seq_header::PixelLayout;
 use crate::error::{Error, Result, SizeStage};
+use crate::frame::butce::{Butce, ButceTutucu, dolu_vec, kopya_vec};
 use crate::frame::{BitDepth, ChromaFormat, Frame, PlaneType};
 
 /// İç düzlemsel çalışma tamponu.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub(crate) struct PlanarBuffer {
     pub(crate) width: u32,
     pub(crate) height: u32,
@@ -36,6 +38,24 @@ pub(crate) struct PlanarBuffer {
     pub(crate) u_plane: PlaneStorage,
     pub(crate) v_plane: PlaneStorage,
     pub(crate) seq_color: Option<ColorInfo>,
+    pub(crate) budget_guard: ButceTutucu,
+}
+
+#[inline]
+pub(crate) fn plane_storage_bytes(storage: &PlaneStorage) -> usize {
+    match storage {
+        PlaneStorage::U8(v) => v.len(),
+        PlaneStorage::U16(v) => v.len().saturating_mul(2),
+    }
+}
+
+pub(crate) fn copy_bytes_budgeted(
+    src: &[u8],
+    butce: &Arc<Butce>,
+) -> Result<(Vec<u8>, ButceTutucu)> {
+    let guard = Butce::tut(butce, src.len())?;
+    let v = kopya_vec(src)?;
+    Ok((v, guard))
 }
 
 /// Yapılandırılmış iş parçacığı sayısını etkin çalışma zamanı sayısına çözümler.
@@ -202,6 +222,7 @@ fn inspect_item_dimensions(
     container: &AvifContainer<'_>,
     item_id: u32,
     depth: usize,
+    butce: &Arc<Butce>,
 ) -> Result<InspectedItem> {
     if depth > 8 {
         return Err(Error::InvalidData(
@@ -258,35 +279,45 @@ fn inspect_item_dimensions(
 
     let (mut w, mut h, bd, cf) = match &info.item_type {
         b"av01" => {
-            if (ispe_dims.is_none() || bit_depth.is_none() || chroma_format.is_none())
-                && let Ok(payload) = container.resolve_item_data(item_id, None)
-                && let Ok(Some(seq)) = parse_sequence_header_obus(&payload)
-            {
-                if ispe_dims.is_none() {
-                    ispe_dims = Some((seq.max_width.max(1) as u32, seq.max_height.max(1) as u32));
-                }
-                if bit_depth.is_none() {
-                    bit_depth = match seq.hbd {
-                        0 => Some(BitDepth::Eight),
-                        1 => Some(BitDepth::Ten),
-                        _ => Some(BitDepth::Twelve),
-                    };
-                }
-                if chroma_format.is_none() {
-                    chroma_format = Some(match seq.layout {
-                        PixelLayout::I400 => ChromaFormat::Monochrome,
-                        PixelLayout::I420 => ChromaFormat::C420,
-                        PixelLayout::I422 => ChromaFormat::C422,
-                        PixelLayout::I444 => ChromaFormat::C444,
-                    });
-                }
-                if seq_color.is_none() {
-                    seq_color = Some(ColorInfo {
-                        color_primaries: u16::from(seq.pri),
-                        transfer_characteristics: u16::from(seq.trc),
-                        matrix_coefficients: u16::from(seq.mtrx),
-                        full_range: seq.color_range != 0,
-                    });
+            if ispe_dims.is_none() || bit_depth.is_none() || chroma_format.is_none() {
+                match container.resolve_item_data(item_id, butce) {
+                    Ok((payload, _guard)) => {
+                        if let Ok(Some(seq)) = parse_sequence_header_obus(&payload) {
+                            if ispe_dims.is_none() {
+                                ispe_dims = Some((
+                                    seq.max_width.max(1) as u32,
+                                    seq.max_height.max(1) as u32,
+                                ));
+                            }
+                            if bit_depth.is_none() {
+                                bit_depth = match seq.hbd {
+                                    0 => Some(BitDepth::Eight),
+                                    1 => Some(BitDepth::Ten),
+                                    _ => Some(BitDepth::Twelve),
+                                };
+                            }
+                            if chroma_format.is_none() {
+                                chroma_format = Some(match seq.layout {
+                                    PixelLayout::I400 => ChromaFormat::Monochrome,
+                                    PixelLayout::I420 => ChromaFormat::C420,
+                                    PixelLayout::I422 => ChromaFormat::C422,
+                                    PixelLayout::I444 => ChromaFormat::C444,
+                                });
+                            }
+                            if seq_color.is_none() {
+                                seq_color = Some(ColorInfo {
+                                    color_primaries: u16::from(seq.pri),
+                                    transfer_characteristics: u16::from(seq.trc),
+                                    matrix_coefficients: u16::from(seq.mtrx),
+                                    full_range: seq.color_range != 0,
+                                });
+                            }
+                        }
+                    }
+                    Err(err @ (Error::BudgetExceeded { .. } | Error::AllocationFailed { .. })) => {
+                        return Err(err);
+                    }
+                    Err(_) => {}
                 }
             }
             let (iw, ih) =
@@ -296,7 +327,7 @@ fn inspect_item_dimensions(
             (iw, ih, bd, cf)
         }
         b"grid" => {
-            let grid_bytes = container.resolve_item_data(item_id, None)?;
+            let (grid_bytes, _grid_guard) = container.resolve_item_data(item_id, butce)?;
             let grid = parse_grid_descriptor(&grid_bytes)?;
             let tiles = container.references_from(item_id, b"dimg");
             let expected = (grid.rows as usize)
@@ -307,7 +338,7 @@ fn inspect_item_dimensions(
                     "grid dimg referans sayısı rows*cols ile uyuşmuyor",
                 ));
             }
-            let tile_info = inspect_item_dimensions(container, tiles[0], depth + 1)?;
+            let tile_info = inspect_item_dimensions(container, tiles[0], depth + 1, butce)?;
             if seq_color.is_none() {
                 seq_color = tile_info.seq_color;
             }
@@ -326,7 +357,7 @@ fn inspect_item_dimensions(
                     "iden öğesi tek bir dimg referansı içermelidir",
                 ));
             }
-            let target_info = inspect_item_dimensions(container, targets[0], depth + 1)?;
+            let target_info = inspect_item_dimensions(container, targets[0], depth + 1, butce)?;
             if seq_color.is_none() {
                 seq_color = target_info.seq_color;
             }
@@ -443,15 +474,16 @@ fn is_premultiplied_alpha(
     to_primary.contains(&alpha_id)
 }
 
-pub(crate) type MetadataPair = (Option<Vec<u8>>, Option<Vec<u8>>);
+pub(crate) type MetadataBundle = (Option<Vec<u8>>, Option<Vec<u8>>, ButceTutucu);
 
 pub(crate) fn extract_metadata_items(
     container: &AvifContainer<'_>,
     primary_id: u32,
-    allocation_limit: Option<usize>,
-) -> Result<MetadataPair> {
+    butce: &Arc<Butce>,
+) -> Result<MetadataBundle> {
     let mut exif: Option<Vec<u8>> = None;
     let mut xmp: Option<Vec<u8>> = None;
+    let mut meta_guard = ButceTutucu::bos(butce);
 
     let meta_ids = container.references_to(primary_id, b"cdsc");
     for mid in meta_ids {
@@ -459,7 +491,7 @@ pub(crate) fn extract_metadata_items(
             continue;
         };
         if &info.item_type == b"Exif" && exif.is_none() {
-            let raw = container.resolve_item_data(mid, allocation_limit)?;
+            let (raw, raw_guard) = container.resolve_item_data(mid, butce)?;
             if raw.len() < 4 {
                 return Err(Error::InvalidData("Exif öğesi 4 bayttan kısa"));
             }
@@ -470,26 +502,35 @@ pub(crate) fn extract_metadata_items(
             let slice = raw.get(start..).ok_or(Error::InvalidData(
                 "Exif TIFF başlık ofseti veri sınırları dışında",
             ))?;
-            exif = Some(slice.to_vec());
+            let (v, g) = copy_bytes_budgeted(slice, butce)?;
+            drop((raw, raw_guard));
+            meta_guard.birlestir(g);
+            exif = Some(v);
         } else if &info.item_type == b"mime"
             && info.content_type == "application/rdf+xml"
             && xmp.is_none()
         {
-            let raw = container.resolve_item_data(mid, allocation_limit)?;
-            xmp = Some(raw.into_owned());
+            let (raw, raw_guard) = container.resolve_item_data(mid, butce)?;
+            let (v, g) = match raw {
+                Cow::Owned(v) => (v, raw_guard),
+                Cow::Borrowed(s) => copy_bytes_budgeted(s, butce)?,
+            };
+            meta_guard.birlestir(g);
+            xmp = Some(v);
         }
     }
-    Ok((exif, xmp))
+    Ok((exif, xmp, meta_guard))
 }
 
 /// `trak` içine gömülü `meta` kutusundan tüm ilişkili `Exif`/`XMP` öğelerini çıkarır
 /// (`libavif` `avifDecoderFindMetadata(..., colorId = 0)` uyumlu).
 pub(crate) fn extract_track_metadata_items(
     container: &AvifContainer<'_>,
-    allocation_limit: Option<usize>,
-) -> Result<MetadataPair> {
+    butce: &Arc<Butce>,
+) -> Result<MetadataBundle> {
     let mut exif: Option<Vec<u8>> = None;
     let mut xmp: Option<Vec<u8>> = None;
+    let mut meta_guard = ButceTutucu::bos(butce);
 
     for info in container.items.values() {
         if !container.item_has_data(info.item_id)
@@ -498,7 +539,7 @@ pub(crate) fn extract_track_metadata_items(
             continue;
         }
         if &info.item_type == b"Exif" && exif.is_none() {
-            let raw = container.resolve_item_data(info.item_id, allocation_limit)?;
+            let (raw, raw_guard) = container.resolve_item_data(info.item_id, butce)?;
             if raw.len() < 4 {
                 return Err(Error::InvalidData("Exif öğesi 4 bayttan kısa"));
             }
@@ -509,16 +550,24 @@ pub(crate) fn extract_track_metadata_items(
             let slice = raw.get(start..).ok_or(Error::InvalidData(
                 "Exif TIFF başlık ofseti veri sınırları dışında",
             ))?;
-            exif = Some(slice.to_vec());
+            let (v, g) = copy_bytes_budgeted(slice, butce)?;
+            drop((raw, raw_guard));
+            meta_guard.birlestir(g);
+            exif = Some(v);
         } else if &info.item_type == b"mime"
             && info.content_type == "application/rdf+xml"
             && xmp.is_none()
         {
-            let raw = container.resolve_item_data(info.item_id, allocation_limit)?;
-            xmp = Some(raw.into_owned());
+            let (raw, raw_guard) = container.resolve_item_data(info.item_id, butce)?;
+            let (v, g) = match raw {
+                Cow::Owned(v) => (v, raw_guard),
+                Cow::Borrowed(s) => copy_bytes_budgeted(s, butce)?,
+            };
+            meta_guard.birlestir(g);
+            xmp = Some(v);
         }
     }
-    Ok((exif, xmp))
+    Ok((exif, xmp, meta_guard))
 }
 
 /// ISO 21496-1 `tmap` öğesini `libavif` (`avifDecoderFindGainMapItem`) kurallarına göre bulur,
@@ -528,8 +577,8 @@ fn find_and_validate_tmap(
     primary_id: u32,
     base_raw_w: u32,
     base_raw_h: u32,
-    allocation_limit: Option<usize>,
-) -> Result<Option<(u32, GainMapMetadata)>> {
+    butce: &Arc<Butce>,
+) -> Result<Option<(u32, GainMapMetadata, ButceTutucu)>> {
     // ISO/IEC 23008-12:2024/AMD 1 §10.2.6 ve libavif uyumu: `tmap` uyumlu markası yoksa
     // `tmap` öğeleri yoksayılır.
     if !container.has_compatible_brand(b"tmap") {
@@ -573,11 +622,12 @@ fn find_and_validate_tmap(
         return Ok(None);
     }
 
-    let tmap_data = container.resolve_item_data(tmap_id, allocation_limit)?;
+    let (tmap_data, _tmap_data_guard) = container.resolve_item_data(tmap_id, butce)?;
     let mut metadata = match parse_tone_mapped_image_box(&tmap_data)? {
         ToneMapParseOutcome::Parsed(m) => *m,
         ToneMapParseOutcome::UnsupportedVersion => return Ok(None),
     };
+    drop((tmap_data, _tmap_data_guard));
 
     // Kazanç haritası öğesi temel geçerlilik kontrolü (desteklenmeyen tür/özellik -> yoksay).
     let Some(gm_info) = container.item_info(gain_map_item_id) else {
@@ -594,6 +644,7 @@ fn find_and_validate_tmap(
     let mut tmap_ispe: Option<(u32, u32)> = None;
     let mut seen_alt_nclx = false;
     let mut seen_alt_icc = false;
+    let mut tmap_guard = ButceTutucu::bos(butce);
     for (p, _) in &tmap_props {
         match p {
             ItemProperty::Ispe { width, height } => {
@@ -615,7 +666,9 @@ fn find_and_validate_tmap(
                     ));
                 }
                 seen_alt_icc = true;
-                metadata.alt_icc_profile = Some(icc.clone());
+                let (icc_vec, g) = copy_bytes_budgeted(icc, butce)?;
+                tmap_guard.birlestir(g);
+                metadata.alt_icc_profile = Some(icc_vec);
             }
             ItemProperty::Clli(clli) => {
                 metadata.alt_clli = Some(*clli);
@@ -664,7 +717,7 @@ fn find_and_validate_tmap(
         }
     }
 
-    Ok(Some((gain_map_item_id, metadata)))
+    Ok(Some((gain_map_item_id, metadata, tmap_guard)))
 }
 
 #[derive(PartialEq, Eq)]
@@ -713,13 +766,28 @@ fn validate_gain_map_transform_parity(
 
 /// Piksel çözme işlemi yapmadan AVIF kapsayıcısının başlık, boyut, renk ve metaveri bilgilerini ayrıştırır.
 pub fn parse_info(data: &[u8]) -> Result<AvifInfo> {
-    let container = parse_container(data)?;
+    parse_info_with(data, &AvifDecodeConfig::default())
+}
+
+/// Belirtilen [`AvifDecodeConfig`] bütçe sınırları (`allocation_limit`) altında piksel çözme
+/// yapmadan AVIF kapsayıcısının başlık, boyut, renk ve metaveri bilgilerini ayrıştırır.
+///
+/// `cmin`/`infe` sıkıştırma açma, `idat`, `ICC`, `Exif`, `XMP` ve `tmap` üst verisi ortak
+/// bellek bütçesi üzerinden denetlenir.
+pub fn parse_info_with(data: &[u8], config: &AvifDecodeConfig) -> Result<AvifInfo> {
+    let butce = Arc::new(Butce::yeni(config.allocation_limit, 0));
+    parse_info_with_budget(data, &butce)
+}
+
+pub(crate) fn parse_info_with_budget(data: &[u8], butce: &Arc<Butce>) -> Result<AvifInfo> {
+    let container = parse_container(data, butce)?;
     let primary_id = container.primary_item_id;
-    let inspected = inspect_item_dimensions(&container, primary_id, 0)?;
+    let inspected = inspect_item_dimensions(&container, primary_id, 0, butce)?;
 
     let props = container.item_properties(primary_id)?;
     let mut color = inspected.seq_color.unwrap_or_default();
-    let mut icc_profile = None;
+    let mut icc_profile: Option<Vec<u8>> = None;
+    let mut _info_guard = ButceTutucu::bos(butce);
     let mut clli = None;
     let mut mdcv = None;
     let mut pasp = None;
@@ -727,7 +795,14 @@ pub fn parse_info(data: &[u8]) -> Result<AvifInfo> {
     for (p, _) in props {
         match p {
             ItemProperty::ColrNclx(c) => color = *c,
-            ItemProperty::ColrIcc(icc) => icc_profile = Some(icc.clone()),
+            ItemProperty::ColrIcc(icc) => {
+                if let Some(ref prev) = icc_profile {
+                    _info_guard.dusur(prev.len());
+                }
+                let (v, g) = copy_bytes_budgeted(icc, butce)?;
+                _info_guard.birlestir(g);
+                icc_profile = Some(v);
+            }
             ItemProperty::Clli(c) => clli = Some(*c),
             ItemProperty::Mdcv(m) => mdcv = Some(*m),
             ItemProperty::Pasp(pa) => pasp = Some(*pa),
@@ -737,15 +812,19 @@ pub fn parse_info(data: &[u8]) -> Result<AvifInfo> {
 
     let alpha_src = find_alpha_source(&container, primary_id)?;
     let premultiplied_alpha = is_premultiplied_alpha(&container, primary_id, alpha_src.as_ref());
-    let (exif, xmp) = extract_metadata_items(&container, primary_id, None)?;
+    let (exif, xmp, meta_guard) = extract_metadata_items(&container, primary_id, butce)?;
+    _info_guard.birlestir(meta_guard);
     let gain_map_metadata = find_and_validate_tmap(
         &container,
         primary_id,
         inspected.raw_width,
         inspected.raw_height,
-        None,
+        butce,
     )?
-    .map(|(_, meta)| meta);
+    .map(|(_, meta, gm_guard)| {
+        _info_guard.birlestir(gm_guard);
+        meta
+    });
 
     Ok(AvifInfo {
         width: inspected.width,
@@ -825,11 +904,16 @@ pub(crate) fn limited_to_full_y_u16(bit_depth: BitDepth, v: u16) -> u16 {
 pub(crate) fn extract_plane(
     frame: &Frame,
     plane_type: PlaneType,
-    allocation_limit: Option<usize>,
-) -> Result<(u32, u32, PlaneStorage)> {
+    butce: &Arc<Butce>,
+) -> Result<(u32, u32, PlaneStorage, ButceTutucu)> {
     let bit_depth = frame.bit_depth();
     let Some(plane) = frame.plane(plane_type) else {
-        return Ok((0, 0, PlaneStorage::empty_for(bit_depth)));
+        return Ok((
+            0,
+            0,
+            PlaneStorage::empty_for(bit_depth),
+            ButceTutucu::bos(butce),
+        ));
     };
     let w = plane.width();
     let h = plane.height();
@@ -844,14 +928,7 @@ pub(crate) fn extract_plane(
         lhs: count,
         rhs: bps,
     })?;
-    if let Some(limit) = allocation_limit
-        && bytes_req > limit
-    {
-        return Err(Error::BudgetExceeded {
-            requested: bytes_req,
-            limit,
-        });
-    }
+    let guard = Butce::tut(butce, bytes_req)?;
 
     match bit_depth {
         BitDepth::Eight => {
@@ -866,7 +943,7 @@ pub(crate) fn extract_plane(
                 ))?;
                 out.extend_from_slice(&row[..w]);
             }
-            Ok((w as u32, h as u32, PlaneStorage::U8(out)))
+            Ok((w as u32, h as u32, PlaneStorage::U8(out), guard))
         }
         BitDepth::Ten | BitDepth::Twelve => {
             let mut out = Vec::new();
@@ -887,7 +964,7 @@ pub(crate) fn extract_plane(
                         .map(|&pair| u16::from_le_bytes(pair)),
                 );
             }
-            Ok((w as u32, h as u32, PlaneStorage::U16(out)))
+            Ok((w as u32, h as u32, PlaneStorage::U16(out), guard))
         }
     }
 }
@@ -898,6 +975,7 @@ fn decode_av01_item(
     config: &AvifDecodeConfig,
     threads_for_item: usize,
     is_alpha: bool,
+    butce: &Arc<Butce>,
 ) -> Result<PlanarBuffer> {
     let props = container.item_properties(item_id)?;
     let mut av1c_opt: Option<&Av1CProperty> = None;
@@ -923,7 +1001,7 @@ fn decode_av01_item(
         ));
     }
 
-    let payload = container.resolve_item_data(item_id, config.allocation_limit)?;
+    let (payload, payload_guard) = container.resolve_item_data(item_id, butce)?;
 
     let dec_config = Config {
         n_threads: threads_for_item,
@@ -935,7 +1013,7 @@ fn decode_av01_item(
         operating_point,
         ..Config::default()
     };
-    let mut decoder = Decoder::new(dec_config)?;
+    let mut decoder = Decoder::new_with_shared_budget(dec_config, Arc::clone(butce))?;
 
     if let Some(av1c) = av1c_opt
         && !av1c.config_obus.is_empty()
@@ -967,43 +1045,13 @@ fn decode_av01_item(
         matrix_coefficients: u16::from(seq.mtrx),
         full_range: seq.color_range != 0,
     });
+    // Çözücü ve girdi yükü artık gerekli değil; düzlem kopyalamasından önce bütçeyi iade et.
+    drop(decoder);
+    drop((payload, payload_guard));
+    let _frame_guard = Butce::tut(butce, frame.allocation_bytes())?;
 
     let bit_depth = frame.bit_depth();
-    let bps = PlaneStorage::bytes_per_sample(bit_depth);
-    let y_samples = frame
-        .plane(PlaneType::Y)
-        .map_or(0usize, |p| p.width().saturating_mul(p.height()));
-    let c_samples = if is_alpha {
-        0usize
-    } else {
-        frame
-            .plane(PlaneType::U)
-            .map_or(0usize, |p| p.width().saturating_mul(p.height()))
-            .saturating_add(
-                frame
-                    .plane(PlaneType::V)
-                    .map_or(0usize, |p| p.width().saturating_mul(p.height())),
-            )
-    };
-    let total_planar_bytes =
-        y_samples
-            .saturating_add(c_samples)
-            .checked_mul(bps)
-            .ok_or(Error::SizeOverflow {
-                stage: SizeStage::TotalAllocation,
-                lhs: y_samples.saturating_add(c_samples),
-                rhs: bps,
-            })?;
-    if let Some(limit) = config.allocation_limit
-        && total_planar_bytes > limit
-    {
-        return Err(Error::BudgetExceeded {
-            requested: total_planar_bytes,
-            limit,
-        });
-    }
-
-    let (w, h, mut y_plane) = extract_plane(&frame, PlaneType::Y, config.allocation_limit)?;
+    let (w, h, mut y_plane, mut planar_guard) = extract_plane(&frame, PlaneType::Y, butce)?;
     let (cw, ch, u_plane, v_plane, chroma_format) = if is_alpha {
         (
             0,
@@ -1013,8 +1061,10 @@ fn decode_av01_item(
             ChromaFormat::Monochrome,
         )
     } else {
-        let (cw, ch, u) = extract_plane(&frame, PlaneType::U, config.allocation_limit)?;
-        let (_, _, v) = extract_plane(&frame, PlaneType::V, config.allocation_limit)?;
+        let (cw, ch, u, ug) = extract_plane(&frame, PlaneType::U, butce)?;
+        planar_guard.birlestir(ug);
+        let (_, _, v, vg) = extract_plane(&frame, PlaneType::V, butce)?;
+        planar_guard.birlestir(vg);
         (cw, ch, u, v, frame.chroma_format())
     };
 
@@ -1046,6 +1096,7 @@ fn decode_av01_item(
         u_plane,
         v_plane,
         seq_color,
+        budget_guard: planar_guard,
     })
 }
 
@@ -1056,13 +1107,22 @@ fn crop_slice<T: Copy>(
     y0: usize,
     new_w: usize,
     new_h: usize,
-) -> Vec<T> {
-    let mut dst = Vec::with_capacity(new_w * new_h);
+) -> Result<Vec<T>> {
+    let count = new_w.checked_mul(new_h).ok_or(Error::SizeOverflow {
+        stage: SizeStage::PlaneArea,
+        lhs: new_w,
+        rhs: new_h,
+    })?;
+    let mut dst = Vec::new();
+    dst.try_reserve_exact(count)
+        .map_err(|_| Error::AllocationFailed {
+            requested: count.saturating_mul(core::mem::size_of::<T>()),
+        })?;
     for r in 0..new_h {
         let src_start = (y0 + r) * old_w + x0;
         dst.extend_from_slice(&src[src_start..src_start + new_w]);
     }
-    dst
+    Ok(dst)
 }
 
 fn crop_storage(
@@ -1072,10 +1132,33 @@ fn crop_storage(
     y0: usize,
     new_w: usize,
     new_h: usize,
-) -> PlaneStorage {
+    butce: &Arc<Butce>,
+) -> Result<(PlaneStorage, ButceTutucu)> {
+    let count = new_w.checked_mul(new_h).ok_or(Error::SizeOverflow {
+        stage: SizeStage::PlaneArea,
+        lhs: new_w,
+        rhs: new_h,
+    })?;
     match storage {
-        PlaneStorage::U8(src) => PlaneStorage::U8(crop_slice(src, old_w, x0, y0, new_w, new_h)),
-        PlaneStorage::U16(src) => PlaneStorage::U16(crop_slice(src, old_w, x0, y0, new_w, new_h)),
+        PlaneStorage::U8(src) => {
+            let guard = Butce::tut(butce, count)?;
+            Ok((
+                PlaneStorage::U8(crop_slice(src, old_w, x0, y0, new_w, new_h)?),
+                guard,
+            ))
+        }
+        PlaneStorage::U16(src) => {
+            let bytes = count.checked_mul(2).ok_or(Error::SizeOverflow {
+                stage: SizeStage::TotalAllocation,
+                lhs: count,
+                rhs: 2,
+            })?;
+            let guard = Butce::tut(butce, bytes)?;
+            Ok((
+                PlaneStorage::U16(crop_slice(src, old_w, x0, y0, new_w, new_h)?),
+                guard,
+            ))
+        }
     }
 }
 
@@ -1085,7 +1168,7 @@ pub(crate) fn crop_planar(
     y0: u32,
     crop_w: u32,
     crop_h: u32,
-    allocation_limit: Option<usize>,
+    butce: &Arc<Butce>,
 ) -> Result<()> {
     if x0 == 0 && y0 == 0 && crop_w == buf.width && crop_h == buf.height {
         return Ok(());
@@ -1101,22 +1184,20 @@ pub(crate) fn crop_planar(
     let old_w = buf.width as usize;
     let new_w = crop_w as usize;
     let new_h = crop_h as usize;
-    let y_count = new_w * new_h;
-    let bps = PlaneStorage::bytes_per_sample(buf.bit_depth);
-    let y_bytes = y_count.checked_mul(bps).ok_or(Error::SizeOverflow {
-        stage: SizeStage::TotalAllocation,
-        lhs: y_count,
-        rhs: bps,
-    })?;
-    if let Some(limit) = allocation_limit
-        && y_bytes > limit
-    {
-        return Err(Error::BudgetExceeded {
-            requested: y_bytes,
-            limit,
-        });
-    }
-    buf.y_plane = crop_storage(&buf.y_plane, old_w, x0 as usize, y0 as usize, new_w, new_h);
+
+    let old_y_bytes = plane_storage_bytes(&buf.y_plane);
+    let (new_y, new_y_guard) = crop_storage(
+        &buf.y_plane,
+        old_w,
+        x0 as usize,
+        y0 as usize,
+        new_w,
+        new_h,
+        butce,
+    )?;
+    buf.y_plane = new_y;
+    buf.budget_guard.dusur(old_y_bytes);
+    buf.budget_guard.birlestir(new_y_guard);
     buf.width = crop_w;
     buf.height = crop_h;
 
@@ -1138,8 +1219,20 @@ pub(crate) fn crop_planar(
                 "kroma kırpma bölgesi düzlem sınırları dışında",
             ));
         }
-        buf.u_plane = crop_storage(&buf.u_plane, old_cw, cx0, cy0, new_cw, new_ch);
-        buf.v_plane = crop_storage(&buf.v_plane, old_cw, cx0, cy0, new_cw, new_ch);
+        let old_u_bytes = plane_storage_bytes(&buf.u_plane);
+        let (new_u, new_u_guard) =
+            crop_storage(&buf.u_plane, old_cw, cx0, cy0, new_cw, new_ch, butce)?;
+        buf.u_plane = new_u;
+        buf.budget_guard.dusur(old_u_bytes);
+        buf.budget_guard.birlestir(new_u_guard);
+
+        let old_v_bytes = plane_storage_bytes(&buf.v_plane);
+        let (new_v, new_v_guard) =
+            crop_storage(&buf.v_plane, old_cw, cx0, cy0, new_cw, new_ch, butce)?;
+        buf.v_plane = new_v;
+        buf.budget_guard.dusur(old_v_bytes);
+        buf.budget_guard.birlestir(new_v_guard);
+
         buf.chroma_width = new_cw as u32;
         buf.chroma_height = new_ch as u32;
     }
@@ -1151,10 +1244,10 @@ fn rotate_slice_ccw<T: Copy + Default>(
     w: usize,
     h: usize,
     angle: u8,
-) -> (usize, usize, Vec<T>) {
+) -> Result<(usize, usize, Vec<T>)> {
     match angle & 3 {
         1 => {
-            let mut dst = vec![T::default(); w * h];
+            let mut dst = dolu_vec(w * h, T::default())?;
             for ny in 0..w {
                 let sx = w - 1 - ny;
                 for nx in 0..h {
@@ -1162,10 +1255,10 @@ fn rotate_slice_ccw<T: Copy + Default>(
                     dst[ny * h + nx] = src[sy * w + sx];
                 }
             }
-            (h, w, dst)
+            Ok((h, w, dst))
         }
         2 => {
-            let mut dst = vec![T::default(); w * h];
+            let mut dst = dolu_vec(w * h, T::default())?;
             for ny in 0..h {
                 let sy = h - 1 - ny;
                 for nx in 0..w {
@@ -1173,10 +1266,10 @@ fn rotate_slice_ccw<T: Copy + Default>(
                     dst[ny * w + nx] = src[sy * w + sx];
                 }
             }
-            (w, h, dst)
+            Ok((w, h, dst))
         }
         3 => {
-            let mut dst = vec![T::default(); w * h];
+            let mut dst = dolu_vec(w * h, T::default())?;
             for ny in 0..w {
                 let sx = ny;
                 for nx in 0..h {
@@ -1184,9 +1277,9 @@ fn rotate_slice_ccw<T: Copy + Default>(
                     dst[ny * h + nx] = src[sy * w + sx];
                 }
             }
-            (h, w, dst)
+            Ok((h, w, dst))
         }
-        _ => (w, h, src.to_vec()),
+        _ => Ok((w, h, kopya_vec(src)?)),
     }
 }
 
@@ -1195,21 +1288,38 @@ fn rotate_plane_ccw(
     w: usize,
     h: usize,
     angle: u8,
-) -> (usize, usize, PlaneStorage) {
+    butce: &Arc<Butce>,
+) -> Result<(usize, usize, PlaneStorage, ButceTutucu)> {
+    let bytes = plane_storage_bytes(src);
+    let guard = Butce::tut(butce, bytes)?;
     match src {
         PlaneStorage::U8(s) => {
-            let (nw, nh, dst) = rotate_slice_ccw(s, w, h, angle);
-            (nw, nh, PlaneStorage::U8(dst))
+            let (nw, nh, dst) = rotate_slice_ccw(s, w, h, angle)?;
+            Ok((nw, nh, PlaneStorage::U8(dst), guard))
         }
         PlaneStorage::U16(s) => {
-            let (nw, nh, dst) = rotate_slice_ccw(s, w, h, angle);
-            (nw, nh, PlaneStorage::U16(dst))
+            let (nw, nh, dst) = rotate_slice_ccw(s, w, h, angle)?;
+            Ok((nw, nh, PlaneStorage::U16(dst), guard))
         }
     }
 }
 
-fn upsample_slice_c422_to_c444<T: Copy>(src: &[T], w: usize, h: usize, cw: usize) -> Vec<T> {
-    let mut dst = Vec::with_capacity(w * h);
+fn upsample_slice_c422_to_c444<T: Copy>(
+    src: &[T],
+    w: usize,
+    h: usize,
+    cw: usize,
+) -> Result<Vec<T>> {
+    let count = w.checked_mul(h).ok_or(Error::SizeOverflow {
+        stage: SizeStage::PlaneArea,
+        lhs: w,
+        rhs: h,
+    })?;
+    let mut dst = Vec::new();
+    dst.try_reserve_exact(count)
+        .map_err(|_| Error::AllocationFailed {
+            requested: count.saturating_mul(core::mem::size_of::<T>()),
+        })?;
     let max_cx = cw.saturating_sub(1);
     for y in 0..h {
         let row_off = y * cw;
@@ -1218,60 +1328,88 @@ fn upsample_slice_c422_to_c444<T: Copy>(src: &[T], w: usize, h: usize, cw: usize
             dst.push(src[row_off + cx]);
         }
     }
-    dst
+    Ok(dst)
 }
 
-fn upsample_c422_to_c444(buf: &mut PlanarBuffer) {
+fn upsample_c422_to_c444(buf: &mut PlanarBuffer, butce: &Arc<Butce>) -> Result<()> {
     if buf.chroma_format != ChromaFormat::C422 {
-        return;
+        return Ok(());
     }
     let w = buf.width as usize;
     let h = buf.height as usize;
     let cw = buf.chroma_width as usize;
-    buf.u_plane = match &buf.u_plane {
-        PlaneStorage::U8(s) => PlaneStorage::U8(upsample_slice_c422_to_c444(s, w, h, cw)),
-        PlaneStorage::U16(s) => PlaneStorage::U16(upsample_slice_c422_to_c444(s, w, h, cw)),
+    let new_bytes = w
+        .saturating_mul(h)
+        .saturating_mul(PlaneStorage::bytes_per_sample(buf.bit_depth));
+
+    let old_u_bytes = plane_storage_bytes(&buf.u_plane);
+    let ug = Butce::tut(butce, new_bytes)?;
+    let new_u = match &buf.u_plane {
+        PlaneStorage::U8(s) => PlaneStorage::U8(upsample_slice_c422_to_c444(s, w, h, cw)?),
+        PlaneStorage::U16(s) => PlaneStorage::U16(upsample_slice_c422_to_c444(s, w, h, cw)?),
     };
-    buf.v_plane = match &buf.v_plane {
-        PlaneStorage::U8(s) => PlaneStorage::U8(upsample_slice_c422_to_c444(s, w, h, cw)),
-        PlaneStorage::U16(s) => PlaneStorage::U16(upsample_slice_c422_to_c444(s, w, h, cw)),
+    buf.u_plane = new_u;
+    buf.budget_guard.dusur(old_u_bytes);
+    buf.budget_guard.birlestir(ug);
+
+    let old_v_bytes = plane_storage_bytes(&buf.v_plane);
+    let vg = Butce::tut(butce, new_bytes)?;
+    let new_v = match &buf.v_plane {
+        PlaneStorage::U8(s) => PlaneStorage::U8(upsample_slice_c422_to_c444(s, w, h, cw)?),
+        PlaneStorage::U16(s) => PlaneStorage::U16(upsample_slice_c422_to_c444(s, w, h, cw)?),
     };
+    buf.v_plane = new_v;
+    buf.budget_guard.dusur(old_v_bytes);
+    buf.budget_guard.birlestir(vg);
+
     buf.chroma_width = buf.width;
     buf.chroma_height = buf.height;
     buf.chroma_format = ChromaFormat::C444;
+    Ok(())
 }
 
-pub(crate) fn apply_irot(buf: &mut PlanarBuffer, angle: u8) {
+pub(crate) fn apply_irot(buf: &mut PlanarBuffer, angle: u8, butce: &Arc<Butce>) -> Result<()> {
     let a = angle & 3;
     if a == 0 {
-        return;
+        return Ok(());
     }
     if (a & 1) != 0 && buf.chroma_format == ChromaFormat::C422 {
-        upsample_c422_to_c444(buf);
+        upsample_c422_to_c444(buf, butce)?;
     }
-    let (nw, nh, ny) = rotate_plane_ccw(&buf.y_plane, buf.width as usize, buf.height as usize, a);
+    let old_y_bytes = plane_storage_bytes(&buf.y_plane);
+    let (nw, nh, ny, yg) = rotate_plane_ccw(
+        &buf.y_plane,
+        buf.width as usize,
+        buf.height as usize,
+        a,
+        butce,
+    )?;
     buf.width = nw as u32;
     buf.height = nh as u32;
     buf.y_plane = ny;
+    buf.budget_guard.dusur(old_y_bytes);
+    buf.budget_guard.birlestir(yg);
 
     if buf.chroma_format != ChromaFormat::Monochrome {
-        let (ncw, nch, nu) = rotate_plane_ccw(
-            &buf.u_plane,
-            buf.chroma_width as usize,
-            buf.chroma_height as usize,
-            a,
-        );
-        let (_, _, nv) = rotate_plane_ccw(
-            &buf.v_plane,
-            buf.chroma_width as usize,
-            buf.chroma_height as usize,
-            a,
-        );
+        let old_cw = buf.chroma_width as usize;
+        let old_ch = buf.chroma_height as usize;
+
+        let old_u_bytes = plane_storage_bytes(&buf.u_plane);
+        let (ncw, nch, nu, ug) = rotate_plane_ccw(&buf.u_plane, old_cw, old_ch, a, butce)?;
+        buf.u_plane = nu;
+        buf.budget_guard.dusur(old_u_bytes);
+        buf.budget_guard.birlestir(ug);
+
+        let old_v_bytes = plane_storage_bytes(&buf.v_plane);
+        let (_, _, nv, vg) = rotate_plane_ccw(&buf.v_plane, old_cw, old_ch, a, butce)?;
+        buf.v_plane = nv;
+        buf.budget_guard.dusur(old_v_bytes);
+        buf.budget_guard.birlestir(vg);
+
         buf.chroma_width = ncw as u32;
         buf.chroma_height = nch as u32;
-        buf.u_plane = nu;
-        buf.v_plane = nv;
     }
+    Ok(())
 }
 
 fn mirror_slice<T>(plane: &mut [T], w: usize, h: usize, axis: u8) {
@@ -1321,7 +1459,7 @@ fn apply_item_transforms(
     container: &AvifContainer<'_>,
     item_id: u32,
     buf: &mut PlanarBuffer,
-    allocation_limit: Option<usize>,
+    butce: &Arc<Butce>,
 ) -> Result<()> {
     let props = container.item_properties(item_id)?;
     let mut clap_opt: Option<&CleanAperture> = None;
@@ -1338,10 +1476,10 @@ fn apply_item_transforms(
     }
     if let Some(clap) = clap_opt {
         let (x0, y0, cw, ch) = compute_clap_rect(buf.width, buf.height, clap)?;
-        crop_planar(buf, x0, y0, cw, ch, allocation_limit)?;
+        crop_planar(buf, x0, y0, cw, ch, butce)?;
     }
     if let Some(angle) = irot_opt {
-        apply_irot(buf, angle);
+        apply_irot(buf, angle, butce)?;
     }
     if let Some(axis) = imir_opt {
         apply_imir(buf, axis);
@@ -1356,6 +1494,7 @@ fn decode_grid_tiles_into_canvas(
     config: &AvifDecodeConfig,
     is_alpha: bool,
     depth: usize,
+    butce: &Arc<Butce>,
 ) -> Result<PlanarBuffer> {
     check_pixel_and_byte_budget(grid.output_width, grid.output_height, 0, config)?;
     let rows = grid.rows as usize;
@@ -1402,6 +1541,7 @@ fn decode_grid_tiles_into_canvas(
         std::thread::scope(|s| {
             let mut handles = Vec::with_capacity(worker_count);
             for chunk in unique_ids.chunks(chunk_size) {
+                let butce_w = Arc::clone(butce);
                 handles.push(s.spawn(move || {
                     let mut out = Vec::with_capacity(chunk.len());
                     for &tid in chunk {
@@ -1412,6 +1552,7 @@ fn decode_grid_tiles_into_canvas(
                             1,
                             is_alpha,
                             depth + 1,
+                            &butce_w,
                         )?);
                     }
                     Ok(out)
@@ -1440,6 +1581,7 @@ fn decode_grid_tiles_into_canvas(
                 total_threads,
                 is_alpha,
                 depth + 1,
+                butce,
             )?);
         }
         flat
@@ -1456,6 +1598,7 @@ fn decode_grid_tiles_into_canvas(
                 1,
                 is_alpha,
                 depth + 1,
+                butce,
             )?);
         }
         flat
@@ -1529,7 +1672,8 @@ fn decode_grid_tiles_into_canvas(
         lhs: total_samples,
         rhs: bps,
     })?;
-    check_pixel_and_byte_budget(grid.output_width, grid.output_height, total_bytes, config)?;
+    check_pixel_and_byte_budget(grid.output_width, grid.output_height, 0, config)?;
+    let canvas_guard = Butce::tut(butce, total_bytes)?;
 
     let copy_chroma = !is_alpha && chroma_format != ChromaFormat::Monochrome;
     let (y_canvas, u_canvas, v_canvas) = match bit_depth {
@@ -1553,7 +1697,7 @@ fn decode_grid_tiles_into_canvas(
                 |t| t.y_plane.as_u8().unwrap_or(&[]),
                 |t| t.u_plane.as_u8().unwrap_or(&[]),
                 |t| t.v_plane.as_u8().unwrap_or(&[]),
-            );
+            )?;
             (
                 PlaneStorage::U8(yc),
                 PlaneStorage::U8(uc),
@@ -1580,7 +1724,7 @@ fn decode_grid_tiles_into_canvas(
                 |t| t.y_plane.as_u16().unwrap_or(&[]),
                 |t| t.u_plane.as_u16().unwrap_or(&[]),
                 |t| t.v_plane.as_u16().unwrap_or(&[]),
-            );
+            )?;
             (
                 PlaneStorage::U16(yc),
                 PlaneStorage::U16(uc),
@@ -1604,6 +1748,7 @@ fn decode_grid_tiles_into_canvas(
         u_plane: u_canvas,
         v_plane: v_canvas,
         seq_color,
+        budget_guard: canvas_guard,
     })
 }
 
@@ -1627,10 +1772,10 @@ fn stitch_grid_canvases<T: Copy + Default>(
     get_y: impl Fn(&PlanarBuffer) -> &[T],
     get_u: impl Fn(&PlanarBuffer) -> &[T],
     get_v: impl Fn(&PlanarBuffer) -> &[T],
-) -> (Vec<T>, Vec<T>, Vec<T>) {
-    let mut y_canvas = vec![T::default(); y_samples];
-    let mut u_canvas = vec![T::default(); c_samples];
-    let mut v_canvas = vec![T::default(); c_samples];
+) -> Result<(Vec<T>, Vec<T>, Vec<T>)> {
+    let mut y_canvas = dolu_vec(y_samples, T::default())?;
+    let mut u_canvas = dolu_vec(c_samples, T::default())?;
+    let mut v_canvas = dolu_vec(c_samples, T::default())?;
 
     for r in 0..rows {
         let dst_y0 = r * tile_h;
@@ -1681,7 +1826,7 @@ fn stitch_grid_canvases<T: Copy + Default>(
         }
     }
 
-    (y_canvas, u_canvas, v_canvas)
+    Ok((y_canvas, u_canvas, v_canvas))
 }
 
 fn decode_grid_item(
@@ -1690,11 +1835,13 @@ fn decode_grid_item(
     config: &AvifDecodeConfig,
     is_alpha: bool,
     depth: usize,
+    butce: &Arc<Butce>,
 ) -> Result<PlanarBuffer> {
-    let grid_bytes = container.resolve_item_data(item_id, config.allocation_limit)?;
+    let (grid_bytes, grid_guard) = container.resolve_item_data(item_id, butce)?;
     let grid = parse_grid_descriptor(&grid_bytes)?;
+    drop((grid_bytes, grid_guard));
     let tile_ids = container.references_from(item_id, b"dimg");
-    decode_grid_tiles_into_canvas(container, grid, &tile_ids, config, is_alpha, depth)
+    decode_grid_tiles_into_canvas(container, grid, &tile_ids, config, is_alpha, depth, butce)
 }
 
 fn decode_item_planar(
@@ -1704,6 +1851,7 @@ fn decode_item_planar(
     threads_for_item: usize,
     is_alpha: bool,
     depth: usize,
+    butce: &Arc<Butce>,
 ) -> Result<PlanarBuffer> {
     if depth > 8 {
         return Err(Error::InvalidData(
@@ -1715,8 +1863,15 @@ fn decode_item_planar(
         .ok_or(Error::InvalidData("AVIF öğesi iinf içinde bulunamadı"))?;
 
     let mut buf = match &info.item_type {
-        b"av01" => decode_av01_item(container, item_id, config, threads_for_item, is_alpha)?,
-        b"grid" => decode_grid_item(container, item_id, config, is_alpha, depth)?,
+        b"av01" => decode_av01_item(
+            container,
+            item_id,
+            config,
+            threads_for_item,
+            is_alpha,
+            butce,
+        )?,
+        b"grid" => decode_grid_item(container, item_id, config, is_alpha, depth, butce)?,
         b"iden" => {
             let targets = container.references_from(item_id, b"dimg");
             if targets.len() != 1 {
@@ -1731,6 +1886,7 @@ fn decode_item_planar(
                 threads_for_item,
                 is_alpha,
                 depth + 1,
+                butce,
             )?
         }
         _ => return Err(Error::Unsupported("desteklenmeyen AVIF görüntü öğesi türü")),
@@ -1743,11 +1899,11 @@ fn decode_item_planar(
         {
             let target_w = (*width).min(buf.width);
             let target_h = (*height).min(buf.height);
-            crop_planar(&mut buf, 0, 0, target_w, target_h, config.allocation_limit)?;
+            crop_planar(&mut buf, 0, 0, target_w, target_h, butce)?;
         }
     }
 
-    apply_item_transforms(container, item_id, &mut buf, config.allocation_limit)?;
+    apply_item_transforms(container, item_id, &mut buf, butce)?;
     Ok(buf)
 }
 
@@ -1758,14 +1914,32 @@ pub fn decode(data: &[u8]) -> Result<AvifImage> {
 
 /// Belirtilen [`AvifDecodeConfig`] yapılandırması ile bir `.avif` bayt dilimini çözer.
 pub fn decode_with(data: &[u8], config: &AvifDecodeConfig) -> Result<AvifImage> {
-    let container = parse_container(data)?;
+    let butce = Arc::new(Butce::yeni(config.allocation_limit, 0));
+    decode_with_budget(data, config, butce)
+}
+
+pub(crate) fn decode_with_budget(
+    data: &[u8],
+    config: &AvifDecodeConfig,
+    butce: Arc<Butce>,
+) -> Result<AvifImage> {
+    let container = parse_container(data, &butce)?;
     let primary_id = container.primary_item_id;
 
-    let color_buf = decode_item_planar(&container, primary_id, config, config.n_threads, false, 0)?;
+    let color_buf = decode_item_planar(
+        &container,
+        primary_id,
+        config,
+        config.n_threads,
+        false,
+        0,
+        &butce,
+    )?;
+    let mut img_guard = color_buf.budget_guard;
 
     let props = container.item_properties(primary_id)?;
     let mut color = color_buf.seq_color.unwrap_or_default();
-    let mut icc_profile = None;
+    let mut icc_profile: Option<Vec<u8>> = None;
     let mut clli = None;
     let mut mdcv = None;
     let mut pasp = None;
@@ -1773,7 +1947,14 @@ pub fn decode_with(data: &[u8], config: &AvifDecodeConfig) -> Result<AvifImage> 
     for (p, _) in props {
         match p {
             ItemProperty::ColrNclx(c) => color = *c,
-            ItemProperty::ColrIcc(icc) => icc_profile = Some(icc.clone()),
+            ItemProperty::ColrIcc(icc) => {
+                if let Some(ref prev) = icc_profile {
+                    img_guard.dusur(prev.len());
+                }
+                let (v, g) = copy_bytes_budgeted(icc, &butce)?;
+                img_guard.birlestir(g);
+                icc_profile = Some(v);
+            }
             ItemProperty::Clli(c) => clli = Some(*c),
             ItemProperty::Mdcv(m) => mdcv = Some(*m),
             ItemProperty::Pasp(pa) => pasp = Some(*pa),
@@ -1787,8 +1968,15 @@ pub fn decode_with(data: &[u8], config: &AvifDecodeConfig) -> Result<AvifImage> 
     let alpha_plane = if let Some(ref src) = alpha_src {
         let alpha_buf = match src {
             AlphaSource::Direct(aid) => {
-                let mut ab =
-                    decode_item_planar(&container, *aid, config, config.n_threads, true, 0)?;
+                let mut ab = decode_item_planar(
+                    &container,
+                    *aid,
+                    config,
+                    config.n_threads,
+                    true,
+                    0,
+                    &butce,
+                )?;
                 // libavif uyumu: alfa öğesinin kendi irot/imir/clap dönüşümleri dikkate alınmaz,
                 // birincil öğenin dönüşümleri birincil görüntü ile birlikte alfa düzlemine de uygulanır.
                 let alpha_has_transforms = container.item_properties(*aid)?.iter().any(|(p, _)| {
@@ -1798,12 +1986,7 @@ pub fn decode_with(data: &[u8], config: &AvifDecodeConfig) -> Result<AvifImage> 
                     )
                 });
                 if !alpha_has_transforms {
-                    apply_item_transforms(
-                        &container,
-                        primary_id,
-                        &mut ab,
-                        config.allocation_limit,
-                    )?;
+                    apply_item_transforms(&container, primary_id, &mut ab, &butce)?;
                 }
                 ab
             }
@@ -1811,9 +1994,10 @@ pub fn decode_with(data: &[u8], config: &AvifDecodeConfig) -> Result<AvifImage> 
                 grid_item_id,
                 alpha_tile_ids,
             } => {
-                let grid_bytes =
-                    container.resolve_item_data(*grid_item_id, config.allocation_limit)?;
+                let (grid_bytes, grid_guard) =
+                    container.resolve_item_data(*grid_item_id, &butce)?;
                 let grid = parse_grid_descriptor(&grid_bytes)?;
+                drop((grid_bytes, grid_guard));
                 let mut ab = decode_grid_tiles_into_canvas(
                     &container,
                     grid,
@@ -1821,8 +2005,9 @@ pub fn decode_with(data: &[u8], config: &AvifDecodeConfig) -> Result<AvifImage> 
                     config,
                     true,
                     0,
+                    &butce,
                 )?;
-                apply_item_transforms(&container, *grid_item_id, &mut ab, config.allocation_limit)?;
+                apply_item_transforms(&container, *grid_item_id, &mut ab, &butce)?;
                 ab
             }
         };
@@ -1836,33 +2021,41 @@ pub fn decode_with(data: &[u8], config: &AvifDecodeConfig) -> Result<AvifImage> 
                 "alfa düzlemi bit derinliği birincil görüntü bit derinliğiyle eşleşmiyor",
             ));
         }
+        img_guard.birlestir(alpha_buf.budget_guard);
         Some(alpha_buf.y_plane)
     } else {
         None
     };
 
-    let (exif, xmp) = extract_metadata_items(&container, primary_id, config.allocation_limit)?;
+    let (exif, xmp, meta_guard) = extract_metadata_items(&container, primary_id, &butce)?;
+    img_guard.birlestir(meta_guard);
     let effective_threads = resolve_effective_threads(config.n_threads);
 
     // ISO 21496-1 `tmap` üst veri ayrıştırması ve normatif doğrulaması her zaman yürütülür;
     // kazanç haritası pikselleri yalnızca `config.decode_gain_map == true` olduğunda çözülür.
-    let (base_raw_w, base_raw_h) = match inspect_item_dimensions(&container, primary_id, 0) {
+    let (base_raw_w, base_raw_h) = match inspect_item_dimensions(&container, primary_id, 0, &butce)
+    {
         Ok(ins) => (ins.raw_width, ins.raw_height),
+        Err(err @ (Error::BudgetExceeded { .. } | Error::AllocationFailed { .. })) => {
+            return Err(err);
+        }
         Err(_) => (color_buf.width, color_buf.height),
     };
-    let tmap_opt = find_and_validate_tmap(
-        &container,
-        primary_id,
-        base_raw_w,
-        base_raw_h,
-        config.allocation_limit,
-    )?;
+    let tmap_opt = find_and_validate_tmap(&container, primary_id, base_raw_w, base_raw_h, &butce)?;
 
-    let (gain_map_metadata, gain_map) = if let Some((gm_item_id, gm_meta)) = tmap_opt {
+    let (gain_map_metadata, gain_map) = if let Some((gm_item_id, gm_meta, tmap_guard)) = tmap_opt {
+        img_guard.birlestir(tmap_guard);
         let decoded_gm = if config.decode_gain_map {
             validate_gain_map_transform_parity(&container, primary_id, gm_item_id)?;
-            let gm_buf =
-                decode_item_planar(&container, gm_item_id, config, config.n_threads, false, 0)?;
+            let gm_buf = decode_item_planar(
+                &container,
+                gm_item_id,
+                config,
+                config.n_threads,
+                false,
+                0,
+                &butce,
+            )?;
             let gm_props = container.item_properties(gm_item_id)?;
             let mut gm_color = gm_buf.seq_color.unwrap_or(ColorInfo {
                 color_primaries: 2,
@@ -1900,6 +2093,8 @@ pub fn decode_with(data: &[u8], config: &AvifDecodeConfig) -> Result<AvifImage> 
                 gain_map_metadata: None,
                 gain_map: None,
                 effective_threads,
+                butce: Some(Arc::clone(&butce)),
+                _butce_tutucu: Some(Arc::new(gm_buf.budget_guard)),
             };
             Some(GainMap {
                 metadata: gm_meta.clone(),
@@ -1935,6 +2130,8 @@ pub fn decode_with(data: &[u8], config: &AvifDecodeConfig) -> Result<AvifImage> 
         gain_map_metadata,
         gain_map,
         effective_threads,
+        butce: Some(butce),
+        _butce_tutucu: Some(Arc::new(img_guard)),
     })
 }
 
@@ -1952,11 +2149,13 @@ pub fn decode_rgba8(data: &[u8]) -> Result<RgbaImage> {
 
 #[cfg(test)]
 mod tests {
+    use alloc::sync::Arc;
     use alloc::vec;
 
     use super::{LIMITED_TO_FULL_Y_8BIT, PlanarBuffer, crop_planar, limited_to_full_y_u16};
     use crate::avif::image::PlaneStorage;
     use crate::error::Error;
+    use crate::frame::butce::{Butce, ButceTutucu};
     use crate::frame::{BitDepth, ChromaFormat};
 
     #[test]
@@ -1971,6 +2170,9 @@ mod tests {
 
     #[test]
     fn allocation_limit_accounts_for_1_byte_8bit_and_2_byte_10bit() {
+        // 32x32 4:2:0 8-bit canlı = 1024 + 256 + 256 = 1536 bayt;
+        // 20x20 kırpmada ilk adım (Y): 1536 + 400 = 1936 bayt tepe gerektirir (sonra eski Y düşer).
+        let b8_low = Arc::new(Butce::yeni(Some(1536 + 399), 0));
         let mut buf8 = PlanarBuffer {
             width: 32,
             height: 32,
@@ -1982,18 +2184,26 @@ mod tests {
             u_plane: PlaneStorage::U8(vec![128u8; 16 * 16]),
             v_plane: PlaneStorage::U8(vec![128u8; 16 * 16]),
             seq_color: None,
+            budget_guard: Butce::tut(&b8_low, 1536).unwrap(),
         };
-        // 20 x 20 kırpma: 8-bit için 400 bayt (399 baytta reddedilmeli, 400 baytta geçmeli).
         assert_eq!(
-            crop_planar(&mut buf8, 0, 0, 20, 20, Some(399)),
+            crop_planar(&mut buf8, 0, 0, 20, 20, &b8_low),
             Err(Error::BudgetExceeded {
-                requested: 400,
-                limit: 399,
+                requested: 1936,
+                limit: 1935,
             })
         );
-        assert_eq!(crop_planar(&mut buf8, 0, 0, 20, 20, Some(400)), Ok(()));
+        let b8_ok = Arc::new(Butce::yeni(Some(1536 + 400), 0));
+        buf8.budget_guard = Butce::tut(&b8_ok, 1536).unwrap();
+        assert_eq!(crop_planar(&mut buf8, 0, 0, 20, 20, &b8_ok), Ok(()));
         assert_eq!(buf8.y_plane.as_u8().map(<[u8]>::len), Some(400));
+        assert_eq!(buf8.budget_guard.bayt(), 400 + 100 + 100);
+        drop(buf8);
+        assert_eq!(b8_ok.canli(), 0);
 
+        // 32x32 4:2:0 10-bit canlı = 2 * 1536 = 3072 bayt;
+        // 20x20 kırpmada ilk adım (Y): 3072 + 800 = 3872 bayt tepe gerektirir.
+        let b10_low = Arc::new(Butce::yeni(Some(3072 + 799), 0));
         let mut buf10 = PlanarBuffer {
             width: 32,
             height: 32,
@@ -2005,16 +2215,22 @@ mod tests {
             u_plane: PlaneStorage::U16(vec![512u16; 16 * 16]),
             v_plane: PlaneStorage::U16(vec![512u16; 16 * 16]),
             seq_color: None,
+            budget_guard: Butce::tut(&b10_low, 3072).unwrap(),
         };
-        // 20 x 20 kırpma: 10-bit için 800 bayt (799 baytta reddedilmeli, 800 baytta geçmeli).
         assert_eq!(
-            crop_planar(&mut buf10, 0, 0, 20, 20, Some(799)),
+            crop_planar(&mut buf10, 0, 0, 20, 20, &b10_low),
             Err(Error::BudgetExceeded {
-                requested: 800,
-                limit: 799,
+                requested: 3872,
+                limit: 3871,
             })
         );
-        assert_eq!(crop_planar(&mut buf10, 0, 0, 20, 20, Some(800)), Ok(()));
+        let b10_ok = Arc::new(Butce::yeni(Some(3072 + 800), 0));
+        buf10.budget_guard = Butce::tut(&b10_ok, 3072).unwrap();
+        assert_eq!(crop_planar(&mut buf10, 0, 0, 20, 20, &b10_ok), Ok(()));
         assert_eq!(buf10.y_plane.as_u16().map(<[u16]>::len), Some(400));
+        assert_eq!(buf10.budget_guard.bayt(), 800 + 200 + 200);
+        drop(buf10);
+        assert_eq!(b10_ok.canli(), 0);
+        let _ = ButceTutucu::bos(&b10_ok);
     }
 }
