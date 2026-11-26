@@ -38,6 +38,8 @@ pub mod lr;
 #[cfg(target_arch = "aarch64")]
 pub mod mc;
 #[cfg(target_arch = "aarch64")]
+pub mod mc_olcekli;
+#[cfg(target_arch = "aarch64")]
 pub mod mem;
 #[cfg(target_arch = "aarch64")]
 pub mod msac;
@@ -45,6 +47,8 @@ pub mod msac;
 pub mod pal;
 #[cfg(target_arch = "aarch64")]
 pub mod refmvs;
+#[cfg(target_arch = "aarch64")]
+pub mod resize;
 #[cfg(all(target_arch = "aarch64", test))]
 mod sozluk;
 
@@ -84,7 +88,7 @@ const fn arm_dotprod_aday(field: &'static str) -> IsaCandidate {
     }
 }
 
-/// `mc` NEON adayları (bir bit derinliği için `32` alan; dav1d `src/arm/mc.h:71-98`).
+/// `mc` NEON adayları (bir bit derinliği için `52` alan: `32` temel + `20` ölçekli).
 macro_rules! mc_neon_adaylari {
     ($bd:literal) => {
         [
@@ -108,6 +112,26 @@ macro_rules! mc_neon_adaylari {
             arm_neon_aday("mc", "mct[FILTER_2D_8TAP_SMOOTH]", $bd),
             arm_neon_aday("mc", "mct[FILTER_2D_8TAP_SMOOTH_SHARP]", $bd),
             arm_neon_aday("mc", "mct[FILTER_2D_BILINEAR]", $bd),
+            arm_neon_aday("mc", "mc_scaled[FILTER_2D_8TAP_REGULAR]", $bd),
+            arm_neon_aday("mc", "mc_scaled[FILTER_2D_8TAP_REGULAR_SMOOTH]", $bd),
+            arm_neon_aday("mc", "mc_scaled[FILTER_2D_8TAP_REGULAR_SHARP]", $bd),
+            arm_neon_aday("mc", "mc_scaled[FILTER_2D_8TAP_SHARP_REGULAR]", $bd),
+            arm_neon_aday("mc", "mc_scaled[FILTER_2D_8TAP_SHARP_SMOOTH]", $bd),
+            arm_neon_aday("mc", "mc_scaled[FILTER_2D_8TAP_SHARP]", $bd),
+            arm_neon_aday("mc", "mc_scaled[FILTER_2D_8TAP_SMOOTH_REGULAR]", $bd),
+            arm_neon_aday("mc", "mc_scaled[FILTER_2D_8TAP_SMOOTH]", $bd),
+            arm_neon_aday("mc", "mc_scaled[FILTER_2D_8TAP_SMOOTH_SHARP]", $bd),
+            arm_neon_aday("mc", "mc_scaled[FILTER_2D_BILINEAR]", $bd),
+            arm_neon_aday("mc", "mct_scaled[FILTER_2D_8TAP_REGULAR]", $bd),
+            arm_neon_aday("mc", "mct_scaled[FILTER_2D_8TAP_REGULAR_SMOOTH]", $bd),
+            arm_neon_aday("mc", "mct_scaled[FILTER_2D_8TAP_REGULAR_SHARP]", $bd),
+            arm_neon_aday("mc", "mct_scaled[FILTER_2D_8TAP_SHARP_REGULAR]", $bd),
+            arm_neon_aday("mc", "mct_scaled[FILTER_2D_8TAP_SHARP_SMOOTH]", $bd),
+            arm_neon_aday("mc", "mct_scaled[FILTER_2D_8TAP_SHARP]", $bd),
+            arm_neon_aday("mc", "mct_scaled[FILTER_2D_8TAP_SMOOTH_REGULAR]", $bd),
+            arm_neon_aday("mc", "mct_scaled[FILTER_2D_8TAP_SMOOTH]", $bd),
+            arm_neon_aday("mc", "mct_scaled[FILTER_2D_8TAP_SMOOTH_SHARP]", $bd),
+            arm_neon_aday("mc", "mct_scaled[FILTER_2D_BILINEAR]", $bd),
             arm_neon_aday("mc", "avg", $bd),
             arm_neon_aday("mc", "w_avg", $bd),
             arm_neon_aday("mc", "mask", $bd),
@@ -147,11 +171,18 @@ const F5A_ADAYLARI: [IsaCandidate; 16] = [
     arm_neon_aday("pal", "pal_idx_finish", 0),
 ];
 
-/// P52 (`F5b`) MC adayları: `3 × 32` NEON + `18` DOTPROD.
-const F5B_MC_NEON: [[IsaCandidate; 32]; 3] = [
+/// MC NEON adayları: `3 × 52 = 156` NEON + `18` DOTPROD.
+const F5B_MC_NEON: [[IsaCandidate; 52]; 3] = [
     mc_neon_adaylari!(8),
     mc_neon_adaylari!(10),
     mc_neon_adaylari!(12),
+];
+
+/// SuperRes `resize/resize` NEON adayları (`8 / 10 / 12` bpc, `3` yuva).
+const RESIZE_NEON: [IsaCandidate; 3] = [
+    arm_neon_aday("resize", "resize", 8),
+    arm_neon_aday("resize", "resize", 10),
+    arm_neon_aday("resize", "resize", 12),
 ];
 
 const F5B_MC_DOTPROD: [IsaCandidate; 18] = [
@@ -268,8 +299,8 @@ const F5D_LF_NEON: [[IsaCandidate; 4]; 3] = [
     lf_neon_adaylari!(12),
 ];
 
-/// P54 (`F5d`) LR NEON adayları: Wiener @ `8/10/12` (`6` yuva) + SGR @ `8/10` (`6` yuva; 12-bpc SGR yok).
-const F5D_LR_NEON: [IsaCandidate; 12] = [
+/// LR NEON adayları: Wiener @ `8/10/12` (`6` yuva) + SGR @ `8/10/12` (`9` yuva; toplam `15`).
+const F5D_LR_NEON: [IsaCandidate; 15] = [
     arm_neon_aday("looprestoration", "wiener[0]", 8),
     arm_neon_aday("looprestoration", "wiener[1]", 8),
     arm_neon_aday("looprestoration", "sgr[0]", 8),
@@ -282,6 +313,9 @@ const F5D_LR_NEON: [IsaCandidate; 12] = [
     arm_neon_aday("looprestoration", "sgr[2]", 10),
     arm_neon_aday("looprestoration", "wiener[0]", 12),
     arm_neon_aday("looprestoration", "wiener[1]", 12),
+    arm_neon_aday("looprestoration", "sgr[0]", 12),
+    arm_neon_aday("looprestoration", "sgr[1]", 12),
+    arm_neon_aday("looprestoration", "sgr[2]", 12),
 ];
 
 /// P54 (`F5d`) MSAC NEON adayları (`7` yuva, `bit_depth == 0`; `src/arm/64/msac.S`).
@@ -308,12 +342,18 @@ const fn birlestir<const N: usize>() -> [IsaCandidate; N] {
     let mut b = 0;
     while b < 3 {
         let mut k = 0;
-        while k < 32 {
+        while k < 52 {
             out[i] = F5B_MC_NEON[b][k];
             i += 1;
             k += 1;
         }
         b += 1;
+    }
+    let mut r_i = 0;
+    while r_i < RESIZE_NEON.len() {
+        out[i] = RESIZE_NEON[r_i];
+        i += 1;
+        r_i += 1;
     }
     let mut d = 0;
     while d < F5B_MC_DOTPROD.len() {
@@ -378,16 +418,17 @@ const fn birlestir<const N: usize>() -> [IsaCandidate; N] {
     out
 }
 
-/// Toplam `aarch64` aday sayısı (`16` F5a + `96` MC NEON + `18` MC DOTPROD + `468` ITX NEON
-/// + `66` IPRED + `24` FG + `12` LF + `12` LR + `7` MSAC = `719` aday, `701` tekil yuva).
-const ARM_ADAY_SAYISI: usize = 16 + 3 * 32 + 18 + 3 * 156 + 3 * 22 + 3 * 8 + 3 * 4 + 12 + 7;
+/// Toplam `aarch64` aday sayısı (`16` F5a + `156` MC NEON + `3` Resize NEON + `18` MC DOTPROD
+/// + `468` ITX NEON + `66` IPRED + `24` FG + `12` LF + `15` LR + `7` MSAC = `785` aday, `767` tekil yuva).
+const ARM_ADAY_SAYISI: usize = 16 + 3 * 52 + 3 + 18 + 3 * 156 + 3 * 22 + 3 * 8 + 3 * 4 + 15 + 7;
 static ARM_ADAYLAR: [IsaCandidate; ARM_ADAY_SAYISI] = birlestir::<ARM_ADAY_SAYISI>();
 
-/// `aarch64` ISA adayları (`719` aday / `701` tekil `DspDispatch` yuvası):
+/// `aarch64` ISA adayları (`785` aday / `767` tekil `DspDispatch` yuvası):
 /// - `F5a` / `P51`: `F5-CDEF` (`12` yuva), `F5-REFMVS` (`3`), `F5-PAL` (`1`)
-/// - `F5b` / `P52`: `F5-MC` `neon` (`96` yuva) + `neon_dotprod` (`18` üst kademe adayı)
+/// - `F5b` / `P52` + `4.A.3`: `F5-MC` `neon` (`156` yuva: `96` temel + `60` ölçekli)
+///   + `resize` (`3` yuva) + `neon_dotprod` (`18` üst kademe adayı)
 /// - `F5c` / `P53`: `F5-ITX` `neon` (`468` yuva, `WHT_WHT` dâhil)
-/// - `F5d` / `P54`: `F5-IPRED` (`66`), `F5-FG` (`24`), `F5-LF` (`12`), `F5-LR` (`12`), `F5-MSAC` (`7`)
+/// - `F5d` / `P54` + `4.A.3`: `F5-IPRED` (`66`), `F5-FG` (`24`), `F5-LF` (`12`), `F5-LR` (`15`), `F5-MSAC` (`7`)
 pub const ARM_ISA_CANDIDATES: &[IsaCandidate] = &ARM_ADAYLAR;
 
 /// `DspDispatch::candidate_entry` için `aarch64` NEON yuva eşlemesi.
@@ -406,6 +447,15 @@ pub(super) fn candidate_entry(
     }
     match candidate.family {
         "mc" => return mc_neon_entry(candidate, neon),
+        "resize" if candidate.field == "resize" => {
+            let f = match candidate.bit_depth {
+                8 => resize::resize_fn::<8>(neon),
+                10 => resize::resize_fn::<10>(neon),
+                12 => resize::resize_fn::<12>(neon),
+                _ => return None,
+            };
+            return Some(IsaEntry::Resize(f));
+        }
         "itx" => return itx_neon_entry(candidate, neon),
         "ipred" => return ipred_neon_entry(candidate, neon),
         "filmgrain" => return fg_neon_entry(candidate, neon),
@@ -465,7 +515,20 @@ fn mc_alan(field: &str) -> Option<(bool, usize)> {
     Some((prep, i))
 }
 
-/// `mc` NEON yuva eşlemesi (`8 / 10 / 12` bpc, P52).
+/// `mc_scaled[...]` / `mct_scaled[...]` alan adından `(prep, filtre dizini)`.
+#[cfg(target_arch = "aarch64")]
+fn mc_olcekli_alan(field: &str) -> Option<(bool, usize)> {
+    let (prep, ad) = if let Some(r) = field.strip_prefix("mct_scaled[") {
+        (true, r)
+    } else {
+        (false, field.strip_prefix("mc_scaled[")?)
+    };
+    let ad = ad.strip_suffix(']')?;
+    let i = super::FILTER_2D_NAMES.iter().position(|n| *n == ad)?;
+    Some((prep, i))
+}
+
+/// `mc` NEON yuva eşlemesi (`8 / 10 / 12` bpc, P52 + 4.A.3).
 #[cfg(target_arch = "aarch64")]
 fn mc_neon_entry(candidate: &IsaCandidate, neon: NeonToken) -> Option<IsaEntry> {
     macro_rules! bpc {
@@ -484,11 +547,19 @@ fn mc_neon_entry(candidate: &IsaCandidate, neon: NeonToken) -> Option<IsaEntry> 
                 "w_mask[1]" => IsaEntry::WMask(1, mc::w_mask_fn::<$b>(neon, 1)),
                 "w_mask[2]" => IsaEntry::WMask(2, mc::w_mask_fn::<$b>(neon, 2)),
                 f => {
-                    let (prep, i) = mc_alan(f)?;
-                    if prep {
-                        IsaEntry::Mct(i, mc::prep_fn::<$b>(neon, i))
+                    if let Some((prep, i)) = mc_olcekli_alan(f) {
+                        if prep {
+                            IsaEntry::MctScaled(i, mc_olcekli::prep_scaled_fn::<$b>(neon, i))
+                        } else {
+                            IsaEntry::McScaled(i, mc_olcekli::put_scaled_fn::<$b>(neon, i))
+                        }
                     } else {
-                        IsaEntry::Mc(i, mc::put_fn::<$b>(neon, i))
+                        let (prep, i) = mc_alan(f)?;
+                        if prep {
+                            IsaEntry::Mct(i, mc::prep_fn::<$b>(neon, i))
+                        } else {
+                            IsaEntry::Mc(i, mc::put_fn::<$b>(neon, i))
+                        }
                     }
                 }
             })
@@ -653,7 +724,7 @@ fn lf_neon_entry(candidate: &IsaCandidate, neon: NeonToken) -> Option<IsaEntry> 
     Some(IsaEntry::LfSb(plane, dir, f))
 }
 
-/// `looprestoration` NEON yuva eşlemesi (`wiener` @ `8/10/12`, `sgr` @ `8/10`, P54).
+/// `looprestoration` NEON yuva eşlemesi (`wiener` ve `sgr` @ `8/10/12`, P54 + 4.A.3).
 #[cfg(target_arch = "aarch64")]
 fn lr_neon_entry(candidate: &IsaCandidate, neon: NeonToken) -> Option<IsaEntry> {
     match candidate.field {
@@ -676,6 +747,7 @@ fn lr_neon_entry(candidate: &IsaCandidate, neon: NeonToken) -> Option<IsaEntry> 
             let f = match candidate.bit_depth {
                 8 => lr::sgr_fn::<8>(neon, idx)?,
                 10 => lr::sgr_fn::<10>(neon, idx)?,
+                12 => lr::sgr_fn::<12>(neon, idx)?,
                 _ => return None,
             };
             Some(IsaEntry::LrSgr(idx, f))

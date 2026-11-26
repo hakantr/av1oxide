@@ -72,17 +72,6 @@ use common::sentinel::SentinelBuffer;
 
 static SAYAC: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-const SKALER_BUYUK_8_DCT: [TxSize; 8] = [
-    TxSize::Rtx16x32,
-    TxSize::Rtx32x16,
-    TxSize::Tx32x32,
-    TxSize::Rtx16x64,
-    TxSize::Rtx32x64,
-    TxSize::Rtx64x16,
-    TxSize::Rtx64x32,
-    TxSize::Tx64x64,
-];
-
 struct Rng(u64);
 
 impl Rng {
@@ -333,8 +322,8 @@ fn dogrula_oracle_12bpc(
 }
 
 #[test]
-fn test_itx12_avx2_slot_install_and_8_large_dct_remain_scalar() {
-    const T: &str = "itx16_12_avx2::test_itx12_avx2_slot_install_and_8_large_dct_remain_scalar";
+fn test_itx12_avx2_slot_install_and_all_large_dct_enabled() {
+    const T: &str = "itx16_12_avx2::test_itx12_avx2_slot_install_and_all_large_dct_enabled";
     let Some((dsp, _)) = avx2_12_tablo(T) else {
         return;
     };
@@ -342,33 +331,20 @@ fn test_itx12_avx2_slot_install_and_8_large_dct_remain_scalar() {
 
     let mut avx2_kucuk = 0usize;
     let mut avx2_buyuk = 0usize;
-    let mut skaler_buyuk_dct = 0usize;
 
     for &(tx, txtp) in &wht_disi_155_hucre() {
         let alan = format!("itxfm_add[{}][{}]", tx.dav1d_name(), txtp.dav1d_name());
         let impl12 = dsp.slot_implementation(BitDepth::Twelve, "itx", &alan);
+        assert_eq!(
+            impl12, "avx2",
+            "CpuLevel::Avx2 altında 12 bpc {alan} yuvası avx2 olmalı"
+        );
 
         if tx.width() <= 16 && tx.height() <= 16 {
-            assert_eq!(
-                impl12, "avx2",
-                "CpuLevel::Avx2 altında 12 bpc küçük {alan} yuvası avx2 olmalı"
-            );
             assert!(itx12_avx2_lookup(token, tx, txtp).is_some());
             assert!(itx12_buyuk_avx2_lookup(token, tx, txtp).is_none());
             avx2_kucuk += 1;
-        } else if txtp == TxType::DctDct && SKALER_BUYUK_8_DCT.contains(&tx) {
-            assert_eq!(
-                impl12, "skaler",
-                "dav1d src/x86/itx.h:249-263 paritesi: 12 bpc en büyük 8 DCT_DCT ({alan}) skaler kalmalı"
-            );
-            assert!(itx12_avx2_lookup(token, tx, txtp).is_none());
-            assert!(itx12_buyuk_avx2_lookup(token, tx, txtp).is_none());
-            skaler_buyuk_dct += 1;
         } else {
-            assert_eq!(
-                impl12, "avx2",
-                "CpuLevel::Avx2 altında 12 bpc büyük {alan} yuvası avx2 olmalı"
-            );
             assert!(itx12_avx2_lookup(token, tx, txtp).is_none());
             assert!(itx12_buyuk_avx2_lookup(token, tx, txtp).is_some());
             avx2_buyuk += 1;
@@ -385,17 +361,18 @@ fn test_itx12_avx2_slot_install_and_8_large_dct_remain_scalar() {
         "140 küçük (w, h <= 16) 12 bpc yuva avx2 olmalı"
     );
     assert_eq!(
-        avx2_buyuk, 7,
-        "7 büyük (8x32/32x8 DCT+IDTX, 16x32/32x16/32x32 IDTX) 12 bpc yuva avx2 olmalı"
+        avx2_buyuk, 15,
+        "15 büyük (5 IDTX + 10 DCT_DCT) 12 bpc yuva avx2 olmalı"
     );
     assert_eq!(
         avx2_kucuk + avx2_buyuk,
-        147,
-        "toplam 147 WHT-dışı 12 bpc yuva avx2 olmalı"
+        155,
+        "toplam 155 WHT-dışı 12 bpc yuva avx2 olmalı"
     );
     assert_eq!(
-        skaler_buyuk_dct, 8,
-        "en büyük 8 DCT_DCT 12 bpc'de skalerde kalmalı"
+        dsp.assigned_count(),
+        767,
+        "CpuLevel::Avx2 altında 767 / 767 DspDispatch yuvası atanmış olmalı"
     );
 }
 
@@ -417,12 +394,12 @@ fn test_itx12_avx2_c_oracle_small_vectors() {
     assert_eq!(toplam, 936);
     assert_eq!(wht_disi, 930);
     assert_eq!(
-        avx2_sayisi, 882,
-        "147 * 6 = 882 AVX2 12 bpc small vektörü doğrulanmalı"
+        avx2_sayisi, 930,
+        "155 * 6 = 930 AVX2 12 bpc small vektörü doğrulanmalı"
     );
     assert_eq!(
-        skaler_buyuk_sayisi, 48,
-        "8 * 6 = 48 skaler büyük DCT_DCT small vektörü doğrulanmalı"
+        skaler_buyuk_sayisi, 0,
+        "12 bpc büyük DCT_DCT skaler vektörü kalmamalı"
     );
     assert_eq!(
         itx_skaler_devir_sayisi(),
@@ -450,12 +427,12 @@ fn test_itx12_avx2_c_oracle_large_vectors() {
     assert_eq!(toplam, 156_000);
     assert_eq!(wht_disi, 155_000);
     assert_eq!(
-        avx2_sayisi, 147_000,
-        "147 * 1000 = 147 000 AVX2 12 bpc large vektörü doğrulanmalı"
+        avx2_sayisi, 155_000,
+        "155 * 1000 = 155 000 AVX2 12 bpc large vektörü doğrulanmalı"
     );
     assert_eq!(
-        skaler_buyuk_sayisi, 8_000,
-        "8 * 1000 = 8 000 skaler büyük DCT_DCT large vektörü doğrulanmalı"
+        skaler_buyuk_sayisi, 0,
+        "12 bpc büyük DCT_DCT skaler vektörü kalmamalı"
     );
     assert_eq!(
         itx_skaler_devir_sayisi(),
@@ -1023,8 +1000,8 @@ fn test_itx12_avx2_isa_boundary_and_stack_frame_objdump() {
         "en az 140 itx12_avx2_cekirdek sembolü bulunmalı: {kucuk_cekirdek}"
     );
     assert!(
-        buyuk_cekirdek >= 7,
-        "en az 7 itx12_buyuk_avx2_cekirdek sembolü bulunmalı: {buyuk_cekirdek}"
+        buyuk_cekirdek >= 15,
+        "en az 15 itx12_buyuk_avx2_cekirdek sembolü bulunmalı: {buyuk_cekirdek}"
     );
     assert!(
         max_rsp_sub < 0x400,

@@ -43,12 +43,9 @@ pub fn wiener_fn<const BPC: u32>(_neon: NeonToken, tap: usize) -> Option<LrFilte
     }
 }
 
-/// `sgr[idx]` (`8 / 10` bpc) için `NeonToken`-kapılı giriş fonksiyonu.
+/// `sgr[idx]` (`8 / 10 / 12` bpc) için `NeonToken`-kapılı giriş fonksiyonu.
 #[must_use]
 pub fn sgr_fn<const BPC: u32>(_neon: NeonToken, idx: usize) -> Option<LrFilterFn> {
-    if BPC == 12 {
-        return None;
-    }
     match idx {
         0 => Some(super::giris::lr_sgr::<BPC, 0>),
         1 => Some(super::giris::lr_sgr::<BPC, 1>),
@@ -752,7 +749,12 @@ fn calc_ab4_vec<const BPC: u32>(
     let z_max = vdupq_n_u32(255);
     let aa_round = vdupq_n_u32(1 << 11);
 
-    let (a, b) = if BPC == 10 {
+    let (a, b) = if BPC == 12 {
+        (
+            vshrq_n_s32::<8>(vaddq_s32(av_raw, vdupq_n_s32(128))),
+            vshrq_n_s32::<4>(vaddq_s32(bv_raw, vdupq_n_s32(8))),
+        )
+    } else if BPC == 10 {
         (
             vshrq_n_s32::<4>(vaddq_s32(av_raw, vdupq_n_s32(8))),
             vshrq_n_s32::<2>(vaddq_s32(bv_raw, vdupq_n_s32(2))),

@@ -145,8 +145,8 @@ const ALTIN_OZETLER: [(&str, u64, u64); 8] = [
 ];
 
 #[test]
-fn p47_msac_x86_kurulum_ve_756_yuva() {
-    let Some(_) = msac_tokenlari("msac_x86::p47_msac_x86_kurulum_ve_756_yuva") else {
+fn p47_msac_x86_kurulum_ve_767_yuva() {
+    let Some(_) = msac_tokenlari("msac_x86::p47_msac_x86_kurulum_ve_767_yuva") else {
         return;
     };
 
@@ -174,9 +174,9 @@ fn p47_msac_x86_kurulum_ve_756_yuva() {
     assert_eq!(d_sse2.assigned_count(), 13);
     assert_eq!(d_ssse3.assigned_count(), 453);
     assert_eq!(d_sse41.assigned_count(), 609);
-    assert_eq!(d_avx2.assigned_count(), 756);
+    assert_eq!(d_avx2.assigned_count(), 767);
     if d_avx512.avx512icl_token().is_some() {
-        assert_eq!(d_avx512.assigned_count(), 756);
+        assert_eq!(d_avx512.assigned_count(), 767);
     }
 
     for (d, beklenen_a16, beklenen_diger) in [

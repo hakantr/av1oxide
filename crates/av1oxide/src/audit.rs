@@ -252,7 +252,7 @@ pub const UNSAFE_EXEMPTIONS: &[UnsafeExemption] = &[
     },
     UnsafeExemption {
         module: "dsp/x86/itx16_12_buyuk.rs",
-        reason: "AVX2 12 bpc büyük boyutlu (32 nokta, 7 kayıt) ters dönüşüm girişi (itx12_buyuk_avx2_giris): \
+        reason: "AVX2 12 bpc büyük boyutlu (32/64 nokta, 15 kayıt) ters dönüşüm girişi (itx12_buyuk_avx2_giris): \
                  güvenli #[target_feature(enable = \"avx2\")] gövdesini AVX2'siz bağlamdan çağırmak Rust 1.100.0'da \
                  unsafe gerektirir; tek çağrı yalnız Avx2Token ile verilen girişlerdedir, gövdeler unsafe içermez (P44).",
         phase: "P44",

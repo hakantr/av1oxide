@@ -511,7 +511,7 @@ fn f5d_lf_ve_lr_arm64_aday_ve_kurulum() {
         .iter()
         .filter(|c| c.family == "looprestoration")
         .collect();
-    assert_eq!(lr_adaylar.len(), 12);
+    assert_eq!(lr_adaylar.len(), 15);
 
     let d_none = DspDispatch::select(CpuLevel::None.allowed());
     for bd in [BitDepth::Eight, BitDepth::Ten, BitDepth::Twelve] {
@@ -536,16 +536,10 @@ fn f5d_lf_ve_lr_arm64_aday_ve_kurulum() {
             for field in LF_FIELDS {
                 assert_eq!(d_neon.slot_implementation(bd, "loopfilter", field), "neon");
             }
-            for (idx, field) in LR_FIELDS.iter().enumerate() {
-                // 12-bpc SGR dav1d ARM64'te tanımlanmadığından skaler kalır.
-                let beklenen = if bd == BitDepth::Twelve && idx >= 2 {
-                    "skaler"
-                } else {
-                    "neon"
-                };
+            for field in LR_FIELDS {
                 assert_eq!(
                     d_neon.slot_implementation(bd, "looprestoration", field),
-                    beklenen,
+                    "neon",
                     "bd={bd:?} {field}"
                 );
             }

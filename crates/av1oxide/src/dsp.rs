@@ -1529,7 +1529,7 @@ impl DspDispatch {
                         let sgr = lr_sgr_slot(field)?;
                         let f = match candidate.bit_depth {
                             8 => x86::lr::sgr_filter_fn(t, sgr)?,
-                            10 => x86::lr16::sgr_10bpc_avx2_fn(t, sgr)?,
+                            10 | 12 => x86::lr16::sgr_16bpc_avx2_fn(t, sgr)?,
                             _ => return None,
                         };
                         Some(IsaEntry::LrSgr(sgr, f))
@@ -8129,14 +8129,22 @@ pub const X86_ISA_CANDIDATES: &[IsaCandidate] = &[
     itx12_avx2_aday("itxfm_add[TX_16X16][IDTX]", ITX12_AVX2_KARAR_KUCUK),
     itx12_avx2_aday("itxfm_add[TX_16X16][V_DCT]", ITX12_AVX2_KARAR_KUCUK),
     itx12_avx2_aday("itxfm_add[TX_16X16][H_DCT]", ITX12_AVX2_KARAR_KUCUK),
-    // Büyük bloklar (`itx16_12_buyuk`, 7)
+    // Büyük bloklar (`itx16_12_buyuk`, 15: 5 IDTX + 10 DCT_DCT)
     itx12_avx2_aday("itxfm_add[RTX_8X32][DCT_DCT]", ITX12_AVX2_KARAR_BUYUK),
     itx12_avx2_aday("itxfm_add[RTX_8X32][IDTX]", ITX12_AVX2_KARAR_BUYUK),
     itx12_avx2_aday("itxfm_add[RTX_32X8][DCT_DCT]", ITX12_AVX2_KARAR_BUYUK),
     itx12_avx2_aday("itxfm_add[RTX_32X8][IDTX]", ITX12_AVX2_KARAR_BUYUK),
+    itx12_avx2_aday("itxfm_add[RTX_16X32][DCT_DCT]", ITX12_AVX2_KARAR_BUYUK),
     itx12_avx2_aday("itxfm_add[RTX_16X32][IDTX]", ITX12_AVX2_KARAR_BUYUK),
+    itx12_avx2_aday("itxfm_add[RTX_32X16][DCT_DCT]", ITX12_AVX2_KARAR_BUYUK),
     itx12_avx2_aday("itxfm_add[RTX_32X16][IDTX]", ITX12_AVX2_KARAR_BUYUK),
+    itx12_avx2_aday("itxfm_add[TX_32X32][DCT_DCT]", ITX12_AVX2_KARAR_BUYUK),
     itx12_avx2_aday("itxfm_add[TX_32X32][IDTX]", ITX12_AVX2_KARAR_BUYUK),
+    itx12_avx2_aday("itxfm_add[RTX_16X64][DCT_DCT]", ITX12_AVX2_KARAR_BUYUK),
+    itx12_avx2_aday("itxfm_add[RTX_32X64][DCT_DCT]", ITX12_AVX2_KARAR_BUYUK),
+    itx12_avx2_aday("itxfm_add[RTX_64X16][DCT_DCT]", ITX12_AVX2_KARAR_BUYUK),
+    itx12_avx2_aday("itxfm_add[RTX_64X32][DCT_DCT]", ITX12_AVX2_KARAR_BUYUK),
+    itx12_avx2_aday("itxfm_add[TX_64X64][DCT_DCT]", ITX12_AVX2_KARAR_BUYUK),
     // =========================================================================
     // P44 Adım 2: 10 bpc WHT-dışı (`w >= 8 && h >= 8`) AVX512ICL ters dönüşüm adayları (75 kayıt:
     // 60 küçük blok `itx16_avx512` + 15 büyük blok `itx16_buyuk_avx512`;
@@ -8862,6 +8870,9 @@ pub const X86_ISA_CANDIDATES: &[IsaCandidate] = &[
     lr_aday(10, "avx2", CpuFlags::AVX2, "sgr[2]", LR16_AVX2_KARAR),
     lr_aday(12, "avx2", CpuFlags::AVX2, "wiener[0]", LR16_AVX2_KARAR),
     lr_aday(12, "avx2", CpuFlags::AVX2, "wiener[1]", LR16_AVX2_KARAR),
+    lr_aday(12, "avx2", CpuFlags::AVX2, "sgr[0]", LR16_AVX2_KARAR),
+    lr_aday(12, "avx2", CpuFlags::AVX2, "sgr[1]", LR16_AVX2_KARAR),
+    lr_aday(12, "avx2", CpuFlags::AVX2, "sgr[2]", LR16_AVX2_KARAR),
     lr_aday(
         10,
         "avx512icl",

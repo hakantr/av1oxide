@@ -586,10 +586,10 @@ fn test_lr_16bpc_yuva_kurulumu() {
             (0x01u32, "skaler", "skaler", "skaler", "skaler"),
             (0x03u32, "ssse3", "ssse3", "ssse3", "skaler"),
             (0x07u32, "ssse3", "ssse3", "ssse3", "skaler"),
-            (0x0fu32, "avx2", "avx2", "avx2", "skaler"),
-            (0x2fu32, "avx2", "avx2", "avx2", "skaler"),
-            (0x1fu32, "avx512icl", "avx512icl", "avx512icl", "skaler"),
-            (0x3fu32, "avx512icl", "avx512icl", "avx512icl", "skaler"),
+            (0x0fu32, "avx2", "avx2", "avx2", "avx2"),
+            (0x2fu32, "avx2", "avx2", "avx2", "avx2"),
+            (0x1fu32, "avx512icl", "avx512icl", "avx512icl", "avx2"),
+            (0x3fu32, "avx512icl", "avx512icl", "avx512icl", "avx2"),
         ] {
             let flags = CpuFlags::from_dav1d_x86_bits(bits);
             let planned = DspDispatch::planned_slot_states(flags);
@@ -692,15 +692,14 @@ fn test_lr_16bpc_skaler_ve_oracle_esitligi() {
                 if c.bd == 8 {
                     continue;
                 }
-                if c.bd == 12 && c.func >= 2 {
-                    // 12-bpc SGR x86 SIMD'de yok (skalerde kalır).
-                    continue;
-                }
                 let cb = fill_case(&c);
                 let exp = &expect[12 + i * 32..12 + (i + 1) * 32];
                 let mut ref_out: Option<Vec<u8>> = None;
 
                 for isa in &isas {
+                    if c.bd == 12 && c.func >= 2 && isa.ad != "avx2" {
+                        continue;
+                    }
                     let kernel = if c.func < 2 {
                         isa.wiener[c.func]
                     } else {
@@ -770,9 +769,6 @@ fn test_lr_16bpc_skaler_ve_oracle_esitligi() {
                         let mut rng =
                             Rng(0x9E37_79B9_7F4A_7C15u64.wrapping_mul(hucre_idx as u64 + 1));
                         hucre_idx += 1;
-                        if bpc == 12 && func >= 2 {
-                            continue;
-                        }
                         let stride_bytes = 448 * 2;
                         let lpf_x = 32usize;
                         let mut orig = vec![0u8; stride_bytes * 64];
@@ -822,7 +818,10 @@ fn test_lr_16bpc_skaler_ve_oracle_esitligi() {
                             (10, 3) => scalar10.sgr[1],
                             (10, _) => scalar10.sgr[2],
                             (12, 0) => scalar12.wiener[0],
-                            (_, _) => scalar12.wiener[1],
+                            (12, 1) => scalar12.wiener[1],
+                            (12, 2) => scalar12.sgr[0],
+                            (12, 3) => scalar12.sgr[1],
+                            (_, _) => scalar12.sgr[2],
                         };
                         let mut ref_dst = orig.clone();
                         skaler_fn(
@@ -840,6 +839,9 @@ fn test_lr_16bpc_skaler_ve_oracle_esitligi() {
                         );
 
                         for isa in &isas {
+                            if bpc == 12 && func >= 2 && isa.ad != "avx2" {
+                                continue;
+                            }
                             let simd_fn = if func < 2 {
                                 isa.wiener[func]
                             } else {
@@ -892,6 +894,9 @@ fn test_lr_16bpc_skaler_ve_oracle_esitligi() {
                     (4, 10),
                     (0, 12),
                     (1, 12),
+                    (2, 12),
+                    (3, 12),
+                    (4, 12),
                 ] {
                     let c = Case {
                         func,
@@ -929,6 +934,9 @@ fn test_lr_16bpc_skaler_ve_oracle_esitligi() {
                     let expected =
                         run_kernel_on_case(skaler_fn, &c, &cb).expect("skaler sözleşme içi");
                     for isa in &isas {
+                        if bpc == 12 && func >= 2 && isa.ad != "avx2" {
+                            continue;
+                        }
                         let simd_fn = if func < 2 {
                             isa.wiener[func]
                         } else {
@@ -1241,8 +1249,10 @@ fn test_lr_16bpc_sozlesme_disi_skalere_devreder() {
                 assert_eq!(dst, before);
             }
 
-            // 8) 10-bpc SGR SIMD işlevine doğrudan geçerli LrBitDepth::B12 verildiğinde
-            // skaler devir sayacını artırır VE 12-bpc skaler SGR ile birebir aynı çıktıyı üretir!
+            // 8) SGR SIMD işlevine geçerli LrBitDepth::B12 verildiğinde:
+            // AVX2 doğrudan 12-bpc SIMD yolunu çalıştırır (skaler devir 0),
+            // SSSE3 ve AVX512ICL 10-bpc çekirdekleri ise 12-bpc skaler devre düşer;
+            // tümü 12-bpc skaler SGR ile birebir aynı çıktıyı üretir.
             let scalar12 = LrDsp::scalar::<12>();
             for sgr_idx in 0..3usize {
                 let (w, h) = (16usize, 4usize);
@@ -1280,10 +1290,15 @@ fn test_lr_16bpc_sozlesme_disi_skalere_devreder() {
                     LrEdgeFlags::NONE,
                     LrBitDepth::B12,
                 );
-                assert_eq!(lr_skaler_devir_sayisi(), d_before + 1);
+                let beklenen_devir = if isa.ad == "avx2" {
+                    d_before
+                } else {
+                    d_before + 1
+                };
+                assert_eq!(lr_skaler_devir_sayisi(), beklenen_devir);
                 assert_eq!(
                     simd_dst, ref_dst,
-                    "10-bpc SGR ({}) B12 çağrısında 12-bpc skaler çıktıyla eşleşmeli",
+                    "SGR ({}) B12 çağrısında 12-bpc skaler çıktıyla eşleşmeli",
                     isa.ad
                 );
             }

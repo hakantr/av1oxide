@@ -41,7 +41,8 @@ use crate::dsp::lr::{
     LrBitDepth, LrEdgeFlags, LrParams, sgr_skaler_devret, sgr_sozlesmesi, wiener_skaler_devret,
     wiener_sozlesmesi,
 };
-use crate::dsp::mc::{McDsp, skaler_devri_say};
+use crate::dsp::mc::{McDsp, olcekli_sozlesmesi, olcekli16_sozlesmesi, skaler_devri_say};
+use crate::dsp::resize::{ResizeBitDepth, buyutme_sozlesmesi, buyutme16_sozlesmesi};
 use crate::entropy::msac::MsacContext;
 use crate::frame::BitDepth;
 
@@ -1160,4 +1161,106 @@ pub(super) fn sozluk_dotprod(
 ) -> [u8; 16] {
     // SAFETY: (1) ISA: `_token` (`DotprodToken`) bu işlemcide NEON ve DOTPROD etkinliğini kanıtlar; `dotprod_govde` yalnız `neon,dotprod` ister. (2) sınır: `acc`, `a`, `b` ve dönüş değeri sabit boyutlu `[u8; 16]` dizileridir. (3) hizalama/takma ad: paylaşılan `&[u8; 16]` referansları yalnız okunur.
     unsafe { super::sozluk::dotprod_govde(acc, a, b, signed) }
+}
+
+// ============================================================================
+// 4.A.3 — `resize` (`3` yuva) ve ölçekli MC (`mc_scaled`/`mct_scaled`, `60` yuva)
+// ============================================================================
+
+/// `resize/resize` NEON girişi (`BPC` = 8 / 10 / 12).
+pub(super) fn mc_resize<const BPC: u32>(
+    dst: &mut [u8],
+    ds: usize,
+    src: &[u8],
+    ss: usize,
+    dst_w: usize,
+    h: usize,
+    src_w: usize,
+    dx: i32,
+    mx0: i32,
+    bd: ResizeBitDepth,
+) {
+    let ok = bd.bits() == BPC
+        && if BPC == 8 {
+            buyutme_sozlesmesi(dst.len(), ds, src.len(), ss, dst_w, h, src_w, dx, mx0)
+        } else {
+            buyutme16_sozlesmesi(dst.len(), ds, src.len(), ss, dst_w, h, src_w, dx, mx0, bd)
+        };
+    if !ok {
+        skaler_devri_say();
+        return (crate::dsp::resize::scalar_for(bd))(
+            dst, ds, src, ss, dst_w, h, src_w, dx, mx0, bd,
+        );
+    }
+    // SAFETY: (1) ISA: Bu köprünün adresi yalnız `NeonToken` ile (`resize::resize_fn`) verilir; belirteç NEON tespitinin kanıtıdır. (2) sınır: `buyutme_sozlesmesi`/`buyutme16_sozlesmesi` `dst` ve `src` satır uzunluklarını O(1) denetledi; gövde erişimleri `[0, src_w - 1]` kırpmalı ve dilim denetimlidir. (3) hizalama/takma ad: `dst` tek `&mut`, `src` `&`.
+    unsafe { super::resize::resize_neon::<BPC>(dst, ds, src, ss, dst_w, h, src_w, dx, mx0) }
+}
+
+/// `mc_scaled[FI]` NEON girişi (`BPC` = 8 / 10 / 12).
+pub(super) fn mc_put_scaled<const BPC: u32, const FI: usize>(
+    dst: &mut [u8],
+    ds: usize,
+    src: &[u8],
+    ss: usize,
+    w: usize,
+    h: usize,
+    mx: i32,
+    my: i32,
+    dx: i32,
+    dy: i32,
+    bd: BitDepth,
+    bdmax: u16,
+) {
+    let bpp = if BPC == 8 { 1 } else { 2 };
+    let bilin = FI == super::mc_olcekli::BILIN;
+    let ok = bd.bits() == BPC
+        && bdmax == ((1u16 << BPC) - 1)
+        && if BPC == 8 {
+            olcekli_sozlesmesi(bilin, src.len(), ss, w, h, mx, my, dx, dy)
+        } else {
+            olcekli16_sozlesmesi(bilin, src.len(), ss, w, h, mx, my, dx, dy, bd, bdmax)
+        }
+        && ds >= w * bpp
+        && dst.len() >= (h - 1) * ds + w * bpp;
+    if !ok {
+        skaler_devri_say();
+        return (McDsp::scalar_for(bd).mc_scaled[FI])(
+            dst, ds, src, ss, w, h, mx, my, dx, dy, bd, bdmax,
+        );
+    }
+    // SAFETY: (1) ISA: Bu köprünün adresi yalnız `NeonToken` ile (`mc_olcekli::put_scaled_fn`) verilir; belirteç NEON tespitinin kanıtıdır. (2) sınır: `olcekli_sozlesmesi`/`olcekli16_sozlesmesi` okuma bölgesini kaynak diliminde, hedef denetimi `h` satır × `w·bpp` baytı O(1) doğruladı; erişimler dilim denetimlidir. (3) hizalama/takma ad: `dst` tek `&mut`, `src` `&`.
+    unsafe { super::mc_olcekli::put_scaled_neon::<BPC, FI>(dst, ds, src, ss, w, h, mx, my, dx, dy) }
+}
+
+/// `mct_scaled[FI]` NEON girişi (`BPC` = 8 / 10 / 12).
+pub(super) fn mc_prep_scaled<const BPC: u32, const FI: usize>(
+    tmp: &mut [i16],
+    src: &[u8],
+    ss: usize,
+    w: usize,
+    h: usize,
+    mx: i32,
+    my: i32,
+    dx: i32,
+    dy: i32,
+    bd: BitDepth,
+    bdmax: u16,
+) {
+    let bilin = FI == super::mc_olcekli::BILIN;
+    let ok = bd.bits() == BPC
+        && bdmax == ((1u16 << BPC) - 1)
+        && if BPC == 8 {
+            olcekli_sozlesmesi(bilin, src.len(), ss, w, h, mx, my, dx, dy)
+        } else {
+            olcekli16_sozlesmesi(bilin, src.len(), ss, w, h, mx, my, dx, dy, bd, bdmax)
+        }
+        && tmp.len() >= w * h;
+    if !ok {
+        skaler_devri_say();
+        return (McDsp::scalar_for(bd).mct_scaled[FI])(
+            tmp, src, ss, w, h, mx, my, dx, dy, bd, bdmax,
+        );
+    }
+    // SAFETY: (1) ISA: Bu köprünün adresi yalnız `NeonToken` ile (`mc_olcekli::prep_scaled_fn`) verilir; belirteç NEON tespitinin kanıtıdır. (2) sınır: `olcekli_sozlesmesi`/`olcekli16_sozlesmesi` okuma bölgesini kaynak diliminde, hedef denetimi `tmp.len() >= w·h` koşulunu O(1) doğruladı; erişimler dilim denetimlidir. (3) hizalama/takma ad: `tmp` tek `&mut`, `src` `&`.
+    unsafe { super::mc_olcekli::prep_scaled_neon::<BPC, FI>(tmp, src, ss, w, h, mx, my, dx, dy) }
 }

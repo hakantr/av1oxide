@@ -27,11 +27,24 @@ fn p52_arm64_mc_aday_sayilari() {
         .iter()
         .filter(|c| c.family == "mc" && c.implementation == "neon")
         .count();
+    let resize = ARM_ISA_CANDIDATES
+        .iter()
+        .filter(|c| c.family == "resize" && c.implementation == "neon")
+        .count();
     let dot: Vec<_> = ARM_ISA_CANDIDATES
         .iter()
         .filter(|c| c.family == "mc" && c.implementation == "neon_dotprod")
         .collect();
-    assert_eq!(neon, 96, "mc neon adayı: 3 bit derinliği × 32 alan");
+    assert_eq!(
+        neon, 156,
+        "mc neon adayı: 3 bit derinliği × 52 alan (32 temel + 20 ölçekli)"
+    );
+    assert_eq!(resize, 3, "resize neon adayı: 8 / 10 / 12 bpc");
+    assert_eq!(
+        ARM_ISA_CANDIDATES.len(),
+        785,
+        "toplam ARM64 aday sayısı 785 (767 NEON + 18 DOTPROD) olmalı"
+    );
     assert_eq!(
         dot.len(),
         18,
@@ -148,9 +161,19 @@ mod arm {
             }
             assert_eq!(
                 neon.slot_implementation(bd, "mc", "mc_scaled[FILTER_2D_8TAP_REGULAR]"),
-                "skaler"
+                "neon"
             );
+            assert_eq!(
+                neon.slot_implementation(bd, "mc", "mct_scaled[FILTER_2D_BILINEAR]"),
+                "neon"
+            );
+            assert_eq!(neon.slot_implementation(bd, "resize", "resize"), "neon");
         }
+        assert_eq!(
+            neon.assigned_count(),
+            767,
+            "aarch64 NEON altında 767 / 767 DspDispatch yuvası atanmış olmalı"
+        );
         if tam.dotprod_token().is_some() {
             assert_eq!(
                 tam.slot_implementation(BitDepth::Eight, "mc", "mc[FILTER_2D_8TAP_SHARP]"),
@@ -601,6 +624,114 @@ mod arm {
                         &sb.data()[row * ds..row * ds + bw * b],
                         &d_ref[row * ds..row * ds + bw * b],
                         "emu_edge bd={bd:?} {bw}x{bh} iw={iw} ih={ih} x={x} y={y}"
+                    );
+                }
+            }
+        }
+        assert_eq!(skaler_devir_sayisi(), devir0);
+    }
+
+    /// `mc_scaled[0..=9]` ve `mct_scaled[0..=9]` (`60` yuva: 8/10/12 bpc, 8-tap + bilinear).
+    #[test]
+    fn arm64_mc_scaled_ve_mct_scaled_8_10_12bpc_bit_exact_sentinel() {
+        let (neon, _, skaler) = tablolar();
+        let devir0 = skaler_devir_sayisi();
+        let mut r = Rng(0x5CA1_ED4A_0003_2026);
+        for bd in BDLER {
+            let b = bpp(bd);
+            let bm = maxv(bd);
+            let (tn, ts): (McDsp, McDsp) =
+                (*neon.for_bit_depth(bd).mc(), *skaler.for_bit_depth(bd).mc());
+            for fi in 0..10usize {
+                for &(w, hs) in &BOYUTLAR {
+                    let h = hs[(r.next() as usize) % hs.len()];
+                    let mx = r.aralik(1024) as i32;
+                    let my = r.aralik(1024) as i32;
+                    let dx =
+                        [1024i32, 2048, 512, 1 + r.aralik(2048) as i32][(r.next() as usize) & 3];
+                    let dy =
+                        [1024i32, 2048, 512, 1 + r.aralik(2048) as i32][(r.next() as usize) & 3];
+                    let max_sx = ((mx + (w as i32 - 1) * dx) >> 10) as usize + 8;
+                    let max_sy = ((my + (h as i32 - 1) * dy) >> 10) as usize + 8;
+                    let ss = max_sx * b + b * (r.aralik(4) as usize);
+                    let src_len = (max_sy - 1) * ss + max_sx * b;
+                    let src = pikseller(&mut r, bd, src_len.div_ceil(b));
+                    let src = &src[..src_len];
+
+                    let ds = w * b + b * (r.aralik(4) as usize);
+                    let dlen = (h - 1) * ds + w * b;
+                    let mut d_ref = vec![0u8; dlen];
+                    (ts.mc_scaled[fi])(&mut d_ref, ds, src, ss, w, h, mx, my, dx, dy, bd, bm);
+                    let mut sb = SentinelBuffer::new(dlen, KORUMA, SENTINEL);
+                    (tn.mc_scaled[fi])(sb.data_mut(), ds, src, ss, w, h, mx, my, dx, dy, bd, bm);
+                    sb.verify().expect("mc_scaled sentinel");
+                    for row in 0..h {
+                        assert_eq!(
+                            &sb.data()[row * ds..row * ds + w * b],
+                            &d_ref[row * ds..row * ds + w * b],
+                            "mc_scaled[{fi}] bd={bd:?} {w}x{h} mx={mx} my={my} dx={dx} dy={dy}"
+                        );
+                    }
+
+                    let tlen = w * h;
+                    let mut t_ref = vec![0i16; tlen];
+                    (ts.mct_scaled[fi])(&mut t_ref, src, ss, w, h, mx, my, dx, dy, bd, bm);
+                    let mut t_got = vec![0x3333i16; tlen + 16];
+                    (tn.mct_scaled[fi])(&mut t_got[..tlen], src, ss, w, h, mx, my, dx, dy, bd, bm);
+                    assert_eq!(
+                        &t_got[..tlen],
+                        &t_ref[..],
+                        "mct_scaled[{fi}] bd={bd:?} {w}x{h} mx={mx} my={my} dx={dx} dy={dy}"
+                    );
+                    assert!(t_got[tlen..].iter().all(|&v| v == 0x3333));
+                }
+            }
+        }
+        assert_eq!(skaler_devir_sayisi(), devir0);
+    }
+
+    /// `resize/resize` (`3` yuva: 8/10/12 bpc, SuperRes yatay büyütme).
+    #[test]
+    fn arm64_resize_8_10_12bpc_bit_exact_sentinel() {
+        use av1oxide::dsp::resize::ResizeBitDepth;
+        let (neon, _, skaler) = tablolar();
+        let devir0 = skaler_devir_sayisi();
+        let mut r = Rng(0x52E5_12E0_4A03_2026);
+        for (bd, rbd) in [
+            (BitDepth::Eight, ResizeBitDepth::B8),
+            (BitDepth::Ten, ResizeBitDepth::B10),
+            (BitDepth::Twelve, ResizeBitDepth::B12),
+        ] {
+            let b = bpp(bd);
+            let f_neon = neon.for_bit_depth(bd).resize();
+            let f_sk = skaler.for_bit_depth(bd).resize();
+            for &(src_w, dst_w, h) in &[
+                (1usize, 1usize, 1usize),
+                (3, 5, 2),
+                (7, 13, 4),
+                (16, 32, 8),
+                (33, 65, 5),
+                (64, 128, 16),
+                (127, 255, 7),
+            ] {
+                let dx = 4096 + r.aralik(16_384) as i32;
+                let mx0 = r.aralik(0x4000) as i32;
+                let ss = src_w * b + b * (r.aralik(4) as usize);
+                let slen = (h - 1) * ss + src_w * b;
+                let src = pikseller(&mut r, bd, slen.div_ceil(b));
+                let src = &src[..slen];
+                let ds = dst_w * b + b * (r.aralik(4) as usize);
+                let dlen = (h - 1) * ds + dst_w * b;
+                let mut d_ref = vec![0u8; dlen];
+                f_sk(&mut d_ref, ds, src, ss, dst_w, h, src_w, dx, mx0, rbd);
+                let mut sb = SentinelBuffer::new(dlen, KORUMA, SENTINEL);
+                f_neon(sb.data_mut(), ds, src, ss, dst_w, h, src_w, dx, mx0, rbd);
+                sb.verify().expect("resize sentinel");
+                for row in 0..h {
+                    assert_eq!(
+                        &sb.data()[row * ds..row * ds + dst_w * b],
+                        &d_ref[row * ds..row * ds + dst_w * b],
+                        "resize bd={bd:?} {src_w}->{dst_w}x{h} dx={dx} mx0={mx0}"
                     );
                 }
             }

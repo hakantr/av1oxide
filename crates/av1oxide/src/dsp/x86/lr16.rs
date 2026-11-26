@@ -26,10 +26,10 @@
 #![allow(clippy::needless_range_loop, clippy::too_many_arguments)]
 
 use core::arch::x86_64::{
-    __m256i, _mm256_add_epi16, _mm256_add_epi32, _mm256_madd_epi16, _mm256_max_epi16,
-    _mm256_max_epi32, _mm256_min_epi16, _mm256_mullo_epi32, _mm256_packs_epi32, _mm256_set1_epi16,
-    _mm256_set1_epi32, _mm256_setzero_si256, _mm256_srai_epi32, _mm256_sub_epi32,
-    _mm256_unpackhi_epi16, _mm256_unpacklo_epi16,
+    __m256i, _mm256_add_epi32, _mm256_madd_epi16, _mm256_max_epi16, _mm256_max_epi32,
+    _mm256_min_epi16, _mm256_mullo_epi32, _mm256_packs_epi32, _mm256_set1_epi16, _mm256_set1_epi32,
+    _mm256_setzero_si256, _mm256_srai_epi32, _mm256_sub_epi32, _mm256_unpackhi_epi16,
+    _mm256_unpacklo_epi16,
 };
 
 use crate::cpu::{Avx2Token, CpuFlags};
@@ -61,19 +61,19 @@ pub const fn wiener_filter5_16bpc_avx2_fn(_token: Avx2Token) -> LrFilterFn {
     wiener_filter5_16bpc_avx2
 }
 
-/// `sgr[0]` (5×5, yalnız 10-bpc) AVX2 yuva kurucusu (`D02728`).
+/// `sgr[0]` (5×5, 10/12-bpc) AVX2 yuva kurucusu (`D02728`).
 #[must_use]
 pub const fn sgr_filter_5x5_16bpc_avx2_fn(_token: Avx2Token) -> LrFilterFn {
     sgr_filter_5x5_16bpc_avx2
 }
 
-/// `sgr[1]` (3×3, yalnız 10-bpc) AVX2 yuva kurucusu (`D02734`).
+/// `sgr[1]` (3×3, 10/12-bpc) AVX2 yuva kurucusu (`D02734`).
 #[must_use]
 pub const fn sgr_filter_3x3_16bpc_avx2_fn(_token: Avx2Token) -> LrFilterFn {
     sgr_filter_3x3_16bpc_avx2
 }
 
-/// `sgr[2]` (mix, yalnız 10-bpc) AVX2 yuva kurucusu (`D02740`).
+/// `sgr[2]` (mix, 10/12-bpc) AVX2 yuva kurucusu (`D02740`).
 #[must_use]
 pub const fn sgr_filter_mix_16bpc_avx2_fn(_token: Avx2Token) -> LrFilterFn {
     sgr_filter_mix_16bpc_avx2
@@ -89,15 +89,21 @@ pub const fn wiener_16bpc_avx2_fn(_token: Avx2Token, tap_idx: usize) -> Option<L
     }
 }
 
-/// `sgr[sgr_idx]` (yalnız 10-bpc) AVX2 yuva kurucusu (`D02728`, `D02734`, `D02740`).
+/// `sgr[sgr_idx]` (10/12-bpc) AVX2 yuva kurucusu (`D02728`, `D02734`, `D02740`).
 #[must_use]
-pub const fn sgr_10bpc_avx2_fn(_token: Avx2Token, sgr_idx: usize) -> Option<LrFilterFn> {
+pub const fn sgr_16bpc_avx2_fn(_token: Avx2Token, sgr_idx: usize) -> Option<LrFilterFn> {
     match sgr_idx {
         0 => Some(sgr_filter_5x5_16bpc_avx2),
         1 => Some(sgr_filter_3x3_16bpc_avx2),
         2 => Some(sgr_filter_mix_16bpc_avx2),
         _ => None,
     }
+}
+
+/// `sgr[sgr_idx]` (10/12-bpc) AVX2 yuva kurucusu takma adı.
+#[must_use]
+pub const fn sgr_10bpc_avx2_fn(token: Avx2Token, sgr_idx: usize) -> Option<LrFilterFn> {
+    sgr_16bpc_avx2_fn(token, sgr_idx)
 }
 
 /// `dav1d_wiener_filter7_16bpc_avx2` (`D02746`, 10-bpc ve 12-bpc).
@@ -237,7 +243,7 @@ fn wiener_dispatch_avx2<const TAP_IDX: usize>(
     }
 }
 
-/// `dav1d_sgr_filter_5x5_16bpc_avx2` (`D02728`, yalnız 10-bpc).
+/// `dav1d_sgr_filter_5x5_16bpc_avx2` (`D02728`, 10-bpc ve 12-bpc).
 pub fn sgr_filter_5x5_16bpc_avx2(
     dst: &mut [u8],
     stride: usize,
@@ -251,21 +257,38 @@ pub fn sgr_filter_5x5_16bpc_avx2(
     edges: LrEdgeFlags,
     bd: LrBitDepth,
 ) {
-    if !sgr_sozlesmesi::<10>(
-        0,
-        dst.len(),
-        stride,
-        left.len(),
-        lpf.len(),
-        lpf_stride,
-        lpf_x,
-        w,
-        h,
-        params,
-        edges,
-        bd,
-    ) || Avx2Token::new(CpuFlags::AVX2).is_none()
-    {
+    let ok = match bd {
+        LrBitDepth::B10 => sgr_sozlesmesi::<10>(
+            0,
+            dst.len(),
+            stride,
+            left.len(),
+            lpf.len(),
+            lpf_stride,
+            lpf_x,
+            w,
+            h,
+            params,
+            edges,
+            bd,
+        ),
+        LrBitDepth::B12 => sgr_sozlesmesi::<12>(
+            0,
+            dst.len(),
+            stride,
+            left.len(),
+            lpf.len(),
+            lpf_stride,
+            lpf_x,
+            w,
+            h,
+            params,
+            edges,
+            bd,
+        ),
+        LrBitDepth::B8 => false,
+    };
+    if !ok || Avx2Token::new(CpuFlags::AVX2).is_none() {
         if bd == LrBitDepth::B12 {
             sgr_skaler_devret::<12>(
                 0, dst, stride, left, lpf, lpf_stride, lpf_x, w, h, params, edges, bd,
@@ -290,12 +313,18 @@ pub fn sgr_filter_5x5_16bpc_avx2(
         edges,
     };
     // SAFETY: (1) ISA: `Avx2Token::new(CpuFlags::AVX2)` bu makinede AVX2 tespitini doğruladı.
-    // (2) sınır: `sgr_sozlesmesi::<10>` `dst`, `left` ve `lpf` dilim sınırlarını O(1) doğruladı.
+    // (2) sınır: `sgr_sozlesmesi::<10/12>` `dst`, `left` ve `lpf` dilim sınırlarını O(1) doğruladı.
     // (3) hizalama/takma ad: tüm SIMD yükleme/saklamalar yığın üzerindeki sabit boyutlu dizilerde `mem` yardımcılarıyla hizasız yapılır; `dst` tek `&mut` referanstır.
-    unsafe { sgr_5x5_10bpc_avx2_giris(dst, &c, h, s0, w0) }
+    unsafe {
+        if bd == LrBitDepth::B12 {
+            sgr_5x5_16bpc_avx2_giris::<12>(dst, &c, h, s0, w0);
+        } else {
+            sgr_5x5_16bpc_avx2_giris::<10>(dst, &c, h, s0, w0);
+        }
+    }
 }
 
-/// `dav1d_sgr_filter_3x3_16bpc_avx2` (`D02734`, yalnız 10-bpc).
+/// `dav1d_sgr_filter_3x3_16bpc_avx2` (`D02734`, 10-bpc ve 12-bpc).
 pub fn sgr_filter_3x3_16bpc_avx2(
     dst: &mut [u8],
     stride: usize,
@@ -309,21 +338,38 @@ pub fn sgr_filter_3x3_16bpc_avx2(
     edges: LrEdgeFlags,
     bd: LrBitDepth,
 ) {
-    if !sgr_sozlesmesi::<10>(
-        1,
-        dst.len(),
-        stride,
-        left.len(),
-        lpf.len(),
-        lpf_stride,
-        lpf_x,
-        w,
-        h,
-        params,
-        edges,
-        bd,
-    ) || Avx2Token::new(CpuFlags::AVX2).is_none()
-    {
+    let ok = match bd {
+        LrBitDepth::B10 => sgr_sozlesmesi::<10>(
+            1,
+            dst.len(),
+            stride,
+            left.len(),
+            lpf.len(),
+            lpf_stride,
+            lpf_x,
+            w,
+            h,
+            params,
+            edges,
+            bd,
+        ),
+        LrBitDepth::B12 => sgr_sozlesmesi::<12>(
+            1,
+            dst.len(),
+            stride,
+            left.len(),
+            lpf.len(),
+            lpf_stride,
+            lpf_x,
+            w,
+            h,
+            params,
+            edges,
+            bd,
+        ),
+        LrBitDepth::B8 => false,
+    };
+    if !ok || Avx2Token::new(CpuFlags::AVX2).is_none() {
         if bd == LrBitDepth::B12 {
             sgr_skaler_devret::<12>(
                 1, dst, stride, left, lpf, lpf_stride, lpf_x, w, h, params, edges, bd,
@@ -348,12 +394,18 @@ pub fn sgr_filter_3x3_16bpc_avx2(
         edges,
     };
     // SAFETY: (1) ISA: `Avx2Token::new(CpuFlags::AVX2)` bu makinede AVX2 tespitini doğruladı.
-    // (2) sınır: `sgr_sozlesmesi::<10>` `dst`, `left` ve `lpf` dilim sınırlarını O(1) doğruladı.
+    // (2) sınır: `sgr_sozlesmesi::<10/12>` `dst`, `left` ve `lpf` dilim sınırlarını O(1) doğruladı.
     // (3) hizalama/takma ad: tüm SIMD yükleme/saklamalar yığın üzerindeki sabit boyutlu dizilerde `mem` yardımcılarıyla hizasız yapılır; `dst` tek `&mut` referanstır.
-    unsafe { sgr_3x3_10bpc_avx2_giris(dst, &c, h, s1, w1) }
+    unsafe {
+        if bd == LrBitDepth::B12 {
+            sgr_3x3_16bpc_avx2_giris::<12>(dst, &c, h, s1, w1);
+        } else {
+            sgr_3x3_16bpc_avx2_giris::<10>(dst, &c, h, s1, w1);
+        }
+    }
 }
 
-/// `dav1d_sgr_filter_mix_16bpc_avx2` (`D02740`, yalnız 10-bpc).
+/// `dav1d_sgr_filter_mix_16bpc_avx2` (`D02740`, 10-bpc ve 12-bpc).
 pub fn sgr_filter_mix_16bpc_avx2(
     dst: &mut [u8],
     stride: usize,
@@ -367,21 +419,38 @@ pub fn sgr_filter_mix_16bpc_avx2(
     edges: LrEdgeFlags,
     bd: LrBitDepth,
 ) {
-    if !sgr_sozlesmesi::<10>(
-        2,
-        dst.len(),
-        stride,
-        left.len(),
-        lpf.len(),
-        lpf_stride,
-        lpf_x,
-        w,
-        h,
-        params,
-        edges,
-        bd,
-    ) || Avx2Token::new(CpuFlags::AVX2).is_none()
-    {
+    let ok = match bd {
+        LrBitDepth::B10 => sgr_sozlesmesi::<10>(
+            2,
+            dst.len(),
+            stride,
+            left.len(),
+            lpf.len(),
+            lpf_stride,
+            lpf_x,
+            w,
+            h,
+            params,
+            edges,
+            bd,
+        ),
+        LrBitDepth::B12 => sgr_sozlesmesi::<12>(
+            2,
+            dst.len(),
+            stride,
+            left.len(),
+            lpf.len(),
+            lpf_stride,
+            lpf_x,
+            w,
+            h,
+            params,
+            edges,
+            bd,
+        ),
+        LrBitDepth::B8 => false,
+    };
+    if !ok || Avx2Token::new(CpuFlags::AVX2).is_none() {
         if bd == LrBitDepth::B12 {
             sgr_skaler_devret::<12>(
                 2, dst, stride, left, lpf, lpf_stride, lpf_x, w, h, params, edges, bd,
@@ -406,9 +475,15 @@ pub fn sgr_filter_mix_16bpc_avx2(
         edges,
     };
     // SAFETY: (1) ISA: `Avx2Token::new(CpuFlags::AVX2)` bu makinede AVX2 tespitini doğruladı.
-    // (2) sınır: `sgr_sozlesmesi::<10>` `dst`, `left` ve `lpf` dilim sınırlarını O(1) doğruladı.
+    // (2) sınır: `sgr_sozlesmesi::<10/12>` `dst`, `left` ve `lpf` dilim sınırlarını O(1) doğruladı.
     // (3) hizalama/takma ad: tüm SIMD yükleme/saklamalar yığın üzerindeki sabit boyutlu dizilerde `mem` yardımcılarıyla hizasız yapılır; `dst` tek `&mut` referanstır.
-    unsafe { sgr_mix_10bpc_avx2_giris(dst, &c, h, s0, s1, w0, w1) }
+    unsafe {
+        if bd == LrBitDepth::B12 {
+            sgr_mix_16bpc_avx2_giris::<12>(dst, &c, h, s0, s1, w0, w1);
+        } else {
+            sgr_mix_16bpc_avx2_giris::<10>(dst, &c, h, s0, s1, w0, w1);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1041,14 +1116,14 @@ fn box5_row_h_avx2(
 
 #[target_feature(enable = "avx2")]
 #[inline]
-fn calc_row_ab_10bpc_avx2<const IS_5X5: bool>(
+fn calc_row_ab_16bpc_avx2<const BPC: u32, const IS_5X5: bool>(
     aa: &mut [i32; BUF_STRIDE],
     bb: &mut [i32; BUF_STRIDE],
     w: usize,
     s: u32,
 ) {
-    let c8 = _mm256_set1_epi32(8);
-    let c2 = _mm256_set1_epi32(2);
+    let ca = _mm256_set1_epi32(if BPC == 12 { 128 } else { 8 });
+    let cb = _mm256_set1_epi32(if BPC == 12 { 8 } else { 2 });
     let vn = _mm256_set1_epi32(if IS_5X5 { 25 } else { 9 });
     let zero = _mm256_setzero_si256();
     let one_by_x: u32 = if IS_5X5 { 164 } else { 455 };
@@ -1059,8 +1134,17 @@ fn calc_row_ab_10bpc_avx2<const IS_5X5: bool>(
         let a_raw = load_i32x8(mem::chunk::<i32, 8>(aa, i));
         let b_raw = load_i32x8(mem::chunk::<i32, 8>(bb, i));
 
-        let a = _mm256_srai_epi32::<4>(_mm256_add_epi32(a_raw, c8));
-        let b = _mm256_srai_epi32::<2>(_mm256_add_epi32(b_raw, c2));
+        let (a, b) = if BPC == 12 {
+            (
+                _mm256_srai_epi32::<8>(_mm256_add_epi32(a_raw, ca)),
+                _mm256_srai_epi32::<4>(_mm256_add_epi32(b_raw, cb)),
+            )
+        } else {
+            (
+                _mm256_srai_epi32::<4>(_mm256_add_epi32(a_raw, ca)),
+                _mm256_srai_epi32::<2>(_mm256_add_epi32(b_raw, cb)),
+            )
+        };
         let p_vec = _mm256_max_epi32(
             _mm256_sub_epi32(_mm256_mullo_epi32(a, vn), _mm256_mullo_epi32(b, b)),
             zero,
@@ -1087,7 +1171,7 @@ fn calc_row_ab_10bpc_avx2<const IS_5X5: bool>(
 
 #[target_feature(enable = "avx2")]
 #[inline]
-fn box3_vert_avx2<const K: usize>(
+fn box3_vert_avx2<const BPC: u32, const K: usize>(
     sums: &Rows<3>,
     sp: &mut [usize; 3],
     ab: &mut Rows<K>,
@@ -1119,13 +1203,13 @@ fn box3_vert_avx2<const K: usize>(
         mem::store_i32x8(mem::chunk_mut::<i32, 8>(ob, x), vs);
         x += 8;
     }
-    calc_row_ab_10bpc_avx2::<false>(oa, ob, w, s);
+    calc_row_ab_16bpc_avx2::<BPC, false>(oa, ob, w, s);
     sp.rotate_left(1);
 }
 
 #[target_feature(enable = "avx2")]
 #[inline]
-fn box5_vert_avx2(
+fn box5_vert_avx2<const BPC: u32>(
     sums: &Rows<5>,
     sp: &mut [usize; 5],
     ab: &mut Rows<2>,
@@ -1177,7 +1261,7 @@ fn box5_vert_avx2(
         mem::store_i32x8(mem::chunk_mut::<i32, 8>(ob, x), vs);
         x += 8;
     }
-    calc_row_ab_10bpc_avx2::<true>(oa, ob, w, s);
+    calc_row_ab_16bpc_avx2::<BPC, true>(oa, ob, w, s);
     sp.rotate_left(2);
 }
 
@@ -1398,17 +1482,18 @@ fn finish_filter2_avx2(
 
 #[target_feature(enable = "avx2")]
 #[inline]
-fn weighted_row1_10bpc_avx2(
+fn weighted_row1_16bpc_avx2<const BPC: u32>(
     dst: &mut [u8],
     row_off: usize,
     t1: &[i32; FILTER_OUT_STRIDE],
     w: usize,
     w1: i32,
 ) {
+    let max_s: i32 = (1 << BPC) - 1;
     let vw1 = _mm256_set1_epi32(w1);
     let c1024 = _mm256_set1_epi32(1 << 10);
     let zero = _mm256_setzero_si256();
-    let max_px = _mm256_set1_epi16(1023);
+    let max_px = _mm256_set1_epi16(max_s as i16);
     let mut out_row = [0i16; FILTER_OUT_STRIDE];
 
     let mut i = 0usize;
@@ -1417,19 +1502,20 @@ fn weighted_row1_10bpc_avx2(
         let t_1 = load_i32x8(mem::chunk::<i32, 8>(t1, i + 8));
         let v_0 = _mm256_srai_epi32::<11>(_mm256_add_epi32(_mm256_mullo_epi32(t_0, vw1), c1024));
         let v_1 = _mm256_srai_epi32::<11>(_mm256_add_epi32(_mm256_mullo_epi32(t_1, vw1), c1024));
-        // _mm256_packs_epi32(v_0, v_1) 128-bit şeritleri [0..3, 8..11, 4..7, 12..15] olarak paketler;
-        // _mm256_permute4x64_epi64::<0xD8> ile [0..15] doğal sıraya döner!
         let delta =
             core::arch::x86_64::_mm256_permute4x64_epi64::<0xD8>(_mm256_packs_epi32(v_0, v_1));
         let d = mem::load_u8x32(mem::chunk::<u8, 32>(dst, row_off + i * 2));
-        let res = _mm256_min_epi16(_mm256_max_epi16(_mm256_add_epi16(d, delta), zero), max_px);
+        let res = _mm256_min_epi16(
+            _mm256_max_epi16(core::arch::x86_64::_mm256_adds_epi16(d, delta), zero),
+            max_px,
+        );
         mem::store_i16x16(mem::chunk_mut::<i16, 16>(&mut out_row, i), res);
         i += 16;
     }
     while i < w {
         let d = i32::from(read_u16_le(dst, row_off + i * 2));
         let v = d + ((w1 * t1[i] + (1 << 10)) >> 11);
-        out_row[i] = v.clamp(0, 1023) as i16;
+        out_row[i] = v.clamp(0, max_s) as i16;
         i += 1;
     }
     store_row_u16_avx2(dst, row_off, w, &out_row);
@@ -1437,7 +1523,7 @@ fn weighted_row1_10bpc_avx2(
 
 #[target_feature(enable = "avx2")]
 #[inline]
-fn weighted2_row_10bpc_avx2(
+fn weighted2_row_16bpc_avx2<const BPC: u32>(
     dst: &mut [u8],
     row_off: usize,
     t1: &[i32; FILTER_OUT_STRIDE],
@@ -1446,11 +1532,12 @@ fn weighted2_row_10bpc_avx2(
     w0: i32,
     w1: i32,
 ) {
+    let max_s: i32 = (1 << BPC) - 1;
     let vw0 = _mm256_set1_epi32(w0);
     let vw1 = _mm256_set1_epi32(w1);
     let c1024 = _mm256_set1_epi32(1 << 10);
     let zero = _mm256_setzero_si256();
-    let max_px = _mm256_set1_epi16(1023);
+    let max_px = _mm256_set1_epi16(max_s as i16);
     let mut out_row = [0i16; FILTER_OUT_STRIDE];
 
     let mut i = 0usize;
@@ -1471,14 +1558,17 @@ fn weighted2_row_10bpc_avx2(
         let delta =
             core::arch::x86_64::_mm256_permute4x64_epi64::<0xD8>(_mm256_packs_epi32(v_0, v_1));
         let d = mem::load_u8x32(mem::chunk::<u8, 32>(dst, row_off + i * 2));
-        let res = _mm256_min_epi16(_mm256_max_epi16(_mm256_add_epi16(d, delta), zero), max_px);
+        let res = _mm256_min_epi16(
+            _mm256_max_epi16(core::arch::x86_64::_mm256_adds_epi16(d, delta), zero),
+            max_px,
+        );
         mem::store_i16x16(mem::chunk_mut::<i16, 16>(&mut out_row, i), res);
         i += 16;
     }
     while i < w {
         let d = i32::from(read_u16_le(dst, row_off + i * 2));
         let v = d + ((w0 * t1[i] + w1 * t2[i] + (1 << 10)) >> 11);
-        out_row[i] = v.clamp(0, 1023) as i16;
+        out_row[i] = v.clamp(0, max_s) as i16;
         i += 1;
     }
     store_row_u16_avx2(dst, row_off, w, &out_row);
@@ -1486,7 +1576,7 @@ fn weighted2_row_10bpc_avx2(
 
 #[target_feature(enable = "avx2")]
 #[inline]
-fn finish1_avx2(
+fn finish1_avx2<const BPC: u32>(
     dst: &mut [u8],
     c: &Ctx<'_>,
     dst_row: &mut usize,
@@ -1497,14 +1587,14 @@ fn finish1_avx2(
 ) {
     let r = *dst_row;
     finish_filter_row1_avx2::<3>(tmp, dst, r * c.stride, ab, *ap, c.w);
-    weighted_row1_10bpc_avx2(dst, r * c.stride, tmp, c.w, w1);
+    weighted_row1_16bpc_avx2::<BPC>(dst, r * c.stride, tmp, c.w, w1);
     *dst_row += 1;
     ap.rotate_left(1);
 }
 
 #[target_feature(enable = "avx2")]
 #[inline]
-fn finish2_avx2(
+fn finish2_avx2<const BPC: u32>(
     dst: &mut [u8],
     c: &Ctx<'_>,
     dst_row: &mut usize,
@@ -1528,10 +1618,10 @@ fn finish2_avx2(
         c.w,
         h,
     );
-    weighted_row1_10bpc_avx2(dst, r * c.stride, tmp0, c.w, w0);
+    weighted_row1_16bpc_avx2::<BPC>(dst, r * c.stride, tmp0, c.w, w0);
     *dst_row += 1;
     if h > 1 {
-        weighted_row1_10bpc_avx2(dst, (r + 1) * c.stride, tmp1, c.w, w0);
+        weighted_row1_16bpc_avx2::<BPC>(dst, (r + 1) * c.stride, tmp1, c.w, w0);
         *dst_row += 1;
     }
     ap.rotate_left(1);
@@ -1539,7 +1629,7 @@ fn finish2_avx2(
 
 #[target_feature(enable = "avx2")]
 #[inline]
-fn finish_mix_avx2(
+fn finish_mix_avx2<const BPC: u32>(
     dst: &mut [u8],
     c: &Ctx<'_>,
     dst_row: &mut usize,
@@ -1576,7 +1666,7 @@ fn finish_mix_avx2(
         [ap3[0], ap3[1], ap3[2]],
         c.w,
     );
-    weighted2_row_10bpc_avx2(dst, r * c.stride, tmp5_0, tmp3_0, c.w, w0, w1);
+    weighted2_row_16bpc_avx2::<BPC>(dst, r * c.stride, tmp5_0, tmp3_0, c.w, w0, w1);
     if h > 1 {
         finish_filter_row1_avx2::<4>(
             tmp3_1,
@@ -1586,7 +1676,7 @@ fn finish_mix_avx2(
             [ap3[1], ap3[2], ap3[3]],
             c.w,
         );
-        weighted2_row_10bpc_avx2(dst, (r + 1) * c.stride, tmp5_1, tmp3_1, c.w, w0, w1);
+        weighted2_row_16bpc_avx2::<BPC>(dst, (r + 1) * c.stride, tmp5_1, tmp3_1, c.w, w0, w1);
     }
     *dst_row += h;
     ap5.rotate_left(1);
@@ -1594,7 +1684,13 @@ fn finish_mix_avx2(
 }
 
 #[target_feature(enable = "avx2")]
-fn sgr_3x3_10bpc_avx2_giris(dst: &mut [u8], c: &Ctx<'_>, h: usize, s1: u32, w1: i32) {
+fn sgr_3x3_16bpc_avx2_giris<const BPC: u32>(
+    dst: &mut [u8],
+    c: &Ctx<'_>,
+    h: usize,
+    s1: u32,
+    w1: i32,
+) {
     enum Kuyruk {
         Bitti,
         Vert2,
@@ -1622,7 +1718,7 @@ fn sgr_3x3_10bpc_avx2_giris(dst: &mut [u8], c: &Ctx<'_>, h: usize, s1: u32, w1: 
             row_h(&mut sums, dst, RowRef::Lpf(0), 0);
             row_h(&mut sums, dst, RowRef::Lpf(1), 1);
             row_h(&mut sums, dst, RowRef::Main(sr), sp[2]);
-            box3_vert_avx2::<3>(&sums, &mut sp, &mut ab, ap[2], w, s1);
+            box3_vert_avx2::<BPC, 3>(&sums, &mut sp, &mut ab, ap[2], w, s1);
             sr += 1;
             ap.rotate_left(1);
             h -= 1;
@@ -1630,7 +1726,7 @@ fn sgr_3x3_10bpc_avx2_giris(dst: &mut [u8], c: &Ctx<'_>, h: usize, s1: u32, w1: 
                 break 'akis Kuyruk::Vert1;
             }
             row_h(&mut sums, dst, RowRef::Main(sr), sp[2]);
-            box3_vert_avx2::<3>(&sums, &mut sp, &mut ab, ap[2], w, s1);
+            box3_vert_avx2::<BPC, 3>(&sums, &mut sp, &mut ab, ap[2], w, s1);
             sr += 1;
             ap.rotate_left(1);
             h -= 1;
@@ -1641,7 +1737,7 @@ fn sgr_3x3_10bpc_avx2_giris(dst: &mut [u8], c: &Ctx<'_>, h: usize, s1: u32, w1: 
             sp = [0, 0, 0];
             row_h(&mut sums, dst, RowRef::Main(sr), 0);
             sr += 1;
-            box3_vert_avx2::<3>(&sums, &mut sp, &mut ab, ap[2], w, s1);
+            box3_vert_avx2::<BPC, 3>(&sums, &mut sp, &mut ab, ap[2], w, s1);
             ap.rotate_left(1);
             h -= 1;
             if h == 0 {
@@ -1649,7 +1745,7 @@ fn sgr_3x3_10bpc_avx2_giris(dst: &mut [u8], c: &Ctx<'_>, h: usize, s1: u32, w1: 
             }
             sp[2] = 1;
             row_h(&mut sums, dst, RowRef::Main(sr), sp[2]);
-            box3_vert_avx2::<3>(&sums, &mut sp, &mut ab, ap[2], w, s1);
+            box3_vert_avx2::<BPC, 3>(&sums, &mut sp, &mut ab, ap[2], w, s1);
             sr += 1;
             ap.rotate_left(1);
             h -= 1;
@@ -1661,9 +1757,9 @@ fn sgr_3x3_10bpc_avx2_giris(dst: &mut [u8], c: &Ctx<'_>, h: usize, s1: u32, w1: 
 
         loop {
             row_h(&mut sums, dst, RowRef::Main(sr), sp[2]);
-            box3_vert_avx2::<3>(&sums, &mut sp, &mut ab, ap[2], w, s1);
+            box3_vert_avx2::<BPC, 3>(&sums, &mut sp, &mut ab, ap[2], w, s1);
             sr += 1;
-            finish1_avx2(dst, c, &mut dr, &ab, &mut ap, &mut tmp, w1);
+            finish1_avx2::<BPC>(dst, c, &mut dr, &ab, &mut ap, &mut tmp, w1);
             h -= 1;
             if h == 0 {
                 break;
@@ -1674,11 +1770,11 @@ fn sgr_3x3_10bpc_avx2_giris(dst: &mut [u8], c: &Ctx<'_>, h: usize, s1: u32, w1: 
             break 'akis Kuyruk::Vert2;
         }
         row_h(&mut sums, dst, RowRef::Lpf(6), sp[2]);
-        box3_vert_avx2::<3>(&sums, &mut sp, &mut ab, ap[2], w, s1);
-        finish1_avx2(dst, c, &mut dr, &ab, &mut ap, &mut tmp, w1);
+        box3_vert_avx2::<BPC, 3>(&sums, &mut sp, &mut ab, ap[2], w, s1);
+        finish1_avx2::<BPC>(dst, c, &mut dr, &ab, &mut ap, &mut tmp, w1);
         row_h(&mut sums, dst, RowRef::Lpf(7), sp[2]);
-        box3_vert_avx2::<3>(&sums, &mut sp, &mut ab, ap[2], w, s1);
-        finish1_avx2(dst, c, &mut dr, &ab, &mut ap, &mut tmp, w1);
+        box3_vert_avx2::<BPC, 3>(&sums, &mut sp, &mut ab, ap[2], w, s1);
+        finish1_avx2::<BPC>(dst, c, &mut dr, &ab, &mut ap, &mut tmp, w1);
         Kuyruk::Bitti
     };
 
@@ -1686,22 +1782,28 @@ fn sgr_3x3_10bpc_avx2_giris(dst: &mut [u8], c: &Ctx<'_>, h: usize, s1: u32, w1: 
         Kuyruk::Bitti => return,
         Kuyruk::Vert2 => {
             sp[2] = sp[1];
-            box3_vert_avx2::<3>(&sums, &mut sp, &mut ab, ap[2], w, s1);
-            finish1_avx2(dst, c, &mut dr, &ab, &mut ap, &mut tmp, w1);
+            box3_vert_avx2::<BPC, 3>(&sums, &mut sp, &mut ab, ap[2], w, s1);
+            finish1_avx2::<BPC>(dst, c, &mut dr, &ab, &mut ap, &mut tmp, w1);
         }
         Kuyruk::Vert1 => {
             sp[2] = sp[1];
-            box3_vert_avx2::<3>(&sums, &mut sp, &mut ab, ap[2], w, s1);
+            box3_vert_avx2::<BPC, 3>(&sums, &mut sp, &mut ab, ap[2], w, s1);
             ap.rotate_left(1);
         }
     }
     sp[2] = sp[1];
-    box3_vert_avx2::<3>(&sums, &mut sp, &mut ab, ap[2], w, s1);
-    finish1_avx2(dst, c, &mut dr, &ab, &mut ap, &mut tmp, w1);
+    box3_vert_avx2::<BPC, 3>(&sums, &mut sp, &mut ab, ap[2], w, s1);
+    finish1_avx2::<BPC>(dst, c, &mut dr, &ab, &mut ap, &mut tmp, w1);
 }
 
 #[target_feature(enable = "avx2")]
-fn sgr_5x5_10bpc_avx2_giris(dst: &mut [u8], c: &Ctx<'_>, h: usize, s0: u32, w0: i32) {
+fn sgr_5x5_16bpc_avx2_giris<const BPC: u32>(
+    dst: &mut [u8],
+    c: &Ctx<'_>,
+    h: usize,
+    s0: u32,
+    w0: i32,
+) {
     enum Kuyruk {
         Output2,
         Vert2,
@@ -1738,7 +1840,7 @@ fn sgr_5x5_10bpc_avx2_giris(dst: &mut [u8], c: &Ctx<'_>, h: usize, s0: u32, w0: 
             }
             row_h(&mut sums, dst, RowRef::Main(sr), 3);
             sr += 1;
-            box5_vert_avx2(&sums, &mut sp, &mut ab, ap[1], w, s0);
+            box5_vert_avx2::<BPC>(&sums, &mut sp, &mut ab, ap[1], w, s0);
             ap.rotate_left(1);
             h -= 1;
             if h == 0 {
@@ -1756,7 +1858,7 @@ fn sgr_5x5_10bpc_avx2_giris(dst: &mut [u8], c: &Ctx<'_>, h: usize, s0: u32, w0: 
             sp[4] = 1;
             row_h(&mut sums, dst, RowRef::Main(sr), 1);
             sr += 1;
-            box5_vert_avx2(&sums, &mut sp, &mut ab, ap[1], w, s0);
+            box5_vert_avx2::<BPC>(&sums, &mut sp, &mut ab, ap[1], w, s0);
             ap.rotate_left(1);
             h -= 1;
             if h == 0 {
@@ -1772,8 +1874,8 @@ fn sgr_5x5_10bpc_avx2_giris(dst: &mut [u8], c: &Ctx<'_>, h: usize, s0: u32, w0: 
             }
             row_h(&mut sums, dst, RowRef::Main(sr), 3);
             sr += 1;
-            box5_vert_avx2(&sums, &mut sp, &mut ab, ap[1], w, s0);
-            finish2_avx2(dst, c, &mut dr, &ab, &mut ap, &mut tmp0, &mut tmp1, 2, w0);
+            box5_vert_avx2::<BPC>(&sums, &mut sp, &mut ab, ap[1], w, s0);
+            finish2_avx2::<BPC>(dst, c, &mut dr, &ab, &mut ap, &mut tmp0, &mut tmp1, 2, w0);
             h -= 1;
             if h == 0 {
                 break 'akis Kuyruk::Vert2;
@@ -1790,8 +1892,8 @@ fn sgr_5x5_10bpc_avx2_giris(dst: &mut [u8], c: &Ctx<'_>, h: usize, s0: u32, w0: 
             }
             row_h(&mut sums, dst, RowRef::Main(sr), sp[4]);
             sr += 1;
-            box5_vert_avx2(&sums, &mut sp, &mut ab, ap[1], w, s0);
-            finish2_avx2(dst, c, &mut dr, &ab, &mut ap, &mut tmp0, &mut tmp1, 2, w0);
+            box5_vert_avx2::<BPC>(&sums, &mut sp, &mut ab, ap[1], w, s0);
+            finish2_avx2::<BPC>(dst, c, &mut dr, &ab, &mut ap, &mut tmp0, &mut tmp1, 2, w0);
             h -= 1;
             if h == 0 {
                 break;
@@ -1815,13 +1917,13 @@ fn sgr_5x5_10bpc_avx2_giris(dst: &mut [u8], c: &Ctx<'_>, h: usize, s0: u32, w0: 
         }
         Kuyruk::Odd => {
             sp[4] = sp[3];
-            box5_vert_avx2(&sums, &mut sp, &mut ab, ap[1], w, s0);
-            finish2_avx2(dst, c, &mut dr, &ab, &mut ap, &mut tmp0, &mut tmp1, 2, w0);
+            box5_vert_avx2::<BPC>(&sums, &mut sp, &mut ab, ap[1], w, s0);
+            finish2_avx2::<BPC>(dst, c, &mut dr, &ab, &mut ap, &mut tmp0, &mut tmp1, 2, w0);
             true
         }
         Kuyruk::Vert1 => {
             sp[4] = sp[3];
-            box5_vert_avx2(&sums, &mut sp, &mut ab, ap[1], w, s0);
+            box5_vert_avx2::<BPC>(&sums, &mut sp, &mut ab, ap[1], w, s0);
             ap.rotate_left(1);
             true
         }
@@ -1829,16 +1931,16 @@ fn sgr_5x5_10bpc_avx2_giris(dst: &mut [u8], c: &Ctx<'_>, h: usize, s0: u32, w0: 
     if output_1 {
         sp[3] = sp[2];
         sp[4] = sp[2];
-        box5_vert_avx2(&sums, &mut sp, &mut ab, ap[1], w, s0);
-        finish2_avx2(dst, c, &mut dr, &ab, &mut ap, &mut tmp0, &mut tmp1, 1, w0);
+        box5_vert_avx2::<BPC>(&sums, &mut sp, &mut ab, ap[1], w, s0);
+        finish2_avx2::<BPC>(dst, c, &mut dr, &ab, &mut ap, &mut tmp0, &mut tmp1, 1, w0);
     } else {
-        box5_vert_avx2(&sums, &mut sp, &mut ab, ap[1], w, s0);
-        finish2_avx2(dst, c, &mut dr, &ab, &mut ap, &mut tmp0, &mut tmp1, 2, w0);
+        box5_vert_avx2::<BPC>(&sums, &mut sp, &mut ab, ap[1], w, s0);
+        finish2_avx2::<BPC>(dst, c, &mut dr, &ab, &mut ap, &mut tmp0, &mut tmp1, 2, w0);
     }
 }
 
 #[target_feature(enable = "avx2")]
-fn sgr_mix_10bpc_avx2_giris(
+fn sgr_mix_16bpc_avx2_giris<const BPC: u32>(
     dst: &mut [u8],
     c: &Ctx<'_>,
     h: usize,
@@ -1886,7 +1988,7 @@ fn sgr_mix_10bpc_avx2_giris(
             row_h35(&mut sums3, &mut sums5, dst, RowRef::Lpf(1), 1, 1);
             row_h35(&mut sums3, &mut sums5, dst, RowRef::Main(sr), 2, 2);
             sr += 1;
-            box3_vert_avx2::<4>(&sums3, &mut sp3, &mut ab3, ap3[3], w, s1);
+            box3_vert_avx2::<BPC, 4>(&sums3, &mut sp3, &mut ab3, ap3[3], w, s1);
             ap3.rotate_left(1);
             h -= 1;
             if h == 0 {
@@ -1894,9 +1996,9 @@ fn sgr_mix_10bpc_avx2_giris(
             }
             row_h35(&mut sums3, &mut sums5, dst, RowRef::Main(sr), sp3[2], 3);
             sr += 1;
-            box5_vert_avx2(&sums5, &mut sp5, &mut ab5, ap5[1], w, s0);
+            box5_vert_avx2::<BPC>(&sums5, &mut sp5, &mut ab5, ap5[1], w, s0);
             ap5.rotate_left(1);
-            box3_vert_avx2::<4>(&sums3, &mut sp3, &mut ab3, ap3[3], w, s1);
+            box3_vert_avx2::<BPC, 4>(&sums3, &mut sp3, &mut ab3, ap3[3], w, s1);
             ap3.rotate_left(1);
             h -= 1;
             if h == 0 {
@@ -1908,7 +2010,7 @@ fn sgr_mix_10bpc_avx2_giris(
             sp3 = [0; 3];
             row_h35(&mut sums3, &mut sums5, dst, RowRef::Main(sr), 0, 0);
             sr += 1;
-            box3_vert_avx2::<4>(&sums3, &mut sp3, &mut ab3, ap3[3], w, s1);
+            box3_vert_avx2::<BPC, 4>(&sums3, &mut sp3, &mut ab3, ap3[3], w, s1);
             ap3.rotate_left(1);
             h -= 1;
             if h == 0 {
@@ -1918,9 +2020,9 @@ fn sgr_mix_10bpc_avx2_giris(
             sp3[2] = 1;
             row_h35(&mut sums3, &mut sums5, dst, RowRef::Main(sr), 1, 1);
             sr += 1;
-            box5_vert_avx2(&sums5, &mut sp5, &mut ab5, ap5[1], w, s0);
+            box5_vert_avx2::<BPC>(&sums5, &mut sp5, &mut ab5, ap5[1], w, s0);
             ap5.rotate_left(1);
-            box3_vert_avx2::<4>(&sums3, &mut sp3, &mut ab3, ap3[3], w, s1);
+            box3_vert_avx2::<BPC, 4>(&sums3, &mut sp3, &mut ab3, ap3[3], w, s1);
             ap3.rotate_left(1);
             h -= 1;
             if h == 0 {
@@ -1931,7 +2033,7 @@ fn sgr_mix_10bpc_avx2_giris(
             sp3[2] = 2;
             row_h35(&mut sums3, &mut sums5, dst, RowRef::Main(sr), 2, 2);
             sr += 1;
-            box3_vert_avx2::<4>(&sums3, &mut sp3, &mut ab3, ap3[3], w, s1);
+            box3_vert_avx2::<BPC, 4>(&sums3, &mut sp3, &mut ab3, ap3[3], w, s1);
             ap3.rotate_left(1);
             h -= 1;
             if h == 0 {
@@ -1939,9 +2041,9 @@ fn sgr_mix_10bpc_avx2_giris(
             }
             row_h35(&mut sums3, &mut sums5, dst, RowRef::Main(sr), sp3[2], 3);
             sr += 1;
-            box5_vert_avx2(&sums5, &mut sp5, &mut ab5, ap5[1], w, s0);
-            box3_vert_avx2::<4>(&sums3, &mut sp3, &mut ab3, ap3[3], w, s1);
-            finish_mix_avx2(
+            box5_vert_avx2::<BPC>(&sums5, &mut sp5, &mut ab5, ap5[1], w, s0);
+            box3_vert_avx2::<BPC, 4>(&sums3, &mut sp3, &mut ab3, ap3[3], w, s1);
+            finish_mix_avx2::<BPC>(
                 dst,
                 c,
                 &mut dr,
@@ -1974,7 +2076,7 @@ fn sgr_mix_10bpc_avx2_giris(
                 sp5[3],
             );
             sr += 1;
-            box3_vert_avx2::<4>(&sums3, &mut sp3, &mut ab3, ap3[3], w, s1);
+            box3_vert_avx2::<BPC, 4>(&sums3, &mut sp3, &mut ab3, ap3[3], w, s1);
             ap3.rotate_left(1);
             h -= 1;
             if h == 0 {
@@ -1989,9 +2091,9 @@ fn sgr_mix_10bpc_avx2_giris(
                 sp5[4],
             );
             sr += 1;
-            box5_vert_avx2(&sums5, &mut sp5, &mut ab5, ap5[1], w, s0);
-            box3_vert_avx2::<4>(&sums3, &mut sp3, &mut ab3, ap3[3], w, s1);
-            finish_mix_avx2(
+            box5_vert_avx2::<BPC>(&sums5, &mut sp5, &mut ab5, ap5[1], w, s0);
+            box3_vert_avx2::<BPC, 4>(&sums3, &mut sp3, &mut ab3, ap3[3], w, s1);
+            finish_mix_avx2::<BPC>(
                 dst,
                 c,
                 &mut dr,
@@ -2017,7 +2119,7 @@ fn sgr_mix_10bpc_avx2_giris(
             break 'akis Kuyruk::Vert2;
         }
         row_h35(&mut sums3, &mut sums5, dst, RowRef::Lpf(6), sp3[2], sp5[3]);
-        box3_vert_avx2::<4>(&sums3, &mut sp3, &mut ab3, ap3[3], w, s1);
+        box3_vert_avx2::<BPC, 4>(&sums3, &mut sp3, &mut ab3, ap3[3], w, s1);
         ap3.rotate_left(1);
         row_h35(&mut sums3, &mut sums5, dst, RowRef::Lpf(7), sp3[2], sp5[4]);
         Kuyruk::Output2
@@ -2029,7 +2131,7 @@ fn sgr_mix_10bpc_avx2_giris(
             sp5[3] = sp5[2];
             sp5[4] = sp5[2];
             sp3[2] = sp3[1];
-            box3_vert_avx2::<4>(&sums3, &mut sp3, &mut ab3, ap3[3], w, s1);
+            box3_vert_avx2::<BPC, 4>(&sums3, &mut sp3, &mut ab3, ap3[3], w, s1);
             ap3.rotate_left(1);
             sp3[2] = sp3[1];
             false
@@ -2037,9 +2139,9 @@ fn sgr_mix_10bpc_avx2_giris(
         Kuyruk::Odd => {
             sp5[4] = sp5[3];
             sp3[2] = sp3[1];
-            box5_vert_avx2(&sums5, &mut sp5, &mut ab5, ap5[1], w, s0);
-            box3_vert_avx2::<4>(&sums3, &mut sp3, &mut ab3, ap3[3], w, s1);
-            finish_mix_avx2(
+            box5_vert_avx2::<BPC>(&sums5, &mut sp5, &mut ab5, ap5[1], w, s0);
+            box3_vert_avx2::<BPC, 4>(&sums3, &mut sp3, &mut ab3, ap3[3], w, s1);
+            finish_mix_avx2::<BPC>(
                 dst,
                 c,
                 &mut dr,
@@ -2060,9 +2162,9 @@ fn sgr_mix_10bpc_avx2_giris(
         Kuyruk::Vert1 => {
             sp5[4] = sp5[3];
             sp3[2] = sp3[1];
-            box5_vert_avx2(&sums5, &mut sp5, &mut ab5, ap5[1], w, s0);
+            box5_vert_avx2::<BPC>(&sums5, &mut sp5, &mut ab5, ap5[1], w, s0);
             ap5.rotate_left(1);
-            box3_vert_avx2::<4>(&sums3, &mut sp3, &mut ab3, ap3[3], w, s1);
+            box3_vert_avx2::<BPC, 4>(&sums3, &mut sp3, &mut ab3, ap3[3], w, s1);
             ap3.rotate_left(1);
             true
         }
@@ -2071,10 +2173,10 @@ fn sgr_mix_10bpc_avx2_giris(
         sp5[3] = sp5[2];
         sp5[4] = sp5[2];
         sp3[2] = sp3[1];
-        box5_vert_avx2(&sums5, &mut sp5, &mut ab5, ap5[1], w, s0);
-        box3_vert_avx2::<4>(&sums3, &mut sp3, &mut ab3, ap3[3], w, s1);
+        box5_vert_avx2::<BPC>(&sums5, &mut sp5, &mut ab5, ap5[1], w, s0);
+        box3_vert_avx2::<BPC, 4>(&sums3, &mut sp3, &mut ab3, ap3[3], w, s1);
         ap3.rotate_left(1);
-        finish_mix_avx2(
+        finish_mix_avx2::<BPC>(
             dst,
             c,
             &mut dr,
@@ -2091,9 +2193,9 @@ fn sgr_mix_10bpc_avx2_giris(
             w1,
         );
     } else {
-        box5_vert_avx2(&sums5, &mut sp5, &mut ab5, ap5[1], w, s0);
-        box3_vert_avx2::<4>(&sums3, &mut sp3, &mut ab3, ap3[3], w, s1);
-        finish_mix_avx2(
+        box5_vert_avx2::<BPC>(&sums5, &mut sp5, &mut ab5, ap5[1], w, s0);
+        box3_vert_avx2::<BPC, 4>(&sums3, &mut sp3, &mut ab3, ap3[3], w, s1);
+        finish_mix_avx2::<BPC>(
             dst,
             c,
             &mut dr,

@@ -108,7 +108,7 @@ const ALTIN_OZETLER: [(&str, u64, u64); 8] = [
 ];
 
 #[test]
-fn f5d_msac_arm64_aday_ve_701_yuva_kurulumu() {
+fn f5d_msac_arm64_aday_ve_767_yuva_kurulumu() {
     let msac_adaylar: Vec<_> = ARM_ISA_CANDIDATES
         .iter()
         .filter(|c| c.family == "msac")
@@ -132,7 +132,7 @@ fn f5d_msac_arm64_aday_ve_701_yuva_kurulumu() {
             "eksik ARM64 MSAC adayı: msac/{field}"
         );
     }
-    assert_eq!(ARM_ISA_CANDIDATES.len(), 719);
+    assert_eq!(ARM_ISA_CANDIDATES.len(), 785);
 
     let d_none = DspDispatch::select(CpuFlags::NONE);
     assert_eq!(d_none.msac_isa(), MsacIsa::Scalar);
@@ -149,9 +149,9 @@ fn f5d_msac_arm64_aday_ve_701_yuva_kurulumu() {
         assert!(matches!(d_dot.msac_isa(), MsacIsa::Neon(_)));
         assert!(matches!(d_tespit.msac_isa(), MsacIsa::Neon(_)));
 
-        assert_eq!(d_neon.assigned_count(), 701);
-        assert_eq!(d_dot.assigned_count(), 701);
-        assert_eq!(d_tespit.assigned_count(), 701);
+        assert_eq!(d_neon.assigned_count(), 767);
+        assert_eq!(d_dot.assigned_count(), 767);
+        assert_eq!(d_tespit.assigned_count(), 767);
 
         for (d, beklenen) in [(&d_none, "skaler"), (&d_neon, "neon"), (&d_dot, "neon")] {
             let mut msac_map = BTreeMap::new();
