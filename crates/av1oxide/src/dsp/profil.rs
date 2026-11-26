@@ -4,12 +4,12 @@
 //! ile sarılıdır. Özellik **kapalıyken** makro çağrı ifadesini olduğu gibi
 //! bırakır (tek bir belirteç bile eklenmez): üretilen kod değişmez; bu
 //! modül derlenmez. Özellik **açıkken** her çağrının süresi
-//! [`Instant`] ile ölçülür ve `(işlev, bit derinliği)` başına çağrı sayısı +
+//! [`std::time::Instant`] ile ölçülür ve `(işlev, bit derinliği)` başına çağrı sayısı +
 //! toplam nanosaniye olarak biriktirilir.
 //!
 //! - **Bit derinliği:** kare başında [`profil_bd!`](crate::dsp::profil_bd) ile
 //!   kaydedilir (çözücü tek iş parçacığıdır; akışta bit derinliği sabittir).
-//! - **Boş çağrı maliyeti:** [`kalibre`] aynı makroyu boş ifadeyle çalıştırır;
+//! - **Boş çağrı maliyeti:** `kalibre` işlevi aynı makroyu boş ifadeyle çalıştırır;
 //!   ölçüm penceresine düşen pay (`ic_ns`) ve çağrı başına toplam ek yük
 //!   (`toplam_ns`) ayrı ayrı döner. Net süre = ham − çağrı × `ic_ns`; kalan
 //!   (yuva dışı) süre = (duvar − toplam çağrı × `toplam_ns`) − Σ net.

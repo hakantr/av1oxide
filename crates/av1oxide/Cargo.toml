@@ -39,3 +39,32 @@ std = ["crossbeam-utils/std", "dep:flate2", "dep:parking_lot"]
 capi = ["std"]
 msac-trace = ["std"]
 profil = ["std"]
+
+# `libdav1d` (1.5.4 / API 7.0.0) uyumlu drop-in C-ABI sistem paketleme üst verisi (`cargo-c` uyumlu).
+[package.metadata.capi.header]
+name = "dav1d"
+subdirectory = "dav1d"
+generation = false
+installed_headers = [
+    "include/dav1d/common.h",
+    "include/dav1d/data.h",
+    "include/dav1d/dav1d.h",
+    "include/dav1d/headers.h",
+    "include/dav1d/picture.h",
+    "include/dav1d/version.h",
+]
+
+[package.metadata.capi.library]
+name = "dav1d"
+version = "1.5.4"
+install_subdir = "dav1d"
+versioning = true
+sover = "7"
+
+[package.metadata.capi.pkg_config]
+name = "dav1d"
+filename = "dav1d"
+version = "1.5.4"
+description = "AV1 decoding library (libdav1d 1.5.4 / API 7.0.0 compatible drop-in implemented in av1oxide)"
+strip_include_path_components = 0
+requires_private = ""

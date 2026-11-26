@@ -1,0 +1,107 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  lint-and-docs:
+    name: Format, Clippy & Rustdoc
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+      - name: Clippy (workspace, all-targets, all-features)
+        run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
+      - name: Clippy (av1oxide no_std + alloc)
+        run: cargo clippy --locked -p av1oxide --no-default-features -- -D warnings
+      - name: Rustdoc (workspace, all-features)
+        env:
+          RUSTDOCFLAGS: "-D warnings"
+        run: cargo doc --locked --workspace --all-features --no-deps
+
+  test-linux-x86_64:
+    name: Linux x86_64 Tests (std & no_std)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Release test suite (workspace, all-features)
+        env:
+          CARGO_PROFILE_RELEASE_STRIP: none
+        run: cargo test --locked --release --workspace --all-features
+      - name: Release unit tests (av1oxide no_std + alloc)
+        run: cargo test --locked --release -p av1oxide --no-default-features --lib
+
+  test-macos-arm64:
+    name: macOS ARM64 Tests
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Release test suite (workspace, all-features)
+        env:
+          CARGO_PROFILE_RELEASE_STRIP: none
+        run: cargo test --locked --release --workspace --all-features
+
+  wasm-and-cross:
+    name: WebAssembly & Cross-Architecture Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: >-
+            wasm32-wasip1,
+            wasm32-unknown-unknown,
+            armv7-unknown-linux-gnueabihf,
+            riscv64gc-unknown-linux-gnu,
+            loongarch64-unknown-linux-gnu,
+            powerpc64le-unknown-linux-gnu
+      - name: Install wabt (wasm-objdump)
+        run: sudo apt-get update && sudo apt-get install -y wabt
+      - name: Build wasm32-wasip1 scalar and verify zero v128 instructions
+        run: |
+          cargo build --locked --release --target wasm32-wasip1 -p av1oxide --lib
+          V128_COUNT=$(wasm-objdump -d target/wasm32-wasip1/release/lib*.rlib 2>/dev/null | grep -c "v128\." || true)
+          echo "scalar v128 instruction count: ${V128_COUNT}"
+          test "${V128_COUNT}" -eq 0
+      - name: Check wasm32-wasip1 (+simd128)
+        env:
+          RUSTFLAGS: "-C target-feature=+simd128"
+        run: cargo check --locked --release --target wasm32-wasip1 -p av1oxide
+      - name: Check wasm32-unknown-unknown (no_std + alloc)
+        run: cargo check --locked -p av1oxide --no-default-features --target wasm32-unknown-unknown
+      - name: Check secondary architectures (armv7, riscv64gc, loongarch64, powerpc64le)
+        run: |
+          cargo check --locked -p av1oxide --target armv7-unknown-linux-gnueabihf
+          cargo check --locked -p av1oxide --target riscv64gc-unknown-linux-gnu
+          cargo check --locked -p av1oxide --target loongarch64-unknown-linux-gnu
+          cargo check --locked -p av1oxide --target powerpc64le-unknown-linux-gnu
+
+  miri:
+    name: Miri Core Safety Audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: miri
+      - name: Run Miri on safe core modules
+        env:
+          MIRIFLAGS: "-Zmiri-strict-provenance"
+        run: |
+          cargo +nightly miri test --locked -p av1oxide --lib bitstream::
+          cargo +nightly miri test --locked -p av1oxide --lib entropy::
+          cargo +nightly miri test --locked -p av1oxide --lib container::
+          cargo +nightly miri test --locked -p av1oxide --lib frame::butce::
+          cargo +nightly miri test --locked -p av1oxide --lib thread::

@@ -113,6 +113,8 @@ impl Drop for RefInner {
 pub(crate) struct ContextInner {
     pub(crate) decoder: Decoder,
     pub(crate) allocator: Dav1dPicAllocator,
+    pub(crate) all_layers: bool,
+    pub(crate) cached_pic: Option<(Frame, OutputCapiMeta)>,
     pub(crate) drain: bool,
     pub(crate) event_flags: Dav1dEventFlags,
     pub(crate) cached_error_props: Dav1dDataProps,
@@ -552,6 +554,8 @@ pub unsafe extern "C" fn dav1d_open(
             inner: ContextInner {
                 decoder,
                 allocator: settings.allocator,
+                all_layers: settings.all_layers != 0,
+                cached_pic: None,
                 drain: false,
                 event_flags: 0,
                 cached_error_props: Dav1dDataProps::default(),
@@ -677,6 +681,76 @@ pub unsafe extern "C" fn dav1d_send_data(c: *mut Dav1dContext, in_data: *mut Dav
     res.unwrap_or(dav1d_err(EINVAL))
 }
 
+/// `dav1d` `all_layers == 0` (`src/lib.c:332-351`) uzamsal katman önbelleğini uygulayarak
+/// sıradaki C-ABI çıktı karesini döndürür.
+fn receive_next_capi_frame(
+    ctx: &mut ContextInner,
+    drain: bool,
+) -> crate::error::Result<Option<(Frame, OutputCapiMeta)>> {
+    let max_spatial_id = ctx.decoder.max_spatial_id();
+    if ctx.all_layers || max_spatial_id == 0 {
+        if let Some(cached) = ctx.cached_pic.take() {
+            return Ok(Some(cached));
+        }
+        return ctx.decoder.receive_frame_capi(drain);
+    }
+
+    loop {
+        if let Some((_, ref cached_meta)) = ctx.cached_pic {
+            let cached_sid = cached_meta.frame_hdr.as_ref().map_or(0, |h| h.spatial_id);
+            if cached_sid >= max_spatial_id {
+                return Ok(ctx.cached_pic.take());
+            }
+            match ctx.decoder.receive_frame_capi(drain)? {
+                Some((next_frame, next_meta)) => {
+                    let next_sid = next_meta.frame_hdr.as_ref().map_or(0, |h| h.spatial_id);
+                    let is_new_tu =
+                        next_sid <= cached_sid || next_meta.packet_tag != cached_meta.packet_tag;
+                    if is_new_tu {
+                        let out = ctx.cached_pic.replace((next_frame, next_meta));
+                        return Ok(out);
+                    }
+                    // Aynı zamansal birimde daha yüksek uzamsal katman: eski katmanı at.
+                    if let Some((_, dropped_meta)) = ctx.cached_pic.replace((next_frame, next_meta))
+                    {
+                        ctx.event_flags |= dropped_meta.event_flags;
+                        let tag = dropped_meta.packet_tag;
+                        let still_held = ctx.decoder.has_pending_packet_tag(tag)
+                            || ctx
+                                .cached_pic
+                                .as_ref()
+                                .is_some_and(|(_, m)| m.packet_tag == tag);
+                        if !still_held
+                            && let Some(pos) = ctx.packet_props.iter().position(|(t, _)| *t == tag)
+                            && let Some((_, mut props)) = ctx.packet_props.remove(pos)
+                        {
+                            data_props_unref_value(&mut props);
+                        }
+                    }
+                }
+                None => {
+                    // dav1d `src/lib.c:476`: `output_picture_ready(c, c->n_fc == 1)`
+                    if drain || ctx.decoder.config().effective_frame_delay() == 1 {
+                        return Ok(ctx.cached_pic.take());
+                    }
+                    return Ok(None);
+                }
+            }
+        } else {
+            match ctx.decoder.receive_frame_capi(drain)? {
+                Some((frame, meta)) => {
+                    let sid = meta.frame_hdr.as_ref().map_or(0, |h| h.spatial_id);
+                    if sid >= max_spatial_id {
+                        return Ok(Some((frame, meta)));
+                    }
+                    ctx.cached_pic = Some((frame, meta));
+                }
+                None => return Ok(None),
+            }
+        }
+    }
+}
+
 /// Çözülmüş sıradaki resmi `*out` içine yazar (`0` = kare hazır, `-EAGAIN` = yeni veri gerekli).
 ///
 /// # Safety
@@ -695,10 +769,14 @@ pub unsafe extern "C" fn dav1d_get_picture(c: *mut Dav1dContext, out: *mut Dav1d
         let drain = ctx.drain;
         ctx.drain = true;
 
-        match ctx.decoder.receive_frame_capi(drain) {
+        match receive_next_capi_frame(ctx, drain) {
             Ok(Some((frame, meta))) => {
                 ctx.event_flags |= meta.event_flags;
-                let still_pending = ctx.decoder.has_pending_packet_tag(meta.packet_tag);
+                let still_pending = ctx.decoder.has_pending_packet_tag(meta.packet_tag)
+                    || ctx
+                        .cached_pic
+                        .as_ref()
+                        .is_some_and(|(_, m)| m.packet_tag == meta.packet_tag);
                 let props = if let Some(pos) = ctx
                     .packet_props
                     .iter()
@@ -835,6 +913,7 @@ pub unsafe extern "C" fn dav1d_flush(c: *mut Dav1dContext) {
         // (3) hizalama/takma ad: `c` münhasıran bu çağrıda değiştirilir.
         let ctx = unsafe { &mut (*c).inner };
         ctx.decoder.reset();
+        ctx.cached_pic = None;
         ctx.drain = false;
         ctx.event_flags = 0;
         data_props_unref_value(&mut ctx.cached_error_props);
