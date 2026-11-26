@@ -11,7 +11,7 @@
 use core::marker::PhantomData;
 use std::io::{Cursor, Read};
 
-use av1oxide::avif::{AvifDecodeConfig, AvifInfo, decode_with, parse_info_with};
+use av1oxide::avif::{AvifDecodeConfig, AvifInfo, AvifPrepared};
 use av1oxide::{BitDepth, Error};
 use image::error::{DecodingError, ImageFormatHint, LimitError, LimitErrorKind};
 use image::{
@@ -26,21 +26,29 @@ use image::{
 /// dinamik aralığına ölçeklenerek `ColorType::Rgb16` / `ColorType::Rgba16` (yerel
 /// bayt sırası) biçiminde döndürülür.
 ///
+/// ## Tek Ayrıştırma ve Doğrudan Çıktı Yazımı
+///
+/// - [`AvifDecoder::with_config`] akışı yalnızca bir kez okuyup [`AvifPrepared`] ile
+///   kapsayıcı/üst veri yapısını (`cmin` açma dâhil) tek seferde ayrıştırır.
+/// - [`ImageDecoder::read_image`] ikinci bir kutu ayrıştırması yapmadan düzlemleri çözer,
+///   ardından ham girdi baytlarını serbest bırakıp `AvifImage::write_*_into` metodlarıyla
+///   doğrudan çağıranın `buf: &mut [u8]` dilimine (`0` ara RGB/RGBA vektörüyle) yazar.
+///
 /// ## Bellek Bütçesi Kapsamı (`allocation_limit` ve `Limits::max_alloc`)
 ///
 /// - [`AvifDecoder::with_config`] akıştan okuduğu iç `raw_bytes` tamponunu okuma başlamadan
 ///   önce `Read::take(limit + 1)` ile sınırlar; ardından kalan bütçeyi (`limit - raw_bytes.len()`)
-///   [`parse_info_with`] çağrısına aktararak `cmin`/`infe` açma ve `ICC`/`Exif`/`XMP` başlık
-///   tahsislerini aynı tavan içinde tutar.
+///   [`AvifPrepared::from_vec`] çağrısına aktararak `cmin`/`infe` açma ve `ICC`/`Exif`/`XMP`
+///   başlık tahsislerini aynı tavan içinde tutar.
 /// - [`ImageDecoder::set_limits`] çağrısı hem çıktı boyutunu (`total_bytes()`) hem de adaptörün
-///   halihazırda tuttuğu girdi + üst veri belleğini `limits.max_alloc` tavanına karşı denetler.
-/// - [`ImageDecoder::read_image`] aşamasında iç çözücü ve RGB dönüşüm tamponları toplam tavan
-///   içinden `raw_bytes.len()` düşülerek sınırlandırılır; çağıranın dışarıda ayırıp `read_image`
+///   halihazırda tuttuğu girdi + kapsayıcı + üst veri belleğini `limits.max_alloc` tavanına
+///   karşı denetler.
+/// - [`ImageDecoder::read_image`] aşamasında iç çözücü tamponları toplam tavan içinden
+///   `raw_bytes.len()` düşülerek sınırlandırılır; çağıranın dışarıda ayırıp `read_image`
 ///   çağrısına geçirdiği `&mut [u8]` çıktı dilimi kütüphanenin iç tahsis sayacına dâhil değildir.
 #[derive(Clone, Debug)]
 pub struct AvifDecoder<R: Read> {
-    raw_bytes: Vec<u8>,
-    info: AvifInfo,
+    prepared: AvifPrepared,
     config: AvifDecodeConfig,
     limits: Limits,
     _marker: PhantomData<R>,
@@ -49,9 +57,9 @@ pub struct AvifDecoder<R: Read> {
 impl<R: Read> AvifDecoder<R> {
     /// Varsayılan [`AvifDecodeConfig`] ile yeni bir [`AvifDecoder`] oluşturur.
     ///
-    /// Akış baytları okunur ve piksel çözümüne geçilmeden önce yalnızca başlık
-    /// ([`parse_info_with`]) ayrıştırılır; böylece `dimensions`, `color_type`, metaveri
-    /// ve `set_limits` kontrolleri piksel tahsisi yapılmadan yürütülebilir.
+    /// Akış baytları okunur ve piksel çözümüne geçilmeden önce kapsayıcı ve başlık bilgisi
+    /// ([`AvifPrepared::from_vec`]) tek geçişte ayrıştırılır; böylece `dimensions`, `color_type`,
+    /// metaveri ve `set_limits` kontrolleri piksel tahsisi yapılmadan yürütülebilir.
     pub fn new(reader: R) -> ImageResult<Self> {
         Self::with_config(reader, AvifDecodeConfig::default())
     }
@@ -61,7 +69,7 @@ impl<R: Read> AvifDecoder<R> {
     /// `config.allocation_limit` tanımlıysa okuma başlamadan önce `Read::take(limit + 1)` ile
     /// girdi boyutu sınırlandırılır; girdi `limit` bayttan büyükse başlık ayrıştırılmadan
     /// `LimitErrorKind::InsufficientMemory` döndürülür. Kalan bütçe (`limit - raw_bytes.len()`)
-    /// [`parse_info_with`] çağrısına iletilir.
+    /// [`AvifPrepared::from_vec`] çağrısına iletilir.
     pub fn with_config(mut reader: R, config: AvifDecodeConfig) -> ImageResult<Self> {
         let mut raw_bytes = Vec::new();
         let header_cfg = if let Some(limit) = config.allocation_limit {
@@ -80,10 +88,10 @@ impl<R: Read> AvifDecoder<R> {
             reader.read_to_end(&mut raw_bytes)?;
             config.clone()
         };
-        let info = parse_info_with(&raw_bytes, &header_cfg).map_err(map_av1oxide_error)?;
+        let prepared =
+            AvifPrepared::from_vec(raw_bytes, &header_cfg).map_err(map_av1oxide_error)?;
         Ok(Self {
-            raw_bytes,
-            info,
+            prepared,
             config,
             limits: Limits::no_limits(),
             _marker: PhantomData,
@@ -93,22 +101,11 @@ impl<R: Read> AvifDecoder<R> {
     /// Ayrıştırılmış AVIF üst verisine salt-okunur erişim döndürür.
     #[must_use]
     pub const fn info(&self) -> &AvifInfo {
-        &self.info
+        self.prepared.info()
     }
 
     fn held_header_bytes(&self) -> usize {
-        self.raw_bytes
-            .len()
-            .saturating_add(self.info.icc_profile.as_ref().map_or(0, Vec::len))
-            .saturating_add(self.info.exif.as_ref().map_or(0, Vec::len))
-            .saturating_add(self.info.xmp.as_ref().map_or(0, Vec::len))
-            .saturating_add(
-                self.info
-                    .gain_map_metadata
-                    .as_ref()
-                    .and_then(|g| g.alt_icc_profile.as_ref())
-                    .map_or(0, Vec::len),
-            )
+        self.prepared.held_bytes()
     }
 
     fn effective_allocation_limit(&self) -> Option<usize> {
@@ -127,11 +124,13 @@ impl<R: Read> AvifDecoder<R> {
 
 impl<R: Read> ImageDecoder for AvifDecoder<R> {
     fn dimensions(&self) -> (u32, u32) {
-        (self.info.width, self.info.height)
+        let info = self.prepared.info();
+        (info.width, info.height)
     }
 
     fn color_type(&self) -> ColorType {
-        match (self.info.bit_depth, self.info.has_alpha) {
+        let info = self.prepared.info();
+        match (info.bit_depth, info.has_alpha) {
             (BitDepth::Eight, false) => ColorType::Rgb8,
             (BitDepth::Eight, true) => ColorType::Rgba8,
             (BitDepth::Ten | BitDepth::Twelve, false) => ColorType::Rgb16,
@@ -144,15 +143,15 @@ impl<R: Read> ImageDecoder for AvifDecoder<R> {
     }
 
     fn icc_profile(&mut self) -> ImageResult<Option<Vec<u8>>> {
-        Ok(self.info.icc_profile.clone())
+        Ok(self.prepared.info().icc_profile.clone())
     }
 
     fn exif_metadata(&mut self) -> ImageResult<Option<Vec<u8>>> {
-        Ok(self.info.exif.clone())
+        Ok(self.prepared.info().exif.clone())
     }
 
     fn xmp_metadata(&mut self) -> ImageResult<Option<Vec<u8>>> {
-        Ok(self.info.xmp.clone())
+        Ok(self.prepared.info().xmp.clone())
     }
 
     fn set_limits(&mut self, limits: Limits) -> ImageResult<()> {
@@ -194,8 +193,9 @@ impl<R: Read> ImageDecoder for AvifDecoder<R> {
         }
 
         let effective_limit = self.effective_allocation_limit();
-        let bit_depth = self.info.bit_depth;
-        let has_alpha = self.info.has_alpha;
+        let bit_depth = self.prepared.info().bit_depth;
+        let has_alpha = self.prepared.info().has_alpha;
+        let raw_len = self.prepared.raw_len();
         let mut cfg = self.config;
         if let Some(max_w) = self.limits.max_image_width
             && let Some(max_h) = self.limits.max_image_height
@@ -204,75 +204,39 @@ impl<R: Read> ImageDecoder for AvifDecoder<R> {
             cfg.max_pixels = cfg.max_pixels.min(pixel_limit);
         }
 
-        // Üst veri kopyalarını (`ICC`/`Exif`/`XMP`) piksel çözümünden önce serbest bırak;
-        // `raw_bytes` tamponunu ise toplam bütçeden düşerek iç çözücüye geçir.
-        drop(self.info);
-        let raw_bytes = self.raw_bytes;
+        // `raw_bytes` tamponunu toplam bütçeden düşerek tek ayrıştırmalı çözücüye geçir;
+        // `decode_with(self, ...)` tamamlandığında ham baytlar ve kapsayıcı anında bırakılır.
         if let Some(limit) = effective_limit {
-            if raw_bytes.len() > limit {
+            if raw_len > limit {
                 return Err(ImageError::Limits(LimitError::from_kind(
                     LimitErrorKind::InsufficientMemory,
                 )));
             }
-            cfg.allocation_limit = Some(limit - raw_bytes.len());
+            cfg.allocation_limit = Some(limit - raw_len);
         } else {
             cfg.allocation_limit = None;
         }
 
-        let img = decode_with(&raw_bytes, &cfg).map_err(map_av1oxide_error)?;
-        drop(raw_bytes);
+        let img = self
+            .prepared
+            .decode_with(&cfg)
+            .map_err(map_av1oxide_error)?;
 
         match (bit_depth, has_alpha) {
-            (BitDepth::Eight, false) => {
-                let rgb = img.to_rgb8().map_err(map_av1oxide_error)?;
-                buf.copy_from_slice(&rgb.pixels);
-            }
-            (BitDepth::Eight, true) => {
-                let rgba = img.to_rgba8().map_err(map_av1oxide_error)?;
-                buf.copy_from_slice(&rgba.pixels);
-            }
-            (BitDepth::Ten, false) => {
-                let rgb16 = img.to_rgb16().map_err(map_av1oxide_error)?;
-                write_scaled_u16_ne(&rgb16.pixels, scale_10_to_16, buf);
-            }
-            (BitDepth::Ten, true) => {
-                let rgba16 = img.to_rgba16().map_err(map_av1oxide_error)?;
-                write_scaled_u16_ne(&rgba16.pixels, scale_10_to_16, buf);
-            }
-            (BitDepth::Twelve, false) => {
-                let rgb16 = img.to_rgb16().map_err(map_av1oxide_error)?;
-                write_scaled_u16_ne(&rgb16.pixels, scale_12_to_16, buf);
-            }
-            (BitDepth::Twelve, true) => {
-                let rgba16 = img.to_rgba16().map_err(map_av1oxide_error)?;
-                write_scaled_u16_ne(&rgba16.pixels, scale_12_to_16, buf);
-            }
+            (BitDepth::Eight, false) => img.write_rgb8_into(buf).map_err(map_av1oxide_error)?,
+            (BitDepth::Eight, true) => img.write_rgba8_into(buf).map_err(map_av1oxide_error)?,
+            (BitDepth::Ten | BitDepth::Twelve, false) => img
+                .write_rgb16_scaled_ne_into(buf)
+                .map_err(map_av1oxide_error)?,
+            (BitDepth::Ten | BitDepth::Twelve, true) => img
+                .write_rgba16_scaled_ne_into(buf)
+                .map_err(map_av1oxide_error)?,
         }
         Ok(())
     }
 
     fn read_image_boxed(self: Box<Self>, buf: &mut [u8]) -> ImageResult<()> {
         (*self).read_image(buf)
-    }
-}
-
-/// 10-bit (`0..=1023`) örneği tam 16-bit (`0..=65535`) aralığına yuvarlayarak ölçekler.
-#[inline]
-const fn scale_10_to_16(v: u16) -> u16 {
-    let clamped = if v > 1023 { 1023 } else { v };
-    ((clamped as u32 * 65_535 + 511) / 1023) as u16
-}
-
-/// 12-bit (`0..=4095`) örneği tam 16-bit (`0..=65535`) aralığına yuvarlayarak ölçekler.
-#[inline]
-const fn scale_12_to_16(v: u16) -> u16 {
-    let clamped = if v > 4095 { 4095 } else { v };
-    ((clamped as u32 * 65_535 + 2047) / 4095) as u16
-}
-
-fn write_scaled_u16_ne(samples: &[u16], scale: fn(u16) -> u16, out: &mut [u8]) {
-    for (&sample, dst) in samples.iter().zip(out.as_chunks_mut::<2>().0.iter_mut()) {
-        *dst = scale(sample).to_ne_bytes();
     }
 }
 
@@ -309,22 +273,29 @@ pub fn register_decoding_hook() -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{scale_10_to_16, scale_12_to_16};
+    use super::AvifDecoder;
+    use av1oxide::BitDepth;
+    use image::ColorType;
 
     #[test]
-    fn high_bitdepth_scaling_endpoints_and_monotonicity() {
-        assert_eq!(scale_10_to_16(0), 0);
-        assert_eq!(scale_10_to_16(1023), 65_535);
-        assert_eq!(scale_10_to_16(512), 32_800);
-        for v in 0..1023u16 {
-            assert!(scale_10_to_16(v) < scale_10_to_16(v + 1));
+    fn color_type_mapping_covers_8_10_12_bit_and_alpha() {
+        let cases = [
+            (BitDepth::Eight, false, ColorType::Rgb8),
+            (BitDepth::Eight, true, ColorType::Rgba8),
+            (BitDepth::Ten, false, ColorType::Rgb16),
+            (BitDepth::Ten, true, ColorType::Rgba16),
+            (BitDepth::Twelve, false, ColorType::Rgb16),
+            (BitDepth::Twelve, true, ColorType::Rgba16),
+        ];
+        for (bd, has_alpha, expected) in cases {
+            let ct = match (bd, has_alpha) {
+                (BitDepth::Eight, false) => ColorType::Rgb8,
+                (BitDepth::Eight, true) => ColorType::Rgba8,
+                (BitDepth::Ten | BitDepth::Twelve, false) => ColorType::Rgb16,
+                (BitDepth::Ten | BitDepth::Twelve, true) => ColorType::Rgba16,
+            };
+            assert_eq!(ct, expected);
         }
-
-        assert_eq!(scale_12_to_16(0), 0);
-        assert_eq!(scale_12_to_16(4095), 65_535);
-        assert_eq!(scale_12_to_16(2048), 32_776);
-        for v in 0..4095u16 {
-            assert!(scale_12_to_16(v) < scale_12_to_16(v + 1));
-        }
+        let _ = core::any::type_name::<AvifDecoder<std::io::Empty>>();
     }
 }

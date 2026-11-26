@@ -7,9 +7,10 @@ use std::path::PathBuf;
 use std::process::Command;
 
 use av1oxide::avif::{
-    AvifDecodeConfig, AvifPlane, AvifSequenceDecoder, CleanAperture, ColorInfo, ContentLightLevel,
-    LoopCount, MasteringDisplay, PixelAspectRatio, decode, decode_rgb8, decode_rgba8, decode_with,
-    parse_info, parse_info_with, parse_sequence_info, parse_sequence_info_with, probe,
+    AvifDecodeConfig, AvifPlane, AvifPrepared, AvifSequenceDecoder, CleanAperture, ColorInfo,
+    ContentLightLevel, LoopCount, MasteringDisplay, PixelAspectRatio, decode, decode_rgb8,
+    decode_rgba8, decode_with, parse_info, parse_info_with, parse_sequence_info,
+    parse_sequence_info_with, probe,
 };
 use av1oxide::{BitDepth, ChromaFormat, Error};
 
@@ -1957,4 +1958,111 @@ fn avif_shared_budget_cmin_grid_alpha_gainmap_color_and_sequence() {
     let frame0 = seq.next_frame().expect("ilk kare").expect("Some");
     assert_eq!(frame0.image.y_plane_u8(), Some(&[190u8][..]));
     assert_eq!(frame0.image.alpha_plane_u8(), Some(&[203u8][..]));
+}
+
+/// `5.B.1` + `5.B.2`: Doğrudan dilime yazan `write_*_into` metodları (`0` çıktı bütçesi + boyut
+/// denetimi + `to_*` eşitliği) ve `AvifPrepared` tek geçişli ayrıştırma doğrulaması.
+#[test]
+fn avif_direct_slice_writers_and_prepared_single_parse() {
+    // 1. `write_*_into` ile `to_*` bit-birebir eşitliği ve yanlış boyut reddi
+    let grid_alpha = build_grid_and_alpha_avif(SAMPLE_1X1_AV1_OBU, 1, 1, 1, 1);
+    let img = decode(&grid_alpha).expect("grid+alpha çözülmeli");
+
+    let exp_rgb8 = img.to_rgb8().unwrap();
+    let exp_rgba8 = img.to_rgba8().unwrap();
+    let exp_rgb16 = img.to_rgb16().unwrap();
+    let exp_rgba16 = img.to_rgba16().unwrap();
+
+    let mut rgb8_buf = vec![0u8; exp_rgb8.pixels.len()];
+    let mut rgba8_buf = vec![0u8; exp_rgba8.pixels.len()];
+    let mut rgb16_buf = vec![0u16; exp_rgb16.pixels.len()];
+    let mut rgba16_buf = vec![0u16; exp_rgba16.pixels.len()];
+    let mut rgb16_ne_buf = vec![0u8; exp_rgb16.pixels.len() * 2];
+    let mut rgba16_ne_buf = vec![0u8; exp_rgba16.pixels.len() * 2];
+
+    img.write_rgb8_into(&mut rgb8_buf).unwrap();
+    img.write_rgba8_into(&mut rgba8_buf).unwrap();
+    img.write_rgb16_into(&mut rgb16_buf).unwrap();
+    img.write_rgba16_into(&mut rgba16_buf).unwrap();
+    img.write_rgb16_scaled_ne_into(&mut rgb16_ne_buf).unwrap();
+    img.write_rgba16_scaled_ne_into(&mut rgba16_ne_buf).unwrap();
+
+    assert_eq!(rgb8_buf, exp_rgb8.pixels);
+    assert_eq!(rgba8_buf, exp_rgba8.pixels);
+    assert_eq!(rgb16_buf, exp_rgb16.pixels);
+    assert_eq!(rgba16_buf, exp_rgba16.pixels);
+
+    let exp_rgb16_ne: Vec<u8> = exp_rgb16
+        .pixels
+        .iter()
+        .flat_map(|&v| (v * 257).to_ne_bytes())
+        .collect();
+    let exp_rgba16_ne: Vec<u8> = exp_rgba16
+        .pixels
+        .iter()
+        .flat_map(|&v| (v * 257).to_ne_bytes())
+        .collect();
+    assert_eq!(rgb16_ne_buf, exp_rgb16_ne);
+    assert_eq!(rgba16_ne_buf, exp_rgba16_ne);
+
+    assert!(matches!(
+        img.write_rgb8_into(&mut [0u8; 2]),
+        Err(Error::InvalidArgument(_))
+    ));
+    assert!(matches!(
+        img.write_rgba8_into(&mut [0u8; 3]),
+        Err(Error::InvalidArgument(_))
+    ));
+    assert!(matches!(
+        img.write_rgb16_into(&mut [0u16; 2]),
+        Err(Error::InvalidArgument(_))
+    ));
+    assert!(matches!(
+        img.write_rgba16_into(&mut [0u16; 3]),
+        Err(Error::InvalidArgument(_))
+    ));
+    assert!(matches!(
+        img.write_rgb16_scaled_ne_into(&mut [0u8; 5]),
+        Err(Error::InvalidArgument(_))
+    ));
+    assert!(matches!(
+        img.write_rgba16_scaled_ne_into(&mut [0u8; 7]),
+        Err(Error::InvalidArgument(_))
+    ));
+
+    // 2. Harici `dst` dilimi bütçe tüketmez: tam canlı görüntü sınırında `to_rgb8()` reddederken
+    //    `write_rgb8_into` sıfır ek bütçe ile başarıyla tamamlanmalı.
+    let xmp_pad = vec![b'X'; 512 * 1024];
+    let exif_block = b"\x00\x00\x00\x00II*\x00EXIF_DIRECT_WRITER";
+    let avif_tight = build_compressed_meta_avif(&xmp_pad, None, exif_block, None, false);
+    let live_only = 3usize + (exif_block.len() - 4) + xmp_pad.len();
+    let img_tight = decode_with(
+        &avif_tight,
+        &AvifDecodeConfig {
+            allocation_limit: Some(live_only),
+            ..AvifDecodeConfig::default()
+        },
+    )
+    .expect("tam canlı sınırda çözülmeli");
+    assert!(matches!(
+        img_tight.to_rgb8(),
+        Err(Error::BudgetExceeded { .. })
+    ));
+    let mut direct_rgb = [0u8; 3];
+    img_tight
+        .write_rgb8_into(&mut direct_rgb)
+        .expect("dış dilime doğrudan yazım ek bütçe tüketmeden geçmeli");
+
+    // 3. `AvifPrepared` tek ayrıştırma (`cmin` sıkıştırılmış meta dâhil) paritesi
+    let avif_cmin = build_compressed_meta_avif(&xmp_pad[..4096], None, exif_block, None, true);
+    let ref_info = parse_info(&avif_cmin).unwrap();
+    let ref_img = decode(&avif_cmin).unwrap();
+
+    let prepared = AvifPrepared::from_vec(avif_cmin, &AvifDecodeConfig::default())
+        .expect("AvifPrepared::from_vec cmin");
+    assert_eq!(prepared.info(), &ref_info);
+    let prep_img = prepared
+        .decode_with(&AvifDecodeConfig::default())
+        .expect("AvifPrepared::decode_with");
+    assert_eq!(prep_img, ref_img);
 }

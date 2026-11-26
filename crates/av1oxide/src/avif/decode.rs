@@ -10,7 +10,7 @@ use alloc::vec::Vec;
 use crate::api::{Config, Decoder, Packet};
 use crate::avif::boxes::{
     ALPHA_AUX_URN_CICP, ALPHA_AUX_URN_HEVC, Av1CProperty, AvifContainer, ItemProperty,
-    parse_container,
+    parse_container, parse_container_owned,
 };
 use crate::avif::gainmap::{
     GainMap, GainMapMetadata, ToneMapParseOutcome, parse_tone_mapped_image_box,
@@ -781,8 +781,15 @@ pub fn parse_info_with(data: &[u8], config: &AvifDecodeConfig) -> Result<AvifInf
 
 pub(crate) fn parse_info_with_budget(data: &[u8], butce: &Arc<Butce>) -> Result<AvifInfo> {
     let container = parse_container(data, butce)?;
+    parse_info_from_container(&container, butce)
+}
+
+fn parse_info_from_container(
+    container: &AvifContainer<'_>,
+    butce: &Arc<Butce>,
+) -> Result<AvifInfo> {
     let primary_id = container.primary_item_id;
-    let inspected = inspect_item_dimensions(&container, primary_id, 0, butce)?;
+    let inspected = inspect_item_dimensions(container, primary_id, 0, butce)?;
 
     let props = container.item_properties(primary_id)?;
     let mut color = inspected.seq_color.unwrap_or_default();
@@ -810,12 +817,12 @@ pub(crate) fn parse_info_with_budget(data: &[u8], butce: &Arc<Butce>) -> Result<
         }
     }
 
-    let alpha_src = find_alpha_source(&container, primary_id)?;
-    let premultiplied_alpha = is_premultiplied_alpha(&container, primary_id, alpha_src.as_ref());
-    let (exif, xmp, meta_guard) = extract_metadata_items(&container, primary_id, butce)?;
+    let alpha_src = find_alpha_source(container, primary_id)?;
+    let premultiplied_alpha = is_premultiplied_alpha(container, primary_id, alpha_src.as_ref());
+    let (exif, xmp, meta_guard) = extract_metadata_items(container, primary_id, butce)?;
     _info_guard.birlestir(meta_guard);
     let gain_map_metadata = find_and_validate_tmap(
-        &container,
+        container,
         primary_id,
         inspected.raw_width,
         inspected.raw_height,
@@ -843,6 +850,76 @@ pub(crate) fn parse_info_with_budget(data: &[u8], butce: &Arc<Butce>) -> Result<
         has_gain_map: gain_map_metadata.is_some(),
         gain_map_metadata,
     })
+}
+
+fn info_metadata_bytes(info: &AvifInfo) -> usize {
+    info.icc_profile
+        .as_ref()
+        .map_or(0, Vec::len)
+        .saturating_add(info.exif.as_ref().map_or(0, Vec::len))
+        .saturating_add(info.xmp.as_ref().map_or(0, Vec::len))
+        .saturating_add(
+            info.gain_map_metadata
+                .as_ref()
+                .and_then(|g| g.alt_icc_profile.as_ref())
+                .map_or(0, Vec::len),
+        )
+}
+
+/// Tek geçişte ayrıştırılmış AVIF kapsayıcısı ve üst bilgisini birlikte tutan hazırlıklı çözücü girdisi.
+///
+/// Başlık incelemesi (`info`) ile piksel çözümünü (`decode_with`) ayırmak isteyen ancak kutu
+/// ağacını (`cmin` açma dâhil) ikinci kez ayrıştırmak istemeyen tüketiciler (ör. `av1oxide-image`)
+/// için tasarlanmıştır. `%100 #![forbid(unsafe_code)]` altında öz-referanssız ofset tabanlı
+/// depolama kullanır.
+#[derive(Clone, Debug)]
+pub struct AvifPrepared {
+    container: AvifContainer<'static>,
+    info: AvifInfo,
+}
+
+impl AvifPrepared {
+    /// Sahipli AVIF bayt vektörünü tek seferde ayrıştırıp başlık/üst bilgisini çıkarır.
+    ///
+    /// `raw_bytes` tamponu çağıran tarafından önceden ayrıldığı için `config.allocation_limit`
+    /// kapsayıcı ve başlık tahsislerini (`cmin`/`infe` açma, `idat`, `ICC`/`Exif`/`XMP`, `tmap`)
+    /// sınırlar; toplam uçtan uca tavan isteniyorsa `limit - raw_bytes.len()` geçirilmelidir.
+    pub fn from_vec(raw_bytes: Vec<u8>, config: &AvifDecodeConfig) -> Result<Self> {
+        let butce = Arc::new(Butce::yeni(config.allocation_limit, 0));
+        let container = parse_container_owned(raw_bytes, &butce)?;
+        let info = parse_info_from_container(&container, &butce)?;
+        Ok(Self { container, info })
+    }
+
+    /// Önceden ayrıştırılmış AVIF üst verisine salt-okunur erişim döndürür.
+    #[must_use]
+    pub const fn info(&self) -> &AvifInfo {
+        &self.info
+    }
+
+    /// İçeride tutulan ham AVIF girdi vektörünün bayt uzunluğu.
+    #[must_use]
+    pub fn raw_len(&self) -> usize {
+        self.container.raw_len()
+    }
+
+    /// İçeride tutulan ham girdi + sahipli kapsayıcı (`cmin`/`idat`/`ipco`) + üst veri bayt toplamı.
+    #[must_use]
+    pub fn held_bytes(&self) -> usize {
+        self.container
+            .raw_len()
+            .saturating_add(self.container.owned_bytes())
+            .saturating_add(info_metadata_bytes(&self.info))
+    }
+
+    /// Önceden ayrıştırılmış kapsayıcıyı yeniden ayrıştırmadan pikselleri çözer ve ham girdiyi bırakır.
+    pub fn decode_with(self, config: &AvifDecodeConfig) -> Result<AvifImage> {
+        let butce = Arc::new(Butce::yeni(config.allocation_limit, 0));
+        // Halihazırda kapsayıcıda canlı tutulan sahipli baytları (`cmin`/`idat`/`ipco`) yeni
+        // bütçe tavanına kaydet; bu nesne fonksiyon sonunda bırakılınca iade edilir.
+        let _container_carry = Butce::tut(&butce, self.container.owned_bytes())?;
+        decode_from_container(&self.container, config, butce, Some(self.info))
+    }
 }
 
 pub(crate) fn check_pixel_and_byte_budget(
@@ -1510,122 +1587,63 @@ fn decode_grid_tiles_into_canvas(
 
     let has_dups = is_alpha && (1..tile_ids.len()).any(|i| tile_ids[..i].contains(&tile_ids[i]));
     let mut unique_ids: Vec<u32> = Vec::with_capacity(num_tiles);
-    let mut tile_to_unique: Vec<usize> = Vec::with_capacity(num_tiles);
+    let mut cells_by_unique: Vec<Vec<(usize, usize)>> = Vec::with_capacity(num_tiles);
     if has_dups {
         let mut unique_set = crate::avif::boxes::FxIndexSet::with_capacity_and_hasher(
             num_tiles,
             rustc_hash::FxBuildHasher,
         );
-        for &tid in tile_ids {
+        for (cell_idx, &tid) in tile_ids.iter().enumerate() {
             let (u_idx, inserted) = unique_set.insert_full(tid);
             if inserted {
                 unique_ids.push(tid);
+                cells_by_unique.push(Vec::new());
             }
-            tile_to_unique.push(u_idx);
+            cells_by_unique[u_idx].push((cell_idx / cols, cell_idx % cols));
         }
     } else {
         unique_ids.extend_from_slice(tile_ids);
-        for i in 0..num_tiles {
-            tile_to_unique.push(i);
+        for cell_idx in 0..num_tiles {
+            cells_by_unique.push(alloc::vec![(cell_idx / cols, cell_idx % cols)]);
         }
     }
     let num_unique = unique_ids.len();
-
     let total_threads = resolve_effective_threads(config.n_threads);
 
     #[cfg(all(feature = "std", not(target_arch = "wasm32")))]
-    let decoded_tiles: Vec<PlanarBuffer> = if total_threads > 1 && num_unique > 1 {
-        let worker_count = total_threads.min(num_unique);
-        let chunk_size = num_unique.div_ceil(worker_count);
-        let mut results: Vec<Result<Vec<PlanarBuffer>>> = Vec::with_capacity(worker_count);
-        std::thread::scope(|s| {
-            let mut handles = Vec::with_capacity(worker_count);
-            for chunk in unique_ids.chunks(chunk_size) {
-                let butce_w = Arc::clone(butce);
-                handles.push(s.spawn(move || {
-                    let mut out = Vec::with_capacity(chunk.len());
-                    for &tid in chunk {
-                        out.push(decode_item_planar(
-                            container,
-                            tid,
-                            config,
-                            1,
-                            is_alpha,
-                            depth + 1,
-                            &butce_w,
-                        )?);
-                    }
-                    Ok(out)
-                }));
-            }
-            for h in handles {
-                let res = h
-                    .join()
-                    .map_err(|_| Error::InvalidState("grid karo iş parçacığı sonlandı"))?;
-                results.push(res);
-            }
-            Ok::<(), Error>(())
-        })?;
-        let mut flat = Vec::with_capacity(num_unique);
-        for group in results {
-            flat.extend(group?);
-        }
-        flat
-    } else {
-        let mut flat = Vec::with_capacity(num_unique);
-        for &tid in &unique_ids {
-            flat.push(decode_item_planar(
-                container,
-                tid,
-                config,
-                total_threads,
-                is_alpha,
-                depth + 1,
-                butce,
-            )?);
-        }
-        flat
-    };
+    let wave_size = total_threads.max(1).min(num_unique);
     #[cfg(not(all(feature = "std", not(target_arch = "wasm32"))))]
-    let decoded_tiles: Vec<PlanarBuffer> = {
-        let _ = total_threads;
-        let mut flat = Vec::with_capacity(num_unique);
-        for &tid in &unique_ids {
-            flat.push(decode_item_planar(
-                container,
-                tid,
-                config,
-                1,
-                is_alpha,
-                depth + 1,
-                butce,
-            )?);
-        }
-        flat
-    };
+    let wave_size = 1usize;
 
-    let first = &decoded_tiles[0];
-    let tile_w = first.width as usize;
-    let tile_h = first.height as usize;
-    let tile_cw = first.chroma_width as usize;
-    let tile_ch = first.chroma_height as usize;
-    let bit_depth = first.bit_depth;
-    let chroma_format = first.chroma_format;
-    let seq_color = first.seq_color;
+    // 1. İlk dalgayı (`0..first_end`, en fazla `worker_count` karo) tuval ayrılmadan önce çöz;
+    //    böylece ilk dalganın AV1 çözücüleri tuvalle çakışmaz ve `num_unique <= wave_size`
+    //    durumunda seri ilk-karo darboğazı oluşmaz.
+    let first_end = wave_size.min(num_unique);
+    let first_wave_threads = if num_unique == 1 { total_threads } else { 1 };
+    let mut first_wave = decode_grid_wave(
+        container,
+        &unique_ids[..first_end],
+        config,
+        first_wave_threads,
+        is_alpha,
+        depth,
+        butce,
+    )?;
+
+    let first_tile = &first_wave[0];
+    let tile_w = first_tile.width as usize;
+    let tile_h = first_tile.height as usize;
+    let tile_cw = first_tile.chroma_width as usize;
+    let tile_ch = first_tile.chroma_height as usize;
+    let bit_depth = first_tile.bit_depth;
+    let chroma_format = first_tile.chroma_format;
+    let seq_color = first_tile.seq_color;
 
     if tile_w == 0 || tile_h == 0 {
         return Err(Error::InvalidData("grid karo boyutu sıfır olamaz"));
     }
-    for t in &decoded_tiles[1..] {
-        if t.width as usize != tile_w
-            || t.height as usize != tile_h
-            || t.bit_depth != bit_depth
-            || (!is_alpha && t.chroma_format != chroma_format)
-        {
-            return Err(Error::InvalidData(
-                "grid karolarının boyut veya biçimleri uyumsuz",
-            ));
-        }
+    for tile in &first_wave[1..] {
+        validate_grid_tile(tile, tile_w, tile_h, bit_depth, chroma_format, is_alpha)?;
     }
 
     let out_w = grid.output_width as usize;
@@ -1676,62 +1694,73 @@ fn decode_grid_tiles_into_canvas(
     let canvas_guard = Butce::tut(butce, total_bytes)?;
 
     let copy_chroma = !is_alpha && chroma_format != ChromaFormat::Monochrome;
-    let (y_canvas, u_canvas, v_canvas) = match bit_depth {
-        BitDepth::Eight => {
-            let (yc, uc, vc) = stitch_grid_canvases::<u8>(
-                &decoded_tiles,
-                &tile_to_unique,
-                rows,
-                cols,
-                tile_w,
-                tile_h,
-                tile_cw,
-                tile_ch,
-                out_w,
-                out_h,
-                out_cw,
-                out_ch,
-                y_samples,
-                c_samples,
-                copy_chroma,
-                |t| t.y_plane.as_u8().unwrap_or(&[]),
-                |t| t.u_plane.as_u8().unwrap_or(&[]),
-                |t| t.v_plane.as_u8().unwrap_or(&[]),
-            )?;
-            (
-                PlaneStorage::U8(yc),
-                PlaneStorage::U8(uc),
-                PlaneStorage::U8(vc),
-            )
-        }
-        BitDepth::Ten | BitDepth::Twelve => {
-            let (yc, uc, vc) = stitch_grid_canvases::<u16>(
-                &decoded_tiles,
-                &tile_to_unique,
-                rows,
-                cols,
-                tile_w,
-                tile_h,
-                tile_cw,
-                tile_ch,
-                out_w,
-                out_h,
-                out_cw,
-                out_ch,
-                y_samples,
-                c_samples,
-                copy_chroma,
-                |t| t.y_plane.as_u16().unwrap_or(&[]),
-                |t| t.u_plane.as_u16().unwrap_or(&[]),
-                |t| t.v_plane.as_u16().unwrap_or(&[]),
-            )?;
-            (
-                PlaneStorage::U16(yc),
-                PlaneStorage::U16(uc),
-                PlaneStorage::U16(vc),
-            )
-        }
+    let mut y_canvas = match bit_depth {
+        BitDepth::Eight => PlaneStorage::U8(dolu_vec(y_samples, 0u8)?),
+        BitDepth::Ten | BitDepth::Twelve => PlaneStorage::U16(dolu_vec(y_samples, 0u16)?),
     };
+    let mut u_canvas = match bit_depth {
+        BitDepth::Eight => PlaneStorage::U8(dolu_vec(c_samples, 0u8)?),
+        BitDepth::Ten | BitDepth::Twelve => PlaneStorage::U16(dolu_vec(c_samples, 0u16)?),
+    };
+    let mut v_canvas = match bit_depth {
+        BitDepth::Eight => PlaneStorage::U8(dolu_vec(c_samples, 0u8)?),
+        BitDepth::Ten | BitDepth::Twelve => PlaneStorage::U16(dolu_vec(c_samples, 0u16)?),
+    };
+
+    let geom = GridCanvasGeom {
+        tile_w,
+        tile_h,
+        tile_cw,
+        tile_ch,
+        out_w,
+        out_h,
+        out_cw,
+        out_ch,
+        copy_chroma,
+    };
+
+    // İlk dalgadaki tüm karoları tuvale yaz ve tamponlarını bir sonraki dalgadan önce serbest bırak.
+    for (i, tile) in first_wave.drain(..).enumerate() {
+        copy_tile_into_canvas(
+            &tile,
+            &cells_by_unique[i],
+            &geom,
+            &mut y_canvas,
+            &mut u_canvas,
+            &mut v_canvas,
+        );
+        drop(tile);
+    }
+    drop(first_wave);
+
+    // 2. Kalan karoları en fazla `wave_size` (worker_count) büyüklüğünde dalgalar halinde çöz,
+    //    tuvale yaz ve bir sonraki dalgaya geçmeden tüm dalga tamponlarını iade et.
+    let mut offset = first_end;
+    while offset < num_unique {
+        let end = (offset + wave_size).min(num_unique);
+        let mut wave_tiles = decode_grid_wave(
+            container,
+            &unique_ids[offset..end],
+            config,
+            1,
+            is_alpha,
+            depth,
+            butce,
+        )?;
+        for (i, tile) in wave_tiles.drain(..).enumerate() {
+            validate_grid_tile(&tile, tile_w, tile_h, bit_depth, chroma_format, is_alpha)?;
+            copy_tile_into_canvas(
+                &tile,
+                &cells_by_unique[offset + i],
+                &geom,
+                &mut y_canvas,
+                &mut u_canvas,
+                &mut v_canvas,
+            );
+            drop(tile);
+        }
+        offset = end;
+    }
 
     Ok(PlanarBuffer {
         width: grid.output_width,
@@ -1752,12 +1781,53 @@ fn decode_grid_tiles_into_canvas(
     })
 }
 
-#[allow(clippy::too_many_arguments)]
-fn stitch_grid_canvases<T: Copy + Default>(
-    decoded_tiles: &[PlanarBuffer],
-    tile_to_unique: &[usize],
-    rows: usize,
-    cols: usize,
+fn decode_grid_wave(
+    container: &AvifContainer<'_>,
+    wave_ids: &[u32],
+    config: &AvifDecodeConfig,
+    single_item_threads: usize,
+    is_alpha: bool,
+    depth: usize,
+    butce: &Arc<Butce>,
+) -> Result<Vec<PlanarBuffer>> {
+    #[cfg(all(feature = "std", not(target_arch = "wasm32")))]
+    if wave_ids.len() > 1 {
+        let mut wave_tiles: Vec<PlanarBuffer> = Vec::with_capacity(wave_ids.len());
+        std::thread::scope(|s| {
+            let mut handles = Vec::with_capacity(wave_ids.len());
+            for &tid in wave_ids {
+                let butce_w = Arc::clone(butce);
+                handles.push(s.spawn(move || {
+                    decode_item_planar(container, tid, config, 1, is_alpha, depth + 1, &butce_w)
+                }));
+            }
+            for h in handles {
+                let tile = h
+                    .join()
+                    .map_err(|_| Error::InvalidState("grid karo iş parçacığı sonlandı"))??;
+                wave_tiles.push(tile);
+            }
+            Ok::<(), Error>(())
+        })?;
+        return Ok(wave_tiles);
+    }
+
+    let mut wave_tiles: Vec<PlanarBuffer> = Vec::with_capacity(wave_ids.len());
+    for &tid in wave_ids {
+        wave_tiles.push(decode_item_planar(
+            container,
+            tid,
+            config,
+            single_item_threads,
+            is_alpha,
+            depth + 1,
+            butce,
+        )?);
+    }
+    Ok(wave_tiles)
+}
+
+struct GridCanvasGeom {
     tile_w: usize,
     tile_h: usize,
     tile_cw: usize,
@@ -1766,67 +1836,105 @@ fn stitch_grid_canvases<T: Copy + Default>(
     out_h: usize,
     out_cw: usize,
     out_ch: usize,
-    y_samples: usize,
-    c_samples: usize,
     copy_chroma: bool,
-    get_y: impl Fn(&PlanarBuffer) -> &[T],
-    get_u: impl Fn(&PlanarBuffer) -> &[T],
-    get_v: impl Fn(&PlanarBuffer) -> &[T],
-) -> Result<(Vec<T>, Vec<T>, Vec<T>)> {
-    let mut y_canvas = dolu_vec(y_samples, T::default())?;
-    let mut u_canvas = dolu_vec(c_samples, T::default())?;
-    let mut v_canvas = dolu_vec(c_samples, T::default())?;
+}
 
-    for r in 0..rows {
-        let dst_y0 = r * tile_h;
-        if dst_y0 >= out_h {
-            continue;
-        }
-        let copy_h = tile_h.min(out_h - dst_y0);
+#[inline]
+fn validate_grid_tile(
+    tile: &PlanarBuffer,
+    tile_w: usize,
+    tile_h: usize,
+    bit_depth: BitDepth,
+    chroma_format: ChromaFormat,
+    is_alpha: bool,
+) -> Result<()> {
+    if tile.width as usize != tile_w
+        || tile.height as usize != tile_h
+        || tile.bit_depth != bit_depth
+        || (!is_alpha && tile.chroma_format != chroma_format)
+    {
+        return Err(Error::InvalidData(
+            "grid karolarının boyut veya biçimleri uyumsuz",
+        ));
+    }
+    Ok(())
+}
 
-        let dst_cy0 = r * tile_ch;
-        let copy_ch = if out_ch > dst_cy0 {
-            tile_ch.min(out_ch - dst_cy0)
-        } else {
-            0
-        };
-
-        for c in 0..cols {
-            let tile = &decoded_tiles[tile_to_unique[r * cols + c]];
-            let dst_x0 = c * tile_w;
-            if dst_x0 >= out_w {
-                continue;
-            }
-            let copy_w = tile_w.min(out_w - dst_x0);
-
-            let ty_src = get_y(tile);
+fn copy_tile_slice<T: Copy>(
+    src: (&[T], &[T], &[T]),
+    cells: &[(usize, usize)],
+    g: &GridCanvasGeom,
+    dst: (&mut [T], &mut [T], &mut [T]),
+) {
+    let (ty_src, tu_src, tv_src) = src;
+    let (y_canvas, u_canvas, v_canvas) = dst;
+    for &(r, c) in cells {
+        let dst_y0 = r * g.tile_h;
+        let dst_x0 = c * g.tile_w;
+        if dst_y0 < g.out_h && dst_x0 < g.out_w {
+            let copy_h = g.tile_h.min(g.out_h - dst_y0);
+            let copy_w = g.tile_w.min(g.out_w - dst_x0);
             for ty in 0..copy_h {
-                let src_off = ty * tile_w;
-                let dst_off = (dst_y0 + ty) * out_w + dst_x0;
+                let src_off = ty * g.tile_w;
+                let dst_off = (dst_y0 + ty) * g.out_w + dst_x0;
                 y_canvas[dst_off..dst_off + copy_w]
                     .copy_from_slice(&ty_src[src_off..src_off + copy_w]);
             }
-
-            if copy_chroma && copy_ch > 0 {
-                let dst_cx0 = c * tile_cw;
-                if dst_cx0 < out_cw {
-                    let copy_cw = tile_cw.min(out_cw - dst_cx0);
-                    let tu_src = get_u(tile);
-                    let tv_src = get_v(tile);
-                    for tcy in 0..copy_ch {
-                        let src_off = tcy * tile_cw;
-                        let dst_off = (dst_cy0 + tcy) * out_cw + dst_cx0;
-                        u_canvas[dst_off..dst_off + copy_cw]
-                            .copy_from_slice(&tu_src[src_off..src_off + copy_cw]);
-                        v_canvas[dst_off..dst_off + copy_cw]
-                            .copy_from_slice(&tv_src[src_off..src_off + copy_cw]);
-                    }
+        }
+        if g.copy_chroma {
+            let dst_cy0 = r * g.tile_ch;
+            let dst_cx0 = c * g.tile_cw;
+            if dst_cy0 < g.out_ch && dst_cx0 < g.out_cw {
+                let copy_ch = g.tile_ch.min(g.out_ch - dst_cy0);
+                let copy_cw = g.tile_cw.min(g.out_cw - dst_cx0);
+                for tcy in 0..copy_ch {
+                    let src_off = tcy * g.tile_cw;
+                    let dst_off = (dst_cy0 + tcy) * g.out_cw + dst_cx0;
+                    u_canvas[dst_off..dst_off + copy_cw]
+                        .copy_from_slice(&tu_src[src_off..src_off + copy_cw]);
+                    v_canvas[dst_off..dst_off + copy_cw]
+                        .copy_from_slice(&tv_src[src_off..src_off + copy_cw]);
                 }
             }
         }
     }
+}
 
-    Ok((y_canvas, u_canvas, v_canvas))
+fn copy_tile_into_canvas(
+    tile: &PlanarBuffer,
+    cells: &[(usize, usize)],
+    g: &GridCanvasGeom,
+    y_canvas: &mut PlaneStorage,
+    u_canvas: &mut PlaneStorage,
+    v_canvas: &mut PlaneStorage,
+) {
+    match (y_canvas, u_canvas, v_canvas) {
+        (PlaneStorage::U8(yc), PlaneStorage::U8(uc), PlaneStorage::U8(vc)) => {
+            copy_tile_slice(
+                (
+                    tile.y_plane.as_u8().unwrap_or(&[]),
+                    tile.u_plane.as_u8().unwrap_or(&[]),
+                    tile.v_plane.as_u8().unwrap_or(&[]),
+                ),
+                cells,
+                g,
+                (yc, uc, vc),
+            );
+        }
+        (PlaneStorage::U16(yc), PlaneStorage::U16(uc), PlaneStorage::U16(vc)) => {
+            copy_tile_slice(
+                (
+                    tile.y_plane.as_u16().unwrap_or(&[]),
+                    tile.u_plane.as_u16().unwrap_or(&[]),
+                    tile.v_plane.as_u16().unwrap_or(&[]),
+                ),
+                cells,
+                g,
+                (yc, uc, vc),
+            );
+        }
+        _ => {}
+    }
 }
 
 fn decode_grid_item(
@@ -1924,10 +2032,19 @@ pub(crate) fn decode_with_budget(
     butce: Arc<Butce>,
 ) -> Result<AvifImage> {
     let container = parse_container(data, &butce)?;
+    decode_from_container(&container, config, butce, None)
+}
+
+fn decode_from_container(
+    container: &AvifContainer<'_>,
+    config: &AvifDecodeConfig,
+    butce: Arc<Butce>,
+    mut cached_info: Option<AvifInfo>,
+) -> Result<AvifImage> {
     let primary_id = container.primary_item_id;
 
     let color_buf = decode_item_planar(
-        &container,
+        container,
         primary_id,
         config,
         config.n_threads,
@@ -1944,39 +2061,48 @@ pub(crate) fn decode_with_budget(
     let mut mdcv = None;
     let mut pasp = None;
 
-    for (p, _) in props {
-        match p {
-            ItemProperty::ColrNclx(c) => color = *c,
-            ItemProperty::ColrIcc(icc) => {
-                if let Some(ref prev) = icc_profile {
-                    img_guard.dusur(prev.len());
-                }
-                let (v, g) = copy_bytes_budgeted(icc, &butce)?;
-                img_guard.birlestir(g);
-                icc_profile = Some(v);
+    if let Some(ref mut ci) = cached_info {
+        for (p, _) in props {
+            match p {
+                ItemProperty::ColrNclx(c) => color = *c,
+                ItemProperty::Clli(c) => clli = Some(*c),
+                ItemProperty::Mdcv(m) => mdcv = Some(*m),
+                ItemProperty::Pasp(pa) => pasp = Some(*pa),
+                _ => {}
             }
-            ItemProperty::Clli(c) => clli = Some(*c),
-            ItemProperty::Mdcv(m) => mdcv = Some(*m),
-            ItemProperty::Pasp(pa) => pasp = Some(*pa),
-            _ => {}
+        }
+        if let Some(icc) = ci.icc_profile.take() {
+            img_guard.ekle(icc.len())?;
+            icc_profile = Some(icc);
+        }
+    } else {
+        for (p, _) in props {
+            match p {
+                ItemProperty::ColrNclx(c) => color = *c,
+                ItemProperty::ColrIcc(icc) => {
+                    if let Some(ref prev) = icc_profile {
+                        img_guard.dusur(prev.len());
+                    }
+                    let (v, g) = copy_bytes_budgeted(icc, &butce)?;
+                    img_guard.birlestir(g);
+                    icc_profile = Some(v);
+                }
+                ItemProperty::Clli(c) => clli = Some(*c),
+                ItemProperty::Mdcv(m) => mdcv = Some(*m),
+                ItemProperty::Pasp(pa) => pasp = Some(*pa),
+                _ => {}
+            }
         }
     }
 
-    let alpha_src = find_alpha_source(&container, primary_id)?;
-    let premultiplied_alpha = is_premultiplied_alpha(&container, primary_id, alpha_src.as_ref());
+    let alpha_src = find_alpha_source(container, primary_id)?;
+    let premultiplied_alpha = is_premultiplied_alpha(container, primary_id, alpha_src.as_ref());
 
     let alpha_plane = if let Some(ref src) = alpha_src {
         let alpha_buf = match src {
             AlphaSource::Direct(aid) => {
-                let mut ab = decode_item_planar(
-                    &container,
-                    *aid,
-                    config,
-                    config.n_threads,
-                    true,
-                    0,
-                    &butce,
-                )?;
+                let mut ab =
+                    decode_item_planar(container, *aid, config, config.n_threads, true, 0, &butce)?;
                 // libavif uyumu: alfa öğesinin kendi irot/imir/clap dönüşümleri dikkate alınmaz,
                 // birincil öğenin dönüşümleri birincil görüntü ile birlikte alfa düzlemine de uygulanır.
                 let alpha_has_transforms = container.item_properties(*aid)?.iter().any(|(p, _)| {
@@ -1986,7 +2112,7 @@ pub(crate) fn decode_with_budget(
                     )
                 });
                 if !alpha_has_transforms {
-                    apply_item_transforms(&container, primary_id, &mut ab, &butce)?;
+                    apply_item_transforms(container, primary_id, &mut ab, &butce)?;
                 }
                 ab
             }
@@ -1999,7 +2125,7 @@ pub(crate) fn decode_with_budget(
                 let grid = parse_grid_descriptor(&grid_bytes)?;
                 drop((grid_bytes, grid_guard));
                 let mut ab = decode_grid_tiles_into_canvas(
-                    &container,
+                    container,
                     grid,
                     alpha_tile_ids,
                     config,
@@ -2007,7 +2133,7 @@ pub(crate) fn decode_with_budget(
                     0,
                     &butce,
                 )?;
-                apply_item_transforms(&container, *grid_item_id, &mut ab, &butce)?;
+                apply_item_transforms(container, *grid_item_id, &mut ab, &butce)?;
                 ab
             }
         };
@@ -2027,85 +2153,111 @@ pub(crate) fn decode_with_budget(
         None
     };
 
-    let (exif, xmp, meta_guard) = extract_metadata_items(&container, primary_id, &butce)?;
-    img_guard.birlestir(meta_guard);
+    let (exif, xmp) = if let Some(ref mut ci) = cached_info {
+        let ex = ci.exif.take();
+        if let Some(ref v) = ex {
+            img_guard.ekle(v.len())?;
+        }
+        let xm = ci.xmp.take();
+        if let Some(ref v) = xm {
+            img_guard.ekle(v.len())?;
+        }
+        (ex, xm)
+    } else {
+        let (ex, xm, meta_guard) = extract_metadata_items(container, primary_id, &butce)?;
+        img_guard.birlestir(meta_guard);
+        (ex, xm)
+    };
     let effective_threads = resolve_effective_threads(config.n_threads);
 
     // ISO 21496-1 `tmap` üst veri ayrıştırması ve normatif doğrulaması her zaman yürütülür;
     // kazanç haritası pikselleri yalnızca `config.decode_gain_map == true` olduğunda çözülür.
-    let (base_raw_w, base_raw_h) = match inspect_item_dimensions(&container, primary_id, 0, &butce)
+    let (gain_map_metadata, gain_map) = if !config.decode_gain_map
+        && let Some(ref mut ci) = cached_info
     {
-        Ok(ins) => (ins.raw_width, ins.raw_height),
-        Err(err @ (Error::BudgetExceeded { .. } | Error::AllocationFailed { .. })) => {
-            return Err(err);
+        let gm_meta = ci.gain_map_metadata.take();
+        if let Some(ref m) = gm_meta
+            && let Some(ref alt_icc) = m.alt_icc_profile
+        {
+            img_guard.ekle(alt_icc.len())?;
         }
-        Err(_) => (color_buf.width, color_buf.height),
-    };
-    let tmap_opt = find_and_validate_tmap(&container, primary_id, base_raw_w, base_raw_h, &butce)?;
-
-    let (gain_map_metadata, gain_map) = if let Some((gm_item_id, gm_meta, tmap_guard)) = tmap_opt {
-        img_guard.birlestir(tmap_guard);
-        let decoded_gm = if config.decode_gain_map {
-            validate_gain_map_transform_parity(&container, primary_id, gm_item_id)?;
-            let gm_buf = decode_item_planar(
-                &container,
-                gm_item_id,
-                config,
-                config.n_threads,
-                false,
-                0,
-                &butce,
-            )?;
-            let gm_props = container.item_properties(gm_item_id)?;
-            let mut gm_color = gm_buf.seq_color.unwrap_or(ColorInfo {
-                color_primaries: 2,
-                transfer_characteristics: 2,
-                matrix_coefficients: 2,
-                full_range: true,
-            });
-            let mut gm_pasp = None;
-            for (p, _) in gm_props {
-                match p {
-                    ItemProperty::ColrNclx(c) => gm_color = *c,
-                    ItemProperty::Pasp(pa) => gm_pasp = Some(*pa),
-                    _ => {}
-                }
-            }
-            let gm_image = AvifImage {
-                width: gm_buf.width,
-                height: gm_buf.height,
-                chroma_width: gm_buf.chroma_width,
-                chroma_height: gm_buf.chroma_height,
-                bit_depth: gm_buf.bit_depth,
-                chroma_format: gm_buf.chroma_format,
-                y_plane: gm_buf.y_plane,
-                u_plane: gm_buf.u_plane,
-                v_plane: gm_buf.v_plane,
-                alpha_plane: None,
-                premultiplied_alpha: false,
-                color: gm_color,
-                icc_profile: None,
-                exif: None,
-                xmp: None,
-                clli: None,
-                mdcv: None,
-                pasp: gm_pasp,
-                gain_map_metadata: None,
-                gain_map: None,
-                effective_threads,
-                butce: Some(Arc::clone(&butce)),
-                _butce_tutucu: Some(Arc::new(gm_buf.budget_guard)),
-            };
-            Some(GainMap {
-                metadata: gm_meta.clone(),
-                image: Box::new(gm_image),
-            })
-        } else {
-            None
-        };
-        (Some(gm_meta), decoded_gm)
+        (gm_meta, None)
     } else {
-        (None, None)
+        let (base_raw_w, base_raw_h) =
+            match inspect_item_dimensions(container, primary_id, 0, &butce) {
+                Ok(ins) => (ins.raw_width, ins.raw_height),
+                Err(err @ (Error::BudgetExceeded { .. } | Error::AllocationFailed { .. })) => {
+                    return Err(err);
+                }
+                Err(_) => (color_buf.width, color_buf.height),
+            };
+        let tmap_opt =
+            find_and_validate_tmap(container, primary_id, base_raw_w, base_raw_h, &butce)?;
+
+        if let Some((gm_item_id, gm_meta, tmap_guard)) = tmap_opt {
+            img_guard.birlestir(tmap_guard);
+            let decoded_gm = if config.decode_gain_map {
+                validate_gain_map_transform_parity(container, primary_id, gm_item_id)?;
+                let gm_buf = decode_item_planar(
+                    container,
+                    gm_item_id,
+                    config,
+                    config.n_threads,
+                    false,
+                    0,
+                    &butce,
+                )?;
+                let gm_props = container.item_properties(gm_item_id)?;
+                let mut gm_color = gm_buf.seq_color.unwrap_or(ColorInfo {
+                    color_primaries: 2,
+                    transfer_characteristics: 2,
+                    matrix_coefficients: 2,
+                    full_range: true,
+                });
+                let mut gm_pasp = None;
+                for (p, _) in gm_props {
+                    match p {
+                        ItemProperty::ColrNclx(c) => gm_color = *c,
+                        ItemProperty::Pasp(pa) => gm_pasp = Some(*pa),
+                        _ => {}
+                    }
+                }
+                let gm_image = AvifImage {
+                    width: gm_buf.width,
+                    height: gm_buf.height,
+                    chroma_width: gm_buf.chroma_width,
+                    chroma_height: gm_buf.chroma_height,
+                    bit_depth: gm_buf.bit_depth,
+                    chroma_format: gm_buf.chroma_format,
+                    y_plane: gm_buf.y_plane,
+                    u_plane: gm_buf.u_plane,
+                    v_plane: gm_buf.v_plane,
+                    alpha_plane: None,
+                    premultiplied_alpha: false,
+                    color: gm_color,
+                    icc_profile: None,
+                    exif: None,
+                    xmp: None,
+                    clli: None,
+                    mdcv: None,
+                    pasp: gm_pasp,
+                    gain_map_metadata: None,
+                    gain_map: None,
+                    effective_threads,
+                    butce: Some(Arc::clone(&butce)),
+                    _butce_tutucu: Some(Arc::new(gm_buf.budget_guard)),
+                };
+                Some(GainMap {
+                    metadata: gm_meta.clone(),
+                    image: Box::new(gm_image),
+                })
+            } else {
+                None
+            };
+            (Some(gm_meta), decoded_gm)
+        } else {
+            (None, None)
+        }
     };
 
     Ok(AvifImage {

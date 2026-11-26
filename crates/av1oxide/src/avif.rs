@@ -23,7 +23,9 @@ pub mod sequence;
 pub(crate) mod tracks;
 
 pub use boxes::probe;
-pub use decode::{decode, decode_rgb8, decode_rgba8, decode_with, parse_info, parse_info_with};
+pub use decode::{
+    AvifPrepared, decode, decode_rgb8, decode_rgba8, decode_with, parse_info, parse_info_with,
+};
 pub use gainmap::{GainMap, GainMapFractionI32, GainMapFractionU32, GainMapMetadata};
 pub use image::{
     AvifDecodeConfig, AvifImage, AvifInfo, AvifPlane, CleanAperture, ColorInfo, ContentLightLevel,

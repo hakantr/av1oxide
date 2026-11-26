@@ -151,11 +151,20 @@ pub(crate) type FxIndexMap<K, V> = indexmap::IndexMap<K, V, rustc_hash::FxBuildH
 /// Ekleme sırasını koruyan deterministik `FxBuildHasher` tabanlı küme.
 pub(crate) type FxIndexSet<T> = indexmap::IndexSet<T, rustc_hash::FxBuildHasher>;
 
+/// `idat` kutusu depolaması: normal `meta` kutusunda dosya içi ofset aralığı (`0` kopya,
+/// öz-referanssız), `cmin` sıkıştırılmış `meta` kutusunda sahipli bayt vektörü.
+#[derive(Clone, Debug)]
+pub(crate) enum IdatStorage {
+    Empty,
+    FileRange(core::ops::Range<usize>),
+    Owned(Vec<u8>),
+}
+
 /// Ayrıştırılmış AVIF / ISOBMFF kapsayıcı yapısı.
 #[allow(dead_code)]
 #[derive(Clone, Debug)]
 pub(crate) struct AvifContainer<'a> {
-    pub(crate) file_data: &'a [u8],
+    pub(crate) file_data: Cow<'a, [u8]>,
     pub(crate) major_brand: [u8; 4],
     pub(crate) compatible_brands: Vec<[u8; 4]>,
     pub(crate) primary_item_id: u32,
@@ -165,7 +174,8 @@ pub(crate) struct AvifContainer<'a> {
     pub(crate) locations: FxIndexMap<u32, IlocItem>,
     pub(crate) references: Vec<ItemReference>,
     pub(crate) entity_groups: Vec<EntityToGroup>,
-    pub(crate) idat: Cow<'a, [u8]>,
+    pub(crate) idat: IdatStorage,
+    pub(crate) owned_bytes: usize,
     pub(crate) _guard: Arc<ButceTutucu>,
 }
 
@@ -432,61 +442,88 @@ pub fn probe(data: &[u8]) -> bool {
     false
 }
 
-/// ISOBMFF / AVIF kapsayıcı yapısını ayrıştırır.
+enum MetaSource {
+    FileRange(core::ops::Range<usize>),
+    Owned(Vec<u8>),
+}
+
+/// Ödünç alınan dilim üzerinden ISOBMFF / AVIF kapsayıcı yapısını ayrıştırır.
 pub(crate) fn parse_container<'a>(data: &'a [u8], butce: &Arc<Butce>) -> Result<AvifContainer<'a>> {
+    parse_container_cow(Cow::Borrowed(data), butce)
+}
+
+/// Sahipli `Vec<u8>` tamponu üzerinden `'static` ömürlü AVIF kapsayıcı yapısını tek geçişte ayrıştırır.
+pub(crate) fn parse_container_owned(
+    data: Vec<u8>,
+    butce: &Arc<Butce>,
+) -> Result<AvifContainer<'static>> {
+    parse_container_cow(Cow::Owned(data), butce)
+}
+
+fn parse_container_cow<'a>(data: Cow<'a, [u8]>, butce: &Arc<Butce>) -> Result<AvifContainer<'a>> {
     let mut offset = 0usize;
     let mut major_brand: Option<[u8; 4]> = None;
     let mut compatible_brands: Vec<[u8; 4]> = Vec::new();
     let mut has_avif_brand = false;
-    let mut meta_payload: Option<Cow<'_, [u8]>> = None;
+    let mut meta_source: Option<MetaSource> = None;
     let mut _cmin_guard: Option<ButceTutucu> = None;
 
-    while let Some(raw_box) = read_box_header(data, offset)? {
-        offset = raw_box.next_offset;
-        match &raw_box.box_type {
-            b"ftyp" => {
-                if raw_box.payload.len() < 8 {
-                    return Err(Error::InvalidData("ftyp kutusu 8 bayttan kısa"));
-                }
-                let major = [
-                    raw_box.payload[0],
-                    raw_box.payload[1],
-                    raw_box.payload[2],
-                    raw_box.payload[3],
-                ];
-                major_brand = Some(major);
-                if is_supported_brand(&major) {
-                    has_avif_brand = true;
-                }
-                for &compat in raw_box.payload[8..].as_chunks::<4>().0 {
-                    compatible_brands.push(compat);
-                    if is_supported_brand(&compat) {
+    {
+        let slice: &[u8] = &data;
+        let base_ptr = slice.as_ptr() as usize;
+        while let Some(raw_box) = read_box_header(slice, offset)? {
+            offset = raw_box.next_offset;
+            match &raw_box.box_type {
+                b"ftyp" => {
+                    if raw_box.payload.len() < 8 {
+                        return Err(Error::InvalidData("ftyp kutusu 8 bayttan kısa"));
+                    }
+                    let major = [
+                        raw_box.payload[0],
+                        raw_box.payload[1],
+                        raw_box.payload[2],
+                        raw_box.payload[3],
+                    ];
+                    major_brand = Some(major);
+                    if is_supported_brand(&major) {
                         has_avif_brand = true;
                     }
+                    for &compat in raw_box.payload[8..].as_chunks::<4>().0 {
+                        compatible_brands.push(compat);
+                        if is_supported_brand(&compat) {
+                            has_avif_brand = true;
+                        }
+                    }
                 }
+                b"meta" => {
+                    if meta_source.is_some() {
+                        return Err(Error::InvalidData("birden fazla üst düzey meta kutusu"));
+                    }
+                    let start = (raw_box.payload.as_ptr() as usize) - base_ptr;
+                    let end = start + raw_box.payload.len();
+                    meta_source = Some(MetaSource::FileRange(start..end));
+                }
+                b"cmin" => {
+                    if meta_source.is_some() {
+                        return Err(Error::InvalidData("birden fazla üst düzey meta kutusu"));
+                    }
+                    let (ver, _flags, body) = read_full_box(raw_box.payload)?;
+                    if ver != 0 || body.len() < 4 {
+                        return Err(Error::InvalidData("geçersiz cmin kutusu"));
+                    }
+                    let comp_type = [body[0], body[1], body[2], body[3]];
+                    let payload_slice = &body[4..];
+                    let (decompressed, guard) = decompress_by_fourcc(
+                        &comp_type,
+                        payload_slice,
+                        payload_slice.len(),
+                        butce,
+                    )?;
+                    meta_source = Some(MetaSource::Owned(decompressed));
+                    _cmin_guard = Some(guard);
+                }
+                _ => {}
             }
-            b"meta" => {
-                if meta_payload.is_some() {
-                    return Err(Error::InvalidData("birden fazla üst düzey meta kutusu"));
-                }
-                meta_payload = Some(Cow::Borrowed(raw_box.payload));
-            }
-            b"cmin" => {
-                if meta_payload.is_some() {
-                    return Err(Error::InvalidData("birden fazla üst düzey meta kutusu"));
-                }
-                let (ver, _flags, body) = read_full_box(raw_box.payload)?;
-                if ver != 0 || body.len() < 4 {
-                    return Err(Error::InvalidData("geçersiz cmin kutusu"));
-                }
-                let comp_type = [body[0], body[1], body[2], body[3]];
-                let payload_slice = &body[4..];
-                let (decompressed, guard) =
-                    decompress_by_fourcc(&comp_type, payload_slice, payload_slice.len(), butce)?;
-                meta_payload = Some(Cow::Owned(decompressed));
-                _cmin_guard = Some(guard);
-            }
-            _ => {}
         }
     }
 
@@ -496,8 +533,8 @@ pub(crate) fn parse_container<'a>(data: &'a [u8], butce: &Arc<Butce>) -> Result<
             "ftyp kutusu desteklenen bir AVIF/MIAF markası içermiyor",
         ));
     }
-    let meta_raw = meta_payload.ok_or(Error::InvalidData("AVIF dosyasında meta kutusu yok"))?;
-    parse_meta_box(data, meta_raw, major_brand, compatible_brands, true, butce)
+    let meta_src = meta_source.ok_or(Error::InvalidData("AVIF dosyasında meta kutusu yok"))?;
+    parse_meta_box_cow(data, meta_src, major_brand, compatible_brands, true, butce)
 }
 
 /// Bir `meta` kutusu yükünü (üst düzey veya `trak` içi gömülü) [`AvifContainer`] olarak ayrıştırır.
@@ -509,13 +546,32 @@ pub(crate) fn parse_meta_box<'a>(
     require_pitm: bool,
     butce: &Arc<Butce>,
 ) -> Result<AvifContainer<'a>> {
-    let (meta_version, _meta_flags, meta_children) = read_full_box(&meta_raw)?;
-    if meta_version != 0 {
-        return Err(Error::Unsupported(
-            "meta kutusu sürümü 0 dışında desteklenmiyor",
-        ));
-    }
+    let meta_src = match meta_raw {
+        Cow::Borrowed(s) => {
+            let base_ptr = file_data.as_ptr() as usize;
+            let start = (s.as_ptr() as usize) - base_ptr;
+            MetaSource::FileRange(start..start + s.len())
+        }
+        Cow::Owned(v) => MetaSource::Owned(v),
+    };
+    parse_meta_box_cow(
+        Cow::Borrowed(file_data),
+        meta_src,
+        major_brand,
+        compatible_brands,
+        require_pitm,
+        butce,
+    )
+}
 
+fn parse_meta_box_cow<'a>(
+    file_data: Cow<'a, [u8]>,
+    meta_src: MetaSource,
+    major_brand: [u8; 4],
+    compatible_brands: Vec<[u8; 4]>,
+    require_pitm: bool,
+    butce: &Arc<Butce>,
+) -> Result<AvifContainer<'a>> {
     let mut primary_item_id: Option<u32> = None;
     let mut items: FxIndexMap<u32, ItemInfoEntry> =
         FxIndexMap::with_hasher(rustc_hash::FxBuildHasher);
@@ -527,85 +583,97 @@ pub(crate) fn parse_meta_box<'a>(
     let mut references: Vec<ItemReference> = Vec::new();
     let mut entity_groups: Vec<EntityToGroup> = Vec::new();
     let mut seen_grpl = false;
-    let mut idat: Cow<'a, [u8]> = Cow::Borrowed(&[]);
+    let mut idat = IdatStorage::Empty;
     let mut idat_owned_bytes = 0usize;
     let mut container_guard = ButceTutucu::bos(butce);
     let mut has_hdlr = false;
 
-    let mut m_off = 0usize;
-    while let Some(child) = read_box_header(meta_children, m_off)? {
-        m_off = child.next_offset;
-        match &child.box_type {
-            b"hdlr" => {
-                let (ver, _flags, body) = read_full_box(child.payload)?;
-                if ver != 0 || body.len() < 8 {
-                    return Err(Error::InvalidData("geçersiz hdlr kutusu"));
+    {
+        let (meta_slice, is_borrowed): (&[u8], bool) = match &meta_src {
+            MetaSource::FileRange(r) => (&file_data[r.clone()], true),
+            MetaSource::Owned(v) => (v.as_slice(), false),
+        };
+        let (meta_version, _meta_flags, meta_children) = read_full_box(meta_slice)?;
+        if meta_version != 0 {
+            return Err(Error::Unsupported(
+                "meta kutusu sürümü 0 dışında desteklenmiyor",
+            ));
+        }
+
+        let base_ptr = file_data.as_ptr() as usize;
+        let mut m_off = 0usize;
+        while let Some(child) = read_box_header(meta_children, m_off)? {
+            m_off = child.next_offset;
+            match &child.box_type {
+                b"hdlr" => {
+                    let (ver, _flags, body) = read_full_box(child.payload)?;
+                    if ver != 0 || body.len() < 8 {
+                        return Err(Error::InvalidData("geçersiz hdlr kutusu"));
+                    }
+                    let handler_type = &body[4..8];
+                    if require_pitm && handler_type != b"pict" {
+                        return Err(Error::InvalidData("meta hdlr türü 'pict' değil"));
+                    }
+                    has_hdlr = true;
                 }
-                let handler_type = &body[4..8];
-                if require_pitm && handler_type != b"pict" {
-                    return Err(Error::InvalidData("meta hdlr türü 'pict' değil"));
+                b"pitm" => {
+                    let (ver, _flags, body) = read_full_box(child.payload)?;
+                    let id = match ver {
+                        0 => u32::from(
+                            read_u16_be(body, 0)
+                                .ok_or(Error::InvalidData("kesik pitm v0 kutusu"))?,
+                        ),
+                        1 => read_u32_be(body, 0)
+                            .ok_or(Error::InvalidData("kesik pitm v1 kutusu"))?,
+                        _ => return Err(Error::Unsupported("desteklenmeyen pitm sürümü")),
+                    };
+                    primary_item_id = Some(id);
                 }
-                has_hdlr = true;
-            }
-            b"pitm" => {
-                let (ver, _flags, body) = read_full_box(child.payload)?;
-                let id = match ver {
-                    0 => u32::from(
-                        read_u16_be(body, 0).ok_or(Error::InvalidData("kesik pitm v0 kutusu"))?,
-                    ),
-                    1 => read_u32_be(body, 0).ok_or(Error::InvalidData("kesik pitm v1 kutusu"))?,
-                    _ => return Err(Error::Unsupported("desteklenmeyen pitm sürümü")),
-                };
-                primary_item_id = Some(id);
-            }
-            b"iinf" => {
-                parse_iinf(child.payload, &mut items)?;
-            }
-            b"iprp" => {
-                parse_iprp(
-                    child.payload,
-                    &mut properties,
-                    &mut associations,
-                    &mut container_guard,
-                )?;
-            }
-            b"iloc" => {
-                parse_iloc(child.payload, &mut locations)?;
-            }
-            b"iref" => {
-                parse_iref(child.payload, &mut references)?;
-            }
-            b"grpl" => {
-                if seen_grpl {
-                    return Err(Error::InvalidData("meta içinde birden fazla grpl kutusu"));
+                b"iinf" => {
+                    parse_iinf(child.payload, &mut items)?;
                 }
-                seen_grpl = true;
-                parse_grpl(child.payload, &mut entity_groups)?;
-            }
-            b"idat" => {
-                if idat_owned_bytes > 0 {
-                    container_guard.dusur(idat_owned_bytes);
-                    idat_owned_bytes = 0;
+                b"iprp" => {
+                    parse_iprp(
+                        child.payload,
+                        &mut properties,
+                        &mut associations,
+                        &mut container_guard,
+                    )?;
                 }
-                idat = match &meta_raw {
-                    Cow::Borrowed(_) => {
-                        let base_ptr = file_data.as_ptr() as usize;
+                b"iloc" => {
+                    parse_iloc(child.payload, &mut locations)?;
+                }
+                b"iref" => {
+                    parse_iref(child.payload, &mut references)?;
+                }
+                b"grpl" => {
+                    if seen_grpl {
+                        return Err(Error::InvalidData("meta içinde birden fazla grpl kutusu"));
+                    }
+                    seen_grpl = true;
+                    parse_grpl(child.payload, &mut entity_groups)?;
+                }
+                b"idat" => {
+                    if idat_owned_bytes > 0 {
+                        container_guard.dusur(idat_owned_bytes);
+                        idat_owned_bytes = 0;
+                    }
+                    idat = if is_borrowed {
                         let child_ptr = child.payload.as_ptr() as usize;
                         let off = child_ptr - base_ptr;
-                        Cow::Borrowed(&file_data[off..off + child.payload.len()])
-                    }
-                    Cow::Owned(_) => {
+                        IdatStorage::FileRange(off..off + child.payload.len())
+                    } else {
                         let len = child.payload.len();
                         container_guard.ekle(len)?;
                         let v = kopya_vec(child.payload).inspect_err(|_| {
                             container_guard.dusur(len);
                         })?;
                         idat_owned_bytes = len;
-                        Cow::Owned(v)
-                    }
-                };
+                        IdatStorage::Owned(v)
+                    };
+                }
+                _ => {}
             }
-            _ => {}
         }
     }
 
@@ -617,6 +685,7 @@ pub(crate) fn parse_meta_box<'a>(
     } else {
         primary_item_id.unwrap_or(0)
     };
+    let owned_bytes = container_guard.bayt();
 
     Ok(AvifContainer {
         file_data,
@@ -630,6 +699,7 @@ pub(crate) fn parse_meta_box<'a>(
         references,
         entity_groups,
         idat,
+        owned_bytes,
         _guard: Arc::new(container_guard),
     })
 }
@@ -1396,21 +1466,42 @@ impl<'a> AvifContainer<'a> {
         sources
     }
 
+    /// İçeride tutulan ham dosya bayt diliminin uzunluğu.
+    #[inline]
+    pub(crate) fn raw_len(&self) -> usize {
+        self.file_data.len()
+    }
+
+    /// Kapsayıcı içinde sahipli tutulan (`cmin` `idat`, `ColrIcc`, `Av1C.config_obus`) bayt toplamı.
+    #[inline]
+    pub(crate) const fn owned_bytes(&self) -> usize {
+        self.owned_bytes
+    }
+
+    #[inline]
+    fn idat_slice(&self) -> &[u8] {
+        match &self.idat {
+            IdatStorage::Empty => &[],
+            IdatStorage::FileRange(r) => &self.file_data[r.clone()],
+            IdatStorage::Owned(v) => v.as_slice(),
+        }
+    }
+
     /// Belirtilen öğenin bayt yükünü `iloc` üzerinden çözümler.
-    pub(crate) fn resolve_item_data(
-        &self,
+    pub(crate) fn resolve_item_data<'b>(
+        &'b self,
         item_id: u32,
         butce: &Arc<Butce>,
-    ) -> Result<(Cow<'a, [u8]>, ButceTutucu)> {
+    ) -> Result<(Cow<'b, [u8]>, ButceTutucu)> {
         self.resolve_item_data_inner(item_id, butce, 0)
     }
 
-    fn resolve_item_data_inner(
-        &self,
+    fn resolve_item_data_inner<'b>(
+        &'b self,
         item_id: u32,
         butce: &Arc<Butce>,
         depth: usize,
-    ) -> Result<(Cow<'a, [u8]>, ButceTutucu)> {
+    ) -> Result<(Cow<'b, [u8]>, ButceTutucu)> {
         if depth > 4 {
             return Err(Error::InvalidData(
                 "iloc item_offset zinciri derinlik sınırını aştı",
@@ -1431,6 +1522,11 @@ impl<'a> AvifContainer<'a> {
 
         let (raw, guard) = match loc.construction_method {
             0 | 1 => {
+                let source: &'b [u8] = if loc.construction_method == 0 {
+                    &self.file_data
+                } else {
+                    self.idat_slice()
+                };
                 if loc.extents.len() == 1 {
                     let ext = &loc.extents[0];
                     let start64 = loc
@@ -1444,34 +1540,11 @@ impl<'a> AvifContainer<'a> {
                     let end = start
                         .checked_add(len)
                         .ok_or(Error::InvalidData("iloc bitiş ofseti taşması"))?;
-                    if loc.construction_method == 0 {
-                        let slice = self.file_data.get(start..end).ok_or(Error::InvalidData(
-                            "iloc extent dosya/idat sınırları dışında",
-                        ))?;
-                        (Cow::Borrowed(slice), ButceTutucu::bos(butce))
-                    } else {
-                        match &self.idat {
-                            Cow::Borrowed(s) => {
-                                let slice = s.get(start..end).ok_or(Error::InvalidData(
-                                    "iloc extent dosya/idat sınırları dışında",
-                                ))?;
-                                (Cow::Borrowed(slice), ButceTutucu::bos(butce))
-                            }
-                            Cow::Owned(v) => {
-                                let slice = v.get(start..end).ok_or(Error::InvalidData(
-                                    "iloc extent dosya/idat sınırları dışında",
-                                ))?;
-                                let g = Butce::tut(butce, slice.len())?;
-                                (Cow::Owned(kopya_vec(slice)?), g)
-                            }
-                        }
-                    }
+                    let slice = source.get(start..end).ok_or(Error::InvalidData(
+                        "iloc extent dosya/idat sınırları dışında",
+                    ))?;
+                    (Cow::Borrowed(slice), ButceTutucu::bos(butce))
                 } else {
-                    let source: &[u8] = if loc.construction_method == 0 {
-                        self.file_data
-                    } else {
-                        &self.idat
-                    };
                     let mut total_len = 0usize;
                     for ext in &loc.extents {
                         let len = usize::try_from(ext.extent_length).map_err(|_| {
@@ -1565,13 +1638,13 @@ impl<'a> AvifContainer<'a> {
         self.decompress_item_if_needed(item_id, raw, guard, butce)
     }
 
-    fn decompress_item_if_needed(
+    fn decompress_item_if_needed<'b>(
         &self,
         item_id: u32,
-        mut data: Cow<'a, [u8]>,
+        mut data: Cow<'b, [u8]>,
         mut guard: ButceTutucu,
         butce: &Arc<Butce>,
-    ) -> Result<(Cow<'a, [u8]>, ButceTutucu)> {
+    ) -> Result<(Cow<'b, [u8]>, ButceTutucu)> {
         let orig_compressed_len = data.len();
         if let Some(info) = self.items.get(&item_id)
             && !info.content_encoding.is_empty()

@@ -1049,6 +1049,232 @@ impl<'a> PixelSink for Rgba16AlphaU16Sink<'a> {
     }
 }
 
+/// Etkin bit derinliğindeki (`8`/`10`/`12`-bit) örneği tam `[0..=65535]` 16-bit aralığına
+/// yuvarlayarak ölçekler (`image::ColorType::Rgb16` / `Rgba16` sözleşmesi).
+#[inline(always)]
+const fn scale_sample_to_u16_full(bit_depth: BitDepth, v: u16) -> u16 {
+    match bit_depth {
+        BitDepth::Eight => v.saturating_mul(257),
+        BitDepth::Ten => {
+            let clamped = if v > 1023 { 1023 } else { v };
+            ((clamped as u32 * 65_535 + 511) / 1023) as u16
+        }
+        BitDepth::Twelve => {
+            let clamped = if v > 4095 { 4095 } else { v };
+            ((clamped as u32 * 65_535 + 2047) / 4095) as u16
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct Rgb16ScaledNeSink {
+    max_f: f32,
+    bit_depth: BitDepth,
+}
+
+impl PixelSink for Rgb16ScaledNeSink {
+    type Channel = u8;
+    type RowAlpha<'r> = ();
+    const CHANNELS: usize = 6;
+
+    #[inline(always)]
+    fn row_alpha(&self, _row: usize) {}
+
+    #[inline(always)]
+    fn write_rgb(&self, dst: &mut [u8], r: f32, g: f32, b: f32, _row_alpha: (), _x: usize) {
+        let rq = scale_sample_to_u16_full(self.bit_depth, (0.5f32 + (r * self.max_f)) as u16)
+            .to_ne_bytes();
+        let gq = scale_sample_to_u16_full(self.bit_depth, (0.5f32 + (g * self.max_f)) as u16)
+            .to_ne_bytes();
+        let bq = scale_sample_to_u16_full(self.bit_depth, (0.5f32 + (b * self.max_f)) as u16)
+            .to_ne_bytes();
+        dst[0] = rq[0];
+        dst[1] = rq[1];
+        dst[2] = gq[0];
+        dst[3] = gq[1];
+        dst[4] = bq[0];
+        dst[5] = bq[1];
+    }
+
+    #[inline(always)]
+    fn write_gray(&self, dst: &mut [u8], gray: f32, _row_alpha: (), _x: usize) {
+        let q = scale_sample_to_u16_full(self.bit_depth, (0.5f32 + (gray * self.max_f)) as u16)
+            .to_ne_bytes();
+        dst[0] = q[0];
+        dst[1] = q[1];
+        dst[2] = q[0];
+        dst[3] = q[1];
+        dst[4] = q[0];
+        dst[5] = q[1];
+    }
+}
+
+#[derive(Clone, Copy)]
+struct Rgba16ScaledNeOpaqueSink {
+    max_f: f32,
+    bit_depth: BitDepth,
+}
+
+impl PixelSink for Rgba16ScaledNeOpaqueSink {
+    type Channel = u8;
+    type RowAlpha<'r> = ();
+    const CHANNELS: usize = 8;
+
+    #[inline(always)]
+    fn row_alpha(&self, _row: usize) {}
+
+    #[inline(always)]
+    fn write_rgb(&self, dst: &mut [u8], r: f32, g: f32, b: f32, _row_alpha: (), _x: usize) {
+        let rq = scale_sample_to_u16_full(self.bit_depth, (0.5f32 + (r * self.max_f)) as u16)
+            .to_ne_bytes();
+        let gq = scale_sample_to_u16_full(self.bit_depth, (0.5f32 + (g * self.max_f)) as u16)
+            .to_ne_bytes();
+        let bq = scale_sample_to_u16_full(self.bit_depth, (0.5f32 + (b * self.max_f)) as u16)
+            .to_ne_bytes();
+        let aq = 65_535u16.to_ne_bytes();
+        dst[0] = rq[0];
+        dst[1] = rq[1];
+        dst[2] = gq[0];
+        dst[3] = gq[1];
+        dst[4] = bq[0];
+        dst[5] = bq[1];
+        dst[6] = aq[0];
+        dst[7] = aq[1];
+    }
+
+    #[inline(always)]
+    fn write_gray(&self, dst: &mut [u8], gray: f32, _row_alpha: (), _x: usize) {
+        let q = scale_sample_to_u16_full(self.bit_depth, (0.5f32 + (gray * self.max_f)) as u16)
+            .to_ne_bytes();
+        let aq = 65_535u16.to_ne_bytes();
+        dst[0] = q[0];
+        dst[1] = q[1];
+        dst[2] = q[0];
+        dst[3] = q[1];
+        dst[4] = q[0];
+        dst[5] = q[1];
+        dst[6] = aq[0];
+        dst[7] = aq[1];
+    }
+}
+
+#[derive(Clone, Copy)]
+struct Rgba16ScaledNeAlphaU8Sink<'a> {
+    max_f: f32,
+    bit_depth: BitDepth,
+    alpha: &'a [u8],
+    stride: usize,
+}
+
+impl<'a> PixelSink for Rgba16ScaledNeAlphaU8Sink<'a> {
+    type Channel = u8;
+    type RowAlpha<'r>
+        = &'a [u8]
+    where
+        Self: 'r;
+    const CHANNELS: usize = 8;
+
+    #[inline(always)]
+    fn row_alpha(&self, row: usize) -> &'a [u8] {
+        let start = row * self.stride;
+        &self.alpha[start..start + self.stride]
+    }
+
+    #[inline(always)]
+    fn write_rgb(&self, dst: &mut [u8], r: f32, g: f32, b: f32, row_alpha: &'a [u8], x: usize) {
+        let rq = scale_sample_to_u16_full(self.bit_depth, (0.5f32 + (r * self.max_f)) as u16)
+            .to_ne_bytes();
+        let gq = scale_sample_to_u16_full(self.bit_depth, (0.5f32 + (g * self.max_f)) as u16)
+            .to_ne_bytes();
+        let bq = scale_sample_to_u16_full(self.bit_depth, (0.5f32 + (b * self.max_f)) as u16)
+            .to_ne_bytes();
+        let aq = (u16::from(row_alpha[x]) * 257).to_ne_bytes();
+        dst[0] = rq[0];
+        dst[1] = rq[1];
+        dst[2] = gq[0];
+        dst[3] = gq[1];
+        dst[4] = bq[0];
+        dst[5] = bq[1];
+        dst[6] = aq[0];
+        dst[7] = aq[1];
+    }
+
+    #[inline(always)]
+    fn write_gray(&self, dst: &mut [u8], gray: f32, row_alpha: &'a [u8], x: usize) {
+        let q = scale_sample_to_u16_full(self.bit_depth, (0.5f32 + (gray * self.max_f)) as u16)
+            .to_ne_bytes();
+        let aq = (u16::from(row_alpha[x]) * 257).to_ne_bytes();
+        dst[0] = q[0];
+        dst[1] = q[1];
+        dst[2] = q[0];
+        dst[3] = q[1];
+        dst[4] = q[0];
+        dst[5] = q[1];
+        dst[6] = aq[0];
+        dst[7] = aq[1];
+    }
+}
+
+#[derive(Clone, Copy)]
+struct Rgba16ScaledNeAlphaU16Sink<'a> {
+    max_f: f32,
+    bit_depth: BitDepth,
+    opaque_alpha: u16,
+    alpha: &'a [u16],
+    stride: usize,
+}
+
+impl<'a> PixelSink for Rgba16ScaledNeAlphaU16Sink<'a> {
+    type Channel = u8;
+    type RowAlpha<'r>
+        = &'a [u16]
+    where
+        Self: 'r;
+    const CHANNELS: usize = 8;
+
+    #[inline(always)]
+    fn row_alpha(&self, row: usize) -> &'a [u16] {
+        let start = row * self.stride;
+        &self.alpha[start..start + self.stride]
+    }
+
+    #[inline(always)]
+    fn write_rgb(&self, dst: &mut [u8], r: f32, g: f32, b: f32, row_alpha: &'a [u16], x: usize) {
+        let rq = scale_sample_to_u16_full(self.bit_depth, (0.5f32 + (r * self.max_f)) as u16)
+            .to_ne_bytes();
+        let gq = scale_sample_to_u16_full(self.bit_depth, (0.5f32 + (g * self.max_f)) as u16)
+            .to_ne_bytes();
+        let bq = scale_sample_to_u16_full(self.bit_depth, (0.5f32 + (b * self.max_f)) as u16)
+            .to_ne_bytes();
+        let aq = scale_sample_to_u16_full(self.bit_depth, row_alpha[x].min(self.opaque_alpha))
+            .to_ne_bytes();
+        dst[0] = rq[0];
+        dst[1] = rq[1];
+        dst[2] = gq[0];
+        dst[3] = gq[1];
+        dst[4] = bq[0];
+        dst[5] = bq[1];
+        dst[6] = aq[0];
+        dst[7] = aq[1];
+    }
+
+    #[inline(always)]
+    fn write_gray(&self, dst: &mut [u8], gray: f32, row_alpha: &'a [u16], x: usize) {
+        let q = scale_sample_to_u16_full(self.bit_depth, (0.5f32 + (gray * self.max_f)) as u16)
+            .to_ne_bytes();
+        let aq = scale_sample_to_u16_full(self.bit_depth, row_alpha[x].min(self.opaque_alpha))
+            .to_ne_bytes();
+        dst[0] = q[0];
+        dst[1] = q[1];
+        dst[2] = q[0];
+        dst[3] = q[1];
+        dst[4] = q[0];
+        dst[5] = q[1];
+        dst[6] = aq[0];
+        dst[7] = aq[1];
+    }
+}
+
 #[inline(always)]
 fn bilinear_col_indices(i: usize, w: usize, cw: usize) -> (usize, usize) {
     let uv_i = (i >> 1).min(cw - 1);
@@ -1862,9 +2088,7 @@ fn build_alpha_u8_lut_budgeted(
     Ok((build_alpha_u8_lut(bit_depth), guard))
 }
 
-/// [`AvifImage`] düzlemlerini 16-bit RGB tamponuna dönüştürür.
-pub(crate) fn image_to_rgb16(img: &AvifImage) -> Result<Rgb16Image> {
-    validate_matrix_coefficients(img.color.matrix_coefficients)?;
+fn expected_output_len(img: &AvifImage, elem_per_pixel: usize) -> Result<usize> {
     let w = img.width as usize;
     let h = img.height as usize;
     let num_pixels = w.checked_mul(h).ok_or(Error::SizeOverflow {
@@ -1872,13 +2096,24 @@ pub(crate) fn image_to_rgb16(img: &AvifImage) -> Result<Rgb16Image> {
         lhs: w,
         rhs: h,
     })?;
-    let total_samples = num_pixels.checked_mul(3).ok_or(Error::SizeOverflow {
-        stage: SizeStage::TotalAllocation,
-        lhs: num_pixels,
-        rhs: 3,
-    })?;
-    let (mut pixels, _out_guard): (Vec<u16>, _) =
-        alloc_output_vec(total_samples, img.butce.as_ref())?;
+    num_pixels
+        .checked_mul(elem_per_pixel)
+        .ok_or(Error::SizeOverflow {
+            stage: SizeStage::TotalAllocation,
+            lhs: num_pixels,
+            rhs: elem_per_pixel,
+        })
+}
+
+/// [`AvifImage`] düzlemlerini doğrudan çağıranın sağladığı 16-bit RGB dilimine yazar (`0` çıktı tahsisi).
+pub(crate) fn write_rgb16_into(img: &AvifImage, dst: &mut [u16]) -> Result<()> {
+    validate_matrix_coefficients(img.color.matrix_coefficients)?;
+    let expected = expected_output_len(img, 3)?;
+    if dst.len() != expected {
+        return Err(Error::InvalidArgument(
+            "RGB16 çıktı dilimi uzunluğu width * height * 3 ile eşleşmiyor",
+        ));
+    }
     let max_val = img.bit_depth.max_sample() as usize;
     let max_f = max_val as f32;
     let sink = Rgb16Sink { max_f };
@@ -1891,7 +2126,7 @@ pub(crate) fn image_to_rgb16(img: &AvifImage) -> Result<Rgb16Image> {
                 table_y: &ty,
                 table_uv: &tuv,
             };
-            dispatch_matrix(yp, up, vp, &mut pixels, img, max_f, max_f, src, sink);
+            dispatch_matrix(yp, up, vp, dst, img, max_f, max_f, src, sink);
         }
         (PlaneStorage::U16(yp), PlaneStorage::U16(up), PlaneStorage::U16(vp)) => {
             let (ty, tuv, _tbl_guard) = build_unorm_tables_budgeted(
@@ -1905,7 +2140,7 @@ pub(crate) fn image_to_rgb16(img: &AvifImage) -> Result<Rgb16Image> {
                 table_uv: &tuv,
                 max_val,
             };
-            dispatch_matrix(yp, up, vp, &mut pixels, img, max_f, max_f, src, sink);
+            dispatch_matrix(yp, up, vp, dst, img, max_f, max_f, src, sink);
         }
         _ => {
             return Err(Error::InvalidState(
@@ -1913,7 +2148,16 @@ pub(crate) fn image_to_rgb16(img: &AvifImage) -> Result<Rgb16Image> {
             ));
         }
     }
+    Ok(())
+}
 
+/// [`AvifImage`] düzlemlerini 16-bit RGB tamponuna dönüştürür.
+pub(crate) fn image_to_rgb16(img: &AvifImage) -> Result<Rgb16Image> {
+    validate_matrix_coefficients(img.color.matrix_coefficients)?;
+    let total_samples = expected_output_len(img, 3)?;
+    let (mut pixels, _out_guard): (Vec<u16>, _) =
+        alloc_output_vec(total_samples, img.butce.as_ref())?;
+    write_rgb16_into(img, &mut pixels)?;
     Ok(Rgb16Image {
         width: img.width,
         height: img.height,
@@ -1922,23 +2166,16 @@ pub(crate) fn image_to_rgb16(img: &AvifImage) -> Result<Rgb16Image> {
     })
 }
 
-/// [`AvifImage`] düzlemlerini 16-bit RGBA tamponuna dönüştürür.
-pub(crate) fn image_to_rgba16(img: &AvifImage) -> Result<Rgba16Image> {
+/// [`AvifImage`] düzlemlerini doğrudan çağıranın sağladığı 16-bit RGBA dilimine yazar (`0` çıktı tahsisi).
+pub(crate) fn write_rgba16_into(img: &AvifImage, dst: &mut [u16]) -> Result<()> {
     validate_matrix_coefficients(img.color.matrix_coefficients)?;
+    let expected = expected_output_len(img, 4)?;
+    if dst.len() != expected {
+        return Err(Error::InvalidArgument(
+            "RGBA16 çıktı dilimi uzunluğu width * height * 4 ile eşleşmiyor",
+        ));
+    }
     let w = img.width as usize;
-    let h = img.height as usize;
-    let num_pixels = w.checked_mul(h).ok_or(Error::SizeOverflow {
-        stage: SizeStage::PlaneArea,
-        lhs: w,
-        rhs: h,
-    })?;
-    let total_samples = num_pixels.checked_mul(4).ok_or(Error::SizeOverflow {
-        stage: SizeStage::TotalAllocation,
-        lhs: num_pixels,
-        rhs: 4,
-    })?;
-    let (mut pixels, _out_guard): (Vec<u16>, _) =
-        alloc_output_vec(total_samples, img.butce.as_ref())?;
     let max_val = img.bit_depth.max_sample() as usize;
     let max_f = max_val as f32;
     let opaque_alpha = max_val as u16;
@@ -1958,14 +2195,14 @@ pub(crate) fn image_to_rgba16(img: &AvifImage) -> Result<Rgba16Image> {
                         alpha: ap,
                         stride: w,
                     };
-                    dispatch_matrix(yp, up, vp, &mut pixels, img, max_f, max_f, src, sink);
+                    dispatch_matrix(yp, up, vp, dst, img, max_f, max_f, src, sink);
                 }
                 None => {
                     let sink = Rgba16OpaqueSink {
                         max_f,
                         opaque_alpha,
                     };
-                    dispatch_matrix(yp, up, vp, &mut pixels, img, max_f, max_f, src, sink);
+                    dispatch_matrix(yp, up, vp, dst, img, max_f, max_f, src, sink);
                 }
                 Some(PlaneStorage::U16(_)) => {
                     return Err(Error::InvalidState(
@@ -1994,14 +2231,14 @@ pub(crate) fn image_to_rgba16(img: &AvifImage) -> Result<Rgba16Image> {
                         alpha: ap,
                         stride: w,
                     };
-                    dispatch_matrix(yp, up, vp, &mut pixels, img, max_f, max_f, src, sink);
+                    dispatch_matrix(yp, up, vp, dst, img, max_f, max_f, src, sink);
                 }
                 None => {
                     let sink = Rgba16OpaqueSink {
                         max_f,
                         opaque_alpha,
                     };
-                    dispatch_matrix(yp, up, vp, &mut pixels, img, max_f, max_f, src, sink);
+                    dispatch_matrix(yp, up, vp, dst, img, max_f, max_f, src, sink);
                 }
                 Some(PlaneStorage::U8(_)) => {
                     return Err(Error::InvalidState(
@@ -2016,7 +2253,16 @@ pub(crate) fn image_to_rgba16(img: &AvifImage) -> Result<Rgba16Image> {
             ));
         }
     }
+    Ok(())
+}
 
+/// [`AvifImage`] düzlemlerini 16-bit RGBA tamponuna dönüştürür.
+pub(crate) fn image_to_rgba16(img: &AvifImage) -> Result<Rgba16Image> {
+    validate_matrix_coefficients(img.color.matrix_coefficients)?;
+    let total_samples = expected_output_len(img, 4)?;
+    let (mut pixels, _out_guard): (Vec<u16>, _) =
+        alloc_output_vec(total_samples, img.butce.as_ref())?;
+    write_rgba16_into(img, &mut pixels)?;
     Ok(Rgba16Image {
         width: img.width,
         height: img.height,
@@ -2025,22 +2271,15 @@ pub(crate) fn image_to_rgba16(img: &AvifImage) -> Result<Rgba16Image> {
     })
 }
 
-/// [`AvifImage`] düzlemlerini 8-bit RGB tamponuna dönüştürür.
-pub(crate) fn image_to_rgb8(img: &AvifImage) -> Result<RgbImage> {
+/// [`AvifImage`] düzlemlerini doğrudan çağıranın sağladığı 8-bit RGB dilimine yazar (`0` çıktı tahsisi).
+pub(crate) fn write_rgb8_into(img: &AvifImage, dst: &mut [u8]) -> Result<()> {
     validate_matrix_coefficients(img.color.matrix_coefficients)?;
-    let w = img.width as usize;
-    let h = img.height as usize;
-    let num_pixels = w.checked_mul(h).ok_or(Error::SizeOverflow {
-        stage: SizeStage::PlaneArea,
-        lhs: w,
-        rhs: h,
-    })?;
-    let total_bytes = num_pixels.checked_mul(3).ok_or(Error::SizeOverflow {
-        stage: SizeStage::TotalAllocation,
-        lhs: num_pixels,
-        rhs: 3,
-    })?;
-    let (mut pixels, _out_guard): (Vec<u8>, _) = alloc_output_vec(total_bytes, img.butce.as_ref())?;
+    let expected = expected_output_len(img, 3)?;
+    if dst.len() != expected {
+        return Err(Error::InvalidArgument(
+            "RGB8 çıktı dilimi uzunluğu width * height * 3 ile eşleşmiyor",
+        ));
+    }
     let max_val = img.bit_depth.max_sample() as usize;
     let yuv_max_f = max_val as f32;
     let identity = img.color.matrix_coefficients == 0;
@@ -2052,17 +2291,7 @@ pub(crate) fn image_to_rgb8(img: &AvifImage) -> Result<RgbImage> {
                 table_y: &ty,
                 table_uv: &tuv,
             };
-            dispatch_matrix(
-                yp,
-                up,
-                vp,
-                &mut pixels,
-                img,
-                yuv_max_f,
-                255.0,
-                src,
-                Rgb8Sink,
-            );
+            dispatch_matrix(yp, up, vp, dst, img, yuv_max_f, 255.0, src, Rgb8Sink);
         }
         (PlaneStorage::U16(yp), PlaneStorage::U16(up), PlaneStorage::U16(vp)) => {
             let (ty, tuv, _tbl_guard) = build_unorm_tables_budgeted(
@@ -2076,17 +2305,7 @@ pub(crate) fn image_to_rgb8(img: &AvifImage) -> Result<RgbImage> {
                 table_uv: &tuv,
                 max_val,
             };
-            dispatch_matrix(
-                yp,
-                up,
-                vp,
-                &mut pixels,
-                img,
-                yuv_max_f,
-                255.0,
-                src,
-                Rgb8Sink,
-            );
+            dispatch_matrix(yp, up, vp, dst, img, yuv_max_f, 255.0, src, Rgb8Sink);
         }
         _ => {
             return Err(Error::InvalidState(
@@ -2094,7 +2313,15 @@ pub(crate) fn image_to_rgb8(img: &AvifImage) -> Result<RgbImage> {
             ));
         }
     }
+    Ok(())
+}
 
+/// [`AvifImage`] düzlemlerini 8-bit RGB tamponuna dönüştürür.
+pub(crate) fn image_to_rgb8(img: &AvifImage) -> Result<RgbImage> {
+    validate_matrix_coefficients(img.color.matrix_coefficients)?;
+    let total_bytes = expected_output_len(img, 3)?;
+    let (mut pixels, _out_guard): (Vec<u8>, _) = alloc_output_vec(total_bytes, img.butce.as_ref())?;
+    write_rgb8_into(img, &mut pixels)?;
     Ok(RgbImage {
         width: img.width,
         height: img.height,
@@ -2102,22 +2329,16 @@ pub(crate) fn image_to_rgb8(img: &AvifImage) -> Result<RgbImage> {
     })
 }
 
-/// [`AvifImage`] düzlemlerini 8-bit RGBA tamponuna dönüştürür.
-pub(crate) fn image_to_rgba8(img: &AvifImage) -> Result<RgbaImage> {
+/// [`AvifImage`] düzlemlerini doğrudan çağıranın sağladığı 8-bit RGBA dilimine yazar (`0` çıktı tahsisi).
+pub(crate) fn write_rgba8_into(img: &AvifImage, dst: &mut [u8]) -> Result<()> {
     validate_matrix_coefficients(img.color.matrix_coefficients)?;
+    let expected = expected_output_len(img, 4)?;
+    if dst.len() != expected {
+        return Err(Error::InvalidArgument(
+            "RGBA8 çıktı dilimi uzunluğu width * height * 4 ile eşleşmiyor",
+        ));
+    }
     let w = img.width as usize;
-    let h = img.height as usize;
-    let num_pixels = w.checked_mul(h).ok_or(Error::SizeOverflow {
-        stage: SizeStage::PlaneArea,
-        lhs: w,
-        rhs: h,
-    })?;
-    let total_bytes = num_pixels.checked_mul(4).ok_or(Error::SizeOverflow {
-        stage: SizeStage::TotalAllocation,
-        lhs: num_pixels,
-        rhs: 4,
-    })?;
-    let (mut pixels, _out_guard): (Vec<u8>, _) = alloc_output_vec(total_bytes, img.butce.as_ref())?;
     let max_val = img.bit_depth.max_sample() as usize;
     let yuv_max_f = max_val as f32;
     let identity = img.color.matrix_coefficients == 0;
@@ -2135,20 +2356,10 @@ pub(crate) fn image_to_rgba8(img: &AvifImage) -> Result<RgbaImage> {
                         alpha: ap,
                         stride: w,
                     };
-                    dispatch_matrix(yp, up, vp, &mut pixels, img, yuv_max_f, 255.0, src, sink);
+                    dispatch_matrix(yp, up, vp, dst, img, yuv_max_f, 255.0, src, sink);
                 }
                 None => {
-                    dispatch_matrix(
-                        yp,
-                        up,
-                        vp,
-                        &mut pixels,
-                        img,
-                        yuv_max_f,
-                        255.0,
-                        src,
-                        Rgba8OpaqueSink,
-                    );
+                    dispatch_matrix(yp, up, vp, dst, img, yuv_max_f, 255.0, src, Rgba8OpaqueSink);
                 }
                 Some(PlaneStorage::U16(_)) => {
                     return Err(Error::InvalidState(
@@ -2179,20 +2390,10 @@ pub(crate) fn image_to_rgba8(img: &AvifImage) -> Result<RgbaImage> {
                         max_val,
                         lut: &lut,
                     };
-                    dispatch_matrix(yp, up, vp, &mut pixels, img, yuv_max_f, 255.0, src, sink);
+                    dispatch_matrix(yp, up, vp, dst, img, yuv_max_f, 255.0, src, sink);
                 }
                 None => {
-                    dispatch_matrix(
-                        yp,
-                        up,
-                        vp,
-                        &mut pixels,
-                        img,
-                        yuv_max_f,
-                        255.0,
-                        src,
-                        Rgba8OpaqueSink,
-                    );
+                    dispatch_matrix(yp, up, vp, dst, img, yuv_max_f, 255.0, src, Rgba8OpaqueSink);
                 }
                 Some(PlaneStorage::U8(_)) => {
                     return Err(Error::InvalidState(
@@ -2207,12 +2408,163 @@ pub(crate) fn image_to_rgba8(img: &AvifImage) -> Result<RgbaImage> {
             ));
         }
     }
+    Ok(())
+}
 
+/// [`AvifImage`] düzlemlerini 8-bit RGBA tamponuna dönüştürür.
+pub(crate) fn image_to_rgba8(img: &AvifImage) -> Result<RgbaImage> {
+    validate_matrix_coefficients(img.color.matrix_coefficients)?;
+    let total_bytes = expected_output_len(img, 4)?;
+    let (mut pixels, _out_guard): (Vec<u8>, _) = alloc_output_vec(total_bytes, img.butce.as_ref())?;
+    write_rgba8_into(img, &mut pixels)?;
     Ok(RgbaImage {
         width: img.width,
         height: img.height,
         pixels,
     })
+}
+
+/// [`AvifImage`] düzlemlerini `[0..=65535]` tam 16-bit aralığına ölçekleyip yerel-endian
+/// bayt çiftleri halinde doğrudan çağıranın RGB16 bayt dilimine yazar (`0` ara vektör tahsisi).
+pub(crate) fn write_rgb16_scaled_ne_into(img: &AvifImage, dst: &mut [u8]) -> Result<()> {
+    validate_matrix_coefficients(img.color.matrix_coefficients)?;
+    let expected = expected_output_len(img, 6)?;
+    if dst.len() != expected {
+        return Err(Error::InvalidArgument(
+            "ölçekli RGB16 bayt dilimi uzunluğu width * height * 6 ile eşleşmiyor",
+        ));
+    }
+    let max_val = img.bit_depth.max_sample() as usize;
+    let max_f = max_val as f32;
+    let sink = Rgb16ScaledNeSink {
+        max_f,
+        bit_depth: img.bit_depth,
+    };
+    let identity = img.color.matrix_coefficients == 0;
+
+    match (&img.y_plane, &img.u_plane, &img.v_plane) {
+        (PlaneStorage::U8(yp), PlaneStorage::U8(up), PlaneStorage::U8(vp)) => {
+            let (ty, tuv) = build_unorm_tables_8bit(img.color.full_range, identity);
+            let src = TablesU8 {
+                table_y: &ty,
+                table_uv: &tuv,
+            };
+            dispatch_matrix(yp, up, vp, dst, img, max_f, max_f, src, sink);
+        }
+        (PlaneStorage::U16(yp), PlaneStorage::U16(up), PlaneStorage::U16(vp)) => {
+            let (ty, tuv, _tbl_guard) = build_unorm_tables_budgeted(
+                img.bit_depth,
+                img.color.full_range,
+                identity,
+                img.butce.as_ref(),
+            )?;
+            let src = TablesU16 {
+                table_y: &ty,
+                table_uv: &tuv,
+                max_val,
+            };
+            dispatch_matrix(yp, up, vp, dst, img, max_f, max_f, src, sink);
+        }
+        _ => {
+            return Err(Error::InvalidState(
+                "AVIF düzlem depolama bit derinlikleri tutarsız",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// [`AvifImage`] düzlemlerini `[0..=65535]` tam 16-bit aralığına ölçekleyip yerel-endian
+/// bayt çiftleri halinde doğrudan çağıranın RGBA16 bayt dilimine yazar (`0` ara vektör tahsisi).
+pub(crate) fn write_rgba16_scaled_ne_into(img: &AvifImage, dst: &mut [u8]) -> Result<()> {
+    validate_matrix_coefficients(img.color.matrix_coefficients)?;
+    let expected = expected_output_len(img, 8)?;
+    if dst.len() != expected {
+        return Err(Error::InvalidArgument(
+            "ölçekli RGBA16 bayt dilimi uzunluğu width * height * 8 ile eşleşmiyor",
+        ));
+    }
+    let w = img.width as usize;
+    let max_val = img.bit_depth.max_sample() as usize;
+    let max_f = max_val as f32;
+    let opaque_alpha = max_val as u16;
+    let identity = img.color.matrix_coefficients == 0;
+
+    match (&img.y_plane, &img.u_plane, &img.v_plane) {
+        (PlaneStorage::U8(yp), PlaneStorage::U8(up), PlaneStorage::U8(vp)) => {
+            let (ty, tuv) = build_unorm_tables_8bit(img.color.full_range, identity);
+            let src = TablesU8 {
+                table_y: &ty,
+                table_uv: &tuv,
+            };
+            match img.alpha_plane.as_ref() {
+                Some(PlaneStorage::U8(ap)) => {
+                    let sink = Rgba16ScaledNeAlphaU8Sink {
+                        max_f,
+                        bit_depth: img.bit_depth,
+                        alpha: ap,
+                        stride: w,
+                    };
+                    dispatch_matrix(yp, up, vp, dst, img, max_f, max_f, src, sink);
+                }
+                None => {
+                    let sink = Rgba16ScaledNeOpaqueSink {
+                        max_f,
+                        bit_depth: img.bit_depth,
+                    };
+                    dispatch_matrix(yp, up, vp, dst, img, max_f, max_f, src, sink);
+                }
+                Some(PlaneStorage::U16(_)) => {
+                    return Err(Error::InvalidState(
+                        "8-bit AVIF görüntüsünde 16-bit alfa düzlemi",
+                    ));
+                }
+            }
+        }
+        (PlaneStorage::U16(yp), PlaneStorage::U16(up), PlaneStorage::U16(vp)) => {
+            let (ty, tuv, _tbl_guard) = build_unorm_tables_budgeted(
+                img.bit_depth,
+                img.color.full_range,
+                identity,
+                img.butce.as_ref(),
+            )?;
+            let src = TablesU16 {
+                table_y: &ty,
+                table_uv: &tuv,
+                max_val,
+            };
+            match img.alpha_plane.as_ref() {
+                Some(PlaneStorage::U16(ap)) => {
+                    let sink = Rgba16ScaledNeAlphaU16Sink {
+                        max_f,
+                        bit_depth: img.bit_depth,
+                        opaque_alpha,
+                        alpha: ap,
+                        stride: w,
+                    };
+                    dispatch_matrix(yp, up, vp, dst, img, max_f, max_f, src, sink);
+                }
+                None => {
+                    let sink = Rgba16ScaledNeOpaqueSink {
+                        max_f,
+                        bit_depth: img.bit_depth,
+                    };
+                    dispatch_matrix(yp, up, vp, dst, img, max_f, max_f, src, sink);
+                }
+                Some(PlaneStorage::U8(_)) => {
+                    return Err(Error::InvalidState(
+                        "10/12-bit AVIF görüntüsünde 8-bit alfa düzlemi",
+                    ));
+                }
+            }
+        }
+        _ => {
+            return Err(Error::InvalidState(
+                "AVIF düzlem depolama bit derinlikleri tutarsız",
+            ));
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]

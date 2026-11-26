@@ -646,6 +646,55 @@ impl AvifImage {
         self.gain_map.as_ref()
     }
 
+    /// Düzlemleri H.273 renk matrisine göre doğrudan çağıranın sağladığı 8-bit RGB dilimine yazar.
+    ///
+    /// Çıktı tamponu `width * height * 3` uzunluğunda olmalıdır; harici `dst` dilimi kütüphane
+    /// tarafından ayrılmadığı için çıktı pikselleri ek bellek tahsis etmez ve bütçe tüketmez.
+    pub fn write_rgb8_into(&self, dst: &mut [u8]) -> Result<()> {
+        color::write_rgb8_into(self, dst)
+    }
+
+    /// Düzlemleri H.273 renk matrisine göre doğrudan çağıranın sağladığı 8-bit RGBA dilimine yazar.
+    ///
+    /// Görüntüde alfa düzlemi yoksa `A` kanalı `255` ile doldurulur. Çıktı tamponu
+    /// `width * height * 4` uzunluğunda olmalıdır; çıktı pikselleri için ara vektör ayrılmaz.
+    pub fn write_rgba8_into(&self, dst: &mut [u8]) -> Result<()> {
+        color::write_rgba8_into(self, dst)
+    }
+
+    /// Düzlemleri H.273 renk matrisine göre doğrudan çağıranın sağladığı 16-bit RGB dilimine yazar.
+    ///
+    /// Örnekler görüntünün etkin bit derinliğinde (`8`/`10`/`12`-bit) üretilir. Çıktı tamponu
+    /// `width * height * 3` elemanlı olmalıdır; çıktı pikselleri için ara vektör ayrılmaz.
+    pub fn write_rgb16_into(&self, dst: &mut [u16]) -> Result<()> {
+        color::write_rgb16_into(self, dst)
+    }
+
+    /// Düzlemleri H.273 renk matrisine göre doğrudan çağıranın sağladığı 16-bit RGBA dilimine yazar.
+    ///
+    /// Görüntüde alfa düzlemi yoksa `A` kanalı `(1 << bit_depth) - 1` ile doldurulur. Çıktı
+    /// tamponu `width * height * 4` elemanlı olmalıdır; çıktı pikselleri için ara vektör ayrılmaz.
+    pub fn write_rgba16_into(&self, dst: &mut [u16]) -> Result<()> {
+        color::write_rgba16_into(self, dst)
+    }
+
+    /// Düzlemleri `[0..=65535]` tam 16-bit aralığına ölçekleyip yerel bayt sırasıyla doğrudan
+    /// çağıranın RGB16 bayt dilimine (`width * height * 6` bayt) yazar.
+    ///
+    /// `8-bit` için `v * 257`, `10-bit` için `(v * 65535 + 511) / 1023`, `12-bit` için
+    /// `(v * 65535 + 2047) / 4095` ölçeklemesini ara `Vec<u16>` ayırmadan uygular.
+    pub fn write_rgb16_scaled_ne_into(&self, dst: &mut [u8]) -> Result<()> {
+        color::write_rgb16_scaled_ne_into(self, dst)
+    }
+
+    /// Düzlemleri `[0..=65535]` tam 16-bit aralığına ölçekleyip yerel bayt sırasıyla doğrudan
+    /// çağıranın RGBA16 bayt dilimine (`width * height * 8` bayt) yazar.
+    ///
+    /// Görüntüde alfa düzlemi yoksa `A` kanalı `65535` ile doldurulur; ara `Vec<u16>` ayrılmaz.
+    pub fn write_rgba16_scaled_ne_into(&self, dst: &mut [u8]) -> Result<()> {
+        color::write_rgba16_scaled_ne_into(self, dst)
+    }
+
     /// Düzlemleri H.273 renk matrisine göre 8-bit RGB (`[R, G, B]`) tamponuna dönüştürür.
     pub fn to_rgb8(&self) -> Result<RgbImage> {
         color::image_to_rgb8(self)
