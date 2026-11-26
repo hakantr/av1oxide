@@ -1,47 +1,62 @@
 //! WebAssembly 128-bit sabit genişlikli SIMD (`simd128`, `core::arch::wasm32`)
-//! DSP çekirdekleri (`F6` / `P50` — `WP-10`, `DSP-07`).
+//! DSP çekirdekleri (`F6` / `P50` — `WP-10`, `DSP-07`; `v0.5.0` Adım `4.A.2`).
 //!
 //! ## Mimari ve Güvenlik Sözleşmesi (`GUV-08`, `GUV-10`, `DSP-07`)
 //!
 //! - `%100 #![forbid(unsafe_code)]`: `core::arch::wasm32` içindeki değer-tabanlı
-//!   vektör intrinsikleri (`v128`, `i16x8_*`, `u16x8_*`, `i32x4_*`, `u32x4_*`,
-//!   `u8x16_*`, `i8x16_shuffle`, `v128_bitselect`, `v128_and`, `v128_or`)
-//!   kararlı Rust'ta (`rustc 1.100.0`) güvenli işlevlerdir.
-//! - Sıfır yeni `unsafe` blok (`GUV-10` bütçesi değişmez).
+//!   vektör intrinsikleri (`v128`, `i8x16_*`, `u8x16_*`, `i16x8_*`, `u16x8_*`,
+//!   `i32x4_*`, `u32x4_*`, `i64x2_*`, `v128_*`) kararlı Rust'ta güvenli işlevlerdir.
+//! - Sıfır yeni `unsafe` blok (`audit::UNSAFE_EXEMPTIONS` değişmez).
 //! - Yalnız `#[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]`
 //!   koşulunda derlenir; skaler WASM artefaktına (`not(target_feature = "simd128")`)
 //!   hiçbir `v128` / `simd128` komutu sızmaz (`wasm-objdump -d` ile doğrulanır).
 //!
-//! ## Kapsanan `DspDispatch` Yuvaları (`31` yuva)
+//! ## Kapsanan `DspDispatch` Yuvaları (`682 / 767` yuva)
 //!
-//! - **MC (`18` yuva, `8 / 10 / 12` bpc):** `avg`, `w_avg`, `mask`, `blend`,
-//!   `blend_v`, `blend_h`
-//! - **CDEF (`12` yuva, `8 / 10 / 12` bpc):** `dir`, `fb[0]`, `fb[1]`, `fb[2]`
+//! - **MC (`96` yuva, `8 / 10 / 12` bpc):** `mc[0..9]`, `mct[0..9]`, `avg`,
+//!   `w_avg`, `mask`, `w_mask[0..2]`, `blend`, `blend_v`, `blend_h`, `warp8x8`,
+//!   `warp8x8t`, `emu_edge` ([`mc`])
+//! - **CDEF (`12` yuva, `8 / 10 / 12` bpc):** `dir`, `fb[0..2]`
 //! - **PAL (`1` yuva, `0` bpc):** `pal/pal_idx_finish`
+//! - **IPRED (`66` yuva, `8 / 10 / 12` bpc):** `intra_pred[0..13]`, `cfl_ac[0..2]`,
+//!   `cfl_pred[0..3]`, `pal_pred` ([`ipred`])
+//! - **ITX (`468` yuva, `8 / 10 / 12` bpc):** desteklenen tüm `156` `itxfm_add[tx][txtp]`
+//!   hücresi (`WHT_WHT` ve DC-only hızlı yolu dahil) ([`itx`])
+//! - **Loop Filter (`12` yuva, `8 / 10 / 12` bpc):** `loop_filter_sb[0..1][0..1]` ([`lf`])
+//! - **Loop Restoration (`15` yuva, `8 / 10 / 12` bpc):** `wiener[0..1]`, `sgr[0..2]` ([`lr`])
+//! - **Film Grain (`12` yuva, `8 / 10 / 12` bpc):** `fgy_32x32xn`, `fguv_32x32xn[0..2]` ([`fg`])
 
 #![allow(clippy::needless_range_loop, clippy::too_many_arguments)]
 #![forbid(unsafe_code)]
 
+mod fg;
+mod ipred;
+mod itx;
+mod lf;
+mod lr;
+mod mc;
+
 use core::arch::wasm32::{
     i8x16_shuffle, i16x8, i16x8_add, i16x8_extract_lane, i16x8_max, i16x8_min, i16x8_narrow_i32x4,
-    i16x8_splat, i16x8_sub, i32x4_abs, i32x4_add, i32x4_dot_i16x8, i32x4_extend_high_i16x8,
-    i32x4_extend_low_i16x8, i32x4_extract_lane, i32x4_lt, i32x4_max, i32x4_min, i32x4_mul,
-    i32x4_neg, i32x4_shr, i32x4_splat, i32x4_sub, i64x2, i64x2_extract_lane, u8x16_narrow_i16x8,
-    u8x16_splat, u16x8_extend_low_u8x16, u16x8_shl, u16x8_shr, u32x4_min, v128, v128_and,
-    v128_bitselect, v128_or,
+    i16x8_splat, i16x8_sub, i32x4, i32x4_abs, i32x4_add, i32x4_dot_i16x8, i32x4_extend_low_i16x8,
+    i32x4_extract_lane, i32x4_lt, i32x4_max, i32x4_min, i32x4_mul, i32x4_neg, i32x4_shr,
+    i32x4_splat, i32x4_sub, i64x2, i64x2_extract_lane, u8x16_narrow_i16x8, u8x16_splat,
+    u16x8_extend_low_u8x16, u16x8_shl, u16x8_shr, u32x4_min, v128, v128_and, v128_bitselect,
+    v128_or,
 };
 
 use crate::cpu::CpuFlags;
+use crate::dsp::arm::itx_alanlari::ITX_NEON_ALANLARI;
 use crate::dsp::cdef::{
     CDEF_DIRECTIONS, CdefBitDepth, CdefDirResult, CdefEdgeFlags, CdefFilterParams,
     DIR_CENTER_WEIGHT, DIV_TABLE, TMP_BUF_LEN, TMP_FILL, clamped_shift, px_at, px_put, tmp_index,
     ulog2,
 };
-use crate::dsp::mc_tables::OBMC_MASKS;
+use crate::dsp::ipred::{CflPredMode, IntraPredMode};
+use crate::dsp::itx::{TX_SIZES, TX_TYPES, TxType};
 use crate::dsp::{IsaCandidate, IsaEntry};
-use crate::frame::BitDepth;
 
-const WASM_SIMD128_KARAR: &str = "varsayılan (P50 / F6 WP-10, wasm32 simd128): %100 #![forbid(unsafe_code)] kararlı core::arch::wasm32 v128 çekirdeği; derleme zamanı +simd128 artefaktında etkin, skaler WASM artefaktına 0 sızıntı (rust_method: core::arch)";
+const WASM_SIMD128_KARAR: &str = "varsayılan (wasm32 simd128): %100 #![forbid(unsafe_code)] kararlı core::arch::wasm32 v128 çekirdeği; derleme zamanı +simd128 artefaktında etkin, skaler WASM artefaktına 0 sızıntı (rust_method: core::arch)";
 
 const fn wasm_aday(family: &'static str, field: &'static str, bit_depth: u8) -> IsaCandidate {
     IsaCandidate {
@@ -55,28 +70,109 @@ const fn wasm_aday(family: &'static str, field: &'static str, bit_depth: u8) -> 
     }
 }
 
-/// `wasm32` (`target_feature = "simd128"`) `DspDispatch` ISA aday tablosu (`31` yuva).
-pub const WASM_ISA_CANDIDATES: &[IsaCandidate] = &[
-    // MC (6 işlev × 3 bit derinliği = 18 yuva)
-    wasm_aday("mc", "avg", 8),
-    wasm_aday("mc", "w_avg", 8),
-    wasm_aday("mc", "mask", 8),
-    wasm_aday("mc", "blend", 8),
-    wasm_aday("mc", "blend_v", 8),
-    wasm_aday("mc", "blend_h", 8),
-    wasm_aday("mc", "avg", 10),
-    wasm_aday("mc", "w_avg", 10),
-    wasm_aday("mc", "mask", 10),
-    wasm_aday("mc", "blend", 10),
-    wasm_aday("mc", "blend_v", 10),
-    wasm_aday("mc", "blend_h", 10),
-    wasm_aday("mc", "avg", 12),
-    wasm_aday("mc", "w_avg", 12),
-    wasm_aday("mc", "mask", 12),
-    wasm_aday("mc", "blend", 12),
-    wasm_aday("mc", "blend_v", 12),
-    wasm_aday("mc", "blend_h", 12),
-    // CDEF (4 işlev × 3 bit derinliği = 12 yuva)
+macro_rules! mc_wasm_adaylari {
+    ($bd:literal) => {
+        [
+            wasm_aday("mc", "mc[FILTER_2D_8TAP_REGULAR]", $bd),
+            wasm_aday("mc", "mc[FILTER_2D_8TAP_REGULAR_SMOOTH]", $bd),
+            wasm_aday("mc", "mc[FILTER_2D_8TAP_REGULAR_SHARP]", $bd),
+            wasm_aday("mc", "mc[FILTER_2D_8TAP_SHARP_REGULAR]", $bd),
+            wasm_aday("mc", "mc[FILTER_2D_8TAP_SHARP_SMOOTH]", $bd),
+            wasm_aday("mc", "mc[FILTER_2D_8TAP_SHARP]", $bd),
+            wasm_aday("mc", "mc[FILTER_2D_8TAP_SMOOTH_REGULAR]", $bd),
+            wasm_aday("mc", "mc[FILTER_2D_8TAP_SMOOTH]", $bd),
+            wasm_aday("mc", "mc[FILTER_2D_8TAP_SMOOTH_SHARP]", $bd),
+            wasm_aday("mc", "mc[FILTER_2D_BILINEAR]", $bd),
+            wasm_aday("mc", "mct[FILTER_2D_8TAP_REGULAR]", $bd),
+            wasm_aday("mc", "mct[FILTER_2D_8TAP_REGULAR_SMOOTH]", $bd),
+            wasm_aday("mc", "mct[FILTER_2D_8TAP_REGULAR_SHARP]", $bd),
+            wasm_aday("mc", "mct[FILTER_2D_8TAP_SHARP_REGULAR]", $bd),
+            wasm_aday("mc", "mct[FILTER_2D_8TAP_SHARP_SMOOTH]", $bd),
+            wasm_aday("mc", "mct[FILTER_2D_8TAP_SHARP]", $bd),
+            wasm_aday("mc", "mct[FILTER_2D_8TAP_SMOOTH_REGULAR]", $bd),
+            wasm_aday("mc", "mct[FILTER_2D_8TAP_SMOOTH]", $bd),
+            wasm_aday("mc", "mct[FILTER_2D_8TAP_SMOOTH_SHARP]", $bd),
+            wasm_aday("mc", "mct[FILTER_2D_BILINEAR]", $bd),
+            wasm_aday("mc", "avg", $bd),
+            wasm_aday("mc", "w_avg", $bd),
+            wasm_aday("mc", "mask", $bd),
+            wasm_aday("mc", "w_mask[0]", $bd),
+            wasm_aday("mc", "w_mask[1]", $bd),
+            wasm_aday("mc", "w_mask[2]", $bd),
+            wasm_aday("mc", "blend", $bd),
+            wasm_aday("mc", "blend_v", $bd),
+            wasm_aday("mc", "blend_h", $bd),
+            wasm_aday("mc", "warp8x8", $bd),
+            wasm_aday("mc", "warp8x8t", $bd),
+            wasm_aday("mc", "emu_edge", $bd),
+        ]
+    };
+}
+
+macro_rules! ipred_wasm_adaylari {
+    ($bd:literal) => {
+        [
+            wasm_aday("ipred", "intra_pred[DC_PRED]", $bd),
+            wasm_aday("ipred", "intra_pred[VERT_PRED]", $bd),
+            wasm_aday("ipred", "intra_pred[HOR_PRED]", $bd),
+            wasm_aday("ipred", "intra_pred[LEFT_DC_PRED]", $bd),
+            wasm_aday("ipred", "intra_pred[TOP_DC_PRED]", $bd),
+            wasm_aday("ipred", "intra_pred[DC_128_PRED]", $bd),
+            wasm_aday("ipred", "intra_pred[Z1_PRED]", $bd),
+            wasm_aday("ipred", "intra_pred[Z2_PRED]", $bd),
+            wasm_aday("ipred", "intra_pred[Z3_PRED]", $bd),
+            wasm_aday("ipred", "intra_pred[SMOOTH_PRED]", $bd),
+            wasm_aday("ipred", "intra_pred[SMOOTH_V_PRED]", $bd),
+            wasm_aday("ipred", "intra_pred[SMOOTH_H_PRED]", $bd),
+            wasm_aday("ipred", "intra_pred[PAETH_PRED]", $bd),
+            wasm_aday("ipred", "intra_pred[FILTER_PRED]", $bd),
+            wasm_aday("ipred", "cfl_ac[DAV1D_PIXEL_LAYOUT_I420-1]", $bd),
+            wasm_aday("ipred", "cfl_ac[DAV1D_PIXEL_LAYOUT_I422-1]", $bd),
+            wasm_aday("ipred", "cfl_ac[DAV1D_PIXEL_LAYOUT_I444-1]", $bd),
+            wasm_aday("ipred", "cfl_pred[DC_PRED]", $bd),
+            wasm_aday("ipred", "cfl_pred[LEFT_DC_PRED]", $bd),
+            wasm_aday("ipred", "cfl_pred[TOP_DC_PRED]", $bd),
+            wasm_aday("ipred", "cfl_pred[DC_128_PRED]", $bd),
+            wasm_aday("ipred", "pal_pred", $bd),
+        ]
+    };
+}
+
+macro_rules! lf_wasm_adaylari {
+    ($bd:literal) => {
+        [
+            wasm_aday("loopfilter", "loop_filter_sb[0][0]", $bd),
+            wasm_aday("loopfilter", "loop_filter_sb[0][1]", $bd),
+            wasm_aday("loopfilter", "loop_filter_sb[1][0]", $bd),
+            wasm_aday("loopfilter", "loop_filter_sb[1][1]", $bd),
+        ]
+    };
+}
+
+macro_rules! lr_wasm_adaylari {
+    ($bd:literal) => {
+        [
+            wasm_aday("looprestoration", "wiener[0]", $bd),
+            wasm_aday("looprestoration", "wiener[1]", $bd),
+            wasm_aday("looprestoration", "sgr[0]", $bd),
+            wasm_aday("looprestoration", "sgr[1]", $bd),
+            wasm_aday("looprestoration", "sgr[2]", $bd),
+        ]
+    };
+}
+
+macro_rules! fg_wasm_adaylari {
+    ($bd:literal) => {
+        [
+            wasm_aday("filmgrain", "fgy_32x32xn", $bd),
+            wasm_aday("filmgrain", "fguv_32x32xn[DAV1D_PIXEL_LAYOUT_I420-1]", $bd),
+            wasm_aday("filmgrain", "fguv_32x32xn[DAV1D_PIXEL_LAYOUT_I422-1]", $bd),
+            wasm_aday("filmgrain", "fguv_32x32xn[DAV1D_PIXEL_LAYOUT_I444-1]", $bd),
+        ]
+    };
+}
+
+const WASM_CDEF_PAL: [IsaCandidate; 13] = [
     wasm_aday("cdef", "dir", 8),
     wasm_aday("cdef", "fb[0]", 8),
     wasm_aday("cdef", "fb[1]", 8),
@@ -89,9 +185,318 @@ pub const WASM_ISA_CANDIDATES: &[IsaCandidate] = &[
     wasm_aday("cdef", "fb[0]", 12),
     wasm_aday("cdef", "fb[1]", 12),
     wasm_aday("cdef", "fb[2]", 12),
-    // PAL (1 yuva, bit derinliğinden bağımsız)
     wasm_aday("pal", "pal_idx_finish", 0),
 ];
+
+const WASM_MC: [[IsaCandidate; 32]; 3] = [
+    mc_wasm_adaylari!(8),
+    mc_wasm_adaylari!(10),
+    mc_wasm_adaylari!(12),
+];
+
+const WASM_IPRED: [[IsaCandidate; 22]; 3] = [
+    ipred_wasm_adaylari!(8),
+    ipred_wasm_adaylari!(10),
+    ipred_wasm_adaylari!(12),
+];
+
+const WASM_LF: [[IsaCandidate; 4]; 3] = [
+    lf_wasm_adaylari!(8),
+    lf_wasm_adaylari!(10),
+    lf_wasm_adaylari!(12),
+];
+
+const WASM_LR: [[IsaCandidate; 5]; 3] = [
+    lr_wasm_adaylari!(8),
+    lr_wasm_adaylari!(10),
+    lr_wasm_adaylari!(12),
+];
+
+const WASM_FG: [[IsaCandidate; 4]; 3] = [
+    fg_wasm_adaylari!(8),
+    fg_wasm_adaylari!(10),
+    fg_wasm_adaylari!(12),
+];
+
+const fn birlestir<const N: usize>() -> [IsaCandidate; N] {
+    let mut out = [WASM_CDEF_PAL[0]; N];
+    let mut i = 0usize;
+
+    let mut j = 0usize;
+    while j < WASM_CDEF_PAL.len() {
+        out[i] = WASM_CDEF_PAL[j];
+        i += 1;
+        j += 1;
+    }
+
+    let mut b = 0usize;
+    while b < 3 {
+        let mut k = 0usize;
+        while k < 32 {
+            out[i] = WASM_MC[b][k];
+            i += 1;
+            k += 1;
+        }
+        b += 1;
+    }
+
+    let mut b = 0usize;
+    while b < 3 {
+        let mut k = 0usize;
+        while k < 22 {
+            out[i] = WASM_IPRED[b][k];
+            i += 1;
+            k += 1;
+        }
+        b += 1;
+    }
+
+    let bdler = [8u8, 10, 12];
+    let mut b = 0usize;
+    while b < 3 {
+        let mut f = 0usize;
+        while f < ITX_NEON_ALANLARI.len() {
+            out[i] = wasm_aday("itx", ITX_NEON_ALANLARI[f], bdler[b]);
+            i += 1;
+            f += 1;
+        }
+        b += 1;
+    }
+
+    let mut b = 0usize;
+    while b < 3 {
+        let mut k = 0usize;
+        while k < 4 {
+            out[i] = WASM_LF[b][k];
+            i += 1;
+            k += 1;
+        }
+        b += 1;
+    }
+
+    let mut b = 0usize;
+    while b < 3 {
+        let mut k = 0usize;
+        while k < 5 {
+            out[i] = WASM_LR[b][k];
+            i += 1;
+            k += 1;
+        }
+        b += 1;
+    }
+
+    let mut b = 0usize;
+    while b < 3 {
+        let mut k = 0usize;
+        while k < 4 {
+            out[i] = WASM_FG[b][k];
+            i += 1;
+            k += 1;
+        }
+        b += 1;
+    }
+
+    assert!(i == N, "WASM_ISA_CANDIDATES uzunluğu uyuşmalı");
+    out
+}
+
+/// Toplam `wasm32 +simd128` aday sayısı:
+/// `13` (CDEF 12 + PAL 1) + `96` (MC) + `66` (IPRED) + `468` (ITX)
+/// + `12` (LF) + `15` (LR) + `12` (FG) = `682` tekil `DspDispatch` yuvası.
+const WASM_ADAY_SAYISI: usize = 13 + 3 * 32 + 3 * 22 + 3 * 156 + 3 * 4 + 3 * 5 + 3 * 4;
+static WASM_ADAYLAR: [IsaCandidate; WASM_ADAY_SAYISI] = birlestir::<WASM_ADAY_SAYISI>();
+
+/// `wasm32` (`target_feature = "simd128"`) `DspDispatch` ISA aday tablosu (`682` yuva).
+pub const WASM_ISA_CANDIDATES: &[IsaCandidate] = &WASM_ADAYLAR;
+
+fn mc_alan(field: &str) -> Option<(bool, usize)> {
+    let (prep, ad) = if let Some(r) = field.strip_prefix("mct[") {
+        (true, r)
+    } else {
+        (false, field.strip_prefix("mc[")?)
+    };
+    let ad = ad.strip_suffix(']')?;
+    let i = super::FILTER_2D_NAMES.iter().position(|n| *n == ad)?;
+    Some((prep, i))
+}
+
+fn duzen_indeksi(field: &str, onek: &str) -> Option<usize> {
+    let ic = field
+        .strip_prefix(onek)?
+        .strip_prefix('[')?
+        .strip_suffix(']')?;
+    super::LAYOUT_INDEX.iter().position(|&l| l == ic)
+}
+
+fn mc_entry(candidate: &IsaCandidate) -> Option<IsaEntry> {
+    macro_rules! bpc {
+        ($b:literal) => {{
+            Some(match candidate.field {
+                "avg" => IsaEntry::Avg(mc::avg::<$b>),
+                "w_avg" => IsaEntry::WAvg(mc::w_avg::<$b>),
+                "mask" => IsaEntry::Mask(mc::mask::<$b>),
+                "w_mask[0]" => IsaEntry::WMask(0, mc::w_mask::<$b, 0>),
+                "w_mask[1]" => IsaEntry::WMask(1, mc::w_mask::<$b, 1>),
+                "w_mask[2]" => IsaEntry::WMask(2, mc::w_mask::<$b, 2>),
+                "blend" => IsaEntry::Blend(mc::blend::<$b>),
+                "blend_v" => IsaEntry::BlendV(mc::blend_v::<$b>),
+                "blend_h" => IsaEntry::BlendH(mc::blend_h::<$b>),
+                "warp8x8" => IsaEntry::Warp(mc::warp8x8::<$b>),
+                "warp8x8t" => IsaEntry::WarpT(mc::warp8x8t::<$b>),
+                "emu_edge" => IsaEntry::EmuEdge(mc::emu_edge::<$b>),
+                f => {
+                    let (prep, i) = mc_alan(f)?;
+                    if prep {
+                        IsaEntry::Mct(i, mc::prep_fn::<$b>(i))
+                    } else {
+                        IsaEntry::Mc(i, mc::put_fn::<$b>(i))
+                    }
+                }
+            })
+        }};
+    }
+    match candidate.bit_depth {
+        8 => bpc!(8),
+        10 => bpc!(10),
+        12 => bpc!(12),
+        _ => None,
+    }
+}
+
+fn ipred_entry(candidate: &IsaCandidate) -> Option<IsaEntry> {
+    macro_rules! bpc {
+        ($b:literal) => {{
+            if candidate.field == "pal_pred" {
+                return Some(IsaEntry::IpredPalPred(ipred::pal_pred::<$b>));
+            }
+            if let Some(ad) = candidate
+                .field
+                .strip_prefix("intra_pred[")
+                .and_then(|s| s.strip_suffix(']'))
+            {
+                let idx = super::INTRA_PRED_NAMES.iter().position(|&n| n == ad)?;
+                let mode = IntraPredMode::from_index(idx)?;
+                return Some(IsaEntry::IpredAngular(
+                    mode.index(),
+                    ipred::intra_pred_fn::<$b>(mode),
+                ));
+            }
+            if let Some(layout) = duzen_indeksi(candidate.field, "cfl_ac") {
+                return Some(IsaEntry::IpredCflAc(
+                    layout,
+                    ipred::cfl_ac_fn::<$b>(layout)?,
+                ));
+            }
+            if let Some(ad) = candidate
+                .field
+                .strip_prefix("cfl_pred[")
+                .and_then(|s| s.strip_suffix(']'))
+            {
+                let idx = super::CFL_PRED_NAMES.iter().position(|&n| n == ad)?;
+                let mode = *CflPredMode::ALL.get(idx)?;
+                return Some(IsaEntry::IpredCflPred(
+                    mode.index(),
+                    ipred::cfl_pred_fn::<$b>(mode),
+                ));
+            }
+            None
+        }};
+    }
+    match candidate.bit_depth {
+        8 => bpc!(8),
+        10 => bpc!(10),
+        12 => bpc!(12),
+        _ => None,
+    }
+}
+
+fn itx_entry(candidate: &IsaCandidate) -> Option<IsaEntry> {
+    let ic = candidate
+        .field
+        .strip_prefix("itxfm_add[")?
+        .strip_suffix(']')?;
+    let (tx_ad, tur_ad) = ic.split_once("][")?;
+    let tx = TX_SIZES.iter().find(|t| t.dav1d_name() == tx_ad)?;
+    let tur = TX_TYPES
+        .iter()
+        .copied()
+        .chain(core::iter::once(TxType::WhtWht))
+        .find(|t| t.dav1d_name() == tur_ad)?;
+    let f = match candidate.bit_depth {
+        8 => itx::itx_add::<8>,
+        10 => itx::itx_add::<10>,
+        12 => itx::itx_add::<12>,
+        _ => return None,
+    };
+    Some(IsaEntry::Itx(tx.index(), tur.index(), f))
+}
+
+fn lf_entry(candidate: &IsaCandidate) -> Option<IsaEntry> {
+    let (plane, dir) = match candidate.field {
+        "loop_filter_sb[0][0]" => (0, 0),
+        "loop_filter_sb[0][1]" => (0, 1),
+        "loop_filter_sb[1][0]" => (1, 0),
+        "loop_filter_sb[1][1]" => (1, 1),
+        _ => return None,
+    };
+    let f = match candidate.bit_depth {
+        8 => lf::loop_filter_sb_fn::<8>(plane, dir)?,
+        10 => lf::loop_filter_sb_fn::<10>(plane, dir)?,
+        12 => lf::loop_filter_sb_fn::<12>(plane, dir)?,
+        _ => return None,
+    };
+    Some(IsaEntry::LfSb(plane, dir, f))
+}
+
+fn lr_entry(candidate: &IsaCandidate) -> Option<IsaEntry> {
+    match candidate.field {
+        "wiener[0]" | "wiener[1]" => {
+            let tap = usize::from(candidate.field == "wiener[1]");
+            let f = match candidate.bit_depth {
+                8 => lr::wiener_fn::<8>(tap)?,
+                10 => lr::wiener_fn::<10>(tap)?,
+                12 => lr::wiener_fn::<12>(tap)?,
+                _ => return None,
+            };
+            Some(IsaEntry::LrWiener(tap, f))
+        }
+        "sgr[0]" | "sgr[1]" | "sgr[2]" => {
+            let idx = match candidate.field {
+                "sgr[0]" => 0,
+                "sgr[1]" => 1,
+                _ => 2,
+            };
+            let f = match candidate.bit_depth {
+                8 => lr::sgr_fn::<8>(idx)?,
+                10 => lr::sgr_fn::<10>(idx)?,
+                12 => lr::sgr_fn::<12>(idx)?,
+                _ => return None,
+            };
+            Some(IsaEntry::LrSgr(idx, f))
+        }
+        _ => None,
+    }
+}
+
+fn fg_entry(candidate: &IsaCandidate) -> Option<IsaEntry> {
+    macro_rules! bpc {
+        ($b:literal) => {{
+            if candidate.field == "fgy_32x32xn" {
+                return Some(IsaEntry::Fgy(fg::fgy_32x32xn::<$b>));
+            }
+            if let Some(d) = duzen_indeksi(candidate.field, "fguv_32x32xn") {
+                return Some(IsaEntry::Fguv(d, fg::fguv_fn::<$b>(d)?));
+            }
+            None
+        }};
+    }
+    match candidate.bit_depth {
+        8 => bpc!(8),
+        10 => bpc!(10),
+        12 => bpc!(12),
+        _ => None,
+    }
+}
 
 /// `DspDispatch::candidate_entry` için `wasm32` `simd128` yuva eşlemesi.
 #[must_use]
@@ -99,25 +504,16 @@ pub(super) fn candidate_entry(candidate: &IsaCandidate) -> Option<IsaEntry> {
     if candidate.implementation != "simd128" {
         return None;
     }
+    match candidate.family {
+        "mc" => return mc_entry(candidate),
+        "ipred" => return ipred_entry(candidate),
+        "itx" => return itx_entry(candidate),
+        "loopfilter" => return lf_entry(candidate),
+        "looprestoration" => return lr_entry(candidate),
+        "filmgrain" => return fg_entry(candidate),
+        _ => {}
+    }
     match (candidate.family, candidate.field, candidate.bit_depth) {
-        ("mc", "avg", 8) => Some(IsaEntry::Avg(avg::<8>)),
-        ("mc", "avg", 10) => Some(IsaEntry::Avg(avg::<10>)),
-        ("mc", "avg", 12) => Some(IsaEntry::Avg(avg::<12>)),
-        ("mc", "w_avg", 8) => Some(IsaEntry::WAvg(w_avg::<8>)),
-        ("mc", "w_avg", 10) => Some(IsaEntry::WAvg(w_avg::<10>)),
-        ("mc", "w_avg", 12) => Some(IsaEntry::WAvg(w_avg::<12>)),
-        ("mc", "mask", 8) => Some(IsaEntry::Mask(mask::<8>)),
-        ("mc", "mask", 10) => Some(IsaEntry::Mask(mask::<10>)),
-        ("mc", "mask", 12) => Some(IsaEntry::Mask(mask::<12>)),
-        ("mc", "blend", 8) => Some(IsaEntry::Blend(blend::<8>)),
-        ("mc", "blend", 10) => Some(IsaEntry::Blend(blend::<10>)),
-        ("mc", "blend", 12) => Some(IsaEntry::Blend(blend::<12>)),
-        ("mc", "blend_v", 8) => Some(IsaEntry::BlendV(blend_v::<8>)),
-        ("mc", "blend_v", 10) => Some(IsaEntry::BlendV(blend_v::<10>)),
-        ("mc", "blend_v", 12) => Some(IsaEntry::BlendV(blend_v::<12>)),
-        ("mc", "blend_h", 8) => Some(IsaEntry::BlendH(blend_h::<8>)),
-        ("mc", "blend_h", 10) => Some(IsaEntry::BlendH(blend_h::<10>)),
-        ("mc", "blend_h", 12) => Some(IsaEntry::BlendH(blend_h::<12>)),
         ("cdef", "dir", 8) => Some(IsaEntry::CdefDir(cdef_find_dir::<8>)),
         ("cdef", "dir", 10) => Some(IsaEntry::CdefDir(cdef_find_dir::<10>)),
         ("cdef", "dir", 12) => Some(IsaEntry::CdefDir(cdef_find_dir::<12>)),
@@ -141,77 +537,144 @@ pub(super) fn candidate_entry(candidate: &IsaCandidate) -> Option<IsaEntry> {
 
 #[inline]
 #[target_feature(enable = "simd128")]
-fn load_v128_u8(src: &[u8], off: usize) -> v128 {
-    let b0: [u8; 8] = src[off..off + 8].try_into().unwrap();
-    let b1: [u8; 8] = src[off + 8..off + 16].try_into().unwrap();
-    i64x2(i64::from_le_bytes(b0), i64::from_le_bytes(b1))
+pub(super) fn load_v128_u8(src: &[u8], off: usize) -> v128 {
+    let b: &[u8; 16] = src[off..off + 16].try_into().unwrap();
+    let lo = i64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]);
+    let hi = i64::from_le_bytes([b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15]]);
+    i64x2(lo, hi)
 }
 
 #[inline]
 #[target_feature(enable = "simd128")]
-fn load_low64_u8(src: &[u8], off: usize) -> v128 {
+pub(super) fn load_low64_u8(src: &[u8], off: usize) -> v128 {
     let b0: [u8; 8] = src[off..off + 8].try_into().unwrap();
     i64x2(i64::from_le_bytes(b0), 0)
 }
 
 #[inline]
 #[target_feature(enable = "simd128")]
-fn load_low32_u8(src: &[u8], off: usize) -> v128 {
+pub(super) fn load_low32_u8(src: &[u8], off: usize) -> v128 {
     let b0: [u8; 4] = src[off..off + 4].try_into().unwrap();
     i64x2(i64::from(u32::from_le_bytes(b0)), 0)
 }
 
 #[inline]
 #[target_feature(enable = "simd128")]
-fn load_i16x8(src: &[i16], off: usize) -> v128 {
-    let s = &src[off..off + 8];
+pub(super) fn load_i16x8(src: &[i16], off: usize) -> v128 {
+    let s: &[i16; 8] = src[off..off + 8].try_into().unwrap();
     i16x8(s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7])
 }
 
 #[inline]
 #[target_feature(enable = "simd128")]
-fn load_i16x4(src: &[i16], off: usize) -> v128 {
-    let s = &src[off..off + 4];
+pub(super) fn load_i16x4(src: &[i16], off: usize) -> v128 {
+    let s: &[i16; 4] = src[off..off + 4].try_into().unwrap();
     i16x8(s[0], s[1], s[2], s[3], 0, 0, 0, 0)
 }
 
 #[inline]
 #[target_feature(enable = "simd128")]
-fn store_v128_u8(dst: &mut [u8], off: usize, v: v128) {
-    dst[off..off + 8].copy_from_slice(&i64x2_extract_lane::<0>(v).to_le_bytes());
-    dst[off + 8..off + 16].copy_from_slice(&i64x2_extract_lane::<1>(v).to_le_bytes());
+pub(super) fn load_u16x8(src: &[u16], off: usize) -> v128 {
+    let s: &[u16; 8] = src[off..off + 8].try_into().unwrap();
+    i16x8(
+        s[0] as i16,
+        s[1] as i16,
+        s[2] as i16,
+        s[3] as i16,
+        s[4] as i16,
+        s[5] as i16,
+        s[6] as i16,
+        s[7] as i16,
+    )
 }
 
 #[inline]
 #[target_feature(enable = "simd128")]
-fn store_low64_u8(dst: &mut [u8], off: usize, v: v128) {
-    dst[off..off + 8].copy_from_slice(&i64x2_extract_lane::<0>(v).to_le_bytes());
+pub(super) fn load_i32x4(src: &[i32], off: usize) -> v128 {
+    let s: &[i32; 4] = src[off..off + 4].try_into().unwrap();
+    i32x4(s[0], s[1], s[2], s[3])
 }
 
 #[inline]
 #[target_feature(enable = "simd128")]
-fn store_low32_u8(dst: &mut [u8], off: usize, v: v128) {
-    dst[off..off + 4].copy_from_slice(&i32x4_extract_lane::<0>(v).to_le_bytes());
+pub(super) fn store_v128_u8(dst: &mut [u8], off: usize, v: v128) {
+    let lo = i64x2_extract_lane::<0>(v).to_le_bytes();
+    let hi = i64x2_extract_lane::<1>(v).to_le_bytes();
+    let out: &mut [u8; 16] = (&mut dst[off..off + 16]).try_into().unwrap();
+    out[0..8].copy_from_slice(&lo);
+    out[8..16].copy_from_slice(&hi);
+}
+
+#[inline]
+#[target_feature(enable = "simd128")]
+pub(super) fn store_low64_u8(dst: &mut [u8], off: usize, v: v128) {
+    let out: &mut [u8; 8] = (&mut dst[off..off + 8]).try_into().unwrap();
+    *out = i64x2_extract_lane::<0>(v).to_le_bytes();
+}
+
+#[inline]
+#[target_feature(enable = "simd128")]
+pub(super) fn store_low32_u8(dst: &mut [u8], off: usize, v: v128) {
+    let out: &mut [u8; 4] = (&mut dst[off..off + 4]).try_into().unwrap();
+    *out = i32x4_extract_lane::<0>(v).to_le_bytes();
+}
+
+#[inline]
+#[target_feature(enable = "simd128")]
+pub(super) fn store_i16x8(dst: &mut [i16], off: usize, v: v128) {
+    let out: &mut [i16; 8] = (&mut dst[off..off + 8]).try_into().unwrap();
+    out[0] = i16x8_extract_lane::<0>(v);
+    out[1] = i16x8_extract_lane::<1>(v);
+    out[2] = i16x8_extract_lane::<2>(v);
+    out[3] = i16x8_extract_lane::<3>(v);
+    out[4] = i16x8_extract_lane::<4>(v);
+    out[5] = i16x8_extract_lane::<5>(v);
+    out[6] = i16x8_extract_lane::<6>(v);
+    out[7] = i16x8_extract_lane::<7>(v);
+}
+
+#[inline]
+#[target_feature(enable = "simd128")]
+pub(super) fn store_u16x8(dst: &mut [u16], off: usize, v: v128) {
+    let out: &mut [u16; 8] = (&mut dst[off..off + 8]).try_into().unwrap();
+    out[0] = i16x8_extract_lane::<0>(v) as u16;
+    out[1] = i16x8_extract_lane::<1>(v) as u16;
+    out[2] = i16x8_extract_lane::<2>(v) as u16;
+    out[3] = i16x8_extract_lane::<3>(v) as u16;
+    out[4] = i16x8_extract_lane::<4>(v) as u16;
+    out[5] = i16x8_extract_lane::<5>(v) as u16;
+    out[6] = i16x8_extract_lane::<6>(v) as u16;
+    out[7] = i16x8_extract_lane::<7>(v) as u16;
+}
+
+#[inline]
+#[target_feature(enable = "simd128")]
+pub(super) fn store_i32x4(dst: &mut [i32], off: usize, v: v128) {
+    let out: &mut [i32; 4] = (&mut dst[off..off + 4]).try_into().unwrap();
+    out[0] = i32x4_extract_lane::<0>(v);
+    out[1] = i32x4_extract_lane::<1>(v);
+    out[2] = i32x4_extract_lane::<2>(v);
+    out[3] = i32x4_extract_lane::<3>(v);
 }
 
 #[inline(always)]
-const fn bpp_of(bits: u32) -> usize {
+pub(super) const fn bpp_of(bits: u32) -> usize {
     if bits == 8 { 1 } else { 2 }
 }
 
 #[inline(always)]
-const fn intermediate_bits_of(bits: u32) -> u32 {
+pub(super) const fn intermediate_bits_of(bits: u32) -> u32 {
     if bits == 8 { 4 } else { 14 - bits }
 }
 
 #[inline(always)]
-const fn prep_bias_of(bits: u32) -> i32 {
+pub(super) const fn prep_bias_of(bits: u32) -> i32 {
     if bits == 8 { 0 } else { 8192 }
 }
 
 #[inline]
 #[target_feature(enable = "simd128")]
-fn load_pixels_8<const BPC: u32>(buf: &[u8], off: usize) -> v128 {
+pub(super) fn load_pixels_8<const BPC: u32>(buf: &[u8], off: usize) -> v128 {
     if BPC == 8 {
         u16x8_extend_low_u8x16(load_low64_u8(buf, off))
     } else {
@@ -221,7 +684,7 @@ fn load_pixels_8<const BPC: u32>(buf: &[u8], off: usize) -> v128 {
 
 #[inline]
 #[target_feature(enable = "simd128")]
-fn load_pixels_4<const BPC: u32>(buf: &[u8], off: usize) -> v128 {
+pub(super) fn load_pixels_4<const BPC: u32>(buf: &[u8], off: usize) -> v128 {
     if BPC == 8 {
         u16x8_extend_low_u8x16(load_low32_u8(buf, off))
     } else {
@@ -231,11 +694,9 @@ fn load_pixels_4<const BPC: u32>(buf: &[u8], off: usize) -> v128 {
 
 #[inline]
 #[target_feature(enable = "simd128")]
-fn pack_and_store_8<const BPC: u32>(dst: &mut [u8], off: usize, lo: v128, hi: v128, v_max: v128) {
-    let p16 = i16x8_min(i16x8_max(i16x8_narrow_i32x4(lo, hi), i16x8_splat(0)), v_max);
+pub(super) fn store_pixels_8_i16<const BPC: u32>(dst: &mut [u8], off: usize, p16: v128) {
     if BPC == 8 {
-        let p8 = u8x16_narrow_i16x8(p16, p16);
-        store_low64_u8(dst, off, p8);
+        store_low64_u8(dst, off, u8x16_narrow_i16x8(p16, p16));
     } else {
         store_v128_u8(dst, off, p16);
     }
@@ -243,18 +704,36 @@ fn pack_and_store_8<const BPC: u32>(dst: &mut [u8], off: usize, lo: v128, hi: v1
 
 #[inline]
 #[target_feature(enable = "simd128")]
-fn pack_and_store_4<const BPC: u32>(dst: &mut [u8], off: usize, lo: v128, v_max: v128) {
-    let p16 = i16x8_min(i16x8_max(i16x8_narrow_i32x4(lo, lo), i16x8_splat(0)), v_max);
+pub(super) fn store_pixels_4_i16<const BPC: u32>(dst: &mut [u8], off: usize, p16: v128) {
     if BPC == 8 {
-        let p8 = u8x16_narrow_i16x8(p16, p16);
-        store_low32_u8(dst, off, p8);
+        store_low32_u8(dst, off, u8x16_narrow_i16x8(p16, p16));
     } else {
         store_low64_u8(dst, off, p16);
     }
 }
 
+#[inline]
+#[target_feature(enable = "simd128")]
+pub(super) fn pack_and_store_8<const BPC: u32>(
+    dst: &mut [u8],
+    off: usize,
+    lo: v128,
+    hi: v128,
+    v_max: v128,
+) {
+    let p16 = i16x8_min(i16x8_max(i16x8_narrow_i32x4(lo, hi), i16x8_splat(0)), v_max);
+    store_pixels_8_i16::<BPC>(dst, off, p16);
+}
+
+#[inline]
+#[target_feature(enable = "simd128")]
+pub(super) fn pack_and_store_4<const BPC: u32>(dst: &mut [u8], off: usize, lo: v128, v_max: v128) {
+    let p16 = i16x8_min(i16x8_max(i16x8_narrow_i32x4(lo, lo), i16x8_splat(0)), v_max);
+    store_pixels_4_i16::<BPC>(dst, off, p16);
+}
+
 #[inline(always)]
-fn load_scalar<const BPC: u32>(buf: &[u8], off: usize) -> i32 {
+pub(super) fn load_scalar<const BPC: u32>(buf: &[u8], off: usize) -> i32 {
     if BPC == 8 {
         i32::from(buf[off])
     } else {
@@ -263,7 +742,7 @@ fn load_scalar<const BPC: u32>(buf: &[u8], off: usize) -> i32 {
 }
 
 #[inline(always)]
-fn store_scalar<const BPC: u32>(buf: &mut [u8], off: usize, value: i32) {
+pub(super) fn store_scalar<const BPC: u32>(buf: &mut [u8], off: usize, value: i32) {
     if BPC == 8 {
         buf[off] = value as u8;
     } else {
@@ -271,535 +750,35 @@ fn store_scalar<const BPC: u32>(buf: &mut [u8], off: usize, value: i32) {
     }
 }
 
-// ============================================================================
-// 1. MC `avg`, `w_avg`, `mask`, `blend`, `blend_v`, `blend_h` (18 yuva)
-// ============================================================================
-
+#[inline]
 #[target_feature(enable = "simd128")]
-fn avg_simd128<const BPC: u32>(
-    dst: &mut [u8],
-    dst_stride: usize,
-    tmp1: &[i16],
-    tmp2: &[i16],
-    w: usize,
-    h: usize,
-) {
-    let ib = intermediate_bits_of(BPC);
-    let shift = ib + 1;
-    let rnd = (1i32 << ib) + prep_bias_of(BPC) * 2;
-    let max_pixel = (1i32 << BPC) - 1;
-    let bpp = bpp_of(BPC);
-    let v_rnd = i32x4_splat(rnd);
-    let v_max = i16x8_splat(max_pixel as i16);
-
-    for y in 0..h {
-        let drow = y * dst_stride;
-        let trow = y * w;
-        let mut x = 0usize;
-        while x + 8 <= w {
-            let a = load_i16x8(tmp1, trow + x);
-            let b = load_i16x8(tmp2, trow + x);
-            let lo = i32x4_shr(
-                i32x4_add(
-                    i32x4_add(i32x4_extend_low_i16x8(a), i32x4_extend_low_i16x8(b)),
-                    v_rnd,
-                ),
-                shift,
-            );
-            let hi = i32x4_shr(
-                i32x4_add(
-                    i32x4_add(i32x4_extend_high_i16x8(a), i32x4_extend_high_i16x8(b)),
-                    v_rnd,
-                ),
-                shift,
-            );
-            pack_and_store_8::<BPC>(dst, drow + x * bpp, lo, hi, v_max);
-            x += 8;
-        }
-        while x + 4 <= w {
-            let a = load_i16x4(tmp1, trow + x);
-            let b = load_i16x4(tmp2, trow + x);
-            let lo = i32x4_shr(
-                i32x4_add(
-                    i32x4_add(i32x4_extend_low_i16x8(a), i32x4_extend_low_i16x8(b)),
-                    v_rnd,
-                ),
-                shift,
-            );
-            pack_and_store_4::<BPC>(dst, drow + x * bpp, lo, v_max);
-            x += 4;
-        }
-        while x < w {
-            let a = i32::from(tmp1[trow + x]);
-            let b = i32::from(tmp2[trow + x]);
-            let val = ((a + b + rnd) >> shift).clamp(0, max_pixel);
-            store_scalar::<BPC>(dst, drow + x * bpp, val);
-            x += 1;
-        }
-    }
-}
-
-/// `mc/avg` WASM `simd128` yuva girişi.
-pub fn avg<const BPC: u32>(
-    dst: &mut [u8],
-    dst_stride: usize,
-    tmp1: &[i16],
-    tmp2: &[i16],
-    w: usize,
-    h: usize,
-    bit_depth: BitDepth,
-    bitdepth_max: u16,
-) {
-    debug_assert_eq!(bit_depth.bits(), BPC);
-    debug_assert_eq!(u32::from(bitdepth_max), (1u32 << BPC) - 1);
-    avg_simd128::<BPC>(dst, dst_stride, tmp1, tmp2, w, h);
-}
-
-#[target_feature(enable = "simd128")]
-fn w_avg_simd128<const BPC: u32>(
-    dst: &mut [u8],
-    dst_stride: usize,
-    tmp1: &[i16],
-    tmp2: &[i16],
-    w: usize,
-    h: usize,
-    weight: i32,
-) {
-    let ib = intermediate_bits_of(BPC);
-    let shift = ib + 4;
-    let rnd = (8i32 << ib) + prep_bias_of(BPC) * 16;
-    let max_pixel = (1i32 << BPC) - 1;
-    let bpp = bpp_of(BPC);
-    let v_w1 = i32x4_splat(weight);
-    let v_w2 = i32x4_splat(16 - weight);
-    let v_rnd = i32x4_splat(rnd);
-    let v_max = i16x8_splat(max_pixel as i16);
-
-    for y in 0..h {
-        let drow = y * dst_stride;
-        let trow = y * w;
-        let mut x = 0usize;
-        while x + 8 <= w {
-            let a = load_i16x8(tmp1, trow + x);
-            let b = load_i16x8(tmp2, trow + x);
-            let lo = i32x4_shr(
-                i32x4_add(
-                    i32x4_add(
-                        i32x4_mul(i32x4_extend_low_i16x8(a), v_w1),
-                        i32x4_mul(i32x4_extend_low_i16x8(b), v_w2),
-                    ),
-                    v_rnd,
-                ),
-                shift,
-            );
-            let hi = i32x4_shr(
-                i32x4_add(
-                    i32x4_add(
-                        i32x4_mul(i32x4_extend_high_i16x8(a), v_w1),
-                        i32x4_mul(i32x4_extend_high_i16x8(b), v_w2),
-                    ),
-                    v_rnd,
-                ),
-                shift,
-            );
-            pack_and_store_8::<BPC>(dst, drow + x * bpp, lo, hi, v_max);
-            x += 8;
-        }
-        while x + 4 <= w {
-            let a = load_i16x4(tmp1, trow + x);
-            let b = load_i16x4(tmp2, trow + x);
-            let lo = i32x4_shr(
-                i32x4_add(
-                    i32x4_add(
-                        i32x4_mul(i32x4_extend_low_i16x8(a), v_w1),
-                        i32x4_mul(i32x4_extend_low_i16x8(b), v_w2),
-                    ),
-                    v_rnd,
-                ),
-                shift,
-            );
-            pack_and_store_4::<BPC>(dst, drow + x * bpp, lo, v_max);
-            x += 4;
-        }
-        while x < w {
-            let a = i32::from(tmp1[trow + x]);
-            let b = i32::from(tmp2[trow + x]);
-            let val = ((a * weight + b * (16 - weight) + rnd) >> shift).clamp(0, max_pixel);
-            store_scalar::<BPC>(dst, drow + x * bpp, val);
-            x += 1;
-        }
-    }
-}
-
-/// `mc/w_avg` WASM `simd128` yuva girişi.
-pub fn w_avg<const BPC: u32>(
-    dst: &mut [u8],
-    dst_stride: usize,
-    tmp1: &[i16],
-    tmp2: &[i16],
-    w: usize,
-    h: usize,
-    weight: i32,
-    bit_depth: BitDepth,
-    bitdepth_max: u16,
-) {
-    debug_assert_eq!(bit_depth.bits(), BPC);
-    debug_assert_eq!(u32::from(bitdepth_max), (1u32 << BPC) - 1);
-    w_avg_simd128::<BPC>(dst, dst_stride, tmp1, tmp2, w, h, weight);
-}
-
-#[target_feature(enable = "simd128")]
-fn mask_simd128<const BPC: u32>(
-    dst: &mut [u8],
-    dst_stride: usize,
-    tmp1: &[i16],
-    tmp2: &[i16],
-    w: usize,
-    h: usize,
-    mask_buf: &[u8],
-) {
-    let ib = intermediate_bits_of(BPC);
-    let shift = ib + 6;
-    let rnd = (32i32 << ib) + prep_bias_of(BPC) * 64;
-    let max_pixel = (1i32 << BPC) - 1;
-    let bpp = bpp_of(BPC);
-    let v_rnd = i32x4_splat(rnd);
-    let v_64 = i16x8_splat(64);
-    let v_max = i16x8_splat(max_pixel as i16);
-
-    for y in 0..h {
-        let drow = y * dst_stride;
-        let trow = y * w;
-        let mut x = 0usize;
-        while x + 8 <= w {
-            let a = load_i16x8(tmp1, trow + x);
-            let b = load_i16x8(tmp2, trow + x);
-            let m16 = u16x8_extend_low_u8x16(load_low64_u8(mask_buf, trow + x));
-            let inv_m16 = i16x8_sub(v_64, m16);
-            let lo = i32x4_shr(
-                i32x4_add(
-                    i32x4_add(
-                        i32x4_mul(i32x4_extend_low_i16x8(a), i32x4_extend_low_i16x8(m16)),
-                        i32x4_mul(i32x4_extend_low_i16x8(b), i32x4_extend_low_i16x8(inv_m16)),
-                    ),
-                    v_rnd,
-                ),
-                shift,
-            );
-            let hi = i32x4_shr(
-                i32x4_add(
-                    i32x4_add(
-                        i32x4_mul(i32x4_extend_high_i16x8(a), i32x4_extend_high_i16x8(m16)),
-                        i32x4_mul(i32x4_extend_high_i16x8(b), i32x4_extend_high_i16x8(inv_m16)),
-                    ),
-                    v_rnd,
-                ),
-                shift,
-            );
-            pack_and_store_8::<BPC>(dst, drow + x * bpp, lo, hi, v_max);
-            x += 8;
-        }
-        while x + 4 <= w {
-            let a = load_i16x4(tmp1, trow + x);
-            let b = load_i16x4(tmp2, trow + x);
-            let m16 = u16x8_extend_low_u8x16(load_low32_u8(mask_buf, trow + x));
-            let inv_m16 = i16x8_sub(v_64, m16);
-            let lo = i32x4_shr(
-                i32x4_add(
-                    i32x4_add(
-                        i32x4_mul(i32x4_extend_low_i16x8(a), i32x4_extend_low_i16x8(m16)),
-                        i32x4_mul(i32x4_extend_low_i16x8(b), i32x4_extend_low_i16x8(inv_m16)),
-                    ),
-                    v_rnd,
-                ),
-                shift,
-            );
-            pack_and_store_4::<BPC>(dst, drow + x * bpp, lo, v_max);
-            x += 4;
-        }
-        while x < w {
-            let m = i32::from(mask_buf[trow + x]);
-            let a = i32::from(tmp1[trow + x]);
-            let b = i32::from(tmp2[trow + x]);
-            let val = ((a * m + b * (64 - m) + rnd) >> shift).clamp(0, max_pixel);
-            store_scalar::<BPC>(dst, drow + x * bpp, val);
-            x += 1;
-        }
-    }
-}
-
-/// `mc/mask` WASM `simd128` yuva girişi.
-pub fn mask<const BPC: u32>(
-    dst: &mut [u8],
-    dst_stride: usize,
-    tmp1: &[i16],
-    tmp2: &[i16],
-    w: usize,
-    h: usize,
-    mask_buf: &[u8],
-    bit_depth: BitDepth,
-    bitdepth_max: u16,
-) {
-    debug_assert_eq!(bit_depth.bits(), BPC);
-    debug_assert_eq!(u32::from(bitdepth_max), (1u32 << BPC) - 1);
-    mask_simd128::<BPC>(dst, dst_stride, tmp1, tmp2, w, h, mask_buf);
+pub(super) fn transpose_4x4_i32(r0: v128, r1: v128, r2: v128, r3: v128) -> [v128; 4] {
+    let t0 = i8x16_shuffle::<0, 1, 2, 3, 16, 17, 18, 19, 4, 5, 6, 7, 20, 21, 22, 23>(r0, r1);
+    let t1 = i8x16_shuffle::<8, 9, 10, 11, 24, 25, 26, 27, 12, 13, 14, 15, 28, 29, 30, 31>(r0, r1);
+    let t2 = i8x16_shuffle::<0, 1, 2, 3, 16, 17, 18, 19, 4, 5, 6, 7, 20, 21, 22, 23>(r2, r3);
+    let t3 = i8x16_shuffle::<8, 9, 10, 11, 24, 25, 26, 27, 12, 13, 14, 15, 28, 29, 30, 31>(r2, r3);
+    let c0 = i8x16_shuffle::<0, 1, 2, 3, 4, 5, 6, 7, 16, 17, 18, 19, 20, 21, 22, 23>(t0, t2);
+    let c1 = i8x16_shuffle::<8, 9, 10, 11, 12, 13, 14, 15, 24, 25, 26, 27, 28, 29, 30, 31>(t0, t2);
+    let c2 = i8x16_shuffle::<0, 1, 2, 3, 4, 5, 6, 7, 16, 17, 18, 19, 20, 21, 22, 23>(t1, t3);
+    let c3 = i8x16_shuffle::<8, 9, 10, 11, 12, 13, 14, 15, 24, 25, 26, 27, 28, 29, 30, 31>(t1, t3);
+    [c0, c1, c2, c3]
 }
 
 #[inline]
 #[target_feature(enable = "simd128")]
-fn blend_8_pixels<const BPC: u32>(
-    dst: &mut [u8],
-    d_off: usize,
-    tmp: &[u8],
-    t_off: usize,
-    m16: v128,
-    v_max: v128,
-) {
-    let a = load_pixels_8::<BPC>(dst, d_off);
-    let b = load_pixels_8::<BPC>(tmp, t_off);
-    let inv_m16 = i16x8_sub(i16x8_splat(64), m16);
-    let v_rnd = i32x4_splat(32);
-    let lo = i32x4_shr(
-        i32x4_add(
-            i32x4_add(
-                i32x4_mul(i32x4_extend_low_i16x8(a), i32x4_extend_low_i16x8(inv_m16)),
-                i32x4_mul(i32x4_extend_low_i16x8(b), i32x4_extend_low_i16x8(m16)),
-            ),
-            v_rnd,
-        ),
-        6,
-    );
-    let hi = i32x4_shr(
-        i32x4_add(
-            i32x4_add(
-                i32x4_mul(i32x4_extend_high_i16x8(a), i32x4_extend_high_i16x8(inv_m16)),
-                i32x4_mul(i32x4_extend_high_i16x8(b), i32x4_extend_high_i16x8(m16)),
-            ),
-            v_rnd,
-        ),
-        6,
-    );
-    pack_and_store_8::<BPC>(dst, d_off, lo, hi, v_max);
-}
-
-#[inline]
-#[target_feature(enable = "simd128")]
-fn blend_4_pixels<const BPC: u32>(
-    dst: &mut [u8],
-    d_off: usize,
-    tmp: &[u8],
-    t_off: usize,
-    m16: v128,
-    v_max: v128,
-) {
-    let a = load_pixels_4::<BPC>(dst, d_off);
-    let b = load_pixels_4::<BPC>(tmp, t_off);
-    let inv_m16 = i16x8_sub(i16x8_splat(64), m16);
-    let v_rnd = i32x4_splat(32);
-    let lo = i32x4_shr(
-        i32x4_add(
-            i32x4_add(
-                i32x4_mul(i32x4_extend_low_i16x8(a), i32x4_extend_low_i16x8(inv_m16)),
-                i32x4_mul(i32x4_extend_low_i16x8(b), i32x4_extend_low_i16x8(m16)),
-            ),
-            v_rnd,
-        ),
-        6,
-    );
-    pack_and_store_4::<BPC>(dst, d_off, lo, v_max);
-}
-
-#[target_feature(enable = "simd128")]
-fn blend_simd128<const BPC: u32>(
-    dst: &mut [u8],
-    dst_stride: usize,
-    tmp: &[u8],
-    w: usize,
-    h: usize,
-    mask_buf: &[u8],
-) {
-    let bpp = bpp_of(BPC);
-    let max_pixel = (1i32 << BPC) - 1;
-    let v_max = i16x8_splat(max_pixel as i16);
-    for y in 0..h {
-        let drow = y * dst_stride;
-        let trow = y * w;
-        let mut x = 0usize;
-        while x + 8 <= w {
-            let m16 = u16x8_extend_low_u8x16(load_low64_u8(mask_buf, trow + x));
-            blend_8_pixels::<BPC>(dst, drow + x * bpp, tmp, (trow + x) * bpp, m16, v_max);
-            x += 8;
-        }
-        while x + 4 <= w {
-            let m16 = u16x8_extend_low_u8x16(load_low32_u8(mask_buf, trow + x));
-            blend_4_pixels::<BPC>(dst, drow + x * bpp, tmp, (trow + x) * bpp, m16, v_max);
-            x += 4;
-        }
-        while x < w {
-            let a = load_scalar::<BPC>(dst, drow + x * bpp);
-            let b = load_scalar::<BPC>(tmp, (trow + x) * bpp);
-            let m = i32::from(mask_buf[trow + x]);
-            store_scalar::<BPC>(dst, drow + x * bpp, (a * (64 - m) + b * m + 32) >> 6);
-            x += 1;
-        }
-    }
-}
-
-/// `mc/blend` WASM `simd128` yuva girişi.
-pub fn blend<const BPC: u32>(
-    dst: &mut [u8],
-    dst_stride: usize,
-    tmp: &[u8],
-    w: usize,
-    h: usize,
-    mask_buf: &[u8],
-    bit_depth: BitDepth,
-    bitdepth_max: u16,
-) {
-    debug_assert_eq!(bit_depth.bits(), BPC);
-    debug_assert_eq!(u32::from(bitdepth_max), (1u32 << BPC) - 1);
-    blend_simd128::<BPC>(dst, dst_stride, tmp, w, h, mask_buf);
-}
-
-#[target_feature(enable = "simd128")]
-fn blend_v_simd128<const BPC: u32>(
-    dst: &mut [u8],
-    dst_stride: usize,
-    tmp: &[u8],
-    w: usize,
-    h: usize,
-) {
-    let bpp = bpp_of(BPC);
-    let max_pixel = (1i32 << BPC) - 1;
-    let v_max = i16x8_splat(max_pixel as i16);
-    let mask_row = &OBMC_MASKS[w..];
-    let cols = (w * 3) >> 2;
-    for y in 0..h {
-        let drow = y * dst_stride;
-        let trow = y * w;
-        let mut x = 0usize;
-        while x + 8 <= cols {
-            let s = &mask_row[x..x + 8];
-            let m16 = i16x8(
-                i16::from(s[0]),
-                i16::from(s[1]),
-                i16::from(s[2]),
-                i16::from(s[3]),
-                i16::from(s[4]),
-                i16::from(s[5]),
-                i16::from(s[6]),
-                i16::from(s[7]),
-            );
-            blend_8_pixels::<BPC>(dst, drow + x * bpp, tmp, (trow + x) * bpp, m16, v_max);
-            x += 8;
-        }
-        while x + 4 <= cols {
-            let s = &mask_row[x..x + 4];
-            let m16 = i16x8(
-                i16::from(s[0]),
-                i16::from(s[1]),
-                i16::from(s[2]),
-                i16::from(s[3]),
-                0,
-                0,
-                0,
-                0,
-            );
-            blend_4_pixels::<BPC>(dst, drow + x * bpp, tmp, (trow + x) * bpp, m16, v_max);
-            x += 4;
-        }
-        while x < cols {
-            let a = load_scalar::<BPC>(dst, drow + x * bpp);
-            let b = load_scalar::<BPC>(tmp, (trow + x) * bpp);
-            let m = i32::from(mask_row[x]);
-            store_scalar::<BPC>(dst, drow + x * bpp, (a * (64 - m) + b * m + 32) >> 6);
-            x += 1;
-        }
-    }
-}
-
-/// `mc/blend_v` WASM `simd128` yuva girişi.
-pub fn blend_v<const BPC: u32>(
-    dst: &mut [u8],
-    dst_stride: usize,
-    tmp: &[u8],
-    w: usize,
-    h: usize,
-    bit_depth: BitDepth,
-    bitdepth_max: u16,
-) {
-    debug_assert_eq!(bit_depth.bits(), BPC);
-    debug_assert_eq!(u32::from(bitdepth_max), (1u32 << BPC) - 1);
-    blend_v_simd128::<BPC>(dst, dst_stride, tmp, w, h);
-}
-
-#[target_feature(enable = "simd128")]
-fn blend_h_simd128<const BPC: u32>(
-    dst: &mut [u8],
-    dst_stride: usize,
-    tmp: &[u8],
-    w: usize,
-    h: usize,
-) {
-    let bpp = bpp_of(BPC);
-    let max_pixel = (1i32 << BPC) - 1;
-    let v_max = i16x8_splat(max_pixel as i16);
-    let mask_col = &OBMC_MASKS[h..];
-    let rows = (h * 3) >> 2;
-    for y in 0..rows {
-        let m = i32::from(mask_col[y]);
-        let m16 = i16x8_splat(m as i16);
-        let drow = y * dst_stride;
-        let trow = y * w;
-        let mut x = 0usize;
-        while x + 8 <= w {
-            blend_8_pixels::<BPC>(dst, drow + x * bpp, tmp, (trow + x) * bpp, m16, v_max);
-            x += 8;
-        }
-        while x + 4 <= w {
-            blend_4_pixels::<BPC>(dst, drow + x * bpp, tmp, (trow + x) * bpp, m16, v_max);
-            x += 4;
-        }
-        while x < w {
-            let a = load_scalar::<BPC>(dst, drow + x * bpp);
-            let b = load_scalar::<BPC>(tmp, (trow + x) * bpp);
-            store_scalar::<BPC>(dst, drow + x * bpp, (a * (64 - m) + b * m + 32) >> 6);
-            x += 1;
-        }
-    }
-}
-
-/// `mc/blend_h` WASM `simd128` yuva girişi.
-pub fn blend_h<const BPC: u32>(
-    dst: &mut [u8],
-    dst_stride: usize,
-    tmp: &[u8],
-    w: usize,
-    h: usize,
-    bit_depth: BitDepth,
-    bitdepth_max: u16,
-) {
-    debug_assert_eq!(bit_depth.bits(), BPC);
-    debug_assert_eq!(u32::from(bitdepth_max), (1u32 << BPC) - 1);
-    blend_h_simd128::<BPC>(dst, dst_stride, tmp, w, h);
-}
-
-// ============================================================================
-// 2. CDEF `dir` ve `fb[0..2]` (12 yuva)
-// ============================================================================
-
-#[inline]
-#[target_feature(enable = "simd128")]
-fn hsum_i32x4(v: v128) -> i32 {
+pub(super) fn hsum_i32x4(v: v128) -> i32 {
     i32x4_extract_lane::<0>(v)
         .wrapping_add(i32x4_extract_lane::<1>(v))
         .wrapping_add(i32x4_extract_lane::<2>(v))
         .wrapping_add(i32x4_extract_lane::<3>(v))
 }
 
+// ============================================================================
+// CDEF `dir` ve `fb[0..2]` (12 yuva)
+// ============================================================================
+
 #[target_feature(enable = "simd128")]
 fn cdef_find_dir_simd128<const BPC: u32>(img: &[u8], stride: usize) -> CdefDirResult {
-    let bpp = bpp_of(BPC);
     let bd_min_8 = BPC - 8;
     let v_128 = i16x8_splat(128);
 
@@ -887,7 +866,6 @@ fn cdef_find_dir_simd128<const BPC: u32>(img: &[u8], stride: usize) -> CdefDirRe
         }
     }
 
-    let _ = bpp;
     CdefDirResult {
         dir: best_dir as u8,
         var: best_cost.wrapping_sub(cost[best_dir ^ 4]) >> 10,
@@ -918,7 +896,6 @@ fn constrain_i32x4(diff: v128, v_thresh: v128, shift: u32) -> v128 {
 #[inline]
 #[target_feature(enable = "simd128")]
 fn round_shift_i32x4(sum: v128) -> v128 {
-    // `(sum - (sum < 0) + 8) >> 4`; `i32x4_lt(sum, 0)` negatif şeritlerde `-1` üretir.
     let neg = i32x4_lt(sum, i32x4_splat(0));
     i32x4_shr(i32x4_add(i32x4_add(sum, neg), i32x4_splat(8)), 4)
 }
@@ -1095,7 +1072,7 @@ pub fn cdef_filter<const BPC: u32>(
 }
 
 // ============================================================================
-// 3. PAL `pal_idx_finish` (1 yuva)
+// PAL `pal_idx_finish` (1 yuva)
 // ============================================================================
 
 #[inline]
