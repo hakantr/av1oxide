@@ -2,6 +2,10 @@
 
 #![forbid(unsafe_code)]
 
+use alloc::boxed::Box;
+use alloc::vec;
+use alloc::vec::Vec;
+
 use crate::api::{Config, Decoder, Packet};
 use crate::avif::boxes::{
     ALPHA_AUX_URN_CICP, ALPHA_AUX_URN_HEVC, Av1CProperty, AvifContainer, ItemProperty,
@@ -36,12 +40,12 @@ pub(crate) struct PlanarBuffer {
 
 /// Yapılandırılmış iş parçacığı sayısını etkin çalışma zamanı sayısına çözümler.
 pub(crate) fn resolve_effective_threads(n_threads: usize) -> usize {
-    #[cfg(target_arch = "wasm32")]
+    #[cfg(any(not(feature = "std"), target_arch = "wasm32"))]
     {
         let _ = n_threads;
         1
     }
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(all(feature = "std", not(target_arch = "wasm32")))]
     {
         if n_threads == 0 {
             std::thread::available_parallelism()
@@ -1390,6 +1394,7 @@ fn decode_grid_tiles_into_canvas(
 
     let total_threads = resolve_effective_threads(config.n_threads);
 
+    #[cfg(all(feature = "std", not(target_arch = "wasm32")))]
     let decoded_tiles: Vec<PlanarBuffer> = if total_threads > 1 && num_unique > 1 {
         let worker_count = total_threads.min(num_unique);
         let chunk_size = num_unique.div_ceil(worker_count);
@@ -1433,6 +1438,22 @@ fn decode_grid_tiles_into_canvas(
                 tid,
                 config,
                 total_threads,
+                is_alpha,
+                depth + 1,
+            )?);
+        }
+        flat
+    };
+    #[cfg(not(all(feature = "std", not(target_arch = "wasm32"))))]
+    let decoded_tiles: Vec<PlanarBuffer> = {
+        let _ = total_threads;
+        let mut flat = Vec::with_capacity(num_unique);
+        for &tid in &unique_ids {
+            flat.push(decode_item_planar(
+                container,
+                tid,
+                config,
+                1,
                 is_alpha,
                 depth + 1,
             )?);
@@ -1931,6 +1952,8 @@ pub fn decode_rgba8(data: &[u8]) -> Result<RgbaImage> {
 
 #[cfg(test)]
 mod tests {
+    use alloc::vec;
+
     use super::{LIMITED_TO_FULL_Y_8BIT, PlanarBuffer, crop_planar, limited_to_full_y_u16};
     use crate::avif::image::PlaneStorage;
     use crate::error::Error;

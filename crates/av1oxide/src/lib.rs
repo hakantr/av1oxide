@@ -116,14 +116,36 @@
 //! | `indexmap` | `2` | `Apache-2.0 OR MIT` | `indexmap-rs/indexmap` | `[]` | Ekleme sırasını koruyan $O(1)$ tekil tablo/küme motoru (`avif::boxes`, `avif::decode`, `dsp`) | Pure Rust (`indexmap` `#![forbid(unsafe_code)]` + Miri onaylı `hashbrown`, `0` C kodu) |
 //! | `flate2` | `1.1` | `MIT OR Apache-2.0` | `rust-lang/flate2-rs` | `["rust_backend"]` | Sınırlı `deflate`/`zlib`/`gzip` HEIF metaveri ve `cmin` açıcısı (`avif::boxes`) | Safe Rust (`miniz_oxide` `#![forbid(unsafe_code)]` arka ucu, `0` C kodu) |
 
+#![cfg_attr(not(feature = "std"), no_std)]
 #![deny(unused_crate_dependencies)]
 #![warn(clippy::all)]
+
+extern crate alloc;
+
+/// Yalnız `std` kipinde tanılama izlerini `stderr`'e yazar; `no_std` kipinde sessizdir.
+#[cfg(feature = "std")]
+macro_rules! trace_eprintln {
+    ($($arg:tt)*) => {
+        ::std::eprintln!($($arg)*);
+    };
+}
+
+#[cfg(not(feature = "std"))]
+macro_rules! trace_eprintln {
+    ($($arg:tt)*) => {{
+        let _ = ::core::format_args!($($arg)*);
+    }};
+}
+
+pub(crate) use trace_eprintln;
 
 pub mod api;
 pub mod audit;
 pub mod avif;
 pub mod bitstream;
+#[cfg(feature = "std")]
 pub mod capi;
+pub mod container;
 pub mod cpu;
 pub mod decode;
 pub mod dsp;

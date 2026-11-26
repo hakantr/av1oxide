@@ -33,6 +33,8 @@
 
 #![forbid(unsafe_code)]
 
+use alloc::vec::Vec;
+
 use crate::error::{Error, Result, SizeStage};
 use crate::frame::BitDepth;
 
@@ -443,6 +445,7 @@ impl FramePlane {
 
     /// Havuzdan geri dönüştürülmüş `buf` kapasitesi `[n, 2*n]` aralığındaysa yeniden
     /// tahsis yapmadan düzlemi kopyalar (`F8b-1`). Bütçe denetimi çağıranındır.
+    #[cfg_attr(not(feature = "std"), allow(dead_code))]
     pub(crate) fn try_clone_with_buf(&self, mut buf: Vec<u8>, allow_reuse: bool) -> Result<Self> {
         let n = self.data.len();
         let data =

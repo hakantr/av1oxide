@@ -26,10 +26,11 @@
 #![forbid(unsafe_code)]
 
 use crate::error::{Error, Result, SizeStage};
+use alloc::sync::Arc;
+use alloc::vec::Vec;
 use core::ops::{Deref, DerefMut};
 use core::sync::atomic::{AtomicUsize, Ordering};
 use crossbeam_utils::{Backoff, CachePadded};
-use std::sync::Arc;
 
 /// Canlı ayırma defteri (atomik sayaçlarla iş parçacıkları arasında `&Butce` veya `Arc<Butce>` ile paylaşılır; BLK-08).
 #[derive(Debug)]
@@ -429,6 +430,10 @@ pub(crate) fn kopya_vec<T: Clone>(kaynak: &[T]) -> Result<Vec<T>> {
 
 #[cfg(test)]
 mod tests {
+    use alloc::vec;
+    #[cfg(feature = "std")]
+    use alloc::vec::Vec;
+
     use super::Butce;
     use crate::error::Error;
 
@@ -483,6 +488,7 @@ mod tests {
         assert_eq!(b.kapasite::<u32>(4).expect("kapasite").capacity(), 4);
     }
 
+    #[cfg(feature = "std")]
     #[test]
     fn eszamanli_ayir_ve_birak_siniri_asmaz_ve_sizdirmaz() {
         use std::sync::{Arc, Barrier};

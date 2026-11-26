@@ -671,6 +671,9 @@ impl SequenceHeader {
 
 #[cfg(test)]
 mod tests {
+    use alloc::vec;
+    use alloc::vec::Vec;
+
     use super::{
         AdaptiveBoolean, ChromaSamplePosition, PixelLayout, SequenceHeader,
         SequenceHeaderParseOptions,

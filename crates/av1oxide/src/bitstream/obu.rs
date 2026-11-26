@@ -295,6 +295,9 @@ pub fn parse_sequence_header_obus(data: &[u8]) -> Result<Option<SequenceHeader>>
 
 #[cfg(test)]
 mod tests {
+    use alloc::vec;
+    use alloc::vec::Vec;
+
     use super::{ObuType, parse_sequence_header_obus, split_next};
     use crate::error::{BitstreamErrorKind, Error};
 

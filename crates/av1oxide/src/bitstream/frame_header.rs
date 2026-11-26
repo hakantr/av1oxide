@@ -106,6 +106,8 @@
 
 #![forbid(unsafe_code)]
 
+use alloc::vec::Vec;
+
 use crate::bitstream::reader::BitReader;
 use crate::bitstream::seq_header::{AdaptiveBoolean, SequenceHeader};
 use crate::error::{BitstreamError, BitstreamErrorKind, Error, Result};
@@ -1945,6 +1947,10 @@ pub fn parse_tile_group(payload: &[u8], header: &FrameHeader) -> Result<TileGrou
 #[cfg(test)]
 #[allow(clippy::field_reassign_with_default)]
 mod tests {
+    use alloc::format;
+    use alloc::vec;
+    use alloc::vec::Vec;
+
     use super::{
         DEFAULT_MODE_REF_DELTAS, DEFAULT_WM_PARAMS, FilmGrainData, FilmGrainHeader, FrameHeader,
         FrameHeaderContext, FrameType, LoopfilterModeRefDeltas, NUM_REF_FRAMES, PRIMARY_REF_NONE,

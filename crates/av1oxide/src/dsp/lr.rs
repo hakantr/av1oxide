@@ -241,8 +241,8 @@ impl LrDsp {
     }
 }
 
-impl std::fmt::Debug for LrDsp {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::Debug for LrDsp {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.write_str("LrDsp { wiener: [fn; 2], sgr: [fn; 3] }")
     }
 }
@@ -487,6 +487,9 @@ pub fn sgr_skaler_devret<const BPC: u32>(
 
 #[cfg(test)]
 mod tests {
+    use alloc::vec;
+    use alloc::vec::Vec;
+
     use super::{LrBitDepth, LrEdgeFlags};
 
     #[test]

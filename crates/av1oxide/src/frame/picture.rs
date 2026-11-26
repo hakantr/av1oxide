@@ -20,6 +20,9 @@
 
 #![forbid(unsafe_code)]
 
+use alloc::sync::Arc;
+use alloc::vec::Vec;
+
 use crate::error::{Error, Result, SizeStage};
 use crate::frame::butce::Butce;
 use crate::frame::{BitDepth, ChromaFormat, FramePlane, PlaneLayout, PlaneType};
@@ -331,7 +334,7 @@ impl Frame {
         height: usize,
         chroma_format: ChromaFormat,
         bit_depth: BitDepth,
-        holder: &std::sync::Arc<P>,
+        holder: &Arc<P>,
         get_plane: fn(&P, usize) -> (&[u8], usize),
         mut recycled: [Vec<u8>; 3],
         butce: &Butce,
@@ -365,7 +368,7 @@ impl Frame {
                     out: None,
                 })
                 .collect();
-            let holder_w = std::sync::Arc::clone(holder);
+            let holder_w = Arc::clone(holder);
             let res = pool.execute_tasks(&mut jobs, move |_wid, _idx, job: &mut SharedCopyJob| {
                 let buf = core::mem::take(&mut job.recycled);
                 let (src, src_stride) = get_plane(&holder_w, job.idx);
@@ -567,6 +570,7 @@ impl Frame {
 
     /// Havuzdan geri dönüştürülmüş düzlem tamponlarıyla (`recycled`) düşebilir
     /// kare kopyası (`F8b-1`).
+    #[cfg_attr(not(feature = "std"), allow(dead_code))]
     pub(crate) fn try_clone_with_bufs(
         &self,
         mut recycled: [Vec<u8>; 3],

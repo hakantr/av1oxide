@@ -31,6 +31,8 @@
 
 #![forbid(unsafe_code)]
 
+use alloc::string::String;
+
 use super::{CpuFlags, quirks};
 
 /// `X(reg, mask)`: maskedeki bütün bitler var mı (`src/x86/cpu.c:45`).
@@ -110,7 +112,7 @@ pub struct X86CpuId {
 
 impl X86CpuId {
     /// Bu makinenin CPUID ve işletim sistemi durumunu okur (güvenli kod).
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(all(feature = "std", target_arch = "x86_64"))]
     #[must_use]
     pub fn read() -> Self {
         use std::arch::x86_64::{__cpuid, __cpuid_count};
@@ -437,7 +439,7 @@ mod tests {
     /// Bu makinede hangi değer dönerse dönsün aşağıdaki çıkarımlar sağlanır;
     /// ham CPUID biti olup std'nin bildirmediği bir AVX özelliği işletim
     /// sisteminin durumu kaydetmediğini gösterir ve tespit onu kullanmaz.
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(all(feature = "std", target_arch = "x86_64"))]
     #[test]
     fn std_tespiti_isletim_sistemi_durumunu_icerir() {
         use std::arch::is_x86_feature_detected as d;
@@ -475,7 +477,7 @@ mod tests {
 
     /// Tespit edilen dav1d bayrakları std'nin bildirdiği özelliklerle
     /// tutarlıdır (fazla raporlama yok).
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(all(feature = "std", target_arch = "x86_64"))]
     #[test]
     fn tespit_std_ile_tutarli() {
         use std::arch::is_x86_feature_detected as d;

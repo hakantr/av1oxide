@@ -2,6 +2,9 @@
 
 #![forbid(unsafe_code)]
 
+use alloc::boxed::Box;
+use alloc::vec::Vec;
+
 use crate::avif::image::{AvifImage, ColorInfo, ContentLightLevel, MasteringDisplay};
 use crate::error::{Error, Result};
 
@@ -287,6 +290,8 @@ pub(crate) fn parse_tone_mapped_image_box(raw: &[u8]) -> Result<ToneMapParseOutc
 
 #[cfg(test)]
 mod tests {
+    use alloc::vec::Vec;
+
     use super::{
         GainMapFractionI32, GainMapFractionU32, ToneMapParseOutcome, parse_tone_mapped_image_box,
     };

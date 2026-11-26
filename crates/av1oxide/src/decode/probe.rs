@@ -37,7 +37,9 @@
 
 #![forbid(unsafe_code)]
 
+#[cfg(feature = "std")]
 use std::cell::{Cell, RefCell};
+#[cfg(feature = "std")]
 use std::sync::OnceLock;
 
 /// Hedef blok: bu pikseli içeren blok(lar) dökülür.
@@ -91,9 +93,12 @@ pub struct Pred {
 
 type Sink = fn(&[u8]);
 
+#[cfg(feature = "std")]
 static SINK: OnceLock<Sink> = OnceLock::new();
+#[cfg(feature = "std")]
 static TARGET: OnceLock<Option<Target>> = OnceLock::new();
 
+#[cfg(feature = "std")]
 thread_local! {
     static FRAME_NO: Cell<u32> = const { Cell::new(0) };
     /// Blok kayıtlarının taşıyacağı **geçerli** kare indeksi (RPL0 ile aynı).
@@ -107,19 +112,42 @@ thread_local! {
 
 /// Alıcıyı kurar (ikinci çağrı yok sayılır).
 pub fn set_sink(sink: Sink) -> bool {
-    SINK.set(sink).is_ok()
+    #[cfg(feature = "std")]
+    {
+        SINK.set(sink).is_ok()
+    }
+    #[cfg(not(feature = "std"))]
+    {
+        let _ = sink;
+        false
+    }
 }
 
 /// Hedefi kurar (ikinci çağrı yok sayılır).
 pub fn set_target(target: Target) -> bool {
-    TARGET.set(Some(target)).is_ok()
+    #[cfg(feature = "std")]
+    {
+        TARGET.set(Some(target)).is_ok()
+    }
+    #[cfg(not(feature = "std"))]
+    {
+        let _ = target;
+        false
+    }
 }
 
 /// Hedef kurulu mu? (kayıt yolu açık mı)
 #[must_use]
 #[inline(always)]
 pub fn enabled() -> bool {
-    SINK.get().is_some() && TARGET.get().is_some_and(Option::is_some)
+    #[cfg(feature = "std")]
+    {
+        SINK.get().is_some() && TARGET.get().is_some_and(Option::is_some)
+    }
+    #[cfg(not(feature = "std"))]
+    {
+        false
+    }
 }
 
 /// Yeni bir **çözülen** kare başladı; sıra numarasını döndürür.
@@ -129,28 +157,36 @@ pub fn enabled() -> bool {
 /// **çıktı** kareleriyle içerikten eşler (çözülemeyen kareler çıktı üretmez,
 /// bu yüzden iki sıra numarası aynı olmayabilir).
 pub fn frame_start(width: u32, height: u32, bpc: u8, layout: u8) -> u32 {
-    FRAME_NO.with(|c| {
-        let v = c.get();
-        c.set(v.wrapping_add(1));
-        CURRENT.with(|cur| cur.set(v));
-        if enabled() {
-            BUF.with(|buf| {
-                let mut b = buf.borrow_mut();
-                b.clear();
-                b.extend_from_slice(b"RPL0");
-                push_u32(&mut b, v);
-                push_u32(&mut b, width);
-                push_u32(&mut b, height);
-                b.push(bpc);
-                b.push(layout);
-                b.extend_from_slice(&[0, 0]);
-                if let Some(sink) = SINK.get() {
-                    sink(&b);
-                }
-            });
-        }
-        v
-    })
+    #[cfg(feature = "std")]
+    {
+        FRAME_NO.with(|c| {
+            let v = c.get();
+            c.set(v.wrapping_add(1));
+            CURRENT.with(|cur| cur.set(v));
+            if enabled() {
+                BUF.with(|buf| {
+                    let mut b = buf.borrow_mut();
+                    b.clear();
+                    b.extend_from_slice(b"RPL0");
+                    push_u32(&mut b, v);
+                    push_u32(&mut b, width);
+                    push_u32(&mut b, height);
+                    b.push(bpc);
+                    b.push(layout);
+                    b.extend_from_slice(&[0, 0]);
+                    if let Some(sink) = SINK.get() {
+                        sink(&b);
+                    }
+                });
+            }
+            v
+        })
+    }
+    #[cfg(not(feature = "std"))]
+    {
+        let _ = (width, height, bpc, layout);
+        0
+    }
 }
 
 /// Çözülen karenin **içerik özeti** (FNV-1a 64) — `RPL3`.
@@ -158,46 +194,59 @@ pub fn frame_start(width: u32, height: u32, bpc: u8, layout: u8) -> u32 {
 /// Sürücü, Rust YUV çıktısındaki kareyi bu özetle eşler; `show_existing` ve
 /// çözülemeyen kareler yüzünden çözme sırası ile çıktı sırası farklı olabilir.
 pub fn frame_end(hash: u64, bytes: u64) {
-    if !enabled() {
-        return;
-    }
-    let frame = CURRENT.with(Cell::get);
-    BUF.with(|buf| {
-        let mut b = buf.borrow_mut();
-        b.clear();
-        b.extend_from_slice(b"RPL3");
-        push_u32(&mut b, frame);
-        b.extend_from_slice(&hash.to_le_bytes());
-        b.extend_from_slice(&bytes.to_le_bytes());
-        if let Some(sink) = SINK.get() {
-            sink(&b);
+    #[cfg(feature = "std")]
+    {
+        if !enabled() {
+            return;
         }
-    });
+        let frame = CURRENT.with(Cell::get);
+        BUF.with(|buf| {
+            let mut b = buf.borrow_mut();
+            b.clear();
+            b.extend_from_slice(b"RPL3");
+            push_u32(&mut b, frame);
+            b.extend_from_slice(&hash.to_le_bytes());
+            b.extend_from_slice(&bytes.to_le_bytes());
+            if let Some(sink) = SINK.get() {
+                sink(&b);
+            }
+        });
+    }
+    #[cfg(not(feature = "std"))]
+    {
+        let _ = (hash, bytes);
+    }
 }
 
 /// Kare süzgeci: `u32::MAX` bütün kareleri seçer.
+#[cfg(feature = "std")]
 fn frame_matches(target: Target, frame: u32) -> bool {
     target.frame == u32::MAX || target.frame == frame
 }
 
 /// Hedefle kesişim var mı?
+#[cfg(feature = "std")]
 fn hits(target: Target, plane: u8, x: u32, y: u32, w: u32, h: u32) -> bool {
     target.plane == plane && target.x >= x && target.x < x + w && target.y >= y && target.y < y + h
 }
 
+#[cfg(feature = "std")]
 fn push_u32(buf: &mut Vec<u8>, v: u32) {
     buf.extend_from_slice(&v.to_le_bytes());
 }
 
+#[cfg(feature = "std")]
 fn push_i32(buf: &mut Vec<u8>, v: i32) {
     buf.extend_from_slice(&v.to_le_bytes());
 }
 
+#[cfg(feature = "std")]
 fn push_blob(buf: &mut Vec<u8>, data: &[u8]) {
     push_u32(buf, data.len() as u32);
     buf.extend_from_slice(data);
 }
 
+#[cfg(feature = "std")]
 fn push_i32_blob(buf: &mut Vec<u8>, data: &[i32]) {
     push_u32(buf, (data.len() * 4) as u32);
     for v in data {
@@ -205,6 +254,7 @@ fn push_i32_blob(buf: &mut Vec<u8>, data: &[i32]) {
     }
 }
 
+#[cfg(feature = "std")]
 fn push_i16_blob(buf: &mut Vec<u8>, data: &[i16]) {
     push_u32(buf, (data.len() * 2) as u32);
     for v in data {
@@ -228,54 +278,61 @@ pub fn pred_record(
     pal: &[u16],
     pred: &[u8],
 ) {
-    if !enabled() {
-        return;
-    }
-    let Some(target) = TARGET.get().copied().flatten() else {
-        return;
-    };
-    let frame = CURRENT.with(Cell::get);
-    if !frame_matches(target, frame) || !hits(target, plane, p.x, p.y, p.w, p.h) {
-        return;
-    }
-    BUF.with(|buf| {
-        let mut b = buf.borrow_mut();
-        b.clear();
-        b.extend_from_slice(b"RPL1");
-        b.push(p.kind);
-        b.push(bpc);
-        b.push(layout);
-        b.push(0);
-        push_u32(&mut b, frame);
-        b.push(plane);
-        b.extend_from_slice(&[0, 0, 0]);
-        push_u32(&mut b, p.x);
-        push_u32(&mut b, p.y);
-        push_u32(&mut b, p.w);
-        push_u32(&mut b, p.h);
-        push_i32(&mut b, p.mode);
-        push_i32(&mut b, p.angle);
-        push_i32(&mut b, p.flags);
-        push_i32(&mut b, p.max_width);
-        push_i32(&mut b, p.max_height);
-        push_i32(&mut b, p.alpha);
-        push_i32(&mut b, p.bitdepth_max);
-        push_u32(&mut b, u32::from(p.tx));
-        push_u32(&mut b, u32::from(p.txtp));
-        push_i32(&mut b, p.eob);
-        push_blob(&mut b, edge);
-        push_i16_blob(&mut b, ac);
-        push_blob(&mut b, idx);
-        push_u32(&mut b, (pal.len() * 2) as u32);
-        for v in pal {
-            b.extend_from_slice(&v.to_le_bytes());
+    #[cfg(feature = "std")]
+    {
+        if !enabled() {
+            return;
         }
-        push_blob(&mut b, pred);
-        if let Some(sink) = SINK.get() {
-            sink(&b);
+        let Some(target) = TARGET.get().copied().flatten() else {
+            return;
+        };
+        let frame = CURRENT.with(Cell::get);
+        if !frame_matches(target, frame) || !hits(target, plane, p.x, p.y, p.w, p.h) {
+            return;
         }
-        PENDING.with(|slot| slot.borrow_mut()[usize::from(plane)] = Some(p));
-    });
+        BUF.with(|buf| {
+            let mut b = buf.borrow_mut();
+            b.clear();
+            b.extend_from_slice(b"RPL1");
+            b.push(p.kind);
+            b.push(bpc);
+            b.push(layout);
+            b.push(0);
+            push_u32(&mut b, frame);
+            b.push(plane);
+            b.extend_from_slice(&[0, 0, 0]);
+            push_u32(&mut b, p.x);
+            push_u32(&mut b, p.y);
+            push_u32(&mut b, p.w);
+            push_u32(&mut b, p.h);
+            push_i32(&mut b, p.mode);
+            push_i32(&mut b, p.angle);
+            push_i32(&mut b, p.flags);
+            push_i32(&mut b, p.max_width);
+            push_i32(&mut b, p.max_height);
+            push_i32(&mut b, p.alpha);
+            push_i32(&mut b, p.bitdepth_max);
+            push_u32(&mut b, u32::from(p.tx));
+            push_u32(&mut b, u32::from(p.txtp));
+            push_i32(&mut b, p.eob);
+            push_blob(&mut b, edge);
+            push_i16_blob(&mut b, ac);
+            push_blob(&mut b, idx);
+            push_u32(&mut b, (pal.len() * 2) as u32);
+            for v in pal {
+                b.extend_from_slice(&v.to_le_bytes());
+            }
+            push_blob(&mut b, pred);
+            if let Some(sink) = SINK.get() {
+                sink(&b);
+            }
+            PENDING.with(|slot| slot.borrow_mut()[usize::from(plane)] = Some(p));
+        });
+    }
+    #[cfg(not(feature = "std"))]
+    {
+        let _ = (p, plane, bpc, layout, edge, ac, idx, pal, pred);
+    }
 }
 
 /// Tx bloğu kaydı: itx **öncesi** hedef, katsayılar ve itx **sonrası** hedef.
@@ -300,73 +357,85 @@ pub fn tx_record(
     coeffs: &[i32],
     after: &[u8],
 ) {
-    if !enabled() {
-        return;
-    }
-    let Some(target) = TARGET.get().copied().flatten() else {
-        return;
-    };
-    let frame = CURRENT.with(Cell::get);
-    if !frame_matches(target, frame) || !hits(target, plane, x, y, w, h) {
-        return;
-    }
-    let pending = PENDING.with(|slot| slot.borrow()[usize::from(plane)]);
-    BUF.with(|buf| {
-        let mut b = buf.borrow_mut();
-        b.clear();
-        b.extend_from_slice(b"RPL2");
-        b.push(plane);
-        b.push(bpc);
-        b.push(layout);
-        b.push(tx);
-        b.push(txtp);
-        b.extend_from_slice(&[0, 0, 0]);
-        push_u32(&mut b, frame);
-        push_u32(&mut b, x);
-        push_u32(&mut b, y);
-        push_u32(&mut b, w);
-        push_u32(&mut b, h);
-        push_i32(&mut b, eob);
-        push_u32(&mut b, dst_x);
-        push_u32(&mut b, dst_y);
-        match pending {
-            Some(p) => {
-                b.push(1);
-                b.push(p.kind);
-                b.extend_from_slice(&[0, 0]);
-                push_i32(&mut b, p.mode);
-                push_i32(&mut b, p.angle);
-                push_i32(&mut b, p.flags);
-                push_i32(&mut b, p.max_width);
-                push_i32(&mut b, p.max_height);
-                push_i32(&mut b, p.alpha);
-                push_i32(&mut b, p.bitdepth_max);
-                push_u32(&mut b, p.x);
-                push_u32(&mut b, p.y);
-                push_u32(&mut b, p.w);
-                push_u32(&mut b, p.h);
-            }
-            None => {
-                // 1 (has_pred) + 1 (kind) + 2 (pad) + 7 i32 + 4 u32 = 48 bayt.
-                b.push(0);
-                b.extend_from_slice(&[0; 47]);
-            }
+    #[cfg(feature = "std")]
+    {
+        if !enabled() {
+            return;
         }
-        push_blob(&mut b, before);
-        push_i32_blob(&mut b, coeffs);
-        push_blob(&mut b, after);
-        if let Some(sink) = SINK.get() {
-            sink(&b);
+        let Some(target) = TARGET.get().copied().flatten() else {
+            return;
+        };
+        let frame = CURRENT.with(Cell::get);
+        if !frame_matches(target, frame) || !hits(target, plane, x, y, w, h) {
+            return;
         }
-    });
+        let pending = PENDING.with(|slot| slot.borrow()[usize::from(plane)]);
+        BUF.with(|buf| {
+            let mut b = buf.borrow_mut();
+            b.clear();
+            b.extend_from_slice(b"RPL2");
+            b.push(plane);
+            b.push(bpc);
+            b.push(layout);
+            b.push(tx);
+            b.push(txtp);
+            b.extend_from_slice(&[0, 0, 0]);
+            push_u32(&mut b, frame);
+            push_u32(&mut b, x);
+            push_u32(&mut b, y);
+            push_u32(&mut b, w);
+            push_u32(&mut b, h);
+            push_i32(&mut b, eob);
+            push_u32(&mut b, dst_x);
+            push_u32(&mut b, dst_y);
+            match pending {
+                Some(p) => {
+                    b.push(1);
+                    b.push(p.kind);
+                    b.extend_from_slice(&[0, 0]);
+                    push_i32(&mut b, p.mode);
+                    push_i32(&mut b, p.angle);
+                    push_i32(&mut b, p.flags);
+                    push_i32(&mut b, p.max_width);
+                    push_i32(&mut b, p.max_height);
+                    push_i32(&mut b, p.alpha);
+                    push_i32(&mut b, p.bitdepth_max);
+                    push_u32(&mut b, p.x);
+                    push_u32(&mut b, p.y);
+                    push_u32(&mut b, p.w);
+                    push_u32(&mut b, p.h);
+                }
+                None => {
+                    // 1 (has_pred) + 1 (kind) + 2 (pad) + 7 i32 + 4 u32 = 48 bayt.
+                    b.push(0);
+                    b.extend_from_slice(&[0; 47]);
+                }
+            }
+            push_blob(&mut b, before);
+            push_i32_blob(&mut b, coeffs);
+            push_blob(&mut b, after);
+            if let Some(sink) = SINK.get() {
+                sink(&b);
+            }
+        });
+    }
+    #[cfg(not(feature = "std"))]
+    {
+        let _ = (
+            plane, bpc, layout, x, y, w, h, tx, txtp, eob, dst_x, dst_y, before, coeffs, after,
+        );
+    }
 }
 
 /// Bekleyen tahmin kayıtlarını temizler (blok/parça sınırında).
 pub fn clear_pending() {
-    PENDING.with(|slot| *slot.borrow_mut() = [None; 3]);
+    #[cfg(feature = "std")]
+    {
+        PENDING.with(|slot| *slot.borrow_mut() = [None; 3]);
+    }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "std"))]
 mod tests {
     use super::*;
     use std::sync::Mutex;

@@ -2,6 +2,8 @@
 
 #![forbid(unsafe_code)]
 
+use alloc::vec::Vec;
+
 use crate::avif::color;
 use crate::avif::gainmap::{GainMap, GainMapMetadata};
 use crate::error::Result;

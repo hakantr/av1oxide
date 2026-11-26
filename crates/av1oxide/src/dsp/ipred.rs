@@ -427,8 +427,8 @@ impl IntraPredDsp {
     }
 }
 
-impl std::fmt::Debug for IntraPredDsp {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::Debug for IntraPredDsp {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("IntraPredDsp")
             .field(
                 "intra_pred",

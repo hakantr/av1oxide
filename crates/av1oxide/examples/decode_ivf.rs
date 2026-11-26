@@ -1,4 +1,4 @@
-//! `av1oxide` çok-thread IVF akışı çözme ve YUV düzlem okuma örneği (`v0.4.0`).
+//! `av1oxide` çok-thread IVF akışı çözme ve YUV düzlem okuma örneği (`v0.5.0-dev`).
 //!
 //! Çalıştırma:
 //!   cargo run --release -p av1oxide --example decode_ivf
@@ -10,29 +10,8 @@ use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::PathBuf;
 
+use av1oxide::container::ivf::IvfParser;
 use av1oxide::{Config, Decoder, Frame, Packet, PlaneType, Result};
-
-/// Basit IVF kapsayıcı ayrıştırıcısı (32 bayt dosya başlığı + kare başına 12 bayt başlık).
-fn parse_ivf_packets(data: &[u8]) -> Vec<(i64, &[u8])> {
-    assert!(
-        data.len() >= 32 && &data[0..4] == b"DKIF" && &data[8..12] == b"AV01",
-        "geçerli bir AV1 IVF dosyası bekleniyor"
-    );
-    let mut offset = 32usize;
-    let mut packets = Vec::new();
-    while offset + 12 <= data.len() {
-        let frame_size =
-            u32::from_le_bytes(data[offset..offset + 4].try_into().expect("4 bayt")) as usize;
-        let pts = i64::from_le_bytes(data[offset + 4..offset + 12].try_into().expect("8 bayt"));
-        offset += 12;
-        if offset + frame_size > data.len() {
-            break;
-        }
-        packets.push((pts, &data[offset..offset + frame_size]));
-        offset += frame_size;
-    }
-    packets
-}
 
 /// Çözülen bir karenin Y, U, V düzlemlerini satır satır (stride dolgusunu atlayarak) yazar.
 ///
@@ -116,7 +95,8 @@ fn main() -> Result<()> {
             ("embedded_1x1.ivf".to_string(), embedded_fallback_ivf())
         }
     };
-    let packets = parse_ivf_packets(&ivf_bytes);
+
+    let parser = IvfParser::new(&ivf_bytes)?;
 
     // Çok-thread çözücü yapılandırması:
     // - n_threads: 4 işçi thread'i
@@ -134,8 +114,9 @@ fn main() -> Result<()> {
     let mut frame_count = 0usize;
     let mut last_dims = (0usize, 0usize);
 
-    for (pts, payload) in packets {
-        decoder.send_packet(&Packet::with_timestamp(payload, pts))?;
+    for pkt in parser {
+        let pkt = pkt?;
+        decoder.send_packet(&Packet::with_timestamp(pkt.data, pkt.pts))?;
         while let Some(frame) = decoder.receive_frame()? {
             last_dims = (frame.width(), frame.height());
             if let Some(w) = yuv_writer.as_mut() {

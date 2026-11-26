@@ -142,6 +142,8 @@ impl fmt::Display for BitstreamError {
 
 #[cfg(test)]
 mod tests {
+    use alloc::string::ToString;
+
     use super::{BitstreamError, BitstreamErrorKind};
 
     #[test]

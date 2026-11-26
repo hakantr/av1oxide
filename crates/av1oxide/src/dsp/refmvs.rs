@@ -72,8 +72,8 @@ impl RefmvsDsp {
     };
 }
 
-impl std::fmt::Debug for RefmvsDsp {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::Debug for RefmvsDsp {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.write_str("RefmvsDsp { load_tmvs: fn, save_tmvs: fn, splat_mv: fn }")
     }
 }
@@ -390,6 +390,8 @@ pub fn splat_mv_skaler_devret(
 
 #[cfg(test)]
 mod tests {
+    use alloc::vec;
+
     use super::*;
 
     #[test]

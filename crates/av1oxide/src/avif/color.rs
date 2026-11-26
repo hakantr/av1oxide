@@ -2,12 +2,15 @@
 
 #![forbid(unsafe_code)]
 
+use alloc::vec::Vec;
+
 use crate::avif::image::{AvifImage, PlaneStorage, Rgb16Image, RgbImage, Rgba16Image, RgbaImage};
 use crate::error::{Error, Result, SizeStage};
 use crate::frame::{BitDepth, ChromaFormat};
 
 /// `std::thread::scope` şerit paralelliği için minimum piksel eşiği (`512 × 512`).
 #[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(feature = "std", not(target_arch = "wasm32")))]
 const PARALLEL_PIXEL_THRESHOLD: usize = 262_144;
 
 /// `color_primaries` kod noktasına karşılık gelen CIE 1931 `(rX, rY, gX, gY, bX, bY, wX, wY)`
@@ -263,6 +266,213 @@ impl MatrixKernel for StandardMatrix {
     }
 }
 
+/// `no_std` + `alloc` kipinde `%100 #![forbid(unsafe_code)]` IEEE-754 `f64` matematik yardımcıları.
+///
+/// `std` açıkken doğrudan standart kütüphane (`f64::sqrt`, `f64::ln`, `f64::exp`, `f64::powf`,
+/// `f32::round`) çağrılır; `no_std` kipinde `< 1 ULP` hassasiyetli saf polinom + Newton-Raphson
+/// yaklaşımları kullanılır.
+mod math {
+    #[cfg(any(not(feature = "std"), test))]
+    pub(super) mod nostd {
+        const LN2_HI: f64 = core::f64::consts::LN_2;
+        const LN2_LO: f64 = 2.319_046_813_846_299_6e-17;
+        const INV_LN2: f64 = core::f64::consts::LOG2_E;
+        const SQRT_2: f64 = core::f64::consts::SQRT_2;
+
+        /// `x >= 0` için 6 adımlı Newton-Raphson IEEE-754 `f64` karekök (`< 0.5 ULP`).
+        #[inline]
+        pub(crate) fn sqrt(x: f64) -> f64 {
+            if x <= 0.0 || x.is_nan() || !x.is_finite() {
+                return if x == 0.0 { x } else { f64::NAN };
+            }
+            let bits = x.to_bits();
+            let mut g = f64::from_bits((bits >> 1) + (0x3ff0_0000_0000_0000u64 >> 1));
+            for _ in 0..6 {
+                g = 0.5 * (g + x / g);
+            }
+            g
+        }
+
+        /// `x > 0` için doğal logaritma (`ln(x)`, `< 1 ULP`).
+        #[inline]
+        pub(crate) fn ln(x: f64) -> f64 {
+            if x <= 0.0 || x.is_nan() || !x.is_finite() {
+                return if x == 0.0 {
+                    f64::NEG_INFINITY
+                } else if x.is_infinite() && x > 0.0 {
+                    f64::INFINITY
+                } else {
+                    f64::NAN
+                };
+            }
+            let mut bits = x.to_bits();
+            let mut exp = ((bits >> 52) & 0x7ff) as i32 - 1023;
+            // Alt-normal (subnormal) normalize etme.
+            if exp == -1023 {
+                let scaled = x * f64::from_bits((1023 + 54) << 52);
+                bits = scaled.to_bits();
+                exp = ((bits >> 52) & 0x7ff) as i32 - 1023 - 54;
+            }
+            let mut m = f64::from_bits((bits & 0x000f_ffff_ffff_ffff) | 0x3ff0_0000_0000_0000);
+            if m > SQRT_2 {
+                m *= 0.5;
+                exp += 1;
+            }
+            // m ∈ [sqrt(0.5), sqrt(2)] ⇒ |u| <= 0.1716, u^2 <= 0.02945
+            let u = (m - 1.0) / (m + 1.0);
+            let u2 = u * u;
+            // 2u * (1 + u^2/3 + u^4/5 + ... + u^18/19)
+            let poly = 1.0 / 19.0;
+            let poly = 1.0 / 17.0 + u2 * poly;
+            let poly = 1.0 / 15.0 + u2 * poly;
+            let poly = 1.0 / 13.0 + u2 * poly;
+            let poly = 1.0 / 11.0 + u2 * poly;
+            let poly = 1.0 / 9.0 + u2 * poly;
+            let poly = 1.0 / 7.0 + u2 * poly;
+            let poly = 1.0 / 5.0 + u2 * poly;
+            let poly = 1.0 / 3.0 + u2 * poly;
+            let poly = 1.0 + u2 * poly;
+            let ln_m = 2.0 * u * poly;
+            let ef = f64::from(exp);
+            (ef * LN2_HI) + (ln_m + ef * LN2_LO)
+        }
+
+        /// `x` için üstel fonksiyon (`exp(x)`, `< 1 ULP`).
+        #[inline]
+        pub(crate) fn exp(x: f64) -> f64 {
+            if x.is_nan() {
+                return f64::NAN;
+            }
+            if x > 709.782_712_893_384 {
+                return f64::INFINITY;
+            }
+            if x < -745.133_219_101_941_2 {
+                return 0.0;
+            }
+            let kf = x * INV_LN2;
+            let k = if kf >= 0.0 {
+                (kf + 0.5) as i32
+            } else {
+                (kf - 0.5) as i32
+            };
+            let kd = f64::from(k);
+            let r = (x - kd * LN2_HI) - kd * LN2_LO;
+            // |r| <= ln(2)/2 ≈ 0.3466 ⇒ 13. derece Taylor < 4e-18
+            let mut p = 1.0 / 6_227_020_800.0; // 1/13!
+            p = 1.0 / 479_001_600.0 + r * p; // 1/12!
+            p = 1.0 / 39_916_800.0 + r * p; // 1/11!
+            p = 1.0 / 3_628_800.0 + r * p; // 1/10!
+            p = 1.0 / 362_880.0 + r * p; // 1/9!
+            p = 1.0 / 40_320.0 + r * p; // 1/8!
+            p = 1.0 / 5_040.0 + r * p; // 1/7!
+            p = 1.0 / 720.0 + r * p; // 1/6!
+            p = 1.0 / 120.0 + r * p; // 1/5!
+            p = 1.0 / 24.0 + r * p; // 1/4!
+            p = 1.0 / 6.0 + r * p; // 1/3!
+            p = 0.5 + r * p; // 1/2!
+            p = 1.0 + r * p;
+            let er = 1.0 + r * p;
+            // 2^k ile çarp (alt-normal aralığı için iki aşamalı ölçekleme).
+            if k >= -1022 {
+                er * f64::from_bits(((k + 1023) as u64) << 52)
+            } else {
+                let half = k / 2;
+                let rem = k - half;
+                er * f64::from_bits(((half + 1023) as u64) << 52)
+                    * f64::from_bits(((rem + 1023) as u64) << 52)
+            }
+        }
+
+        /// `x >= 0` için kuvvet (`x^y`, `< 1 ULP` tipik hassasiyet).
+        #[inline]
+        pub(crate) fn powf(x: f64, y: f64) -> f64 {
+            if y == 0.0 || x == 1.0 {
+                return 1.0;
+            }
+            if x == 0.0 {
+                return if y > 0.0 { 0.0 } else { f64::INFINITY };
+            }
+            if x <= 0.0 || x.is_nan() {
+                return f64::NAN;
+            }
+            exp(y * ln(x))
+        }
+
+        /// Sıfırdan uzağa yarı-yuvarlama (`f32::round` karşılığı).
+        #[inline]
+        pub(crate) fn round_f32(x: f32) -> f32 {
+            if !x.is_finite() || x.abs() >= 8_388_608.0 {
+                return x;
+            }
+            if x >= 0.0 {
+                ((x + 0.5) as i64) as f32
+            } else {
+                ((x - 0.5) as i64) as f32
+            }
+        }
+    }
+
+    #[inline]
+    pub(super) fn sqrt(x: f64) -> f64 {
+        #[cfg(feature = "std")]
+        {
+            x.sqrt()
+        }
+        #[cfg(not(feature = "std"))]
+        {
+            nostd::sqrt(x)
+        }
+    }
+
+    #[inline]
+    pub(super) fn ln(x: f64) -> f64 {
+        #[cfg(feature = "std")]
+        {
+            x.ln()
+        }
+        #[cfg(not(feature = "std"))]
+        {
+            nostd::ln(x)
+        }
+    }
+
+    #[inline]
+    pub(super) fn exp(x: f64) -> f64 {
+        #[cfg(feature = "std")]
+        {
+            x.exp()
+        }
+        #[cfg(not(feature = "std"))]
+        {
+            nostd::exp(x)
+        }
+    }
+
+    #[inline]
+    pub(super) fn powf(x: f64, y: f64) -> f64 {
+        #[cfg(feature = "std")]
+        {
+            x.powf(y)
+        }
+        #[cfg(not(feature = "std"))]
+        {
+            nostd::powf(x, y)
+        }
+    }
+
+    #[inline]
+    pub(super) fn round_f32(x: f32) -> f32 {
+        #[cfg(feature = "std")]
+        {
+            x.round()
+        }
+        #[cfg(not(feature = "std"))]
+        {
+            nostd::round_f32(x)
+        }
+    }
+}
+
 /// SMPTE ST 2084 (PQ) ters EOTF: doğrusal olmayan `E' ∈ [0, 1]` → doğrusal `E ∈ [0, 1]`.
 #[inline]
 fn pq_eotf(e_prime: f64) -> f64 {
@@ -276,13 +486,13 @@ fn pq_eotf(e_prime: f64) -> f64 {
     if ep == 0.0 {
         return 0.0;
     }
-    let p = ep.powf(1.0 / M2);
+    let p = math::powf(ep, 1.0 / M2);
     let num = (p - C1).max(0.0);
     let den = C2 - C3 * p;
     if den <= 0.0 {
         1.0
     } else {
-        (num / den).powf(1.0 / M1).clamp(0.0, 1.0)
+        math::powf(num / den, 1.0 / M1).clamp(0.0, 1.0)
     }
 }
 
@@ -299,8 +509,8 @@ fn pq_oetf(linear: f64) -> f64 {
     if lin == 0.0 {
         return 0.0;
     }
-    let p = lin.powf(M1);
-    ((C1 + C2 * p) / (1.0 + C3 * p)).powf(M2).clamp(0.0, 1.0)
+    let p = math::powf(lin, M1);
+    math::powf((C1 + C2 * p) / (1.0 + C3 * p), M2).clamp(0.0, 1.0)
 }
 
 /// ITU-R BT.2100 HLG ters OETF: doğrusal olmayan `E' ∈ [0, 1]` → doğrusal `E ∈ [0, 1]`.
@@ -314,7 +524,7 @@ fn hlg_inv_oetf(e_prime: f64) -> f64 {
     if ep <= 0.5 {
         (ep * ep) / 3.0
     } else {
-        ((((ep - C) / A).exp() + B) / 12.0).clamp(0.0, 1.0)
+        ((math::exp((ep - C) / A) + B) / 12.0).clamp(0.0, 1.0)
     }
 }
 
@@ -327,9 +537,9 @@ fn hlg_oetf(linear: f64) -> f64 {
 
     let lin = linear.clamp(0.0, 1.0);
     if lin <= 1.0 / 12.0 {
-        (3.0 * lin).sqrt()
+        math::sqrt(3.0 * lin)
     } else {
-        (A * (12.0 * lin - B).ln() + C).clamp(0.0, 1.0)
+        (A * math::ln(12.0 * lin - B) + C).clamp(0.0, 1.0)
     }
 }
 
@@ -343,7 +553,7 @@ fn bt2020_oetf(linear: f64) -> f64 {
     if lin < BETA {
         4.5 * lin
     } else {
-        (ALPHA * lin.powf(0.45) - (ALPHA - 1.0)).clamp(0.0, 1.0)
+        (ALPHA * math::powf(lin, 0.45) - (ALPHA - 1.0)).clamp(0.0, 1.0)
     }
 }
 
@@ -357,9 +567,7 @@ fn bt2020_inv_oetf(e_prime: f64) -> f64 {
     if ep < BETA_PRIME {
         ep / 4.5
     } else {
-        ((ep + (ALPHA - 1.0)) / ALPHA)
-            .powf(1.0 / 0.45)
-            .clamp(0.0, 1.0)
+        math::powf((ep + (ALPHA - 1.0)) / ALPHA, 1.0 / 0.45).clamp(0.0, 1.0)
     }
 }
 
@@ -423,8 +631,8 @@ impl MatrixKernel for SpecialMatrix {
                 max_rgb,
             } => {
                 let yy = i32::from(unorm_y);
-                let cg = (cb * yuv_max_f).round() as i32;
-                let co = (cr * yuv_max_f).round() as i32;
+                let cg = math::round_f32(cb * yuv_max_f) as i32;
+                let co = math::round_f32(cr * yuv_max_f) as i32;
                 let t = yy - (cg >> 1);
                 let g_i = (t + cg).clamp(0, max_rgb);
                 let b_i = (t - (co >> 1)).clamp(0, max_rgb);
@@ -1365,7 +1573,10 @@ fn convert_image_strips<S: SampleSource, M: MatrixKernel, O: PixelSink>(
         return;
     }
 
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(not(all(feature = "std", not(target_arch = "wasm32"))))]
+    let _ = effective_threads;
+
+    #[cfg(all(feature = "std", not(target_arch = "wasm32")))]
     {
         let num_pixels = w * h;
         let threads = effective_threads.max(1);
@@ -1953,8 +2164,56 @@ pub(crate) fn image_to_rgba8(img: &AvifImage) -> Result<RgbaImage> {
 
 #[cfg(test)]
 mod tests {
+    use alloc::vec::Vec;
+
     use super::{chroma_derived_kr_kb, validate_matrix_coefficients};
     use crate::error::Error;
+
+    #[test]
+    fn nostd_math_matches_std_accuracy() {
+        use super::math::nostd;
+
+        for i in 1..=200 {
+            let x = (i as f64) / 200.0;
+            let sq = nostd::sqrt(x);
+            assert!((sq * sq - x).abs() <= 1e-15, "sqrt({x})={sq}");
+            #[cfg(feature = "std")]
+            {
+                assert!((sq - x.sqrt()).abs() <= 1e-15, "sqrt std diff at {x}");
+                let l = nostd::ln(x);
+                assert!(
+                    (l - x.ln()).abs() <= 1e-14,
+                    "ln({x}) diff: {l} vs {}",
+                    x.ln()
+                );
+                let e = nostd::exp((x - 0.5) * 10.0);
+                let es = ((x - 0.5) * 10.0).exp();
+                assert!(((e - es) / es).abs() <= 1e-14, "exp diff: {e} vs {es}");
+                for &y in &[
+                    0.45_f64,
+                    1.0 / 0.45,
+                    0.1593017578125,
+                    78.84375,
+                    1.0 / 78.84375,
+                ] {
+                    let p = nostd::powf(x, y);
+                    let ps = x.powf(y);
+                    let denom = ps.abs().max(1e-30);
+                    assert!(
+                        ((p - ps) / denom).abs() <= 1e-12,
+                        "powf({x}, {y}) diff: {p} vs {ps}"
+                    );
+                }
+            }
+        }
+        for v in [-127.5_f32, -2.5, -0.5, -0.49, 0.0, 0.49, 0.5, 2.5, 511.5] {
+            let r = nostd::round_f32(v);
+            #[cfg(feature = "std")]
+            assert_eq!(r, v.round(), "round_f32({v})");
+            #[cfg(not(feature = "std"))]
+            assert!((r - v).abs() <= 0.5);
+        }
+    }
 
     #[test]
     fn h273_chroma_derived_kr_kb_matches_cie_primaries() {

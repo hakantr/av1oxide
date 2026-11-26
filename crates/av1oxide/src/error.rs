@@ -143,7 +143,7 @@ impl fmt::Display for Error {
     }
 }
 
-impl std::error::Error for Error {}
+impl core::error::Error for Error {}
 
 impl From<BitstreamError> for Error {
     fn from(err: BitstreamError) -> Self {
@@ -156,6 +156,9 @@ pub type Result<T> = core::result::Result<T, Error>;
 
 #[cfg(test)]
 mod tests {
+    use alloc::boxed::Box;
+    use alloc::string::ToString;
+
     use super::{Error, Result, SizeStage};
 
     #[test]
@@ -199,7 +202,7 @@ mod tests {
 
     #[test]
     fn hata_std_error_olarak_kullanilabilir() {
-        let boxed: Box<dyn std::error::Error> = Box::new(Error::Unsupported("test"));
+        let boxed: Box<dyn core::error::Error> = Box::new(Error::Unsupported("test"));
         assert_eq!(boxed.to_string(), "desteklenmeyen işlev: test");
     }
 

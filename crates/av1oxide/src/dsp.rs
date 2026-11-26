@@ -155,6 +155,10 @@ pub use arm::ARM_ISA_CANDIDATES;
 #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
 pub mod wasm;
 
+use alloc::format;
+use alloc::string::{String, ToString};
+use alloc::vec::Vec;
+
 use crate::cpu::{
     Avx2Token, Avx512IclToken, CpuFlags, DotprodToken, NeonToken, Sse2Token, Sse41Token, Ssse3Token,
 };
@@ -351,10 +355,11 @@ pub const fn isa_rank(implementation: &str) -> u8 {
 /// makine koduyla koştu; `.text` karşılaştırması tur belgesinde).
 #[allow(clippy::unnecessary_sort_by)]
 fn kurulum_sirasi() -> &'static [(u8, u16, u16)] {
-    static SIRA: std::sync::OnceLock<Vec<(u8, u16, u16)>> = std::sync::OnceLock::new();
+    static SIRA: crate::sync::OnceLock<alloc::vec::Vec<(u8, u16, u16)>> =
+        crate::sync::OnceLock::new();
     SIRA.get_or_init(|| {
         let mut temsilci = indexmap::IndexMap::with_hasher(rustc_hash::FxBuildHasher);
-        let mut sira = Vec::new();
+        let mut sira = alloc::vec::Vec::new();
         for (i, c) in ISA_CANDIDATES.iter().enumerate() {
             let i = u16::try_from(i).expect("aday sayısı u16'ya sığar");
             let yuva = *temsilci
@@ -9308,7 +9313,7 @@ pub fn slot_keys() -> Vec<SlotKey> {
     keys
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "std"))]
 impl DspDispatch {
     /// Test kurucusu: skaler tabloyu `edit` ile değiştirir (yalnız birim
     /// testleri; üretim yolu [`DspDispatch::select`]'tir).
@@ -9324,5 +9329,5 @@ impl DspDispatch {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "std"))]
 mod tests;

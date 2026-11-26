@@ -31,6 +31,8 @@
 #![forbid(unsafe_code)]
 #![allow(clippy::too_many_arguments, clippy::needless_range_loop)]
 
+use alloc::vec::Vec;
+
 use crate::bitstream::frame_header::FrameHeader;
 use crate::decode::intra::{PicBuf, ToolCounts};
 use crate::dsp::cdef::{
@@ -53,17 +55,24 @@ struct TraceCfg {
 }
 
 fn trace_cfg() -> Option<TraceCfg> {
-    static CFG: std::sync::OnceLock<Option<TraceCfg>> = std::sync::OnceLock::new();
-    *CFG.get_or_init(|| {
-        std::env::var_os("AV1OXIDE_CDEF_TRACE")?;
-        let frame = std::env::var("AV1OXIDE_CDEF_TRACE_FRAME")
-            .ok()
-            .and_then(|v| v.parse().ok());
-        let plane = std::env::var("AV1OXIDE_CDEF_TRACE_PLANE")
-            .ok()
-            .and_then(|v| v.parse().ok());
-        Some(TraceCfg { frame, plane })
-    })
+    #[cfg(feature = "std")]
+    {
+        static CFG: std::sync::OnceLock<Option<TraceCfg>> = std::sync::OnceLock::new();
+        *CFG.get_or_init(|| {
+            std::env::var_os("AV1OXIDE_CDEF_TRACE")?;
+            let frame = std::env::var("AV1OXIDE_CDEF_TRACE_FRAME")
+                .ok()
+                .and_then(|v| v.parse().ok());
+            let plane = std::env::var("AV1OXIDE_CDEF_TRACE_PLANE")
+                .ok()
+                .and_then(|v| v.parse().ok());
+            Some(TraceCfg { frame, plane })
+        })
+    }
+    #[cfg(not(feature = "std"))]
+    {
+        None
+    }
 }
 
 impl TraceCfg {
@@ -365,7 +374,7 @@ fn filter_plane(
         && t.on(frame_no, p)
     {
         let hash = fnv_block(&pic.data[p][off..], stride, size.w(), size.h(), bpp);
-        eprintln!(
+        crate::trace_eprintln!(
             "C {frame_no} {p} {x} {y} {} {} {pri} {sec} {} {damping} {} {hash}",
             size.w(),
             size.h(),
@@ -646,7 +655,7 @@ pub(crate) fn apply(
                     if let Some(t) = trace.as_ref()
                         && t.on(frame_no, 0)
                     {
-                        eprintln!(
+                        crate::trace_eprintln!(
                             "D {frame_no} {dir} {variance} {} {}",
                             plane_x(0, bx),
                             plane_y(0, by)
@@ -807,7 +816,7 @@ fn apply_parallel_bands(
     pool: &crate::thread::WorkerPool,
 ) -> crate::error::Result<()> {
     use crate::frame::butce::dolu_vec;
-    use std::sync::Arc;
+    use alloc::sync::Arc;
 
     struct BandChunk {
         band_start: usize,
@@ -1228,6 +1237,8 @@ fn apply_parallel_bands(
 
 #[cfg(test)]
 mod tests {
+    use alloc::vec;
+
     use super::*;
 
     /// `adjust_strength` (`cdef_apply_tmpl.c:91-95`): `var == 0` → 0; aksi

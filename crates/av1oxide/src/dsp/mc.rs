@@ -1181,8 +1181,8 @@ impl McDsp {
     }
 }
 
-impl std::fmt::Debug for McDsp {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::Debug for McDsp {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("McDsp")
             .field("mc", &format_args!("[{} fn]", self.mc.len()))
             .field("mc_scaled", &format_args!("[{} fn]", self.mc_scaled.len()))
@@ -1616,6 +1616,8 @@ mod mac_wrap {
 
 #[cfg(test)]
 mod tests {
+    use alloc::vec;
+
     use super::{
         MC_4TAP_REGULAR, MC_8TAP_REGULAR, MC_MAX_H, MC_MAX_W, MC_SUBPEL_POSITIONS, MC_TAPS,
         McBitDepth, horizontal_filter, is_valid_call, vertical_filter,

@@ -2,6 +2,9 @@
 
 #![forbid(unsafe_code)]
 
+use alloc::boxed::Box;
+use alloc::vec::Vec;
+
 use crate::api::{Config, Decoder, Packet};
 use crate::avif::boxes::{Av1CProperty, ItemProperty};
 use crate::avif::decode::{

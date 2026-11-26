@@ -146,8 +146,8 @@ impl ItxDsp {
     }
 }
 
-impl std::fmt::Debug for ItxDsp {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::Debug for ItxDsp {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         write!(
             f,
             "ItxDsp {{ itxfm_add: [[fn; {N_TX_TYPES_PLUS_LL}]; {N_RECT_TX_SIZES}] }}"

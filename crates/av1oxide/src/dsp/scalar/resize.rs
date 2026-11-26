@@ -88,6 +88,9 @@ pub fn resize<const BPC: u32>(
 
 #[cfg(test)]
 mod tests {
+    use alloc::vec;
+    use alloc::vec::Vec;
+
     use super::*;
 
     /// Test kısayolu: bit derinliğinin skaler yuvası.

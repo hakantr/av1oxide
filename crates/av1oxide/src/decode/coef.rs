@@ -1416,6 +1416,8 @@ fn dequant_block(
 
 #[cfg(test)]
 mod tests {
+    use alloc::vec;
+
     use super::*;
 
     #[test]
@@ -1539,7 +1541,7 @@ mod tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "std"))]
 pub(crate) fn coef_label(off: usize) -> String {
     use layout::*;
     let range = |start: usize, row: usize| {
@@ -1588,7 +1590,7 @@ pub(crate) fn coef_label(off: usize) -> String {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "std"))]
 mod oracle_diff {
     use super::*;
     use std::io::{BufRead, BufReader, Write};

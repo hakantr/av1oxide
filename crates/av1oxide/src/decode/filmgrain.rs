@@ -21,6 +21,8 @@
 
 #![forbid(unsafe_code)]
 
+use alloc::vec::Vec;
+
 use crate::bitstream::frame_header::FilmGrainData;
 use crate::dsp::fg::{
     EMPTY_LUT, FG_BLOCK_SIZE, FgBitDepth, FgDsp, FgLayout, GRAIN_HEIGHT, GRAIN_WIDTH, GrainLut,
@@ -165,7 +167,7 @@ fn prep_grain(
     trace: Option<u64>,
 ) -> GrainPrep {
     if let Some(pic) = trace {
-        eprintln!(
+        crate::trace_eprintln!(
             "P {pic} {w} {h} {} {} {} {} {} {} {} {} {} {} {} {} {}",
             bd.bits(),
             layout.map_or(0, |l| l.index() + 1),
@@ -187,7 +189,7 @@ fn prep_grain(
     let mut luts: [GrainLut; 3] = [EMPTY_LUT; 3];
     crate::dsp::profil_olc!(FgGrainY, (dsp.generate_grain_y)(&mut luts[0], data, bd));
     if let Some(pic) = trace {
-        eprintln!(
+        crate::trace_eprintln!(
             "G {pic} 0 {}",
             lut_hash(&luts[0], GRAIN_WIDTH, GRAIN_HEIGHT)
         );
@@ -211,7 +213,7 @@ fn prep_grain(
                     } else {
                         GRAIN_HEIGHT
                     };
-                    eprintln!("G {pic} {} {}", pl + 1, lut_hash(&uv[pl], cw, ch));
+                    crate::trace_eprintln!("G {pic} {} {}", pl + 1, lut_hash(&uv[pl], cw, ch));
                 }
             }
         }
@@ -290,6 +292,7 @@ fn copy_rows_to_frame(
 /// P38 / `4.A.1`: çıktı düzlemleri ön-kopyasız hazırlanır; tek genişlik luma
 /// dolgusu tam-kare yerine 32 satırlık şerit tamponuyla yapılır; paralel modda
 /// dalga tamponları (`wave_size = n_threads.min(rows)`) yeniden kullanılır.
+#[cfg_attr(not(feature = "std"), allow(dead_code))]
 pub(crate) fn apply_grain(
     input: &Frame,
     data: &FilmGrainData,
@@ -494,7 +497,7 @@ pub(crate) fn apply_grain_in_place(
             );
             if let Some(pic) = trace {
                 let hsh = rows_hash(&y_pl.data()[off..], y_stride, band, w * bpp);
-                eprintln!("Y {pic} {row} {band} {w} {hsh}");
+                crate::trace_eprintln!("Y {pic} {row} {band} {w} {hsh}");
             }
         }
         let Some(l) = layout.filter(|_| do_u || do_v) else {
@@ -547,7 +550,7 @@ pub(crate) fn apply_grain_in_place(
             );
             if let Some(pic) = trace {
                 let hsh = rows_hash(&c_pl.data()[uv_off..], c_stride, bh, cpw * bpp);
-                eprintln!(
+                crate::trace_eprintln!(
                     "C {pic} {} {row} {bh} {cpw} {} {hsh}",
                     pl + 1,
                     u8::from(is_id)
@@ -585,7 +588,7 @@ fn apply_grain_in_place_waves(
     pool: &crate::thread::WorkerPool,
 ) -> crate::error::Result<()> {
     use crate::frame::butce::dolu_vec;
-    use std::sync::Arc;
+    use alloc::sync::Arc;
 
     struct InPlaceWaveJob {
         row: usize,
@@ -861,7 +864,7 @@ pub(crate) fn apply_grain_from_pic_mut(
 
     let rows = pic.height.div_ceil(FG_BLOCK_SIZE);
     if pool.is_parallel() && rows > 1 && trace.is_none() {
-        use std::sync::Arc;
+        use alloc::sync::Arc;
         let prep = prep_grain(pic.width, pic.height, bd, layout, data, dsp, None);
         alloc_pic_grain_temp_budget(
             pic.width, pic.height, pic.stride, &out, bd, layout, do_y, do_u, do_v, butce,
@@ -911,7 +914,7 @@ pub(crate) fn apply_grain_from_pic_mut(
 /// grain'li çıktı [`Frame`]'ini üretir (`show_existing_frame` ve boru hattı yolu; `4.A.1`).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn apply_grain_from_ref_pic(
-    rf: &std::sync::Arc<crate::decode::intra::RefFrame>,
+    rf: &alloc::sync::Arc<crate::decode::intra::RefFrame>,
     data: &FilmGrainData,
     is_id: bool,
     dsp: &FgDsp,
@@ -1121,7 +1124,7 @@ fn apply_grain_into_out_slices(
     let rows = h.div_ceil(FG_BLOCK_SIZE);
     if pool.is_parallel() && rows > 1 && trace.is_none() {
         use crate::frame::butce::kopya_vec;
-        use std::sync::Arc;
+        use alloc::sync::Arc;
         drop(src_strip);
         drop(luma_strip);
         let shared = Arc::new([
@@ -1195,7 +1198,7 @@ fn apply_grain_into_out_slices(
             );
             if let Some(pic) = trace {
                 let hsh = rows_hash(&y_out.data()[dst_off..], dst_stride, band, row_bytes);
-                eprintln!("Y {pic} {row} {band} {w} {hsh}");
+                crate::trace_eprintln!("Y {pic} {row} {band} {w} {hsh}");
             }
         }
         let Some(l) = layout.filter(|_| do_u || do_v) else {
@@ -1269,7 +1272,7 @@ fn apply_grain_into_out_slices(
             );
             if let Some(pic) = trace {
                 let hsh = rows_hash(&c_out.data()[dst_off..], dst_stride, bh, row_bytes_uv);
-                eprintln!(
+                crate::trace_eprintln!(
                     "C {pic} {} {row} {bh} {cpw} {} {hsh}",
                     pl + 1,
                     u8::from(is_id)
@@ -1282,7 +1285,7 @@ fn apply_grain_into_out_slices(
 
 #[allow(clippy::too_many_arguments)]
 fn apply_grain_parallel_waves_shared<P, G>(
-    holder: &std::sync::Arc<P>,
+    holder: &alloc::sync::Arc<P>,
     get_plane: G,
     out: &mut Frame,
     data: &FilmGrainData,
@@ -1302,7 +1305,7 @@ where
     G: Fn(&P, usize) -> (&[u8], usize) + Copy + Send + Sync + 'static,
 {
     use crate::frame::butce::dolu_vec;
-    use std::sync::Arc;
+    use alloc::sync::Arc;
 
     struct WaveJob {
         row: usize,
@@ -1555,24 +1558,34 @@ where
 /// ```
 #[must_use]
 pub(crate) fn trace_picture(pic: u64) -> Option<u64> {
-    use std::sync::OnceLock;
-    static CFG: OnceLock<Option<Option<u64>>> = OnceLock::new();
-    let cfg = *CFG.get_or_init(|| {
-        std::env::var_os("AV1OXIDE_FG_TRACE")?;
-        let sel: Option<u64> = std::env::var("AV1OXIDE_FG_TRACE_PIC")
-            .ok()
-            .and_then(|v| v.parse().ok());
-        Some(sel)
-    });
-    let sel = cfg?;
-    if sel.is_some_and(|s| s != pic) {
-        return None;
+    #[cfg(feature = "std")]
+    {
+        use std::sync::OnceLock;
+        static CFG: OnceLock<Option<Option<u64>>> = OnceLock::new();
+        let cfg = *CFG.get_or_init(|| {
+            std::env::var_os("AV1OXIDE_FG_TRACE")?;
+            let sel: Option<u64> = std::env::var("AV1OXIDE_FG_TRACE_PIC")
+                .ok()
+                .and_then(|v| v.parse().ok());
+            Some(sel)
+        });
+        let sel = cfg?;
+        if sel.is_some_and(|s| s != pic) {
+            return None;
+        }
+        Some(pic)
     }
-    Some(pic)
+    #[cfg(not(feature = "std"))]
+    {
+        let _ = pic;
+        None
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use alloc::vec;
+
     use super::*;
 
     /// Ölçekleme: tek nokta → bütün tablo o değer; nokta yok → sıfır.

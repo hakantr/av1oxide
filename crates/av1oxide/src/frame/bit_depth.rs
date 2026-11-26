@@ -94,6 +94,8 @@ impl fmt::Display for BitDepth {
 
 #[cfg(test)]
 mod tests {
+    use alloc::string::ToString;
+
     use super::BitDepth;
 
     #[test]

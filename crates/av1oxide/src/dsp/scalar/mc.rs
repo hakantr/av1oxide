@@ -60,6 +60,8 @@
 
 #![forbid(unsafe_code)]
 
+use alloc::vec;
+
 use crate::dsp::mc::{Filter2d, MC_MAX_W, McBitDepth};
 use crate::dsp::mc_tables::{
     MC_SUBPEL_FILTERS, MC_TAPS, MC_WARP_FILTER, N_WARP_FILTERS, OBMC_MASKS,

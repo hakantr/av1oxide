@@ -32,6 +32,10 @@
 
 use crate::bitstream::frame_header::{FrameHeader, MAX_SEGMENTS};
 use crate::tables::decode as t;
+use alloc::format;
+use alloc::vec;
+use alloc::vec::Vec;
+#[cfg(feature = "std")]
 use std::sync::OnceLock;
 
 pub(crate) use crate::dsp::lf::LimLut;
@@ -104,17 +108,20 @@ pub(crate) fn calc_lf_values(hdr: &FrameHeader, lf_delta: [i8; 4]) -> LfLvlAll {
     } else {
         1
     };
-    static LF_CALC: OnceLock<bool> = OnceLock::new();
-    if *LF_CALC.get_or_init(|| std::env::var_os("AV1OXIDE_LF_CALC").is_some()) {
-        eprintln!(
-            "CALC en={} nseg={} lv={:?} mr={} u={} v={}",
-            hdr.segmentation.enabled,
-            n_seg,
-            hdr.segmentation.seg_data.d[0],
-            hdr.loopfilter.mode_ref_delta_enabled,
-            hdr.loopfilter.level_u,
-            hdr.loopfilter.level_v
-        );
+    #[cfg(feature = "std")]
+    {
+        static LF_CALC: OnceLock<bool> = OnceLock::new();
+        if *LF_CALC.get_or_init(|| std::env::var_os("AV1OXIDE_LF_CALC").is_some()) {
+            crate::trace_eprintln!(
+                "CALC en={} nseg={} lv={:?} mr={} u={} v={}",
+                hdr.segmentation.enabled,
+                n_seg,
+                hdr.segmentation.seg_data.d[0],
+                hdr.loopfilter.mode_ref_delta_enabled,
+                hdr.loopfilter.level_u,
+                hdr.loopfilter.level_v
+            );
+        }
     }
     let mr = if hdr.loopfilter.mode_ref_delta_enabled {
         Some(&hdr.loopfilter.mode_ref_deltas)
@@ -957,8 +964,15 @@ fn fnv_bytes(mut h: u64, b: &[u8]) -> u64 {
 
 #[inline(always)]
 fn trace_on() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("AV1OXIDE_LF_TRACE").is_some())
+    #[cfg(feature = "std")]
+    {
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("AV1OXIDE_LF_TRACE").is_some())
+    }
+    #[cfg(not(feature = "std"))]
+    {
+        false
+    }
 }
 
 impl LfFrame {
@@ -1025,9 +1039,13 @@ impl LfFrame {
         count: usize,
     ) {
         if stage == "pre-cols" || stage == "pre-filter" {
-            eprintln!(
+            crate::trace_eprintln!(
                 "TILE {} {} {} {:?} {:?}",
-                frame_no, self.n_cols, self.n_rows, 0, 0
+                frame_no,
+                self.n_cols,
+                self.n_rows,
+                0,
+                0
             );
             for gy in y0..y0 + count {
                 let mut line = format!("MC {} {} {} {}", stage, frame_no, sby, gy);
@@ -1037,7 +1055,7 @@ impl LfFrame {
                         format_args!(" {}", self.mask_y_col[gy * self.bw + gx]),
                     );
                 }
-                eprintln!("{line}");
+                crate::trace_eprintln!("{line}");
                 let mut line = format!("MR {} {} {} {}", stage, frame_no, sby, gy);
                 for gx in 0..self.bw {
                     let _ = core::fmt::Write::write_fmt(
@@ -1045,7 +1063,7 @@ impl LfFrame {
                         format_args!(" {}", self.mask_y_row[gy * self.bw + gx]),
                     );
                 }
-                eprintln!("{line}");
+                crate::trace_eprintln!("{line}");
             }
         }
         if stage == "pre-cols" {
@@ -1058,7 +1076,7 @@ impl LfFrame {
                         format_args!(" {},{},{},{}", e[0], e[1], e[2], e[3]),
                     );
                 }
-                eprintln!("{line}");
+                crate::trace_eprintln!("{line}");
             }
         }
         let mut lo = y0 * 4;
@@ -1067,7 +1085,7 @@ impl LfFrame {
             lo = lo.saturating_sub(8);
             hi = (hi + 8).min((y0 + count) * 4);
         }
-        eprintln!(
+        crate::trace_eprintln!(
             "T {} {} {} off={} lv={},{},{},{} {:016x} {:016x} {:016x} lvl={:016x} msk={:016x}",
             frame_no,
             sby,
@@ -1115,15 +1133,20 @@ impl LfFrame {
         }
         let has_chroma = pic.has_chroma;
         let uv_lvl = hdr.loopfilter.level_u != 0 || hdr.loopfilter.level_v != 0;
-        static MASKCNT: OnceLock<bool> = OnceLock::new();
-        if *MASKCNT.get_or_init(|| std::env::var_os("AV1OXIDE_LF_MASKCNT").is_some()) {
-            let nc = self.mask_uv_col.iter().filter(|&&v| v != 0).count();
-            let nr = self.mask_uv_row.iter().filter(|&&v| v != 0).count();
-            let lc = self.level.iter().filter(|e| e[2] != 0 || e[3] != 0).count();
-            eprintln!(
-                "MASKCNT off={} uv_lvl={} has={} col={nc} row={nr} lvl={lc}",
-                hdr.frame_offset, uv_lvl, has_chroma
-            );
+        #[cfg(feature = "std")]
+        {
+            static MASKCNT: OnceLock<bool> = OnceLock::new();
+            if *MASKCNT.get_or_init(|| std::env::var_os("AV1OXIDE_LF_MASKCNT").is_some()) {
+                let nc = self.mask_uv_col.iter().filter(|&&v| v != 0).count();
+                let nr = self.mask_uv_row.iter().filter(|&&v| v != 0).count();
+                let lc = self.level.iter().filter(|e| e[2] != 0 || e[3] != 0).count();
+                crate::trace_eprintln!(
+                    "MASKCNT off={} uv_lvl={} has={} col={nc} row={nr} lvl={lc}",
+                    hdr.frame_offset,
+                    uv_lvl,
+                    has_chroma
+                );
+            }
         }
         let trace = trace_on() && frame_no < 12;
         if pool.is_parallel() && !trace && self.sbh > 0 && (has_chroma && uv_lvl) {
@@ -1287,7 +1310,7 @@ impl LfFrame {
             }
         }
         if trace_on() && frame_no < 12 {
-            eprintln!(
+            crate::trace_eprintln!(
                 "F {} off={} {:016x} {:016x} {:016x}",
                 frame_no,
                 self.trace_off,
@@ -1309,7 +1332,7 @@ impl LfFrame {
         dsp: &LoopFilterDsp,
         pool: &crate::thread::WorkerPool,
     ) {
-        use std::sync::Arc;
+        use alloc::sync::Arc;
 
         let has_chroma = pic.has_chroma;
         if self.n_cols > 1 || self.n_rows > 1 {
@@ -1506,7 +1529,7 @@ impl LfFrame {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "std"))]
 mod loopfilter_oracle_tests {
     //! S2c.1 çekirdek oracle differential'ı (`scripts/oracle/run_loopfilter_oracle.sh`).
     //!

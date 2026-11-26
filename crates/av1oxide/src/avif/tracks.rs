@@ -3,7 +3,8 @@
 
 #![forbid(unsafe_code)]
 
-use std::borrow::Cow;
+use alloc::borrow::Cow;
+use alloc::vec::Vec;
 
 use crate::avif::boxes::{
     ALPHA_AUX_URN_CICP, ALPHA_AUX_URN_HEVC, AvifContainer, ItemProperty, decompress_by_fourcc,

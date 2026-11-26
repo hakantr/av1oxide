@@ -40,7 +40,9 @@
 
 #![forbid(unsafe_code)]
 
-use std::sync::OnceLock;
+use alloc::vec::Vec;
+
+use crate::sync::OnceLock;
 
 /// İlk maske tablosu blok boyutu: dav1d `BS_32x32` = 7.
 pub(crate) const FIRST_BS: usize = 7;

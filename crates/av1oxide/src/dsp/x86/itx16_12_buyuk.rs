@@ -48,6 +48,7 @@ use crate::cpu::Avx2Token;
 use crate::dsp::itx::{ItxFn, TxSize, TxType, itx_skaler_devret, itx16_sozlesmesi};
 use crate::dsp::itx_tables::LNZC_TABLES;
 use crate::frame::BitDepth;
+#[cfg(feature = "std")]
 use core::cell::RefCell;
 
 const ROW_MIN: i32 = -524_288;
@@ -1158,6 +1159,7 @@ struct BuyukAra {
     tek: [i32; 128],
 }
 
+#[cfg(feature = "std")]
 std::thread_local! {
     static BUYUK_ARA: RefCell<BuyukAra> = const {
         RefCell::new(BuyukAra {
@@ -1166,6 +1168,23 @@ std::thread_local! {
             tek: [0i32; 128],
         })
     };
+}
+
+#[inline]
+fn with_buyuk_ara(f: impl FnOnce(&mut BuyukAra)) {
+    #[cfg(feature = "std")]
+    {
+        BUYUK_ARA.with_borrow_mut(f);
+    }
+    #[cfg(not(feature = "std"))]
+    {
+        let mut ara = alloc::boxed::Box::new(BuyukAra {
+            mat: [0i32; 2048],
+            serit: [0i32; 512],
+            tek: [0i32; 128],
+        });
+        f(&mut ara);
+    }
 }
 
 /// `serit[0..128]` (`16 × 8` `i32`) üzerinde yerinde 16 noktalı 1B ters DCT.
@@ -2362,7 +2381,7 @@ fn itx12_buyuk_avx2_giris<const TX: u8, const TXTP: u8>(
         }
         return;
     }
-    BUYUK_ARA.with_borrow_mut(|ara| {
+    with_buyuk_ara(|ara| {
         // SAFETY: (1) ISA: bu işlevin adresi yalnız `Avx2Token` ile verilir (`itx12_buyuk_avx2_fn` /
         // `itx12_buyuk_avx2_lookup`); belirteç AVX2 tespiti ve maske izninin kanıtıdır. (2) sınır:
         // `itx16_sozlesmesi` `dst_stride`'ın çift ve `≥ w·2` olduğunu, `dst`'nin `(h − 1)·dst_stride + w·2`

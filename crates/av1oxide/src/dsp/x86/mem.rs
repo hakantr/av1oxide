@@ -511,7 +511,7 @@ pub fn olcekleme16_gather_512<const N: usize>(tablo: &[u8; N], v: __m512i) -> __
     _mm512_ternarylogic_epi32::<0xD8>(bt, bc, dmask)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "std"))]
 mod tests {
     use super::{chunk, chunk_mut};
 

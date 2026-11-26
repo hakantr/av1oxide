@@ -3,9 +3,13 @@
 
 #![forbid(unsafe_code)]
 
-use std::borrow::Cow;
+use alloc::borrow::{Cow, ToOwned};
+use alloc::string::String;
+use alloc::vec::Vec;
+#[cfg(feature = "std")]
 use std::io::Read;
 
+#[cfg(feature = "std")]
 use flate2::read::{DeflateDecoder, GzDecoder, ZlibDecoder};
 
 use crate::avif::image::{
@@ -163,12 +167,16 @@ pub(crate) struct AvifContainer<'a> {
 }
 
 /// Tek bir sıkıştırılmış HEIF öğesi veya `cmin` kutusu için azami açılmış boyut (`64 MiB`).
+#[cfg(feature = "std")]
 const MAX_DECOMPRESSED_BYTES: usize = 64 * 1024 * 1024;
 /// Sıkıştırma oranı denetiminin devreye girdiği alt eşik (`64 KiB`).
+#[cfg(feature = "std")]
 const ZIP_BOMB_THRESHOLD_BYTES: usize = 64 * 1024;
 /// `ZIP_BOMB_THRESHOLD_BYTES` üzerinde izin verilen azami genişleme oranı (`1024:1`).
+#[cfg(feature = "std")]
 const MAX_EXPANSION_RATIO: usize = 1024;
 
+#[cfg(feature = "std")]
 fn decompress_bounded<R: Read>(
     mut reader: R,
     compressed_len: usize,
@@ -214,6 +222,7 @@ fn decompress_bounded<R: Read>(
     Ok(out)
 }
 
+#[cfg(feature = "std")]
 fn decompress_zlib(
     data: &[u8],
     orig_compressed_len: usize,
@@ -226,6 +235,7 @@ fn decompress_zlib(
     )
 }
 
+#[cfg(feature = "std")]
 fn decompress_deflate(
     data: &[u8],
     orig_compressed_len: usize,
@@ -238,6 +248,7 @@ fn decompress_deflate(
     )
 }
 
+#[cfg(feature = "std")]
 fn decompress_gzip(
     data: &[u8],
     orig_compressed_len: usize,
@@ -252,13 +263,28 @@ pub(crate) fn decompress_by_fourcc(
     orig_compressed_len: usize,
     allocation_limit: Option<usize>,
 ) -> Result<Vec<u8>> {
-    match compression_type {
-        b"defl" => decompress_deflate(data, orig_compressed_len, allocation_limit),
-        b"zlib" => decompress_zlib(data, orig_compressed_len, allocation_limit),
-        b"gzip" => decompress_gzip(data, orig_compressed_len, allocation_limit),
-        _ => Err(Error::Unsupported(
-            "desteklenmeyen cmpC sıkıştırma algoritması",
-        )),
+    #[cfg(feature = "std")]
+    {
+        match compression_type {
+            b"defl" => decompress_deflate(data, orig_compressed_len, allocation_limit),
+            b"zlib" => decompress_zlib(data, orig_compressed_len, allocation_limit),
+            b"gzip" => decompress_gzip(data, orig_compressed_len, allocation_limit),
+            _ => Err(Error::Unsupported(
+                "desteklenmeyen cmpC sıkıştırma algoritması",
+            )),
+        }
+    }
+    #[cfg(not(feature = "std"))]
+    {
+        let _ = (
+            compression_type,
+            data,
+            orig_compressed_len,
+            allocation_limit,
+        );
+        Err(Error::Unsupported(
+            "compressed HEIF boxes require the std feature",
+        ))
     }
 }
 
@@ -1530,9 +1556,11 @@ impl<'a> AvifContainer<'a> {
         {
             let decoded = match info.content_encoding.as_str() {
                 "deflate" | "zlib" => {
-                    decompress_zlib(&data, orig_compressed_len, allocation_limit)?
+                    decompress_by_fourcc(b"zlib", &data, orig_compressed_len, allocation_limit)?
                 }
-                "gzip" | "x-gzip" => decompress_gzip(&data, orig_compressed_len, allocation_limit)?,
+                "gzip" | "x-gzip" => {
+                    decompress_by_fourcc(b"gzip", &data, orig_compressed_len, allocation_limit)?
+                }
                 _ => {
                     return Err(Error::Unsupported(
                         "desteklenmeyen infe content_encoding algoritması",

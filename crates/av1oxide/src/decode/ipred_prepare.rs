@@ -356,7 +356,7 @@ const _: () = {
     assert!(EDGE_I420_LEFT_HAS_BOTTOM != 0);
 };
 
-#[cfg(test)]
+#[cfg(all(test, feature = "std"))]
 mod oracle_diff {
     use super::*;
     use std::io::{BufRead, BufReader, Write};

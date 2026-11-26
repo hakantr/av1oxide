@@ -23,6 +23,8 @@
 //! | iz sırası (SB satırı: `copy_lpf` → CDEF → büyütme) | `recon_tmpl.c:2004-2023,2100-2108` |
 #![forbid(unsafe_code)]
 
+use alloc::vec::Vec;
+
 use crate::decode::intra::PicBuf;
 use crate::dsp::resize::{ResizeBitDepth, ResizeFn};
 use crate::frame::{BitDepth, ChromaFormat};
@@ -150,7 +152,7 @@ pub(crate) fn upscale_planes(
     }
 
     use crate::frame::butce::dolu_vec;
-    use std::sync::Arc;
+    use alloc::sync::Arc;
 
     struct ResizeJob {
         y0: usize,
@@ -301,6 +303,7 @@ pub(crate) fn upscale_lr_backup(
 }
 
 /// FNV-1a 64 — `resize_trace.c` ile aynı.
+#[cfg(feature = "std")]
 fn fnv_rows(data: &[u8], stride: usize, y0: usize, rows: usize, w_bytes: usize) -> u64 {
     let mut hash = 0xcbf2_9ce4_8422_2325u64;
     for y in y0..y0 + rows {
@@ -334,67 +337,87 @@ pub(crate) fn trace(
     chroma: ChromaFormat,
     bpp: usize,
 ) {
-    if std::env::var_os("AV1OXIDE_SR_TRACE").is_none() {
-        return;
+    #[cfg(not(feature = "std"))]
+    {
+        let _ = (
+            frame_no,
+            sr_pic,
+            sr_pre,
+            restore_planes,
+            height,
+            bw,
+            sb128,
+            sr,
+            chroma,
+            bpp,
+        );
     }
-    let fsel: Option<u32> = std::env::var("AV1OXIDE_SR_TRACE_FRAME")
-        .ok()
-        .and_then(|v| v.parse().ok());
-    if fsel.is_some_and(|f| f != frame_no) {
-        return;
-    }
-    let sb128 = usize::from(sb128);
-    let sbsz = 16usize << sb128; // 4×4 biriminde
-    let bh4 = ((height + 7) >> 3) << 1;
-    let sbh = bh4.div_ceil(sbsz);
-    let n_planes = if chroma.has_chroma() { 3 } else { 1 };
-    for sby in 0..sbh {
-        // --- `dav1d_copy_lpf` (`lf_apply_tmpl.c:104-`), yalnız LR düzlemleri.
-        if let Some(pre) = sr_pre {
-            let offset = if sby != 0 { 8 } else { 0 };
-            for p in 0..n_planes {
-                if (restore_planes >> p) & 1 == 0 {
-                    continue;
-                }
-                let (ss_hor, ss_ver) = plane_ss(p, chroma);
-                let h = (height + ss_ver) >> ss_ver;
-                let row_h = ((sby + 1) << ((6 - ss_ver) + sb128)).min(h - 1);
-                let mut row = (sby << ((6 - ss_ver) + sb128)) - (offset >> ss_ver);
-                let mut stripe_h = (64 - if row == 0 { 8 } else { 0 }) >> ss_ver;
-                let dst_w = (sr.sr_w + ss_hor) >> ss_hor;
-                let src_w = (4 * bw + ss_hor) >> ss_hor;
-                while row + stripe_h <= row_h {
-                    let b = row + stripe_h;
-                    let n_lines = 4 - usize::from(b + 1 == h);
-                    let y = b - 2;
-                    let k = (b - (56 >> ss_ver)) >> (6 - ss_ver);
-                    let hash = fnv_rows(&pre.data[p], pre.stride[p], 4 * k, n_lines, dst_w * bpp);
-                    eprintln!(
-                        "Z {frame_no} L {p} {y} {n_lines} {dst_w} {src_w} {} {} {hash}",
-                        sr.step[ss_hor], sr.start[ss_hor]
-                    );
-                    row += stripe_h;
-                    stripe_h = 64 >> ss_ver;
+    #[cfg(feature = "std")]
+    {
+        if std::env::var_os("AV1OXIDE_SR_TRACE").is_none() {
+            return;
+        }
+        let fsel: Option<u32> = std::env::var("AV1OXIDE_SR_TRACE_FRAME")
+            .ok()
+            .and_then(|v| v.parse().ok());
+        if fsel.is_some_and(|f| f != frame_no) {
+            return;
+        }
+        let sb128 = usize::from(sb128);
+        let sbsz = 16usize << sb128; // 4×4 biriminde
+        let bh4 = ((height + 7) >> 3) << 1;
+        let sbh = bh4.div_ceil(sbsz);
+        let n_planes = if chroma.has_chroma() { 3 } else { 1 };
+        for sby in 0..sbh {
+            // --- `dav1d_copy_lpf` (`lf_apply_tmpl.c:104-`), yalnız LR düzlemleri.
+            if let Some(pre) = sr_pre {
+                let offset = if sby != 0 { 8 } else { 0 };
+                for p in 0..n_planes {
+                    if (restore_planes >> p) & 1 == 0 {
+                        continue;
+                    }
+                    let (ss_hor, ss_ver) = plane_ss(p, chroma);
+                    let h = (height + ss_ver) >> ss_ver;
+                    let row_h = ((sby + 1) << ((6 - ss_ver) + sb128)).min(h - 1);
+                    let mut row = (sby << ((6 - ss_ver) + sb128)) - (offset >> ss_ver);
+                    let mut stripe_h = (64 - if row == 0 { 8 } else { 0 }) >> ss_ver;
+                    let dst_w = (sr.sr_w + ss_hor) >> ss_hor;
+                    let src_w = (4 * bw + ss_hor) >> ss_hor;
+                    while row + stripe_h <= row_h {
+                        let b = row + stripe_h;
+                        let n_lines = 4 - usize::from(b + 1 == h);
+                        let y = b - 2;
+                        let k = (b - (56 >> ss_ver)) >> (6 - ss_ver);
+                        let hash =
+                            fnv_rows(&pre.data[p], pre.stride[p], 4 * k, n_lines, dst_w * bpp);
+                        crate::trace_eprintln!(
+                            "Z {frame_no} L {p} {y} {n_lines} {dst_w} {src_w} {} {} {hash}",
+                            sr.step[ss_hor],
+                            sr.start[ss_hor]
+                        );
+                        row += stripe_h;
+                        stripe_h = 64 >> ss_ver;
+                    }
                 }
             }
-        }
-        // --- `dav1d_filter_sbrow_resize` (`recon_tmpl.c:2053-2086`).
-        let y = sby * sbsz * 4;
-        for p in 0..n_planes {
-            let (ss_hor, ss_ver) = plane_ss(p, chroma);
-            let h_start = (if sby != 0 { 8 } else { 0 }) >> ss_ver;
-            let h_end = (4 * (sbsz - 2 * usize::from(sby + 1 < sbh))) >> ss_ver;
-            let img_h = (height - sbsz * 4 * sby + ss_ver) >> ss_ver;
-            let rows = img_h.min(h_end) + h_start;
-            let y0 = (y >> ss_ver) - h_start;
-            let dst_w = (sr.sr_w + ss_hor) >> ss_hor;
-            let src_w = (4 * bw + ss_hor) >> ss_hor;
-            let hash = fnv_rows(&sr_pic.data[p], sr_pic.stride[p], y0, rows, dst_w * bpp);
-            eprintln!(
-                "Z {frame_no} S {p} {y0} {rows} {dst_w} {src_w} {} {} {hash}",
-                sr.step[usize::from(p != 0)],
-                sr.start[usize::from(p != 0)]
-            );
+            // --- `dav1d_filter_sbrow_resize` (`recon_tmpl.c:2053-2086`).
+            let y = sby * sbsz * 4;
+            for p in 0..n_planes {
+                let (ss_hor, ss_ver) = plane_ss(p, chroma);
+                let h_start = (if sby != 0 { 8 } else { 0 }) >> ss_ver;
+                let h_end = (4 * (sbsz - 2 * usize::from(sby + 1 < sbh))) >> ss_ver;
+                let img_h = (height - sbsz * 4 * sby + ss_ver) >> ss_ver;
+                let rows = img_h.min(h_end) + h_start;
+                let y0 = (y >> ss_ver) - h_start;
+                let dst_w = (sr.sr_w + ss_hor) >> ss_hor;
+                let src_w = (4 * bw + ss_hor) >> ss_hor;
+                let hash = fnv_rows(&sr_pic.data[p], sr_pic.stride[p], y0, rows, dst_w * bpp);
+                crate::trace_eprintln!(
+                    "Z {frame_no} S {p} {y0} {rows} {dst_w} {src_w} {} {} {hash}",
+                    sr.step[usize::from(p != 0)],
+                    sr.start[usize::from(p != 0)]
+                );
+            }
         }
     }
 }

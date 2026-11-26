@@ -185,11 +185,11 @@ impl Config {
     ///   döndürür.
     #[must_use]
     pub fn effective_threads(&self) -> usize {
-        #[cfg(target_arch = "wasm32")]
+        #[cfg(any(not(feature = "std"), target_arch = "wasm32"))]
         {
             1
         }
-        #[cfg(not(target_arch = "wasm32"))]
+        #[cfg(all(feature = "std", not(target_arch = "wasm32")))]
         {
             if self.n_threads == 0 {
                 std::thread::available_parallelism()
@@ -318,7 +318,10 @@ mod tests {
                 n_threads: n,
                 ..Config::default()
             };
+            #[cfg(all(feature = "std", not(target_arch = "wasm32")))]
             assert_eq!(cfg.effective_threads(), n);
+            #[cfg(any(not(feature = "std"), target_arch = "wasm32"))]
+            assert_eq!(cfg.effective_threads(), 1);
         }
     }
 
@@ -348,7 +351,13 @@ mod tests {
                 max_frame_delay: 0,
                 ..Config::default()
             };
+            #[cfg(all(feature = "std", not(target_arch = "wasm32")))]
             assert_eq!(cfg.effective_frame_delay(), exp_fc, "n_threads={n_threads}");
+            #[cfg(any(not(feature = "std"), target_arch = "wasm32"))]
+            {
+                let _ = exp_fc;
+                assert_eq!(cfg.effective_frame_delay(), 1, "n_threads={n_threads}");
+            }
         }
         // Açık `max_frame_delay` değeri `effective_threads()` ile üstten sınırlanır.
         let clamped = Config {
@@ -356,7 +365,10 @@ mod tests {
             max_frame_delay: 8,
             ..Config::default()
         };
+        #[cfg(all(feature = "std", not(target_arch = "wasm32")))]
         assert_eq!(clamped.effective_frame_delay(), 4);
+        #[cfg(any(not(feature = "std"), target_arch = "wasm32"))]
+        assert_eq!(clamped.effective_frame_delay(), 1);
         let single_fc = Config {
             n_threads: 8,
             max_frame_delay: 1,

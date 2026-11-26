@@ -1514,7 +1514,10 @@ pub fn pal_pred<const BPC: u32>(
 #[cfg(test)]
 mod tests {
     use super::{get_filter_strength, get_upsample, required_range};
-    use crate::dsp::ipred::{Edge, IntraPredMode};
+    #[cfg(feature = "std")]
+    use crate::dsp::ipred::Edge;
+    use crate::dsp::ipred::IntraPredMode;
+    #[cfg(feature = "std")]
     use crate::frame::BitDepth;
 
     #[test]
@@ -1564,6 +1567,7 @@ mod tests {
         assert_eq!(required_range(M::Z3, 32, 8, 203 | (1 << 10)), (40, 0));
     }
 
+    #[cfg(feature = "std")]
     #[test]
     fn gecersiz_kenar_dilimi_panikler() {
         let bytes = [0u8; 4];

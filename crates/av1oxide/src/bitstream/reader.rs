@@ -368,6 +368,9 @@ fn inv_recenter(r: u32, v: u32) -> u32 {
 
 #[cfg(test)]
 mod tests {
+    use alloc::vec;
+    use alloc::vec::Vec;
+
     use super::{BitReader, BitstreamErrorKind, inv_recenter};
     use crate::error::Error;
 

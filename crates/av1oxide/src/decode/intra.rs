@@ -59,8 +59,12 @@ use crate::entropy::msac::{MsacContext, ulog2};
 use crate::error::{Error, Result, SizeStage};
 use crate::frame::butce::Butce;
 use crate::frame::{BitDepth, ChromaFormat};
+use crate::sync::OnceLock;
 use crate::tables::decode as t;
-use std::sync::{Arc, OnceLock};
+use alloc::format;
+use alloc::sync::Arc;
+use alloc::vec;
+use alloc::vec::Vec;
 
 // --- kare düzeyi sabitler -------------------------------------------------
 
@@ -1645,15 +1649,18 @@ fn warp_trace_line(
     matrix: [i32; 6],
 ) {
     let _ = matrix;
-    eprintln!(
+    crate::trace_eprintln!(
         "W {frame} {fname} {bx} {by} {hash:016x} {x} {y} {plane} {mx} {my} {refslot} {sx} {sy} {} {} {} {}",
-        abcd[0], abcd[1], abcd[2], abcd[3]
+        abcd[0],
+        abcd[1],
+        abcd[2],
+        abcd[3]
     );
 }
 
 /// Tanılama: OBMC blend satırı (`dsp_trace.c` `B` biçimi).
 fn blend_trace_line(frame: u32, fname: &str, bx: usize, by: usize, w: usize, h: usize, hash: u64) {
-    eprintln!("B {frame} {fname} {bx} {by} {w} {h} {hash:016x}");
+    crate::trace_eprintln!("B {frame} {fname} {bx} {by} {w} {h} {hash:016x}");
 }
 
 /// Tanılama: MC çağrı satırı (`dsp_trace.c` `D` biçimi).
@@ -1675,7 +1682,7 @@ fn mc_trace_line(
     sy: u32,
     hash: u64,
 ) {
-    eprintln!(
+    crate::trace_eprintln!(
         "D {frame} {fname} {filter} {bx} {by} {w} {h} {mx} {my} {p1} {p2} {refpoc} 0 {sx} {sy} {hash:016x}"
     );
 }
@@ -1765,6 +1772,7 @@ struct DspTrace {
     lr_off: bool,
 }
 
+#[cfg(feature = "std")]
 fn dsp_trace_env(birincil: &str, ikincil: &str) -> i64 {
     std::env::var(birincil)
         .ok()
@@ -1775,21 +1783,42 @@ fn dsp_trace_env(birincil: &str, ikincil: &str) -> i64 {
 
 #[inline(always)]
 fn dsp_trace() -> &'static DspTrace {
-    static T: OnceLock<DspTrace> = OnceLock::new();
-    T.get_or_init(|| DspTrace {
-        on: std::env::var_os("AV1OXIDE_DSP_TRACE").is_some(),
-        frame: dsp_trace_env("AV1OXIDE_DSP_FRAME", "DSP_TRACE_FRAME"),
-        plane: dsp_trace_env("AV1OXIDE_DSP_PLANE", "DSP_TRACE_PLANE"),
-        x: dsp_trace_env("AV1OXIDE_DSP_X", "DSP_TRACE_X"),
-        y: dsp_trace_env("AV1OXIDE_DSP_Y", "DSP_TRACE_Y"),
-        blk_trace: std::env::var_os("AV1OXIDE_TRACE").is_some(),
-        lf_blk: std::env::var_os("AV1OXIDE_LF_BLK").is_some(),
-        lf_dlf: std::env::var_os("AV1OXIDE_LF_DLF").is_some(),
-        refmvs_trace: std::env::var_os("AV1OXIDE_REFMVS_TRACE").is_some(),
-        lf_off: std::env::var_os("AV1OXIDE_LF_OFF").is_some(),
-        cdef_off: std::env::var_os("AV1OXIDE_CDEF_OFF").is_some(),
-        lr_off: std::env::var_os("AV1OXIDE_LR_OFF").is_some(),
-    })
+    #[cfg(feature = "std")]
+    {
+        static T: OnceLock<DspTrace> = OnceLock::new();
+        T.get_or_init(|| DspTrace {
+            on: std::env::var_os("AV1OXIDE_DSP_TRACE").is_some(),
+            frame: dsp_trace_env("AV1OXIDE_DSP_FRAME", "DSP_TRACE_FRAME"),
+            plane: dsp_trace_env("AV1OXIDE_DSP_PLANE", "DSP_TRACE_PLANE"),
+            x: dsp_trace_env("AV1OXIDE_DSP_X", "DSP_TRACE_X"),
+            y: dsp_trace_env("AV1OXIDE_DSP_Y", "DSP_TRACE_Y"),
+            blk_trace: std::env::var_os("AV1OXIDE_TRACE").is_some(),
+            lf_blk: std::env::var_os("AV1OXIDE_LF_BLK").is_some(),
+            lf_dlf: std::env::var_os("AV1OXIDE_LF_DLF").is_some(),
+            refmvs_trace: std::env::var_os("AV1OXIDE_REFMVS_TRACE").is_some(),
+            lf_off: std::env::var_os("AV1OXIDE_LF_OFF").is_some(),
+            cdef_off: std::env::var_os("AV1OXIDE_CDEF_OFF").is_some(),
+            lr_off: std::env::var_os("AV1OXIDE_LR_OFF").is_some(),
+        })
+    }
+    #[cfg(not(feature = "std"))]
+    {
+        static DEFAULT: DspTrace = DspTrace {
+            on: false,
+            frame: -1,
+            plane: -1,
+            x: -1,
+            y: -1,
+            blk_trace: false,
+            lf_blk: false,
+            lf_dlf: false,
+            refmvs_trace: false,
+            lf_off: false,
+            cdef_off: false,
+            lr_off: false,
+        };
+        &DEFAULT
+    }
 }
 
 impl DspTrace {
@@ -1827,7 +1856,7 @@ fn mct_trace_line(
     sy: u32,
     hash: u64,
 ) {
-    eprintln!(
+    crate::trace_eprintln!(
         "N {frame} {fname} {filter} {bx} {by} {w} {h} {mx} {my} {p1} {p2} {refpoc} 0 {sx} {sy} {hash:016x}"
     );
 }
@@ -1846,7 +1875,7 @@ fn avg_trace_line(
     hash_t1: u64,
     hash_t2: u64,
 ) {
-    eprintln!(
+    crate::trace_eprintln!(
         "A {frame} {fname} {bx} {by} {w} {h} {weight} {hash_dst:016x} {hash_t1:016x} {hash_t2:016x}"
     );
 }
@@ -1867,7 +1896,7 @@ fn mask_trace_line(
     hash_t2: u64,
     hash_mask: u64,
 ) {
-    eprintln!(
+    crate::trace_eprintln!(
         "C {frame} {fname} {idx} {sign} {bx} {by} {w} {h} {hash_dst:016x} {hash_t1:016x} {hash_t2:016x} {hash_mask:016x}"
     );
 }
@@ -1886,7 +1915,7 @@ fn emu_trace_line(
     y: i32,
     hash: u64,
 ) {
-    eprintln!("E {frame} {bx} {by} {bw} {bh} {iw} {ih} {x} {y} {hash:016x}");
+    crate::trace_eprintln!("E {frame} {bx} {by} {bw} {bh} {iw} {ih} {x} {y} {hash:016x}");
 }
 
 /// itx satırı — `dsp_trace.c` `T` biçimi. Konum **gerçek hedef** (düzlem
@@ -1914,12 +1943,12 @@ fn itx_trace_line(
             let _ = core::fmt::Write::write_fmt(&mut line, format_args!(" {i}:{c}"));
         }
     }
-    eprintln!("{line}");
+    crate::trace_eprintln!("{line}");
 }
 
 /// Blok satırı — `dsp_trace.c` `K` biçimi.
 fn block_trace_line(frame: u32, bx: usize, by: usize, bs: u8, b: &Av1Block) {
-    eprintln!(
+    crate::trace_eprintln!(
         "K {frame} {bx} {by} {bs} {} {} {} {} {} {} {} {} {} {} {}",
         u8::from(b.intra),
         if b.intra { 0 } else { b.comp_type },
@@ -2351,7 +2380,7 @@ impl<'a> Dec<'a> {
             && self.hdr.loopfilter.level_y[0] == 13
             && self.hdr.loopfilter.level_v == 61
         {
-            eprintln!(
+            crate::trace_eprintln!(
                 "BLK bx={} by={} bs={} bw4={} bh4={} chroma={} intra={} seg={} lv={:?} ref0={} im={} ct={}",
                 self.bx,
                 self.by,
@@ -3217,7 +3246,7 @@ impl<'a> Dec<'a> {
                 self.lflvl =
                     crate::decode::loopfilter::calc_lf_values(self.hdr, self.last_delta_lf);
                 if dsp_trace().lf_dlf {
-                    eprintln!(
+                    crate::trace_eprintln!(
                         "DLF frame={} bx={} by={} d={:?} v={:?}",
                         self.frame_no,
                         self.bx,
@@ -3372,7 +3401,7 @@ impl<'a> Dec<'a> {
             }
 
             if dsp_trace().blk_trace {
-                eprintln!(
+                crate::trace_eprintln!(
                     "B bx={} by={} bs={} skip={} seg={} y={} uv={} tx={} cnt={} intra={} mv={} maxytx={} split={:x}/{:x}",
                     self.bx,
                     self.by,
@@ -3626,7 +3655,7 @@ impl<'a> Dec<'a> {
         if dsp_trace().blk_trace {
             // Blok düzeyi tanılama (varsayılan kapalı): kare, blok konumu,
             // araç seçimleri. Farklı karelerde ilk farklı bloğu bulmak için.
-            eprintln!(
+            crate::trace_eprintln!(
                 "K {} {} {} {} {} {} {} {} {} {} {} {} {} {} {}",
                 self.frame_no,
                 blk_bx,
@@ -3879,7 +3908,7 @@ impl<'a> Dec<'a> {
                                         bpp,
                                     );
                                     let (au, lu, ai_ctx, li) = self.ipred_ctx();
-                                    eprintln!(
+                                    crate::trace_eprintln!(
                                         "P {} {} {} {} {} {} {:016x} {:016x} {} {} {} {} {} {} {}",
                                         self.frame_no,
                                         prepared.mode,
@@ -4188,7 +4217,7 @@ impl<'a> Dec<'a> {
                                             bpp,
                                         );
                                         let (au, lu, ai_ctx, li) = self.ipred_ctx();
-                                        eprintln!(
+                                        crate::trace_eprintln!(
                                             "P {} {} {} {} {} {} {:016x} {:016x} {} {} {} {} {} {} {}",
                                             self.frame_no,
                                             prepared.mode,
@@ -5410,7 +5439,7 @@ impl<'a> Dec<'a> {
         let (emu_bw, emu_bh) = (pw + 7 * mxn as usize, ph + 7 * myn as usize);
         let (emu_x, emu_y) = (dx - 3 * mxn, dy - 3 * myn);
         let (emu_hoff, emu_voff) = ((3 - 3 * mxn) as usize, (3 - 3 * myn) as usize);
-        let mut buf = std::mem::take(&mut self.scratch.emu_edge);
+        let mut buf = core::mem::take(&mut self.scratch.emu_edge);
         // Rust MC sözleşmesi (`dsp/scalar/mc.rs:150-157`, `:589`): `src`
         // **dolgu hücresini** (blok başlangıcının −3 satır/−3 sütunu)
         // gösterir. `emu_edge` tamponunun (0,0) hücresi tam olarak
@@ -7250,7 +7279,7 @@ impl Dec<'_> {
             emu_voff = (3 - 3 * myn) as usize;
             emu_cstride = 192 * bpp;
             if dx < 3 || dy < 3 || dx + pw as i32 + 4 > w || dy + ph as i32 + 4 > h {
-                let mut buf = std::mem::take(&mut self.scratch.emu_edge);
+                let mut buf = core::mem::take(&mut self.scratch.emu_edge);
                 crate::dsp::profil_olc!(
                     McEmuEdge,
                     (mc.emu_edge)(
@@ -7308,7 +7337,7 @@ impl Dec<'_> {
             emu_voff = 0;
             emu_cstride = 320 * bpp;
             if left < 3 || top < 3 || right + 4 > w || bottom + 4 > h {
-                let mut buf = std::mem::take(&mut self.scratch.emu_edge);
+                let mut buf = core::mem::take(&mut self.scratch.emu_edge);
                 crate::dsp::profil_olc!(
                     McEmuEdge,
                     (mc.emu_edge)(
@@ -7615,7 +7644,7 @@ impl Dec<'_> {
                 let my = ((mvy & 0xffff) - gamma * 4 - delta * 4) & !0x3f;
 
                 if dx < 3 || dx + 12 > width as i32 || dy < 3 || dy + 12 > height as i32 {
-                    let mut buf = std::mem::take(&mut self.scratch.emu_edge);
+                    let mut buf = core::mem::take(&mut self.scratch.emu_edge);
                     crate::dsp::profil_olc!(
                         McEmuEdge,
                         (mc.emu_edge)(
@@ -7670,7 +7699,7 @@ impl Dec<'_> {
                         self.refs
                             .get(i)
                             .and_then(|r| r.as_ref())
-                            .is_some_and(|r| std::ptr::eq(refp, &r.pic))
+                            .is_some_and(|r| core::ptr::eq(refp, &r.pic))
                     });
                     (
                         slot.map_or(255u32, |i| i as u32),
@@ -7829,7 +7858,7 @@ impl Dec<'_> {
         let h_mul = 4 >> ss_hor;
         let v_mul = 4 >> ss_ver;
         let bpp = self.bd.bytes_per_sample();
-        let mut lap = std::mem::take(&mut self.scratch.lap);
+        let mut lap = core::mem::take(&mut self.scratch.lap);
         let lw = 128usize;
         if self.by > self.row_start
             && (plane == 0 || usize::from(b_dim[0]) * h_mul + usize::from(b_dim[1]) * v_mul >= 16)
@@ -7991,7 +8020,7 @@ impl Dec<'_> {
         let ss_hor = if plane != 0 { self.ss_hor } else { 0 };
         let ss_ver = if plane != 0 { self.ss_ver } else { 0 };
         let (tw, th) = (bw4, bh4);
-        let mut edge = std::mem::take(&mut self.scratch.edge);
+        let mut edge = core::mem::take(&mut self.scratch.edge);
         let mode_in = if b.interintra_mode == II_SMOOTH_PRED {
             SMOOTH_PRED
         } else {
@@ -8017,7 +8046,7 @@ impl Dec<'_> {
             32 * bpp,
             bd,
         );
-        let mut tmp = std::mem::take(&mut self.scratch.interintra);
+        let mut tmp = core::mem::take(&mut self.scratch.interintra);
         let ipred = self.bdsp.ipred();
         crate::dsp::profil_olc!(
             IntraPred,
@@ -8037,7 +8066,7 @@ impl Dec<'_> {
         if dsp_trace().frame_ok(self.frame_no) {
             let hash = pred_hash(&tmp, 0, tw * 4 * bpp, tw * 4, th * 4, bpp);
             let (au, lu, ai_ctx, li) = self.ipred_ctx();
-            eprintln!(
+            crate::trace_eprintln!(
                 "P {} {} {} {} {} {} {:016x} {:016x} 0 0 0 {} {} {} {}",
                 self.frame_no,
                 prepared.mode,
@@ -8150,7 +8179,7 @@ impl Dec<'_> {
         let lw = bw4 * 4;
         let lh = bh4 * 4;
         let n = lw * lh;
-        let mut tmp = std::mem::take(&mut self.scratch.compinter);
+        let mut tmp = core::mem::take(&mut self.scratch.compinter);
         let mc = self.bdsp.mc();
 
         // --- luma ---------------------------------------------------------
@@ -8270,7 +8299,7 @@ impl Dec<'_> {
                 }
             }
             COMP_INTER_SEG => {
-                let mut mask = std::mem::take(&mut self.scratch.seg_mask);
+                let mut mask = core::mem::take(&mut self.scratch.seg_mask);
                 let sign = i32::from(b.mask_sign);
                 let (t1, t2) = if b.mask_sign != 0 {
                     (&tmp[n..2 * n], &tmp[..n])
@@ -8367,7 +8396,7 @@ impl Dec<'_> {
             let ch = lh >> ss_ver;
             let cn = cw * ch;
             let seg_mask = if seg_mask_used {
-                Some(std::mem::take(&mut self.scratch.seg_mask))
+                Some(core::mem::take(&mut self.scratch.seg_mask))
             } else {
                 None
             };
@@ -8642,7 +8671,7 @@ impl Dec<'_> {
             if b.motion_mode == MM_OBMC {
                 let dst_off = self.pic.off(0, dst_x, dst_y);
                 let stride = self.pic.stride[0];
-                let mut dst = std::mem::take(&mut self.pic.data[0]);
+                let mut dst = core::mem::take(&mut self.pic.data[0]);
                 let dst_slice = &mut dst[dst_off..];
                 self.obmc_block(0, dst_slice, stride, bs, bx4, by4, w4, h4)?;
                 self.pic.data[0] = dst;
@@ -8808,7 +8837,7 @@ impl Dec<'_> {
                     if b.motion_mode == MM_OBMC {
                         let dst_off = self.pic.off(pl, dst_x, dst_y);
                         let stride = self.pic.stride[pl];
-                        let mut dst = std::mem::take(&mut self.pic.data[pl]);
+                        let mut dst = core::mem::take(&mut self.pic.data[pl]);
                         let dst_slice = &mut dst[dst_off..];
                         self.obmc_block(pl, dst_slice, stride, bs, bx4, by4, w4, h4)?;
                         self.pic.data[pl] = dst;
@@ -8970,7 +8999,7 @@ impl Dec<'_> {
                     wm.matrix[5]
                 ),
             );
-            eprintln!("{line}");
+            crate::trace_eprintln!("{line}");
         }
         if ok {
             (wm, true)

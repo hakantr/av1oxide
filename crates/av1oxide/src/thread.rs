@@ -29,11 +29,16 @@ use crate::decode::intra::{DecodeBufPool, RefFrame};
 use crate::error::{Error, Result};
 use crate::frame::{BitDepth, ChromaFormat};
 use crate::sync::{Condvar, Mutex};
+use alloc::boxed::Box;
+use alloc::collections::VecDeque;
+use alloc::sync::Arc;
+use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use crossbeam_utils::CachePadded;
-use std::collections::VecDeque;
-use std::sync::Arc;
-use std::thread::{self, JoinHandle};
+#[cfg(all(feature = "std", not(target_arch = "wasm32")))]
+use std::thread;
+#[cfg(feature = "std")]
+use std::thread::JoinHandle;
 
 /// Yardımcı iş parçacığı yığın boyutu (`2 MiB`; derin özyinelemeli
 /// `decode_sb` + 128×128 blok yığın çerçeveleri için güvenli sınır).
@@ -179,6 +184,7 @@ struct QueueState {
     /// Her yeni iş eklendiğinde (`execute_tasks` veya `spawn_async`) artan kuşak sayacı.
     generation: u64,
     /// Havuz kapanıyor mu (`Drop`).
+    #[cfg(feature = "std")]
     shutdown: bool,
     /// Etkin paralel alt-görev partileri (`execute_tasks` / `execute_indexed`).
     active_batches: Vec<Arc<TaskBatch>>,
@@ -319,6 +325,7 @@ pub struct WorkerPool {
     scratch: Arc<ScratchPool>,
     buf_pool: Arc<DecodeBufPool>,
     shared: Option<Arc<SharedQueue>>,
+    #[cfg(feature = "std")]
     workers: Vec<JoinHandle<()>>,
 }
 
@@ -326,7 +333,7 @@ impl core::fmt::Debug for WorkerPool {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("WorkerPool")
             .field("n_threads", &self.n_threads)
-            .field("spawned_workers", &self.workers.len())
+            .field("spawned_workers", &self.spawned_workers())
             .finish()
     }
 }
@@ -339,19 +346,22 @@ impl Clone for WorkerPool {
 
 impl Drop for WorkerPool {
     fn drop(&mut self) {
-        if !self.workers.is_empty()
-            && let Some(shared) = &self.shared
+        #[cfg(feature = "std")]
         {
+            if !self.workers.is_empty()
+                && let Some(shared) = &self.shared
             {
-                let mut st = shared.state.lock();
-                st.shutdown = true;
-                st.active_batches.clear();
-                st.async_tasks.clear();
+                {
+                    let mut st = shared.state.lock();
+                    st.shutdown = true;
+                    st.active_batches.clear();
+                    st.async_tasks.clear();
+                }
+                shared.work_cv.notify_all();
             }
-            shared.work_cv.notify_all();
-        }
-        for handle in self.workers.drain(..) {
-            let _ = handle.join();
+            for handle in self.workers.drain(..) {
+                let _ = handle.join();
+            }
         }
     }
 }
@@ -359,67 +369,78 @@ impl Drop for WorkerPool {
 impl WorkerPool {
     /// `n_threads` (`Config::effective_threads()`) için iş parçacığı havuzu kurar.
     ///
-    /// `n_threads <= 1` ise (veya `target_arch = "wasm32"` altında, `DSP-07`)
-    /// hiçbir işletim sistemi iş parçacığı başlatılmaz. İşletim sistemi yeni iş
-    /// parçacığı açamazsa havuz güvenli biçimde daha az yardımcı iş parçacığına
+    /// `n_threads <= 1` ise (veya `target_arch = "wasm32"` / `not(feature = "std")`
+    /// altında) hiçbir işletim sistemi iş parçacığı başlatılmaz. İşletim sistemi yeni
+    /// iş parçacığı açamazsa havuz güvenli biçimde daha az yardımcı iş parçacığına
     /// (en kötü durumda tek iş parçacığına) düşer; panik üretmez.
     #[must_use]
     pub fn new(n_threads: usize) -> Self {
-        #[cfg(target_arch = "wasm32")]
-        let n_threads = {
+        #[cfg(any(not(feature = "std"), target_arch = "wasm32"))]
+        {
             let _ = n_threads;
-            1usize
-        };
-        #[cfg(not(target_arch = "wasm32"))]
-        let n_threads = n_threads.max(1);
-        let scratch = Arc::new(ScratchPool::new(n_threads));
-        let buf_pool = Arc::new(DecodeBufPool::new(n_threads));
-        if n_threads == 1 {
-            return Self {
+            let scratch = Arc::new(ScratchPool::new(1));
+            let buf_pool = Arc::new(DecodeBufPool::new(1));
+            Self {
                 n_threads: 1,
                 scratch,
                 buf_pool,
                 shared: None,
+                #[cfg(feature = "std")]
                 workers: Vec::new(),
-            };
-        }
-        let shared = Arc::new(SharedQueue {
-            state: Mutex::new(QueueState {
-                generation: 0,
-                shutdown: false,
-                active_batches: Vec::new(),
-                async_tasks: VecDeque::new(),
-            }),
-            work_cv: Condvar::new(),
-        });
-        let mut workers = Vec::with_capacity(n_threads - 1);
-        for worker_id in 1..n_threads {
-            let q = Arc::clone(&shared);
-            let spawn_res = thread::Builder::new()
-                .name(format!("av1oxide-w{worker_id}"))
-                .stack_size(WORKER_STACK_SIZE)
-                .spawn(move || worker_loop(worker_id, &q));
-            match spawn_res {
-                Ok(handle) => workers.push(handle),
-                Err(_) => break,
             }
         }
-        if workers.is_empty() {
-            return Self {
-                n_threads: 1,
-                scratch: Arc::new(ScratchPool::new(1)),
+        #[cfg(all(feature = "std", not(target_arch = "wasm32")))]
+        {
+            let n_threads = n_threads.max(1);
+            let scratch = Arc::new(ScratchPool::new(n_threads));
+            let buf_pool = Arc::new(DecodeBufPool::new(n_threads));
+            if n_threads == 1 {
+                return Self {
+                    n_threads: 1,
+                    scratch,
+                    buf_pool,
+                    shared: None,
+                    workers: Vec::new(),
+                };
+            }
+            let shared = Arc::new(SharedQueue {
+                state: Mutex::new(QueueState {
+                    generation: 0,
+                    shutdown: false,
+                    active_batches: Vec::new(),
+                    async_tasks: VecDeque::new(),
+                }),
+                work_cv: Condvar::new(),
+            });
+            let mut workers = Vec::with_capacity(n_threads - 1);
+            for worker_id in 1..n_threads {
+                let q = Arc::clone(&shared);
+                let spawn_res = thread::Builder::new()
+                    .name(alloc::format!("av1oxide-w{worker_id}"))
+                    .stack_size(WORKER_STACK_SIZE)
+                    .spawn(move || worker_loop(worker_id, &q));
+                match spawn_res {
+                    Ok(handle) => workers.push(handle),
+                    Err(_) => break,
+                }
+            }
+            if workers.is_empty() {
+                return Self {
+                    n_threads: 1,
+                    scratch: Arc::new(ScratchPool::new(1)),
+                    buf_pool,
+                    shared: None,
+                    workers: Vec::new(),
+                };
+            }
+            let active_threads = workers.len() + 1;
+            Self {
+                n_threads: active_threads,
+                scratch,
                 buf_pool,
-                shared: None,
-                workers: Vec::new(),
-            };
-        }
-        let active_threads = workers.len() + 1;
-        Self {
-            n_threads: active_threads,
-            scratch,
-            buf_pool,
-            shared: Some(shared),
-            workers,
+                shared: Some(shared),
+                workers,
+            }
         }
     }
 
@@ -432,7 +453,14 @@ impl WorkerPool {
     /// Havuzda başlatılmış yardımcı iş parçacığı sayısı (`n_threads == 1` için `0`).
     #[must_use]
     pub fn spawned_workers(&self) -> usize {
-        self.workers.len()
+        #[cfg(feature = "std")]
+        {
+            self.workers.len()
+        }
+        #[cfg(not(feature = "std"))]
+        {
+            0
+        }
     }
 
     /// Paralel yürütme etkin mi (`n_threads > 1`)?
@@ -468,6 +496,7 @@ impl WorkerPool {
             scratch: Arc::clone(&self.scratch),
             buf_pool: Arc::clone(&self.buf_pool),
             shared: self.shared.as_ref().map(Arc::clone),
+            #[cfg(feature = "std")]
             workers: Vec::new(),
         }
     }
@@ -485,6 +514,7 @@ impl WorkerPool {
             scratch: Arc::clone(&self.scratch),
             buf_pool: Arc::clone(&self.buf_pool),
             shared: None,
+            #[cfg(feature = "std")]
             workers: Vec::new(),
         }
     }
@@ -698,6 +728,7 @@ impl WorkerPool {
     }
 }
 
+#[cfg(all(feature = "std", not(target_arch = "wasm32")))]
 fn worker_loop(worker_id: usize, shared: &SharedQueue) {
     enum WorkItem {
         Batch(Arc<TaskBatch>),
@@ -740,7 +771,12 @@ fn worker_loop(worker_id: usize, shared: &SharedQueue) {
 
 #[cfg(test)]
 mod tests {
+    use alloc::vec;
+    #[cfg(feature = "std")]
+    use alloc::vec::Vec;
+
     use super::WorkerPool;
+    #[cfg(feature = "std")]
     use crate::error::Error;
 
     #[test]
@@ -758,6 +794,7 @@ mod tests {
         assert_eq!(items, vec![1, 12, 23, 34]);
     }
 
+    #[cfg(feature = "std")]
     #[test]
     fn cok_thread_havuzu_tum_gorevleri_ve_en_kucuk_indeksli_hatayi_belirlenimli_dondurur() {
         let pool = WorkerPool::new(4);
@@ -798,6 +835,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "std")]
     #[test]
     fn ardisik_hizli_kucuk_parti_kusaklar_arasi_yaris_ve_underflow_uretmez() {
         let pool = WorkerPool::new(if cfg!(miri) { 4 } else { 8 });
@@ -817,6 +855,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "std")]
     #[test]
     fn ic_ice_paralel_kare_ve_alt_parti_gorevleri_kilitlenmeden_tamamlanir() {
         use std::sync::{Arc, Condvar, Mutex};

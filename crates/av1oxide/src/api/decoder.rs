@@ -56,9 +56,13 @@ use crate::frame::butce::{Butce, ButceTutucu};
 use crate::frame::{BitDepth, ChromaFormat, Frame};
 use crate::sync::{Condvar, Mutex};
 use crate::thread::{FrameSlot, WorkerPool};
+use alloc::collections::VecDeque;
+use alloc::format;
+use alloc::string::String;
+use alloc::sync::Arc;
+use alloc::vec;
+use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, Ordering};
-use std::collections::VecDeque;
-use std::sync::Arc;
 
 /// Çözücünün çağrı sırası durumu (BLK-01).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -93,6 +97,7 @@ pub(crate) struct ItutT35Meta {
 }
 
 /// C-ABI (`Dav1dPicture`) çıktı karesi için eşlik eden başlık, metaveri ve olay bayrakları.
+#[cfg_attr(not(feature = "std"), allow(dead_code))]
 #[derive(Clone, Debug, Default)]
 pub(crate) struct OutputCapiMeta {
     pub seq_hdr: Option<Arc<SequenceHeader>>,
@@ -1997,11 +2002,13 @@ impl Decoder {
     }
 
     /// Son çözme hatasını üreten paketin C-ABI kimlik etiketi.
+    #[cfg_attr(not(feature = "std"), allow(dead_code))]
     pub(crate) const fn last_error_packet_tag(&self) -> Option<u64> {
         self.last_error_packet_tag
     }
 
     /// Verilen C-ABI paket etiketine (`packet_tag`) sahip bekleyen çıktı veya uçuş görevi var mı?
+    #[cfg_attr(not(feature = "std"), allow(dead_code))]
     pub(crate) fn has_pending_packet_tag(&self, tag: u64) -> bool {
         self.output_capi_meta.iter().any(|m| m.packet_tag == tag)
             || self.in_flight.iter().any(|e| match e {
@@ -2011,6 +2018,7 @@ impl Decoder {
     }
 
     /// C-ABI (`dav1d_apply_grain`) için verilen kareye film grain uygular.
+    #[cfg_attr(not(feature = "std"), allow(dead_code))]
     pub(crate) fn apply_grain_capi(
         &self,
         frame: &Frame,
@@ -2548,6 +2556,7 @@ fn build_output_frame_from_ref(
 
 /// Çıktı karesini (varsa Film Grain uygulayarak) üretir (`dav1d_apply_grain` C-ABI yolu).
 #[allow(clippy::too_many_arguments)]
+#[cfg_attr(not(feature = "std"), allow(dead_code))]
 fn build_output_frame(
     apply_grain_cfg: bool,
     dsp: &DspDispatch,
@@ -2755,6 +2764,9 @@ fn frame_format(
 
 #[cfg(test)]
 mod tests {
+    use alloc::vec;
+    use alloc::vec::Vec;
+
     use super::{Decoder, DecoderState};
     use crate::api::{Config, Packet};
     use crate::cpu::CpuFlags;

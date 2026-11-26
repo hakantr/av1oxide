@@ -26,6 +26,7 @@ mod decoder;
 mod packet;
 
 pub use config::{Config, MAX_FRAME_DELAY, MAX_THREADS};
+#[cfg(feature = "std")]
 pub(crate) use decoder::OutputCapiMeta;
 pub use decoder::{Decoder, DecoderState};
 pub use packet::Packet;

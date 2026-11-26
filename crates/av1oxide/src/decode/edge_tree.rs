@@ -20,6 +20,8 @@
 
 #![forbid(unsafe_code)]
 
+use alloc::vec::Vec;
+
 /// Blok seviyesi: 8×8 (`BL_8X8`).
 pub(crate) const BL_8X8: u8 = 4;
 

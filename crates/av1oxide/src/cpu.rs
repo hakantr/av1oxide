@@ -53,6 +53,7 @@ pub use token::{
     Avx2Token, Avx512IclToken, DotprodToken, NeonToken, Sse2Token, Sse41Token, Ssse3Token,
 };
 
+use alloc::vec::Vec;
 use core::fmt;
 
 /// CPU özellik ve mikro-mimari kısıt bit kümesi (DSP-01, DSP-04).
@@ -301,15 +302,87 @@ impl CpuFlags {
     /// API yaşam döngüsü testleri Miri'de koşar. Normal derlemeye etkisi yoktur.
     #[must_use]
     pub fn detect() -> Self {
-        static DETECTED: std::sync::OnceLock<CpuFlags> = std::sync::OnceLock::new();
-        *DETECTED.get_or_init(|| {
+        #[cfg(feature = "std")]
+        {
+            static DETECTED: crate::sync::OnceLock<CpuFlags> = crate::sync::OnceLock::new();
+            *DETECTED.get_or_init(|| {
+                #[cfg(all(target_arch = "x86_64", not(miri)))]
+                {
+                    x86::X86CpuId::read().flags()
+                }
+                #[cfg(all(target_arch = "aarch64", not(miri)))]
+                {
+                    arm::ArmCpuId::read().flags()
+                }
+                #[cfg(all(target_arch = "wasm32", target_feature = "simd128", not(miri)))]
+                {
+                    Self::WASM_SIMD128
+                }
+                #[cfg(any(
+                    miri,
+                    not(any(
+                        target_arch = "x86_64",
+                        target_arch = "aarch64",
+                        all(target_arch = "wasm32", target_feature = "simd128")
+                    ))
+                ))]
+                {
+                    Self::NONE
+                }
+            })
+        }
+        #[cfg(not(feature = "std"))]
+        {
             #[cfg(all(target_arch = "x86_64", not(miri)))]
             {
-                x86::X86CpuId::read().flags()
+                let mut flags = Self::NONE;
+                if cfg!(target_feature = "sse2") {
+                    flags = flags.union(Self::SSE2);
+                    if cfg!(all(target_feature = "sse3", target_feature = "ssse3")) {
+                        flags = flags.union(Self::SSSE3);
+                        if cfg!(target_feature = "sse4.1") {
+                            flags = flags.union(Self::SSE4_1);
+                            if cfg!(all(
+                                target_feature = "avx",
+                                target_feature = "avx2",
+                                target_feature = "bmi1",
+                                target_feature = "bmi2"
+                            )) {
+                                flags = flags.union(Self::AVX2);
+                                if cfg!(all(
+                                    target_feature = "avx512f",
+                                    target_feature = "avx512dq",
+                                    target_feature = "avx512ifma",
+                                    target_feature = "avx512cd",
+                                    target_feature = "avx512bw",
+                                    target_feature = "avx512vl",
+                                    target_feature = "avx512vbmi",
+                                    target_feature = "avx512vbmi2",
+                                    target_feature = "gfni",
+                                    target_feature = "vaes",
+                                    target_feature = "vpclmulqdq",
+                                    target_feature = "avx512vnni",
+                                    target_feature = "avx512bitalg",
+                                    target_feature = "avx512vpopcntdq"
+                                )) {
+                                    flags = flags.union(Self::AVX512ICL);
+                                }
+                            }
+                        }
+                    }
+                }
+                flags
             }
             #[cfg(all(target_arch = "aarch64", not(miri)))]
             {
-                arm::ArmCpuId::read().flags()
+                let mut flags = Self::NONE;
+                if cfg!(target_feature = "neon") {
+                    flags = flags.union(Self::NEON);
+                    if cfg!(target_feature = "dotprod") {
+                        flags = flags.union(Self::DOTPROD);
+                    }
+                }
+                flags
             }
             #[cfg(all(target_arch = "wasm32", target_feature = "simd128", not(miri)))]
             {
@@ -326,7 +399,7 @@ impl CpuFlags {
             {
                 Self::NONE
             }
-        })
+        }
     }
 }
 
@@ -487,6 +560,11 @@ impl CpuLevel {
 
 #[cfg(test)]
 mod tests {
+    use alloc::format;
+    use alloc::string::ToString;
+    use alloc::vec;
+    use alloc::vec::Vec;
+
     use super::{CpuFlags, CpuLevel};
 
     #[test]
@@ -647,6 +725,7 @@ mod tests {
         #[cfg(target_arch = "x86_64")]
         {
             assert!(detected.contains(CpuFlags::SSE2), "x86_64'te SSE2 tabandır");
+            #[cfg(feature = "std")]
             assert_eq!(detected, super::x86::X86CpuId::read().flags());
             assert!(CpuFlags::X86_DAV1D.contains(detected));
         }

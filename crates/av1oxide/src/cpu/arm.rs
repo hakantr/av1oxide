@@ -53,7 +53,7 @@ pub struct ArmCpuId {
 
 impl ArmCpuId {
     /// Çalışma zamanında `aarch64` özelliklerini okur.
-    #[cfg(all(target_arch = "aarch64", not(miri)))]
+    #[cfg(all(feature = "std", target_arch = "aarch64", not(miri)))]
     #[must_use]
     pub fn read() -> Self {
         let neon = std::arch::is_aarch64_feature_detected!("neon");

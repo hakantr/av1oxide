@@ -28,6 +28,8 @@
 //! `scan_row`/`scan_col` ilerlemesini belirler.
 #![forbid(unsafe_code)]
 
+use alloc::vec::Vec;
+
 use crate::bitstream::frame_header::{
     FrameHeader, WarpedMotionParams, WarpedMotionType, get_poc_diff,
 };
@@ -153,7 +155,7 @@ pub(crate) struct RefMvs {
     /// (`refmvs.c:400`); türetilmiş alandan **farklıdır**.
     hdr_use_ref_frame_mvs: bool,
     /// `rf->rp_proj` — geçerli karenin projeksiyonu (tam kare, 8×8; paralel tile'lar arasında sıfır-kopya paylaşılır).
-    pub(crate) rp_proj: std::sync::Arc<Vec<TemporalBlock>>,
+    pub(crate) rp_proj: alloc::sync::Arc<Vec<TemporalBlock>>,
     /// `rf->rp_stride`.
     rp_stride: usize,
     /// `frm_hdr->gmv[7]`.
@@ -206,7 +208,7 @@ impl RefMvs {
             pocdiff: [0; 7],
             use_ref_frame_mvs: false,
             hdr_use_ref_frame_mvs: false,
-            rp_proj: std::sync::Arc::new(Vec::new()),
+            rp_proj: alloc::sync::Arc::new(Vec::new()),
             rp_stride: 0,
             gmv: [WarpedMotionParams::default(); 7],
             hp: false,
@@ -255,7 +257,7 @@ impl RefMvs {
             pocdiff: self.pocdiff,
             use_ref_frame_mvs: self.use_ref_frame_mvs,
             hdr_use_ref_frame_mvs: self.hdr_use_ref_frame_mvs,
-            rp_proj: std::sync::Arc::clone(&self.rp_proj),
+            rp_proj: alloc::sync::Arc::clone(&self.rp_proj),
             rp_stride: self.rp_stride,
             gmv: self.gmv,
             hp: self.hp,
@@ -334,7 +336,7 @@ impl RefMvs {
         // `rp_stride`, kare genişliği 128'e hizalanmış 8×8 sütun sayısıdır.
         self.rp_stride = ((hdr.width[0] as usize + 127) & !127) >> 3;
         let ih8 = (hdr.height as usize + 7) >> 3;
-        self.rp_proj = std::sync::Arc::new(butce.reuse_vec(
+        self.rp_proj = alloc::sync::Arc::new(butce.reuse_vec(
             old_rp_proj,
             self.rp_stride * ih8.max(1),
             TemporalBlock::default(),
@@ -401,11 +403,11 @@ impl RefMvs {
             return;
         }
         {
-            static CALL: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-            let call = CALL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            static CALL: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+            let call = CALL.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
             trace::maybe_dump_refs(call, refs, self.rp_stride, self.iw4 >> 1);
         }
-        let rp_proj = std::sync::Arc::make_mut(&mut self.rp_proj);
+        let rp_proj = alloc::sync::Arc::make_mut(&mut self.rp_proj);
         let ih8 = rp_proj.len() / self.rp_stride.max(1);
         let mut row = 0usize;
         while row < ih8 {
@@ -1535,25 +1537,42 @@ fn add_temporal_candidate(
 /// referans yolunda yazmadığı için (başlatılmamış) karşılaştırılmaz.
 mod trace {
     use super::{Candidate, Mv, RefBlock, TileBounds};
+    #[cfg(feature = "std")]
     use std::sync::OnceLock;
 
     /// `<kare>:<by4>:<bx4>:<satır0>:<satır1>`
+    #[cfg(feature = "std")]
     type GridFilter = (u32, usize, usize, usize, usize);
 
+    #[cfg(feature = "std")]
     static ON: OnceLock<bool> = OnceLock::new();
+    #[cfg(feature = "std")]
     static FRAME: OnceLock<Option<u32>> = OnceLock::new();
+    #[cfg(feature = "std")]
     static GRID: OnceLock<Option<GridFilter>> = OnceLock::new();
+    #[cfg(feature = "std")]
     static TMVS: OnceLock<Option<(usize, usize)>> = OnceLock::new();
+    #[cfg(feature = "std")]
     static BY: OnceLock<Option<usize>> = OnceLock::new();
+    #[cfg(feature = "std")]
     static REFS: OnceLock<Option<(usize, usize)>> = OnceLock::new();
+    #[cfg(feature = "std")]
     static BX: OnceLock<Option<usize>> = OnceLock::new();
 
     /// İz açık mı? (`AV1OXIDE_REFMVS_TRACE`)
     #[must_use]
     pub(super) fn enabled() -> bool {
-        *ON.get_or_init(|| std::env::var_os("AV1OXIDE_REFMVS_TRACE").is_some())
+        #[cfg(feature = "std")]
+        {
+            *ON.get_or_init(|| std::env::var_os("AV1OXIDE_REFMVS_TRACE").is_some())
+        }
+        #[cfg(not(feature = "std"))]
+        {
+            false
+        }
     }
 
+    #[cfg(feature = "std")]
     fn frame_filter() -> Option<u32> {
         *FRAME.get_or_init(|| {
             std::env::var("AV1OXIDE_REFMVS_FRAME")
@@ -1562,14 +1581,17 @@ mod trace {
         })
     }
 
+    #[cfg(feature = "std")]
     fn by_filter() -> Option<usize> {
         *BY.get_or_init(|| std::env::var("AV1OXIDE_REFMVS_BY").ok()?.parse().ok())
     }
 
+    #[cfg(feature = "std")]
     fn bx_filter() -> Option<usize> {
         *BX.get_or_init(|| std::env::var("AV1OXIDE_REFMVS_BX").ok()?.parse().ok())
     }
 
+    #[cfg(feature = "std")]
     fn grid_filter() -> Option<GridFilter> {
         *GRID.get_or_init(|| {
             let v = std::env::var("AV1OXIDE_REFMVS_GRID").ok()?;
@@ -1583,6 +1605,7 @@ mod trace {
         })
     }
 
+    #[cfg(feature = "std")]
     fn refs_filter() -> Option<(usize, usize)> {
         *REFS.get_or_init(|| {
             let v = std::env::var("AV1OXIDE_REFMVS_REFS").ok()?;
@@ -1600,22 +1623,35 @@ mod trace {
         stride: usize,
         iw8: usize,
     ) {
-        let Some((row0, row1)) = refs_filter() else {
-            return;
-        };
-        for (i, r) in refs.iter().enumerate() {
-            let Some(r) = r else { continue };
-            for row in row0..=row1 {
-                for x in 0..iw8 {
-                    let Some(b) = r.get(row * stride + x) else {
-                        continue;
-                    };
-                    eprintln!("S {call} {i} {row} {x} {} {} {}", b.mv.y, b.mv.x, b.ref_);
+        #[cfg(feature = "std")]
+        {
+            let Some((row0, row1)) = refs_filter() else {
+                return;
+            };
+            for (i, r) in refs.iter().enumerate() {
+                let Some(r) = r else { continue };
+                for row in row0..=row1 {
+                    for x in 0..iw8 {
+                        let Some(b) = r.get(row * stride + x) else {
+                            continue;
+                        };
+                        crate::trace_eprintln!(
+                            "S {call} {i} {row} {x} {} {} {}",
+                            b.mv.y,
+                            b.mv.x,
+                            b.ref_
+                        );
+                    }
                 }
             }
         }
+        #[cfg(not(feature = "std"))]
+        {
+            let _ = (call, refs, stride, iw8);
+        }
     }
 
+    #[cfg(feature = "std")]
     fn tmvs_filter() -> Option<(usize, usize)> {
         *TMVS.get_or_init(|| {
             let v = std::env::var("AV1OXIDE_REFMVS_TMVS").ok()?;
@@ -1636,24 +1672,31 @@ mod trace {
         rp_proj: &[super::TemporalBlock],
         stride: usize,
     ) {
-        let Some((row0, row1)) = tmvs_filter() else {
-            return;
-        };
-        if frame_filter().is_some_and(|f| f != frame) {
-            return;
-        }
-        if by_filter().is_some_and(|y| y != by4) {
-            return;
-        }
-        if bx_filter().is_some_and(|x| x != bx4) {
-            return;
-        }
-        let rows = rp_proj.len() / stride.max(1);
-        for row in row0..=row1.min(rows.saturating_sub(1)) {
-            for x in 0..stride {
-                let b = rp_proj[row * stride + x];
-                eprintln!("T {row} {x} {} {} {}", b.mv.y, b.mv.x, b.ref_);
+        #[cfg(feature = "std")]
+        {
+            let Some((row0, row1)) = tmvs_filter() else {
+                return;
+            };
+            if frame_filter().is_some_and(|f| f != frame) {
+                return;
             }
+            if by_filter().is_some_and(|y| y != by4) {
+                return;
+            }
+            if bx_filter().is_some_and(|x| x != bx4) {
+                return;
+            }
+            let rows = rp_proj.len() / stride.max(1);
+            for row in row0..=row1.min(rows.saturating_sub(1)) {
+                for x in 0..stride {
+                    let b = rp_proj[row * stride + x];
+                    crate::trace_eprintln!("T {row} {x} {} {} {}", b.mv.y, b.mv.x, b.ref_);
+                }
+            }
+        }
+        #[cfg(not(feature = "std"))]
+        {
+            let _ = (frame, by4, bx4, rp_proj, stride);
         }
     }
 
@@ -1670,23 +1713,35 @@ mod trace {
         grid: &[RefBlock],
         iw4: usize,
     ) {
-        let Some((gf, gby, gbx, row0, row1)) = grid_filter() else {
-            return;
-        };
-        if frame_filter().is_some_and(|f| f != frame) {
-            return;
-        }
-        if gf != frame || gby != by4 || gbx != bx4 {
-            return;
-        }
-        for row in row0..=row1.min(grid.len() / iw4 - 1) {
-            for x in 0..iw4 {
-                let b = grid[row * iw4 + x];
-                eprintln!(
-                    "G {row} {x} {} {} {} {} {} {}",
-                    b.mv[0].y, b.mv[0].x, b.ref_pair[0], b.ref_pair[1], b.bs, b.mf
-                );
+        #[cfg(feature = "std")]
+        {
+            let Some((gf, gby, gbx, row0, row1)) = grid_filter() else {
+                return;
+            };
+            if frame_filter().is_some_and(|f| f != frame) {
+                return;
             }
+            if gf != frame || gby != by4 || gbx != bx4 {
+                return;
+            }
+            for row in row0..=row1.min(grid.len() / iw4 - 1) {
+                for x in 0..iw4 {
+                    let b = grid[row * iw4 + x];
+                    crate::trace_eprintln!(
+                        "G {row} {x} {} {} {} {} {} {}",
+                        b.mv[0].y,
+                        b.mv[0].x,
+                        b.ref_pair[0],
+                        b.ref_pair[1],
+                        b.bs,
+                        b.mf
+                    );
+                }
+            }
+        }
+        #[cfg(not(feature = "std"))]
+        {
+            let _ = (frame, by4, bx4, grid, iw4);
         }
     }
 
@@ -1704,18 +1759,33 @@ mod trace {
         ctx: usize,
         tile: TileBounds,
     ) {
-        if frame_filter().is_some_and(|f| f != frame) {
-            return;
+        #[cfg(feature = "std")]
+        {
+            if frame_filter().is_some_and(|f| f != frame) {
+                return;
+            }
+            crate::trace_eprintln!(
+                "V {frame} {seq} {by4} {bx4} {bs} {} {} {edge_flags} {cnt} {ctx} \
+                 {} {} {} {}",
+                ref_pair[0],
+                ref_pair[1],
+                tile.row_start,
+                tile.row_end,
+                tile.col_start,
+                tile.col_end
+            );
+            for (i, c) in stack.iter().take(2).enumerate() {
+                let mv: Mv = c.mv[0];
+                // `mv[1]` dav1d'de tek referans yolunda yazılmaz; karşılaştırılmaz.
+                crate::trace_eprintln!("W {frame} {seq} {i} {} {} {}", mv.y, mv.x, c.weight);
+            }
         }
-        eprintln!(
-            "V {frame} {seq} {by4} {bx4} {bs} {} {} {edge_flags} {cnt} {ctx} \
-             {} {} {} {}",
-            ref_pair[0], ref_pair[1], tile.row_start, tile.row_end, tile.col_start, tile.col_end
-        );
-        for (i, c) in stack.iter().take(2).enumerate() {
-            let mv: Mv = c.mv[0];
-            // `mv[1]` dav1d'de tek referans yolunda yazılmaz; karşılaştırılmaz.
-            eprintln!("W {frame} {seq} {i} {} {} {}", mv.y, mv.x, c.weight);
+        #[cfg(not(feature = "std"))]
+        {
+            let _ = (
+                frame, seq, by4, bx4, bs, ref_pair, edge_flags, stack, cnt, ctx, tile,
+            );
+            let _: Option<Mv> = None;
         }
     }
 }

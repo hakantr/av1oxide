@@ -264,6 +264,8 @@ impl CdfContext {
 
 #[cfg(test)]
 mod tests {
+    use alloc::vec;
+
     use super::*;
 
     /// `init_static` dört kategoriyi dav1d sınırlarıyla seçer.

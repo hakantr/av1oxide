@@ -135,5 +135,5 @@ pub mod refmvs_avx512;
 pub mod refmvs_sse2;
 pub mod refmvs_sse41;
 pub mod refmvs_ssse3;
-#[cfg(test)]
+#[cfg(all(test, feature = "std"))]
 mod sozluk;

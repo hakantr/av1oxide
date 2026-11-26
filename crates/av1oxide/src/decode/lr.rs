@@ -24,6 +24,9 @@
 //! (`decode.c:2484-2496`, `2681-2699`).
 #![forbid(unsafe_code)]
 
+use alloc::vec;
+use alloc::vec::Vec;
+
 use crate::bitstream::frame_header::{FrameHeader, RestorationType};
 use crate::decode::intra::{PicBuf, ToolCounts};
 use crate::dsp::lr::{LrBitDepth, LrEdgeFlags, LrFilterFn, LrParams};
@@ -493,17 +496,24 @@ struct TraceCfg {
 }
 
 fn trace_cfg() -> Option<TraceCfg> {
-    static CFG: std::sync::OnceLock<Option<TraceCfg>> = std::sync::OnceLock::new();
-    *CFG.get_or_init(|| {
-        std::env::var_os("AV1OXIDE_LR_TRACE")?;
-        let frame = std::env::var("AV1OXIDE_LR_TRACE_FRAME")
-            .ok()
-            .and_then(|v| v.parse().ok());
-        let plane = std::env::var("AV1OXIDE_LR_TRACE_PLANE")
-            .ok()
-            .and_then(|v| v.parse().ok());
-        Some(TraceCfg { frame, plane })
-    })
+    #[cfg(feature = "std")]
+    {
+        static CFG: std::sync::OnceLock<Option<TraceCfg>> = std::sync::OnceLock::new();
+        *CFG.get_or_init(|| {
+            std::env::var_os("AV1OXIDE_LR_TRACE")?;
+            let frame = std::env::var("AV1OXIDE_LR_TRACE_FRAME")
+                .ok()
+                .and_then(|v| v.parse().ok());
+            let plane = std::env::var("AV1OXIDE_LR_TRACE_PLANE")
+                .ok()
+                .and_then(|v| v.parse().ok());
+            Some(TraceCfg { frame, plane })
+        })
+    }
+    #[cfg(not(feature = "std"))]
+    {
+        None
+    }
 }
 
 impl TraceCfg {
@@ -755,7 +765,7 @@ fn apply_parallel_sbrows(
     pool: &crate::thread::WorkerPool,
 ) -> crate::error::Result<()> {
     use crate::frame::butce::dolu_vec;
-    use std::sync::Arc;
+    use alloc::sync::Arc;
 
     // `n_threads = 1` ile birebir aynı tepe bütçeyi (`allocation_peak`) üretmek
     // için tek bir `8 * max_stride` geçici `lpf` ayırmasını defterden geçir.
@@ -1363,7 +1373,7 @@ impl Apply<'_> {
                     ],
                     LrParams::Sgr { s0, s1, w0, w1 } => [s0 as i32, s1 as i32, w0, w1, 0, 0, 0, 0],
                 };
-                eprintln!(
+                crate::trace_eprintln!(
                     "L {} {p} {x} {y} {unit_w} {stripe_h} {kind_name} {} {} {} {} {} {} {} {} {} {hash}",
                     self.frame_no,
                     pv[0],

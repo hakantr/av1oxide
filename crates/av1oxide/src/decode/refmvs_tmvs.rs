@@ -131,6 +131,8 @@ pub struct MfmvPlan {
 
 #[cfg(test)]
 mod tests {
+    use alloc::vec;
+
     use super::*;
     use crate::decode::refmvs::RefBlock;
     use crate::dsp::scalar::refmvs::{load_tmvs, save_tmvs, splat_mv};

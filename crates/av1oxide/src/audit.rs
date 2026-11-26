@@ -28,7 +28,7 @@
 #![forbid(unsafe_code)]
 
 /// Envanter belgesi ile kaynak ağacını senkron tutan denetim (S15.6).
-#[cfg(test)]
+#[cfg(all(test, feature = "std"))]
 mod envanter;
 
 /// `unsafe` kullanımına izin verilen modülün kaydı.
@@ -709,7 +709,7 @@ pub const UNSAFE_EXEMPTIONS: &[UnsafeExemption] = &[
     },
 ];
 
-#[cfg(test)]
+#[cfg(all(test, feature = "std"))]
 mod tests {
     use super::UNSAFE_EXEMPTIONS;
     use std::fs;

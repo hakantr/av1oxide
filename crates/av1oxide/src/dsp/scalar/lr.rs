@@ -1650,6 +1650,9 @@ mod tests {
     //! Oracle'dan bağımsız sözleşme testleri (dav1d differential'ı:
     //! `tests/lr_scalar_oracle.rs` + `scripts/oracle/run_lr_oracle.sh`).
 
+    use alloc::vec;
+    use alloc::vec::Vec;
+
     use super::{REACH_2, REACH_3};
     use crate::dsp::lr::{LrBitDepth, LrDsp, LrEdgeFlags, LrFilterFn, LrParams};
     use crate::dsp::lr_tables::SGR_PARAMS;
