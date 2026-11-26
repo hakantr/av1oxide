@@ -17,10 +17,12 @@
 pub(crate) mod boxes;
 pub(crate) mod color;
 pub(crate) mod decode;
+pub mod gainmap;
 pub mod image;
 
 pub use boxes::probe;
 pub use decode::{decode, decode_rgb8, decode_rgba8, decode_with, parse_info};
+pub use gainmap::{GainMap, GainMapFractionI32, GainMapFractionU32, GainMapMetadata};
 pub use image::{
     AvifDecodeConfig, AvifImage, AvifInfo, AvifPlane, CleanAperture, ColorInfo, ContentLightLevel,
     MasteringDisplay, PixelAspectRatio, Rgb16Image, RgbImage, Rgba16Image, RgbaImage,

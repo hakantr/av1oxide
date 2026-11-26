@@ -130,6 +130,15 @@ pub(crate) struct ItemReference {
     pub(crate) to_item_ids: Vec<u32>,
 }
 
+/// `grpl` kutusu içindeki varlık grubu (`EntityToGroupBox`) kaydı.
+#[allow(dead_code)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct EntityToGroup {
+    pub(crate) grouping_type: [u8; 4],
+    pub(crate) group_id: u32,
+    pub(crate) entity_ids: Vec<u32>,
+}
+
 /// Ekleme sırasını koruyan deterministik `FxBuildHasher` tabanlı harita.
 pub(crate) type FxIndexMap<K, V> = indexmap::IndexMap<K, V, rustc_hash::FxBuildHasher>;
 
@@ -142,12 +151,14 @@ pub(crate) type FxIndexSet<T> = indexmap::IndexSet<T, rustc_hash::FxBuildHasher>
 pub(crate) struct AvifContainer<'a> {
     pub(crate) file_data: &'a [u8],
     pub(crate) major_brand: [u8; 4],
+    pub(crate) compatible_brands: Vec<[u8; 4]>,
     pub(crate) primary_item_id: u32,
     pub(crate) items: FxIndexMap<u32, ItemInfoEntry>,
     pub(crate) properties: Vec<ItemProperty>,
     pub(crate) associations: FxIndexMap<u32, Vec<PropertyAssoc>>,
     pub(crate) locations: FxIndexMap<u32, IlocItem>,
     pub(crate) references: Vec<ItemReference>,
+    pub(crate) entity_groups: Vec<EntityToGroup>,
     pub(crate) idat: Cow<'a, [u8]>,
 }
 
@@ -404,6 +415,7 @@ pub fn probe(data: &[u8]) -> bool {
 pub(crate) fn parse_container(data: &[u8]) -> Result<AvifContainer<'_>> {
     let mut offset = 0usize;
     let mut major_brand: Option<[u8; 4]> = None;
+    let mut compatible_brands: Vec<[u8; 4]> = Vec::new();
     let mut has_avif_brand = false;
     let mut meta_payload: Option<Cow<'_, [u8]>> = None;
 
@@ -424,8 +436,9 @@ pub(crate) fn parse_container(data: &[u8]) -> Result<AvifContainer<'_>> {
                 if is_supported_brand(&major) {
                     has_avif_brand = true;
                 }
-                for compat in raw_box.payload[8..].as_chunks::<4>().0 {
-                    if is_supported_brand(compat) {
+                for &compat in raw_box.payload[8..].as_chunks::<4>().0 {
+                    compatible_brands.push(compat);
+                    if is_supported_brand(&compat) {
                         has_avif_brand = true;
                     }
                 }
@@ -477,6 +490,8 @@ pub(crate) fn parse_container(data: &[u8]) -> Result<AvifContainer<'_>> {
     let mut locations: FxIndexMap<u32, IlocItem> =
         FxIndexMap::with_hasher(rustc_hash::FxBuildHasher);
     let mut references: Vec<ItemReference> = Vec::new();
+    let mut entity_groups: Vec<EntityToGroup> = Vec::new();
+    let mut seen_grpl = false;
     let mut idat: Cow<'_, [u8]> = Cow::Borrowed(&[]);
     let mut has_hdlr = false;
 
@@ -518,6 +533,13 @@ pub(crate) fn parse_container(data: &[u8]) -> Result<AvifContainer<'_>> {
             b"iref" => {
                 parse_iref(child.payload, &mut references)?;
             }
+            b"grpl" => {
+                if seen_grpl {
+                    return Err(Error::InvalidData("meta içinde birden fazla grpl kutusu"));
+                }
+                seen_grpl = true;
+                parse_grpl(child.payload, &mut entity_groups)?;
+            }
             b"idat" => {
                 idat = match &meta_raw {
                     Cow::Borrowed(_) => {
@@ -542,14 +564,47 @@ pub(crate) fn parse_container(data: &[u8]) -> Result<AvifContainer<'_>> {
     Ok(AvifContainer {
         file_data: data,
         major_brand,
+        compatible_brands,
         primary_item_id,
         items,
         properties,
         associations,
         locations,
         references,
+        entity_groups,
         idat,
     })
+}
+
+fn parse_grpl(payload: &[u8], groups: &mut Vec<EntityToGroup>) -> Result<()> {
+    let mut offset = 0usize;
+    while let Some(child) = read_box_header(payload, offset)? {
+        offset = child.next_offset;
+        let (_ver, _flags, body) = read_full_box(child.payload)?;
+        let group_id = read_u32_be(body, 0).ok_or(Error::InvalidData("kesik grpl group_id"))?;
+        let num_entities = read_u32_be(body, 4)
+            .ok_or(Error::InvalidData("kesik grpl num_entities_in_group"))?
+            as usize;
+        let rem_bytes = body.len().saturating_sub(8);
+        let needed_bytes = num_entities
+            .checked_mul(4)
+            .ok_or(Error::InvalidData("grpl entity sayısı taşması"))?;
+        if needed_bytes > rem_bytes {
+            return Err(Error::InvalidData("kesik grpl varlık kimlik listesi"));
+        }
+        let mut entity_ids = Vec::with_capacity(num_entities);
+        for i in 0..num_entities {
+            let eid =
+                read_u32_be(body, 8 + i * 4).ok_or(Error::InvalidData("kesik grpl entity_id"))?;
+            entity_ids.push(eid);
+        }
+        groups.push(EntityToGroup {
+            grouping_type: child.box_type,
+            group_id,
+            entity_ids,
+        });
+    }
+    Ok(())
 }
 
 fn parse_iinf(payload: &[u8], items: &mut FxIndexMap<u32, ItemInfoEntry>) -> Result<()> {
@@ -1123,6 +1178,62 @@ fn parse_iref(payload: &[u8], references: &mut Vec<ItemReference>) -> Result<()>
 }
 
 impl<'a> AvifContainer<'a> {
+    /// `ftyp` uyumlu markalar listesinde verilen 4 baytlık markanın bulunup bulunmadığını döndürür.
+    pub(crate) fn has_compatible_brand(&self, brand: &[u8; 4]) -> bool {
+        self.compatible_brands.contains(brand)
+    }
+
+    /// `grpl` / `altr` varlık grubunda `id1`'in `id2`'den önce listelenip listelenmediğini döndürür.
+    pub(crate) fn is_preferred_alternative(&self, id1: u32, id2: u32) -> bool {
+        for group in &self.entity_groups {
+            if &group.grouping_type != b"altr" {
+                continue;
+            }
+            let mut id1_found = false;
+            for &eid in &group.entity_ids {
+                if eid == id1 {
+                    id1_found = true;
+                } else if eid == id2 {
+                    return id1_found;
+                }
+            }
+        }
+        false
+    }
+
+    /// Belirtilen `item_id` için `iloc` üzerinde sıfırdan büyük veri boyutu tanımlanıp tanımlanmadığı.
+    pub(crate) fn item_has_data(&self, item_id: u32) -> bool {
+        self.locations
+            .get(&item_id)
+            .is_some_and(|loc| loc.extents.iter().any(|e| e.extent_length > 0))
+    }
+
+    /// Belirtilen `item_id` üzerinde desteklenmeyen zorunlu (`essential`) bir `ipco` özelliği olup olmadığı.
+    pub(crate) fn has_unsupported_essential_property(&self, item_id: u32) -> Result<bool> {
+        let Some(assocs) = self.associations.get(&item_id) else {
+            return Ok(false);
+        };
+        for assoc in assocs {
+            if assoc.property_index == 0 {
+                continue;
+            }
+            let idx = (assoc.property_index as usize) - 1;
+            let prop = self.properties.get(idx).ok_or(Error::InvalidData(
+                "ipma özellik indeksi ipco sınırları dışında",
+            ))?;
+            if assoc.essential && matches!(prop, ItemProperty::Unknown(_)) {
+                return Ok(true);
+            }
+            if let ItemProperty::CmpC { compression_type } = prop
+                && !matches!(compression_type, b"defl" | b"zlib" | b"gzip")
+                && assoc.essential
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     /// Belirtilen `item_id` için `infe` kaydını döndürür.
     pub(crate) fn item_info(&self, item_id: u32) -> Option<&ItemInfoEntry> {
         self.items.get(&item_id)

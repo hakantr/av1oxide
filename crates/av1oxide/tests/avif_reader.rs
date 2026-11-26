@@ -1190,3 +1190,256 @@ fn avif_compressed_heif_metadata_cmin_and_security_limits() {
         Err(Error::InvalidData(_))
     ));
 }
+
+#[allow(clippy::too_many_arguments)]
+fn build_tmap_gainmap_avif(
+    include_tmap_brand: bool,
+    altr_order: &[u32],
+    tmap_version: u8,
+    min_version: u16,
+    writer_version: u16,
+    gamma_n: u32,
+    extra_trailing: &[u8],
+    colr_mtrx: u16,
+    colr_trc: u16,
+) -> Vec<u8> {
+    let mut compat = vec![*b"avif", *b"miaf"];
+    if include_tmap_brand {
+        compat.push(*b"tmap");
+    }
+    let ftyp = make_ftyp(b"mif1", &compat);
+    let hdlr = make_hdlr_pict();
+    let pitm = make_full_box(b"pitm", 0, 0, &1u16.to_be_bytes());
+
+    // Öğeler: 1 = taban (av01), 2 = kazanç haritası (av01), 3 = tmap
+    let mut iinf_body = Vec::new();
+    iinf_body.extend_from_slice(&3u16.to_be_bytes());
+    iinf_body.extend_from_slice(&make_infe_v2(1, b"av01", None));
+    iinf_body.extend_from_slice(&make_infe_v2(2, b"av01", None));
+    iinf_body.extend_from_slice(&make_infe_v2(3, b"tmap", None));
+    let iinf = make_full_box(b"iinf", 0, 0, &iinf_body);
+
+    // ipco:
+    // 1: ispe (1x1)
+    // 2: av1C
+    // 3: colr nclx (taban görüntü)
+    // 4: colr nclx (alternatif HDR: BT.2020 + PQ + BT.2020 NCL)
+    // 5: colr rICC (alternatif ICC)
+    // 6: clli (1000, 400)
+    // 7: pixi (10, 10, 10)
+    let ispe = make_ispe(1, 1);
+    let av1c = make_box(b"av1C", &[0x81, 0x00, 0x0C, 0x00]);
+    let colr_base = make_box(
+        b"colr",
+        &[
+            b'n',
+            b'c',
+            b'l',
+            b'x',
+            0,
+            9,
+            (colr_trc >> 8) as u8,
+            (colr_trc & 0xFF) as u8,
+            (colr_mtrx >> 8) as u8,
+            (colr_mtrx & 0xFF) as u8,
+            0x80,
+        ],
+    );
+    let colr_alt = make_box(b"colr", &[b'n', b'c', b'l', b'x', 0, 9, 0, 16, 0, 9, 0x80]);
+    let mut colr_alt_icc = b"rICC".to_vec();
+    colr_alt_icc.extend_from_slice(b"ALT_HDR_ICC");
+    let colr_icc_box = make_box(b"colr", &colr_alt_icc);
+    let clli = make_box(b"clli", &[0x03, 0xE8, 0x01, 0x90]);
+    let pixi_alt = make_full_box(b"pixi", 0, 0, &[3, 10, 10, 10]);
+
+    let mut ipco_body = Vec::new();
+    for p in [
+        &ispe,
+        &av1c,
+        &colr_base,
+        &colr_alt,
+        &colr_icc_box,
+        &clli,
+        &pixi_alt,
+    ] {
+        ipco_body.extend_from_slice(p);
+    }
+    let ipco = make_box(b"ipco", &ipco_body);
+
+    let mut ipma_body = Vec::new();
+    ipma_body.extend_from_slice(&3u32.to_be_bytes());
+    // item 1 (base) -> 1, 2, 3
+    ipma_body.extend_from_slice(&1u16.to_be_bytes());
+    ipma_body.push(3);
+    ipma_body.extend_from_slice(&[1, 0x82, 3]);
+    // item 2 (gain map) -> 1, 2
+    ipma_body.extend_from_slice(&2u16.to_be_bytes());
+    ipma_body.push(2);
+    ipma_body.extend_from_slice(&[1, 0x82]);
+    // item 3 (tmap) -> 1 (ispe), 4 (alt nclx), 5 (alt icc), 6 (clli), 7 (pixi)
+    ipma_body.extend_from_slice(&3u16.to_be_bytes());
+    ipma_body.push(5);
+    ipma_body.extend_from_slice(&[1, 4, 5, 6, 7]);
+    let ipma = make_full_box(b"ipma", 0, 0, &ipma_body);
+
+    let mut iprp_body = Vec::new();
+    iprp_body.extend_from_slice(&ipco);
+    iprp_body.extend_from_slice(&ipma);
+    let iprp = make_box(b"iprp", &iprp_body);
+
+    // iref: dimg 3 -> [1, 2]
+    let mut dimg_body = Vec::new();
+    dimg_body.extend_from_slice(&3u16.to_be_bytes());
+    dimg_body.extend_from_slice(&2u16.to_be_bytes());
+    dimg_body.extend_from_slice(&1u16.to_be_bytes());
+    dimg_body.extend_from_slice(&2u16.to_be_bytes());
+    let iref = make_full_box(b"iref", 0, 0, &make_box(b"dimg", &dimg_body));
+
+    // grpl -> altr
+    let mut altr_body = Vec::new();
+    altr_body.extend_from_slice(&100u32.to_be_bytes()); // group_id
+    altr_body.extend_from_slice(&(altr_order.len() as u32).to_be_bytes());
+    for &eid in altr_order {
+        altr_body.extend_from_slice(&eid.to_be_bytes());
+    }
+    let grpl = make_box(b"grpl", &make_full_box(b"altr", 0, 0, &altr_body));
+
+    // ISO 21496-1 tmap ikili yükü (tek kanallı)
+    let mut tmap_payload = Vec::new();
+    tmap_payload.push(tmap_version);
+    tmap_payload.extend_from_slice(&min_version.to_be_bytes());
+    tmap_payload.extend_from_slice(&writer_version.to_be_bytes());
+    tmap_payload.push(0x40); // is_multichannel=0, use_base_color_space=1
+    // base_hdr_headroom = 0/1, alternate_hdr_headroom = 2/1
+    tmap_payload.extend_from_slice(&0u32.to_be_bytes());
+    tmap_payload.extend_from_slice(&1u32.to_be_bytes());
+    tmap_payload.extend_from_slice(&2u32.to_be_bytes());
+    tmap_payload.extend_from_slice(&1u32.to_be_bytes());
+    // min=-1/1, max=3/1, gamma=gamma_n/1, base_off=1/64, alt_off=1/64
+    tmap_payload.extend_from_slice(&(-1i32).to_be_bytes());
+    tmap_payload.extend_from_slice(&1u32.to_be_bytes());
+    tmap_payload.extend_from_slice(&3i32.to_be_bytes());
+    tmap_payload.extend_from_slice(&1u32.to_be_bytes());
+    tmap_payload.extend_from_slice(&gamma_n.to_be_bytes());
+    tmap_payload.extend_from_slice(&1u32.to_be_bytes());
+    tmap_payload.extend_from_slice(&1i32.to_be_bytes());
+    tmap_payload.extend_from_slice(&64u32.to_be_bytes());
+    tmap_payload.extend_from_slice(&1i32.to_be_bytes());
+    tmap_payload.extend_from_slice(&64u32.to_be_bytes());
+    tmap_payload.extend_from_slice(extra_trailing);
+
+    let mut idat_payload = Vec::new();
+    idat_payload.extend_from_slice(SAMPLE_1X1_AV1_OBU);
+    let tmap_off = idat_payload.len() as u32;
+    idat_payload.extend_from_slice(&tmap_payload);
+    let idat = make_box(b"idat", &idat_payload);
+
+    let mut iloc_body = Vec::new();
+    iloc_body.push(0x44);
+    iloc_body.push(0x00);
+    iloc_body.extend_from_slice(&3u16.to_be_bytes());
+    for (id, off, len) in [
+        (1u16, 0u32, SAMPLE_1X1_AV1_OBU.len() as u32),
+        (2u16, 0u32, SAMPLE_1X1_AV1_OBU.len() as u32),
+        (3u16, tmap_off, tmap_payload.len() as u32),
+    ] {
+        iloc_body.extend_from_slice(&id.to_be_bytes());
+        iloc_body.extend_from_slice(&1u16.to_be_bytes());
+        iloc_body.extend_from_slice(&0u16.to_be_bytes());
+        iloc_body.extend_from_slice(&1u16.to_be_bytes());
+        iloc_body.extend_from_slice(&off.to_be_bytes());
+        iloc_body.extend_from_slice(&len.to_be_bytes());
+    }
+    let iloc = make_full_box(b"iloc", 1, 0, &iloc_body);
+
+    let mut meta_children = Vec::new();
+    for b in [&hdlr, &pitm, &iinf, &iprp, &iref, &grpl, &iloc, &idat] {
+        meta_children.extend_from_slice(b);
+    }
+    let meta = make_full_box(b"meta", 0, 0, &meta_children);
+
+    let mut file = Vec::new();
+    file.extend_from_slice(&ftyp);
+    file.extend_from_slice(&meta);
+    file
+}
+
+#[test]
+fn avif_tmap_gain_map_and_h273_nonlinear_matrices() {
+    // 1. Geçerli tmap: parse_info, decode_gain_map=false ve decode_gain_map=true
+    let valid_tmap = build_tmap_gainmap_avif(true, &[3, 1], 0, 0, 0, 1, &[], 1, 13);
+    let info = parse_info(&valid_tmap).expect("geçerli tmap parse_info");
+    assert!(info.has_gain_map);
+    let gm_meta = info
+        .gain_map_metadata
+        .as_ref()
+        .expect("gain_map_metadata mevcut olmalı");
+    assert!(gm_meta.use_base_color_space);
+    assert_eq!(gm_meta.alternate_hdr_headroom.numerator, 2);
+    assert_eq!(gm_meta.alt_depth, 10);
+    assert_eq!(gm_meta.alt_plane_count, 3);
+    assert_eq!(
+        gm_meta.alt_icc_profile.as_deref(),
+        Some(&b"ALT_HDR_ICC"[..])
+    );
+    assert_eq!(
+        gm_meta.alt_clli,
+        Some(ContentLightLevel {
+            max_content_light_level: 1000,
+            max_pic_average_light_level: 400,
+        })
+    );
+
+    let img_no_gm = decode(&valid_tmap).expect("decode_gain_map=false çözülmeli");
+    assert!(img_no_gm.has_gain_map());
+    assert!(img_no_gm.gain_map_metadata().is_some());
+    assert!(img_no_gm.gain_map().is_none());
+
+    let img_with_gm = decode_with(
+        &valid_tmap,
+        &AvifDecodeConfig {
+            decode_gain_map: true,
+            ..AvifDecodeConfig::default()
+        },
+    )
+    .expect("decode_gain_map=true çözülmeli");
+    let gm = img_with_gm.gain_map().expect("kazanç haritası çözülmeli");
+    assert_eq!((gm.image.width(), gm.image.height()), (1, 1));
+    assert_eq!(gm.image.y_plane_u8(), Some(&[190u8][..]));
+
+    // 2. tmap markası eksikse veya altr sırası tersse yoksayılır (libavif uyumu)
+    let no_brand = build_tmap_gainmap_avif(false, &[3, 1], 0, 0, 0, 1, &[], 1, 13);
+    assert!(!parse_info(&no_brand).unwrap().has_gain_map);
+    let wrong_altr = build_tmap_gainmap_avif(true, &[1, 3], 0, 0, 0, 1, &[], 1, 13);
+    assert!(!parse_info(&wrong_altr).unwrap().has_gain_map);
+
+    // 3. Desteklenmeyen version / minimum_version -> yoksayılır; writer_version > 0 fazladan bayt -> kabul
+    let unsup_ver = build_tmap_gainmap_avif(true, &[3, 1], 1, 0, 0, 1, &[], 1, 13);
+    assert!(!parse_info(&unsup_ver).unwrap().has_gain_map);
+    let unsup_min = build_tmap_gainmap_avif(true, &[3, 1], 0, 1, 1, 1, &[], 1, 13);
+    assert!(!parse_info(&unsup_min).unwrap().has_gain_map);
+    let forward_extra = build_tmap_gainmap_avif(true, &[3, 1], 0, 0, 1, 1, &[0xAA, 0xBB], 1, 13);
+    assert!(parse_info(&forward_extra).unwrap().has_gain_map);
+
+    // 4. writer_version == 0 + fazladan bayt ve gamma == 0 -> reddedilmeli
+    let bad_extra = build_tmap_gainmap_avif(true, &[3, 1], 0, 0, 0, 1, &[0x00], 1, 13);
+    assert!(matches!(decode(&bad_extra), Err(Error::InvalidData(_))));
+    let gamma_zero = build_tmap_gainmap_avif(true, &[3, 1], 0, 0, 0, 0, &[], 1, 13);
+    assert!(matches!(decode(&gamma_zero), Err(Error::InvalidData(_))));
+
+    // 5. Doğrusal olmayan ITU-T H.273 matrisleri: ICtCp (14, PQ=16 ve HLG=18) ve BT.2020 CL (10)
+    for (mtrx, trc) in [
+        (14u16, 16u16),
+        (14u16, 18u16),
+        (10u16, 14u16),
+        (10u16, 16u16),
+    ] {
+        let avif_hdr = build_tmap_gainmap_avif(false, &[], 0, 0, 0, 1, &[], mtrx, trc);
+        let img = decode(&avif_hdr).expect("HDR matrisli AVIF çözülmeli");
+        assert_eq!(img.color().matrix_coefficients, mtrx);
+        assert_eq!(img.to_rgb8().unwrap().pixels.len(), 3);
+        assert_eq!(img.to_rgba8().unwrap().pixels.len(), 4);
+        assert_eq!(img.to_rgb16().unwrap().pixels.len(), 3);
+        assert_eq!(img.to_rgba16().unwrap().pixels.len(), 4);
+    }
+}

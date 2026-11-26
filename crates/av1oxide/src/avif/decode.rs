@@ -7,6 +7,9 @@ use crate::avif::boxes::{
     ALPHA_AUX_URN_CICP, ALPHA_AUX_URN_HEVC, Av1CProperty, AvifContainer, ItemProperty,
     parse_container,
 };
+use crate::avif::gainmap::{
+    GainMap, GainMapMetadata, ToneMapParseOutcome, parse_tone_mapped_image_box,
+};
 use crate::avif::image::{
     AvifDecodeConfig, AvifImage, AvifInfo, CleanAperture, ColorInfo, PlaneStorage, RgbImage,
     RgbaImage,
@@ -175,12 +178,23 @@ fn compute_clap_rect(w: u32, h: u32, clap: &CleanAperture) -> Result<(u32, u32, 
     Ok((x0_i64 as u32, y0_i64 as u32, crop_w, crop_h))
 }
 
-/// Bir öğenin dönüşümler (`clap`, `irot`, `imir`) sonrası boyutlarını ve temel özelliklerini çözümler.
+/// Bir öğenin dönüşüm öncesi (`raw_w`, `raw_h`) ve dönüşümler (`clap`, `irot`, `imir`) sonrası
+/// boyutlarını ve temel özelliklerini çözümler.
+struct InspectedItem {
+    width: u32,
+    height: u32,
+    raw_width: u32,
+    raw_height: u32,
+    bit_depth: BitDepth,
+    chroma_format: ChromaFormat,
+    seq_color: Option<ColorInfo>,
+}
+
 fn inspect_item_dimensions(
     container: &AvifContainer<'_>,
     item_id: u32,
     depth: usize,
-) -> Result<(u32, u32, BitDepth, ChromaFormat, Option<ColorInfo>)> {
+) -> Result<InspectedItem> {
     if depth > 8 {
         return Err(Error::InvalidData(
             "AVIF öğe referans zinciri derinlik sınırını aştı",
@@ -285,17 +299,16 @@ fn inspect_item_dimensions(
                     "grid dimg referans sayısı rows*cols ile uyuşmuyor",
                 ));
             }
-            let (_, _, t_bd, t_cf, t_col) =
-                inspect_item_dimensions(container, tiles[0], depth + 1)?;
+            let tile_info = inspect_item_dimensions(container, tiles[0], depth + 1)?;
             if seq_color.is_none() {
-                seq_color = t_col;
+                seq_color = tile_info.seq_color;
             }
             let (gw, gh) = ispe_dims.unwrap_or((grid.output_width, grid.output_height));
             (
                 gw,
                 gh,
-                bit_depth.unwrap_or(t_bd),
-                chroma_format.unwrap_or(t_cf),
+                bit_depth.unwrap_or(tile_info.bit_depth),
+                chroma_format.unwrap_or(tile_info.chroma_format),
             )
         }
         b"iden" => {
@@ -305,15 +318,22 @@ fn inspect_item_dimensions(
                     "iden öğesi tek bir dimg referansı içermelidir",
                 ));
             }
-            let (tw, th, t_bd, t_cf, t_col) =
-                inspect_item_dimensions(container, targets[0], depth + 1)?;
+            let target_info = inspect_item_dimensions(container, targets[0], depth + 1)?;
             if seq_color.is_none() {
-                seq_color = t_col;
+                seq_color = target_info.seq_color;
             }
-            (tw, th, t_bd, t_cf)
+            (
+                target_info.width,
+                target_info.height,
+                target_info.bit_depth,
+                target_info.chroma_format,
+            )
         }
         _ => return Err(Error::Unsupported("desteklenmeyen birincil AVIF öğe türü")),
     };
+
+    let raw_width = w;
+    let raw_height = h;
 
     // MIAF dönüşüm sırası: önce clap, sonra irot, sonra imir.
     if let Some(clap) = clap_opt {
@@ -327,7 +347,15 @@ fn inspect_item_dimensions(
         core::mem::swap(&mut w, &mut h);
     }
 
-    Ok((w, h, bd, cf, seq_color))
+    Ok(InspectedItem {
+        width: w,
+        height: h,
+        raw_width,
+        raw_height,
+        bit_depth: bd,
+        chroma_format: cf,
+        seq_color,
+    })
 }
 
 fn find_direct_alpha_item(container: &AvifContainer<'_>, target_id: u32) -> Result<Option<u32>> {
@@ -446,15 +474,204 @@ fn extract_metadata_items(
     Ok((exif, xmp))
 }
 
+/// ISO 21496-1 `tmap` öğesini `libavif` (`avifDecoderFindGainMapItem`) kurallarına göre bulur,
+/// ikili `ToneMapImage` yükünü ve `tmap` özelliklerini doğrular.
+fn find_and_validate_tmap(
+    container: &AvifContainer<'_>,
+    primary_id: u32,
+    base_raw_w: u32,
+    base_raw_h: u32,
+    allocation_limit: Option<usize>,
+) -> Result<Option<(u32, GainMapMetadata)>> {
+    // ISO/IEC 23008-12:2024/AMD 1 §10.2.6 ve libavif uyumu: `tmap` uyumlu markası yoksa
+    // `tmap` öğeleri yoksayılır.
+    if !container.has_compatible_brand(b"tmap") {
+        return Ok(None);
+    }
+
+    let mut found: Option<(u32, u32)> = None;
+    for item in container.items.values() {
+        if &item.item_type != b"tmap" {
+            continue;
+        }
+        if !container.item_has_data(item.item_id)
+            || container.has_unsupported_essential_property(item.item_id)?
+            || !container.references_from(item.item_id, b"thmb").is_empty()
+        {
+            continue;
+        }
+        let dimg_ids = container.references_from(item.item_id, b"dimg");
+        if dimg_ids.len() != 2
+            || dimg_ids[0] == dimg_ids[1]
+            || container.item_info(dimg_ids[0]).is_none()
+            || container.item_info(dimg_ids[1]).is_none()
+        {
+            return Err(Error::InvalidData(
+                "tmap dimg referansları tam olarak 2 farklı geçerli öğe içermelidir",
+            ));
+        }
+        if dimg_ids[0] != primary_id {
+            continue;
+        }
+        found = Some((item.item_id, dimg_ids[1]));
+        break;
+    }
+
+    let Some((tmap_id, gain_map_item_id)) = found else {
+        return Ok(None);
+    };
+
+    // `grpl` / `altr` varlık grubunda `tmap` öğesi birincil öğeden önce tercih edilmelidir.
+    if !container.is_preferred_alternative(tmap_id, primary_id) {
+        return Ok(None);
+    }
+
+    let tmap_data = container.resolve_item_data(tmap_id, allocation_limit)?;
+    let mut metadata = match parse_tone_mapped_image_box(&tmap_data)? {
+        ToneMapParseOutcome::Parsed(m) => *m,
+        ToneMapParseOutcome::UnsupportedVersion => return Ok(None),
+    };
+
+    // Kazanç haritası öğesi temel geçerlilik kontrolü (desteklenmeyen tür/özellik -> yoksay).
+    let Some(gm_info) = container.item_info(gain_map_item_id) else {
+        return Ok(None);
+    };
+    if !matches!(&gm_info.item_type, b"av01" | b"grid" | b"iden")
+        || container.has_unsupported_essential_property(gain_map_item_id)?
+    {
+        return Ok(None);
+    }
+
+    // `tmap` öğesinin özelliklerini (`ispe`, `colr`, `clli`, `mdcv`, `pixi` ve yasak dönüşümler) doğrula.
+    let tmap_props = container.item_properties(tmap_id)?;
+    let mut tmap_ispe: Option<(u32, u32)> = None;
+    let mut seen_alt_nclx = false;
+    let mut seen_alt_icc = false;
+    for (p, _) in &tmap_props {
+        match p {
+            ItemProperty::Ispe { width, height } => {
+                tmap_ispe = Some((*width, *height));
+            }
+            ItemProperty::ColrNclx(c) => {
+                if seen_alt_nclx {
+                    return Err(Error::InvalidData(
+                        "tmap öğesinde birden fazla colr nclx özelliği",
+                    ));
+                }
+                seen_alt_nclx = true;
+                metadata.alt_color = Some(*c);
+            }
+            ItemProperty::ColrIcc(icc) => {
+                if seen_alt_icc {
+                    return Err(Error::InvalidData(
+                        "tmap öğesinde birden fazla colr ICC özelliği",
+                    ));
+                }
+                seen_alt_icc = true;
+                metadata.alt_icc_profile = Some(icc.clone());
+            }
+            ItemProperty::Clli(clli) => {
+                metadata.alt_clli = Some(*clli);
+            }
+            ItemProperty::Mdcv(mdcv) => {
+                metadata.alt_mdcv = Some(*mdcv);
+            }
+            ItemProperty::Pixi { bits_per_channel } => {
+                metadata.alt_plane_count = bits_per_channel.len().min(usize::from(u8::MAX)) as u8;
+                metadata.alt_depth = bits_per_channel.first().copied().unwrap_or(0);
+            }
+            ItemProperty::Pasp(_)
+            | ItemProperty::Clap(_)
+            | ItemProperty::Irot(_)
+            | ItemProperty::Imir(_) => {
+                return Err(Error::InvalidData(
+                    "tmap öğesine pasp, clap, irot veya imir özelliği doğrudan bağlanamaz",
+                ));
+            }
+            _ => {}
+        }
+    }
+
+    let Some((tmap_w, tmap_h)) = tmap_ispe else {
+        return Err(Error::InvalidData(
+            "tmap öğesinde zorunlu ispe özelliği eksik",
+        ));
+    };
+    if tmap_w != base_raw_w || tmap_h != base_raw_h {
+        return Err(Error::InvalidData(
+            "tmap ispe boyutları taban görüntü boyutlarıyla eşleşmiyor",
+        ));
+    }
+
+    // Kazanç haritası öğesinde birden fazla `colr nclx` olmamalı (`libavif` `avifReadColorNclxProperty`).
+    let gm_props = container.item_properties(gain_map_item_id)?;
+    let mut seen_gm_nclx = false;
+    for (p, _) in &gm_props {
+        if matches!(p, ItemProperty::ColrNclx(_)) {
+            if seen_gm_nclx {
+                return Err(Error::InvalidData(
+                    "kazanç haritası öğesinde birden fazla colr nclx özelliği",
+                ));
+            }
+            seen_gm_nclx = true;
+        }
+    }
+
+    Ok(Some((gain_map_item_id, metadata)))
+}
+
+#[derive(PartialEq, Eq)]
+struct ItemTransformTuple {
+    pasp: Option<crate::avif::image::PixelAspectRatio>,
+    clap: Option<CleanAperture>,
+    irot: Option<u8>,
+    imir: Option<u8>,
+}
+
+/// Kazanç haritası öğesi ile birincil görüntü öğesinin `pasp`/`clap`/`irot`/`imir`
+/// özelliklerinin eşleştiğini doğrular (`libavif` `avifDecoderCheckGainMapProperties`).
+fn validate_gain_map_transform_parity(
+    container: &AvifContainer<'_>,
+    primary_id: u32,
+    gain_map_item_id: u32,
+) -> Result<()> {
+    let extract_xforms = |item_id: u32| -> Result<ItemTransformTuple> {
+        let mut out = ItemTransformTuple {
+            pasp: None,
+            clap: None,
+            irot: None,
+            imir: None,
+        };
+        for (p, _) in container.item_properties(item_id)? {
+            match p {
+                ItemProperty::Pasp(pa) => out.pasp = Some(*pa),
+                ItemProperty::Clap(c) => out.clap = Some(*c),
+                ItemProperty::Irot(a) => out.irot = Some(*a),
+                ItemProperty::Imir(m) => out.imir = Some(*m),
+                _ => {}
+            }
+        }
+        Ok(out)
+    };
+
+    let primary_x = extract_xforms(primary_id)?;
+    let gm_x = extract_xforms(gain_map_item_id)?;
+    if primary_x != gm_x {
+        return Err(Error::InvalidData(
+            "kazanç haritası öğesi ile taban görüntünün pasp/clap/irot/imir özellikleri uyumsuz",
+        ));
+    }
+    Ok(())
+}
+
 /// Piksel çözme işlemi yapmadan AVIF kapsayıcısının başlık, boyut, renk ve metaveri bilgilerini ayrıştırır.
 pub fn parse_info(data: &[u8]) -> Result<AvifInfo> {
     let container = parse_container(data)?;
     let primary_id = container.primary_item_id;
-    let (width, height, bit_depth, chroma_format, seq_color) =
-        inspect_item_dimensions(&container, primary_id, 0)?;
+    let inspected = inspect_item_dimensions(&container, primary_id, 0)?;
 
     let props = container.item_properties(primary_id)?;
-    let mut color = seq_color.unwrap_or_default();
+    let mut color = inspected.seq_color.unwrap_or_default();
     let mut icc_profile = None;
     let mut clli = None;
     let mut mdcv = None;
@@ -474,12 +691,20 @@ pub fn parse_info(data: &[u8]) -> Result<AvifInfo> {
     let alpha_src = find_alpha_source(&container, primary_id)?;
     let premultiplied_alpha = is_premultiplied_alpha(&container, primary_id, alpha_src.as_ref());
     let (exif, xmp) = extract_metadata_items(&container, primary_id, None)?;
+    let gain_map_metadata = find_and_validate_tmap(
+        &container,
+        primary_id,
+        inspected.raw_width,
+        inspected.raw_height,
+        None,
+    )?
+    .map(|(_, meta)| meta);
 
     Ok(AvifInfo {
-        width,
-        height,
-        bit_depth,
-        chroma_format,
+        width: inspected.width,
+        height: inspected.height,
+        bit_depth: inspected.bit_depth,
+        chroma_format: inspected.chroma_format,
         has_alpha: alpha_src.is_some(),
         premultiplied_alpha,
         color,
@@ -489,6 +714,8 @@ pub fn parse_info(data: &[u8]) -> Result<AvifInfo> {
         clli,
         mdcv,
         pasp,
+        has_gain_map: gain_map_metadata.is_some(),
+        gain_map_metadata,
     })
 }
 
@@ -1551,6 +1778,76 @@ pub fn decode_with(data: &[u8], config: &AvifDecodeConfig) -> Result<AvifImage> 
     };
 
     let (exif, xmp) = extract_metadata_items(&container, primary_id, config.allocation_limit)?;
+    let effective_threads = resolve_effective_threads(config.n_threads);
+
+    // ISO 21496-1 `tmap` üst veri ayrıştırması ve normatif doğrulaması her zaman yürütülür;
+    // kazanç haritası pikselleri yalnızca `config.decode_gain_map == true` olduğunda çözülür.
+    let (base_raw_w, base_raw_h) = match inspect_item_dimensions(&container, primary_id, 0) {
+        Ok(ins) => (ins.raw_width, ins.raw_height),
+        Err(_) => (color_buf.width, color_buf.height),
+    };
+    let tmap_opt = find_and_validate_tmap(
+        &container,
+        primary_id,
+        base_raw_w,
+        base_raw_h,
+        config.allocation_limit,
+    )?;
+
+    let (gain_map_metadata, gain_map) = if let Some((gm_item_id, gm_meta)) = tmap_opt {
+        let decoded_gm = if config.decode_gain_map {
+            validate_gain_map_transform_parity(&container, primary_id, gm_item_id)?;
+            let gm_buf =
+                decode_item_planar(&container, gm_item_id, config, config.n_threads, false, 0)?;
+            let gm_props = container.item_properties(gm_item_id)?;
+            let mut gm_color = gm_buf.seq_color.unwrap_or(ColorInfo {
+                color_primaries: 2,
+                transfer_characteristics: 2,
+                matrix_coefficients: 2,
+                full_range: true,
+            });
+            let mut gm_pasp = None;
+            for (p, _) in gm_props {
+                match p {
+                    ItemProperty::ColrNclx(c) => gm_color = *c,
+                    ItemProperty::Pasp(pa) => gm_pasp = Some(*pa),
+                    _ => {}
+                }
+            }
+            let gm_image = AvifImage {
+                width: gm_buf.width,
+                height: gm_buf.height,
+                chroma_width: gm_buf.chroma_width,
+                chroma_height: gm_buf.chroma_height,
+                bit_depth: gm_buf.bit_depth,
+                chroma_format: gm_buf.chroma_format,
+                y_plane: gm_buf.y_plane,
+                u_plane: gm_buf.u_plane,
+                v_plane: gm_buf.v_plane,
+                alpha_plane: None,
+                premultiplied_alpha: false,
+                color: gm_color,
+                icc_profile: None,
+                exif: None,
+                xmp: None,
+                clli: None,
+                mdcv: None,
+                pasp: gm_pasp,
+                gain_map_metadata: None,
+                gain_map: None,
+                effective_threads,
+            };
+            Some(GainMap {
+                metadata: gm_meta.clone(),
+                image: Box::new(gm_image),
+            })
+        } else {
+            None
+        };
+        (Some(gm_meta), decoded_gm)
+    } else {
+        (None, None)
+    };
 
     Ok(AvifImage {
         width: color_buf.width,
@@ -1571,7 +1868,9 @@ pub fn decode_with(data: &[u8], config: &AvifDecodeConfig) -> Result<AvifImage> 
         clli,
         mdcv,
         pasp,
-        effective_threads: resolve_effective_threads(config.n_threads),
+        gain_map_metadata,
+        gain_map,
+        effective_threads,
     })
 }
 

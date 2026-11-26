@@ -48,14 +48,17 @@ fn chroma_derived_kr_kb(color_primaries: u16) -> (f32, f32) {
     (kr, kb)
 }
 
-/// Doğrusal YUV → RGB dönüşümünde desteklenmeyen veya ayrılmış `ITU-T H.273` `matrix_coefficients`
-/// kod noktalarını denetler.
+/// Desteklenmeyen veya ayrılmış `ITU-T H.273` `matrix_coefficients` kod noktalarını denetler.
+///
+/// Doğrusal matrisler (`0`, `1`, `2`, `4..=9`, `12`, `16`, `17`) ile doğrusal olmayan HDR
+/// matrisleri (`10` = `BT.2020 Constant Luminance`, `14` = `ICtCp`) desteklenir; rezerve ve
+/// tanımlanmamış kod noktaları (`3`, `11`, `13`, `15`, `>= 18`) [`Error::Unsupported`] döner.
 #[inline]
 fn validate_matrix_coefficients(matrix_coefficients: u16) -> Result<()> {
     match matrix_coefficients {
-        0 | 1 | 2 | 4..=9 | 12 | 16 | 17 => Ok(()),
+        0 | 1 | 2 | 4..=10 | 12 | 14 | 16 | 17 => Ok(()),
         _ => Err(Error::Unsupported(
-            "doğrusal olmayan veya ayrılmış H.273 matrix_coefficients değeri doğrusal RGB dönüşümünde desteklenmiyor",
+            "desteklenmeyen veya ayrılmış ITU-T H.273 matrix_coefficients kod noktası",
         )),
     }
 }
@@ -260,7 +263,108 @@ impl MatrixKernel for StandardMatrix {
     }
 }
 
-/// `Identity` (`0`), `YCgCo` (`8`) ve `YCgCo-Re/Ro` (`16`/`17`) matrisleri.
+/// SMPTE ST 2084 (PQ) ters EOTF: doğrusal olmayan `E' ∈ [0, 1]` → doğrusal `E ∈ [0, 1]`.
+#[inline]
+fn pq_eotf(e_prime: f64) -> f64 {
+    const M1: f64 = 2610.0 / 16384.0;
+    const M2: f64 = (2523.0 / 4096.0) * 128.0;
+    const C1: f64 = 3424.0 / 4096.0;
+    const C2: f64 = (2413.0 / 4096.0) * 32.0;
+    const C3: f64 = (2392.0 / 4096.0) * 32.0;
+
+    let ep = e_prime.clamp(0.0, 1.0);
+    if ep == 0.0 {
+        return 0.0;
+    }
+    let p = ep.powf(1.0 / M2);
+    let num = (p - C1).max(0.0);
+    let den = C2 - C3 * p;
+    if den <= 0.0 {
+        1.0
+    } else {
+        (num / den).powf(1.0 / M1).clamp(0.0, 1.0)
+    }
+}
+
+/// SMPTE ST 2084 (PQ) ileri OETF: doğrusal `E ∈ [0, 1]` → doğrusal olmayan `E' ∈ [0, 1]`.
+#[inline]
+fn pq_oetf(linear: f64) -> f64 {
+    const M1: f64 = 2610.0 / 16384.0;
+    const M2: f64 = (2523.0 / 4096.0) * 128.0;
+    const C1: f64 = 3424.0 / 4096.0;
+    const C2: f64 = (2413.0 / 4096.0) * 32.0;
+    const C3: f64 = (2392.0 / 4096.0) * 32.0;
+
+    let lin = linear.clamp(0.0, 1.0);
+    if lin == 0.0 {
+        return 0.0;
+    }
+    let p = lin.powf(M1);
+    ((C1 + C2 * p) / (1.0 + C3 * p)).powf(M2).clamp(0.0, 1.0)
+}
+
+/// ITU-R BT.2100 HLG ters OETF: doğrusal olmayan `E' ∈ [0, 1]` → doğrusal `E ∈ [0, 1]`.
+#[inline]
+fn hlg_inv_oetf(e_prime: f64) -> f64 {
+    const A: f64 = 0.17883277;
+    const B: f64 = 0.28466892;
+    const C: f64 = 0.55991073;
+
+    let ep = e_prime.clamp(0.0, 1.0);
+    if ep <= 0.5 {
+        (ep * ep) / 3.0
+    } else {
+        ((((ep - C) / A).exp() + B) / 12.0).clamp(0.0, 1.0)
+    }
+}
+
+/// ITU-R BT.2100 HLG ileri OETF: doğrusal `E ∈ [0, 1]` → doğrusal olmayan `E' ∈ [0, 1]`.
+#[inline]
+fn hlg_oetf(linear: f64) -> f64 {
+    const A: f64 = 0.17883277;
+    const B: f64 = 0.28466892;
+    const C: f64 = 0.55991073;
+
+    let lin = linear.clamp(0.0, 1.0);
+    if lin <= 1.0 / 12.0 {
+        (3.0 * lin).sqrt()
+    } else {
+        (A * (12.0 * lin - B).ln() + C).clamp(0.0, 1.0)
+    }
+}
+
+/// ITU-R BT.2020 OETF (`transfer_characteristics` `14` / `15`): doğrusal `E ∈ [0, 1]` → `E' ∈ [0, 1]`.
+#[inline]
+fn bt2020_oetf(linear: f64) -> f64 {
+    const ALPHA: f64 = 1.09929682680944;
+    const BETA: f64 = 0.018053968510807;
+
+    let lin = linear.clamp(0.0, 1.0);
+    if lin < BETA {
+        4.5 * lin
+    } else {
+        (ALPHA * lin.powf(0.45) - (ALPHA - 1.0)).clamp(0.0, 1.0)
+    }
+}
+
+/// ITU-R BT.2020 ters OETF: doğrusal olmayan `E' ∈ [0, 1]` → doğrusal `E ∈ [0, 1]`.
+#[inline]
+fn bt2020_inv_oetf(e_prime: f64) -> f64 {
+    const ALPHA: f64 = 1.09929682680944;
+    const BETA_PRIME: f64 = 4.5 * 0.018053968510807;
+
+    let ep = e_prime.clamp(0.0, 1.0);
+    if ep < BETA_PRIME {
+        ep / 4.5
+    } else {
+        ((ep + (ALPHA - 1.0)) / ALPHA)
+            .powf(1.0 / 0.45)
+            .clamp(0.0, 1.0)
+    }
+}
+
+/// `Identity` (`0`), `YCgCo` (`8`), `YCgCo-Re/Ro` (`16`/`17`), `BT.2020 CL` (`10`) ve
+/// `ICtCp` (`14`) matrisleri.
 #[derive(Clone, Copy)]
 enum SpecialMatrix {
     Identity,
@@ -270,6 +374,38 @@ enum SpecialMatrix {
         rgb_max_f: f32,
         max_rgb: i32,
     },
+    /// ITU-T H.273 Denklem 58–67 (`matrix_coefficients == 10`, BT.2020 Constant Luminance).
+    Bt2020Cl {
+        is_pq: bool,
+        two_nb: f64,
+        two_pb: f64,
+        two_nr: f64,
+        two_pr: f64,
+    },
+    /// ITU-T H.273 §8.3 / ITU-R BT.2100 (`matrix_coefficients == 14`, ICtCp PQ/HLG).
+    ICtCp {
+        is_hlg: bool,
+    },
+}
+
+impl SpecialMatrix {
+    fn bt2020_cl(transfer_characteristics: u16) -> Self {
+        const KR: f64 = 0.2627;
+        const KB: f64 = 0.0593;
+        let is_pq = transfer_characteristics == 16;
+        let oetf = if is_pq { pq_oetf } else { bt2020_oetf };
+        let nb = oetf(1.0 - KB);
+        let pb = 1.0 - oetf(KB);
+        let nr = oetf(1.0 - KR);
+        let pr = 1.0 - oetf(KR);
+        Self::Bt2020Cl {
+            is_pq,
+            two_nb: 2.0 * nb,
+            two_pb: 2.0 * pb,
+            two_nr: 2.0 * nr,
+            two_pr: 2.0 * pr,
+        }
+    }
 }
 
 impl MatrixKernel for SpecialMatrix {
@@ -298,6 +434,101 @@ impl MatrixKernel for SpecialMatrix {
                     (g_i as f32) / rgb_max_f,
                     (b_i as f32) / rgb_max_f,
                 )
+            }
+            Self::Bt2020Cl {
+                is_pq,
+                two_nb,
+                two_pb,
+                two_nr,
+                two_pr,
+            } => {
+                const KR: f64 = 0.2627;
+                const KB: f64 = 0.0593;
+                const KG: f64 = 0.6780;
+
+                let yc_p = f64::from(y_norm);
+                let cbc = f64::from(cb);
+                let crc = f64::from(cr);
+
+                let b_p = if cbc <= 0.0 {
+                    cbc * two_nb + yc_p
+                } else {
+                    cbc * two_pb + yc_p
+                }
+                .clamp(0.0, 1.0);
+                let r_p = if crc <= 0.0 {
+                    crc * two_nr + yc_p
+                } else {
+                    crc * two_pr + yc_p
+                }
+                .clamp(0.0, 1.0);
+
+                let (y_lin, b_lin, r_lin) = if is_pq {
+                    (pq_eotf(yc_p), pq_eotf(b_p), pq_eotf(r_p))
+                } else {
+                    (
+                        bt2020_inv_oetf(yc_p),
+                        bt2020_inv_oetf(b_p),
+                        bt2020_inv_oetf(r_p),
+                    )
+                };
+                let g_lin = ((y_lin - KR * r_lin - KB * b_lin) / KG).clamp(0.0, 1.0);
+                let g_p = if is_pq {
+                    pq_oetf(g_lin)
+                } else {
+                    bt2020_oetf(g_lin)
+                };
+                (r_p as f32, g_p as f32, b_p as f32)
+            }
+            Self::ICtCp { is_hlg } => {
+                let i = f64::from(y_norm);
+                let ct = f64::from(cb);
+                let cp = f64::from(cr);
+
+                let (l_p, m_p, s_p) = if is_hlg {
+                    (
+                        i + 0.015_718_580_108_730_4 * ct + 0.209_581_068_116_405_5 * cp,
+                        i - 0.015_718_580_108_730_4 * ct - 0.209_581_068_116_405_5 * cp,
+                        i + 1.021_271_079_842_234_2 * ct - 0.605_274_490_992_431_5 * cp,
+                    )
+                } else {
+                    (
+                        i + 0.008_609_037_037_932_8 * ct + 0.111_029_625_003_026 * cp,
+                        i - 0.008_609_037_037_932_8 * ct - 0.111_029_625_003_026 * cp,
+                        i + 0.560_031_335_710_679_1 * ct - 0.320_627_174_987_318_9 * cp,
+                    )
+                };
+
+                let (l, m, s) = if is_hlg {
+                    (hlg_inv_oetf(l_p), hlg_inv_oetf(m_p), hlg_inv_oetf(s_p))
+                } else {
+                    (pq_eotf(l_p), pq_eotf(m_p), pq_eotf(s_p))
+                };
+
+                // Doğrusal LMS -> doğrusal BT.2020 RGB (ITU-R BT.2100-2 matrisinin tam tersi)
+                let r_lin = (3.436_606_694_333_078_4 * l - 2.506_452_118_656_27 * m
+                    + 0.069_845_424_323_191_5 * s)
+                    .clamp(0.0, 1.0);
+                let g_lin = (-0.791_329_555_598_928_7 * l + 1.983_600_451_792_290_7 * m
+                    - 0.192_270_896_193_362 * s)
+                    .clamp(0.0, 1.0);
+                let b_lin = (-0.025_949_899_690_592_7 * l - 0.098_913_714_711_726_4 * m
+                    + 1.124_863_614_402_319_2 * s)
+                    .clamp(0.0, 1.0);
+
+                if is_hlg {
+                    (
+                        hlg_oetf(r_lin) as f32,
+                        hlg_oetf(g_lin) as f32,
+                        hlg_oetf(b_lin) as f32,
+                    )
+                } else {
+                    (
+                        pq_oetf(r_lin) as f32,
+                        pq_oetf(g_lin) as f32,
+                        pq_oetf(b_lin) as f32,
+                    )
+                }
             }
         };
         (clamp01(r), clamp01(g), clamp01(b))
@@ -1300,6 +1531,38 @@ fn dispatch_matrix<S: SampleSource, O: PixelSink>(
             SpecialMatrix::YCgCo,
             sink,
         ),
+        10 => convert_image_strips(
+            y_plane,
+            u_plane,
+            v_plane,
+            pixels,
+            w,
+            h,
+            cw,
+            ch,
+            img.chroma_format,
+            img.effective_threads,
+            src,
+            SpecialMatrix::bt2020_cl(img.color.transfer_characteristics),
+            sink,
+        ),
+        14 => convert_image_strips(
+            y_plane,
+            u_plane,
+            v_plane,
+            pixels,
+            w,
+            h,
+            cw,
+            ch,
+            img.chroma_format,
+            img.effective_threads,
+            src,
+            SpecialMatrix::ICtCp {
+                is_hlg: img.color.transfer_characteristics == 18,
+            },
+            sink,
+        ),
         16 | 17 => convert_image_strips(
             y_plane,
             u_plane,
@@ -1713,10 +1976,10 @@ mod tests {
 
     #[test]
     fn h273_nonlinear_and_reserved_matrices_return_unsupported() {
-        for supported in [0u16, 1, 2, 4, 5, 6, 7, 8, 9, 12, 16, 17] {
+        for supported in [0u16, 1, 2, 4, 5, 6, 7, 8, 9, 10, 12, 14, 16, 17] {
             assert_eq!(validate_matrix_coefficients(supported), Ok(()));
         }
-        for unsupported in [3u16, 10, 11, 13, 14, 15, 18, 255] {
+        for unsupported in [3u16, 11, 13, 15, 18, 255] {
             assert!(matches!(
                 validate_matrix_coefficients(unsupported),
                 Err(Error::Unsupported(_))
@@ -1817,6 +2080,8 @@ mod tests {
                 clli: None,
                 mdcv: None,
                 pasp: None,
+                gain_map_metadata: None,
+                gain_map: None,
                 effective_threads: threads,
             }
         };
@@ -1856,6 +2121,135 @@ mod tests {
             assert_eq!(img_t1.to_rgba8().unwrap(), img_t4.to_rgba8().unwrap());
             assert_eq!(img_t1.to_rgb16().unwrap(), img_t4.to_rgb16().unwrap());
             assert_eq!(img_t1.to_rgba16().unwrap(), img_t4.to_rgba16().unwrap());
+        }
+    }
+
+    #[test]
+    fn h273_ictcp_pq_and_hlg_reference_vectors() {
+        use super::{MatrixKernel, SpecialMatrix, hlg_inv_oetf, hlg_oetf, pq_eotf, pq_oetf};
+
+        // İleri BT.2100 RGB' -> ICtCp (PQ ve HLG) -> SpecialMatrix::ICtCp geri dönüşümü.
+        let encode_ictcp = |r_p: f64, g_p: f64, b_p: f64, is_hlg: bool| -> (f32, f32, f32) {
+            let (r, g, b) = if is_hlg {
+                (hlg_inv_oetf(r_p), hlg_inv_oetf(g_p), hlg_inv_oetf(b_p))
+            } else {
+                (pq_eotf(r_p), pq_eotf(g_p), pq_eotf(b_p))
+            };
+            let l = (1688.0 * r + 2146.0 * g + 262.0 * b) / 4096.0;
+            let m = (683.0 * r + 2951.0 * g + 462.0 * b) / 4096.0;
+            let s = (99.0 * r + 309.0 * g + 3688.0 * b) / 4096.0;
+            let (lp, mp, sp) = if is_hlg {
+                (hlg_oetf(l), hlg_oetf(m), hlg_oetf(s))
+            } else {
+                (pq_oetf(l), pq_oetf(m), pq_oetf(s))
+            };
+            let i = 0.5 * lp + 0.5 * mp;
+            let (ct, cp) = if is_hlg {
+                (
+                    (3625.0 * lp - 7465.0 * mp + 3840.0 * sp) / 4096.0,
+                    (9500.0 * lp - 9212.0 * mp - 288.0 * sp) / 4096.0,
+                )
+            } else {
+                (
+                    (6610.0 * lp - 13613.0 * mp + 7003.0 * sp) / 4096.0,
+                    (17933.0 * lp - 17390.0 * mp - 543.0 * sp) / 4096.0,
+                )
+            };
+            (i as f32, ct as f32, cp as f32)
+        };
+
+        let samples = [
+            (0.0, 0.0, 0.0),   // Siyah
+            (1.0, 1.0, 1.0),   // Beyaz
+            (0.5, 0.5, 0.5),   // Orta gri
+            (0.8, 0.2, 0.1),   // Doygun kırmızımsı
+            (0.1, 0.85, 0.2),  // Doygun yeşilimsi
+            (0.15, 0.25, 0.9), // Doygun mavimsi
+        ];
+        for is_hlg in [false, true] {
+            let kernel = SpecialMatrix::ICtCp { is_hlg };
+            for (er, eg, eb) in samples {
+                let (i, ct, cp) = encode_ictcp(er, eg, eb, is_hlg);
+                let (rr, rg, rb) = kernel.to_rgb_f32(0, i, ct, cp);
+                assert!(
+                    (f64::from(rr) - er).abs() < 1e-4
+                        && (f64::from(rg) - eg).abs() < 1e-4
+                        && (f64::from(rb) - eb).abs() < 1e-4,
+                    "ICtCp(is_hlg={is_hlg}) sapması: girdi=({er},{eg},{eb}) çıktı=({rr},{rg},{rb})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn h273_bt2020_cl_reference_vectors() {
+        use super::{MatrixKernel, SpecialMatrix, bt2020_inv_oetf, bt2020_oetf, pq_eotf, pq_oetf};
+
+        let encode_bt2020_cl = |r_p: f64, g_p: f64, b_p: f64, trc: u16| -> (f32, f32, f32) {
+            const KR: f64 = 0.2627;
+            const KB: f64 = 0.0593;
+            const KG: f64 = 0.6780;
+            let is_pq = trc == 16;
+            let (r, g, b) = if is_pq {
+                (pq_eotf(r_p), pq_eotf(g_p), pq_eotf(b_p))
+            } else {
+                (
+                    bt2020_inv_oetf(r_p),
+                    bt2020_inv_oetf(g_p),
+                    bt2020_inv_oetf(b_p),
+                )
+            };
+            let oetf = if is_pq { pq_oetf } else { bt2020_oetf };
+            let y_lin = KR * r + KG * g + KB * b;
+            let yc_p = oetf(y_lin);
+            let nb = oetf(1.0 - KB);
+            let pb = 1.0 - oetf(KB);
+            let nr = oetf(1.0 - KR);
+            let pr = 1.0 - oetf(KR);
+            let cbc = if b_p <= yc_p {
+                (b_p - yc_p) / (2.0 * nb)
+            } else {
+                (b_p - yc_p) / (2.0 * pb)
+            };
+            let crc = if r_p <= yc_p {
+                (r_p - yc_p) / (2.0 * nr)
+            } else {
+                (r_p - yc_p) / (2.0 * pr)
+            };
+            (yc_p as f32, cbc as f32, crc as f32)
+        };
+
+        let samples = [
+            (0.0, 0.0, 0.0), // Siyah
+            (1.0, 1.0, 1.0), // Beyaz
+            (0.5, 0.5, 0.5), // Nötr gri
+            (1.0, 0.0, 0.0), // Saf kırmızı
+            (0.0, 1.0, 0.0), // Saf yeşil
+            (0.0, 0.0, 1.0), // Saf mavi
+            (1.0, 1.0, 0.0), // Sarı
+            (0.0, 1.0, 1.0), // Camgöbeği
+        ];
+        for trc in [14u16, 16u16] {
+            let kernel = SpecialMatrix::bt2020_cl(trc);
+            // PQ (trc=16) OETF'nin sıfır civarındaki dik eğimi nedeniyle `f32` giriş yuvarlaması
+            // doğrusal ışıkta <1e-5 sapmayla kod uzayında ~3.5e-3 üretebilir.
+            let tol = if trc == 16 { 5e-3 } else { 1e-4 };
+            for (er, eg, eb) in samples {
+                let (yc, cbc, crc) = encode_bt2020_cl(er, eg, eb, trc);
+                let (rr, rg, rb) = kernel.to_rgb_f32(0, yc, cbc, crc);
+                assert!(
+                    (f64::from(rr) - er).abs() < tol
+                        && (f64::from(rg) - eg).abs() < tol
+                        && (f64::from(rb) - eb).abs() < tol,
+                    "BT.2020 CL (trc={trc}) sapması: girdi=({er},{eg},{eb}) çıktı=({rr},{rg},{rb})"
+                );
+                if trc == 16 {
+                    assert!(
+                        (pq_eotf(f64::from(rg)) - pq_eotf(eg)).abs() < 1e-5,
+                        "BT.2020 CL (PQ) doğrusal G sapması"
+                    );
+                }
+            }
         }
     }
 }

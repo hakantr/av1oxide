@@ -3,6 +3,7 @@
 #![forbid(unsafe_code)]
 
 use crate::avif::color;
+use crate::avif::gainmap::{GainMap, GainMapMetadata};
 use crate::error::Result;
 use crate::frame::{BitDepth, ChromaFormat};
 
@@ -19,6 +20,11 @@ pub struct AvifDecodeConfig {
     pub apply_grain: bool,
     /// Katı standart uyumluluğu denetimi.
     pub strict: bool,
+    /// Varsa ISO 21496-1 `tmap` kazanç haritası görüntüsünün de çözülüp çözülmeyeceği.
+    ///
+    /// Varsayılan `false` değerinde `tmap` üst verisi ve kutu doğrulaması yürütülür ancak
+    /// ikincil kazanç haritası AV1 akışı çözülmez.
+    pub decode_gain_map: bool,
 }
 
 impl Default for AvifDecodeConfig {
@@ -29,6 +35,7 @@ impl Default for AvifDecodeConfig {
             allocation_limit: None,
             apply_grain: true,
             strict: false,
+            decode_gain_map: false,
         }
     }
 }
@@ -139,6 +146,10 @@ pub struct AvifInfo {
     pub mdcv: Option<MasteringDisplay>,
     /// Varsa piksel en-boy oranı (`pasp`) bilgisi.
     pub pasp: Option<PixelAspectRatio>,
+    /// Görüntüde geçerli ve desteklenen bir ISO 21496-1 `tmap` kazanç haritası bulunup bulunmadığı.
+    pub has_gain_map: bool,
+    /// Varsa ISO 21496-1 `tmap` kazanç haritası üst verisi ve alternatif görüntü özellikleri.
+    pub gain_map_metadata: Option<GainMapMetadata>,
 }
 
 /// 8-bit sıkı paketlenmiş (`R, G, B`) RGB görüntü tamponu.
@@ -325,6 +336,8 @@ pub struct AvifImage {
     pub(crate) clli: Option<ContentLightLevel>,
     pub(crate) mdcv: Option<MasteringDisplay>,
     pub(crate) pasp: Option<PixelAspectRatio>,
+    pub(crate) gain_map_metadata: Option<GainMapMetadata>,
+    pub(crate) gain_map: Option<GainMap>,
     pub(crate) effective_threads: usize,
 }
 
@@ -348,6 +361,8 @@ impl PartialEq for AvifImage {
             && self.clli == other.clli
             && self.mdcv == other.mdcv
             && self.pasp == other.pasp
+            && self.gain_map_metadata == other.gain_map_metadata
+            && self.gain_map == other.gain_map
     }
 }
 
@@ -597,6 +612,24 @@ impl AvifImage {
     #[must_use]
     pub const fn pasp(&self) -> Option<PixelAspectRatio> {
         self.pasp
+    }
+
+    /// Görüntüde geçerli ve desteklenen bir ISO 21496-1 `tmap` kazanç haritası bulunup bulunmadığı.
+    #[must_use]
+    pub const fn has_gain_map(&self) -> bool {
+        self.gain_map_metadata.is_some()
+    }
+
+    /// Varsa ISO 21496-1 `tmap` kazanç haritası üst verisi ve alternatif görüntü özellikleri.
+    #[must_use]
+    pub fn gain_map_metadata(&self) -> Option<&GainMapMetadata> {
+        self.gain_map_metadata.as_ref()
+    }
+
+    /// `AvifDecodeConfig::decode_gain_map == true` ile çözülmüşse kazanç haritası görüntüsü ve üst verisi.
+    #[must_use]
+    pub fn gain_map(&self) -> Option<&GainMap> {
+        self.gain_map.as_ref()
     }
 
     /// Düzlemleri H.273 renk matrisine göre 8-bit RGB (`[R, G, B]`) tamponuna dönüştürür.
