@@ -15,7 +15,7 @@ use crate::error::{Error, Result};
 
 /// AVIF / HEIF dosya imzasında kabul edilen `ftyp` marka kodları.
 const SUPPORTED_BRANDS: &[[u8; 4]] = &[
-    *b"avif", *b"avis", *b"mif1", *b"msf1", *b"miaf", *b"MA1B", *b"MA1A",
+    *b"avif", *b"avis", *b"avio", *b"mif1", *b"msf1", *b"miaf", *b"MA1B", *b"MA1A",
 ];
 
 /// Alfa yardımcı öğesi için standart URN tanımlayıcıları.
@@ -246,7 +246,7 @@ fn decompress_gzip(
     decompress_bounded(GzDecoder::new(data), orig_compressed_len, allocation_limit)
 }
 
-fn decompress_by_fourcc(
+pub(crate) fn decompress_by_fourcc(
     compression_type: &[u8; 4],
     data: &[u8],
     orig_compressed_len: usize,
@@ -262,22 +262,22 @@ fn decompress_by_fourcc(
     }
 }
 
-fn read_u16_be(buf: &[u8], offset: usize) -> Option<u16> {
+pub(crate) fn read_u16_be(buf: &[u8], offset: usize) -> Option<u16> {
     let bytes = buf.get(offset..offset.checked_add(2)?)?;
     Some(u16::from_be_bytes([bytes[0], bytes[1]]))
 }
 
-fn read_u32_be(buf: &[u8], offset: usize) -> Option<u32> {
+pub(crate) fn read_u32_be(buf: &[u8], offset: usize) -> Option<u32> {
     let bytes = buf.get(offset..offset.checked_add(4)?)?;
     Some(u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
 }
 
-fn read_i32_be(buf: &[u8], offset: usize) -> Option<i32> {
+pub(crate) fn read_i32_be(buf: &[u8], offset: usize) -> Option<i32> {
     let bytes = buf.get(offset..offset.checked_add(4)?)?;
     Some(i32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
 }
 
-fn read_u64_be(buf: &[u8], offset: usize) -> Option<u64> {
+pub(crate) fn read_u64_be(buf: &[u8], offset: usize) -> Option<u64> {
     let bytes = buf.get(offset..offset.checked_add(8)?)?;
     Some(u64::from_be_bytes([
         bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
@@ -381,7 +381,7 @@ pub(crate) fn read_full_box(payload: &[u8]) -> Result<(u8, u32, &[u8])> {
     Ok((version, flags, &payload[4..]))
 }
 
-fn is_supported_brand(brand: &[u8; 4]) -> bool {
+pub(crate) fn is_supported_brand(brand: &[u8; 4]) -> bool {
     SUPPORTED_BRANDS.contains(brand)
 }
 
@@ -474,6 +474,17 @@ pub(crate) fn parse_container(data: &[u8]) -> Result<AvifContainer<'_>> {
         ));
     }
     let meta_raw = meta_payload.ok_or(Error::InvalidData("AVIF dosyasında meta kutusu yok"))?;
+    parse_meta_box(data, meta_raw, major_brand, compatible_brands, true)
+}
+
+/// Bir `meta` kutusu yükünü (üst düzey veya `trak` içi gömülü) [`AvifContainer`] olarak ayrıştırır.
+pub(crate) fn parse_meta_box<'a>(
+    file_data: &'a [u8],
+    meta_raw: Cow<'a, [u8]>,
+    major_brand: [u8; 4],
+    compatible_brands: Vec<[u8; 4]>,
+    require_pitm: bool,
+) -> Result<AvifContainer<'a>> {
     let (meta_version, _meta_flags, meta_children) = read_full_box(&meta_raw)?;
     if meta_version != 0 {
         return Err(Error::Unsupported(
@@ -492,7 +503,7 @@ pub(crate) fn parse_container(data: &[u8]) -> Result<AvifContainer<'_>> {
     let mut references: Vec<ItemReference> = Vec::new();
     let mut entity_groups: Vec<EntityToGroup> = Vec::new();
     let mut seen_grpl = false;
-    let mut idat: Cow<'_, [u8]> = Cow::Borrowed(&[]);
+    let mut idat: Cow<'a, [u8]> = Cow::Borrowed(&[]);
     let mut has_hdlr = false;
 
     let mut m_off = 0usize;
@@ -505,7 +516,7 @@ pub(crate) fn parse_container(data: &[u8]) -> Result<AvifContainer<'_>> {
                     return Err(Error::InvalidData("geçersiz hdlr kutusu"));
                 }
                 let handler_type = &body[4..8];
-                if handler_type != b"pict" {
+                if require_pitm && handler_type != b"pict" {
                     return Err(Error::InvalidData("meta hdlr türü 'pict' değil"));
                 }
                 has_hdlr = true;
@@ -543,10 +554,10 @@ pub(crate) fn parse_container(data: &[u8]) -> Result<AvifContainer<'_>> {
             b"idat" => {
                 idat = match &meta_raw {
                     Cow::Borrowed(_) => {
-                        let base_ptr = data.as_ptr() as usize;
+                        let base_ptr = file_data.as_ptr() as usize;
                         let child_ptr = child.payload.as_ptr() as usize;
                         let off = child_ptr - base_ptr;
-                        Cow::Borrowed(&data[off..off + child.payload.len()])
+                        Cow::Borrowed(&file_data[off..off + child.payload.len()])
                     }
                     Cow::Owned(_) => Cow::Owned(child.payload.to_vec()),
                 };
@@ -558,11 +569,14 @@ pub(crate) fn parse_container(data: &[u8]) -> Result<AvifContainer<'_>> {
     if !has_hdlr {
         return Err(Error::InvalidData("meta kutusunda hdlr alt kutusu eksik"));
     }
-    let primary_item_id =
-        primary_item_id.ok_or(Error::InvalidData("meta kutusunda pitm alt kutusu eksik"))?;
+    let primary_item_id = if require_pitm {
+        primary_item_id.ok_or(Error::InvalidData("meta kutusunda pitm alt kutusu eksik"))?
+    } else {
+        primary_item_id.unwrap_or(0)
+    };
 
     Ok(AvifContainer {
-        file_data: data,
+        file_data,
         major_brand,
         compatible_brands,
         primary_item_id,
@@ -723,6 +737,15 @@ fn parse_iprp(
 }
 
 fn parse_ipco(payload: &[u8], properties: &mut Vec<ItemProperty>) -> Result<()> {
+    parse_property_boxes(payload, properties, false)
+}
+
+/// `ipco` veya `stsd` `av01` örnek girişi içindeki alt özellik kutularını ayrıştırır.
+pub(crate) fn parse_property_boxes(
+    payload: &[u8],
+    properties: &mut Vec<ItemProperty>,
+    is_track: bool,
+) -> Result<()> {
     let mut offset = 0usize;
     while let Some(prop_box) = read_box_header(payload, offset)? {
         offset = prop_box.next_offset;
@@ -918,10 +941,19 @@ fn parse_ipco(payload: &[u8], properties: &mut Vec<ItemProperty>) -> Result<()> 
                 let layer_id = read_u16_be(prop_box.payload, 0).unwrap_or(0);
                 ItemProperty::Lsel(layer_id)
             }
-            b"auxC" => {
+            b"auxC" if !is_track => {
                 let (ver, _flags, body) = read_full_box(prop_box.payload)?;
                 if ver != 0 {
                     return Err(Error::Unsupported("auxC sürümü 0 dışında desteklenmiyor"));
+                }
+                let (aux_type, next_pos) = read_cstring(body, 0)?;
+                let subtype = body.get(next_pos..).unwrap_or(&[]).to_vec();
+                ItemProperty::AuxC { aux_type, subtype }
+            }
+            b"auxi" if is_track => {
+                let (ver, _flags, body) = read_full_box(prop_box.payload)?;
+                if ver != 0 {
+                    return Err(Error::Unsupported("auxi sürümü 0 dışında desteklenmiyor"));
                 }
                 let (aux_type, next_pos) = read_cstring(body, 0)?;
                 let subtype = body.get(next_pos..).unwrap_or(&[]).to_vec();

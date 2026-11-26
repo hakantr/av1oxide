@@ -21,21 +21,21 @@ use crate::frame::{BitDepth, ChromaFormat, Frame, PlaneType};
 
 /// İç düzlemsel çalışma tamponu.
 #[derive(Clone, Debug)]
-struct PlanarBuffer {
-    width: u32,
-    height: u32,
-    chroma_width: u32,
-    chroma_height: u32,
-    bit_depth: BitDepth,
-    chroma_format: ChromaFormat,
-    y_plane: PlaneStorage,
-    u_plane: PlaneStorage,
-    v_plane: PlaneStorage,
-    seq_color: Option<ColorInfo>,
+pub(crate) struct PlanarBuffer {
+    pub(crate) width: u32,
+    pub(crate) height: u32,
+    pub(crate) chroma_width: u32,
+    pub(crate) chroma_height: u32,
+    pub(crate) bit_depth: BitDepth,
+    pub(crate) chroma_format: ChromaFormat,
+    pub(crate) y_plane: PlaneStorage,
+    pub(crate) u_plane: PlaneStorage,
+    pub(crate) v_plane: PlaneStorage,
+    pub(crate) seq_color: Option<ColorInfo>,
 }
 
 /// Yapılandırılmış iş parçacığı sayısını etkin çalışma zamanı sayısına çözümler.
-fn resolve_effective_threads(n_threads: usize) -> usize {
+pub(crate) fn resolve_effective_threads(n_threads: usize) -> usize {
     #[cfg(target_arch = "wasm32")]
     {
         let _ = n_threads;
@@ -110,7 +110,7 @@ fn parse_grid_descriptor(data: &[u8]) -> Result<GridDescriptor> {
     })
 }
 
-fn av1c_to_format(av1c: &Av1CProperty) -> Result<(BitDepth, ChromaFormat)> {
+pub(crate) fn av1c_to_format(av1c: &Av1CProperty) -> Result<(BitDepth, ChromaFormat)> {
     let bit_depth = match (av1c.high_bitdepth, av1c.twelve_bit) {
         (false, _) => BitDepth::Eight,
         (true, false) => BitDepth::Ten,
@@ -133,7 +133,11 @@ fn av1c_to_format(av1c: &Av1CProperty) -> Result<(BitDepth, ChromaFormat)> {
     Ok((bit_depth, chroma_format))
 }
 
-fn compute_clap_rect(w: u32, h: u32, clap: &CleanAperture) -> Result<(u32, u32, u32, u32)> {
+pub(crate) fn compute_clap_rect(
+    w: u32,
+    h: u32,
+    clap: &CleanAperture,
+) -> Result<(u32, u32, u32, u32)> {
     if clap.width_d == 0 || clap.height_d == 0 || clap.horiz_off_d == 0 || clap.vert_off_d == 0 {
         return Err(Error::InvalidData("clap paydası sıfır olamaz"));
     }
@@ -435,9 +439,9 @@ fn is_premultiplied_alpha(
     to_primary.contains(&alpha_id)
 }
 
-type MetadataPair = (Option<Vec<u8>>, Option<Vec<u8>>);
+pub(crate) type MetadataPair = (Option<Vec<u8>>, Option<Vec<u8>>);
 
-fn extract_metadata_items(
+pub(crate) fn extract_metadata_items(
     container: &AvifContainer<'_>,
     primary_id: u32,
     allocation_limit: Option<usize>,
@@ -468,6 +472,45 @@ fn extract_metadata_items(
             && xmp.is_none()
         {
             let raw = container.resolve_item_data(mid, allocation_limit)?;
+            xmp = Some(raw.into_owned());
+        }
+    }
+    Ok((exif, xmp))
+}
+
+/// `trak` içine gömülü `meta` kutusundan tüm ilişkili `Exif`/`XMP` öğelerini çıkarır
+/// (`libavif` `avifDecoderFindMetadata(..., colorId = 0)` uyumlu).
+pub(crate) fn extract_track_metadata_items(
+    container: &AvifContainer<'_>,
+    allocation_limit: Option<usize>,
+) -> Result<MetadataPair> {
+    let mut exif: Option<Vec<u8>> = None;
+    let mut xmp: Option<Vec<u8>> = None;
+
+    for info in container.items.values() {
+        if !container.item_has_data(info.item_id)
+            || container.has_unsupported_essential_property(info.item_id)?
+        {
+            continue;
+        }
+        if &info.item_type == b"Exif" && exif.is_none() {
+            let raw = container.resolve_item_data(info.item_id, allocation_limit)?;
+            if raw.len() < 4 {
+                return Err(Error::InvalidData("Exif öğesi 4 bayttan kısa"));
+            }
+            let tiff_offset = u32::from_be_bytes([raw[0], raw[1], raw[2], raw[3]]) as usize;
+            let start = 4usize
+                .checked_add(tiff_offset)
+                .ok_or(Error::InvalidData("Exif TIFF başlık ofseti taşması"))?;
+            let slice = raw.get(start..).ok_or(Error::InvalidData(
+                "Exif TIFF başlık ofseti veri sınırları dışında",
+            ))?;
+            exif = Some(slice.to_vec());
+        } else if &info.item_type == b"mime"
+            && info.content_type == "application/rdf+xml"
+            && xmp.is_none()
+        {
+            let raw = container.resolve_item_data(info.item_id, allocation_limit)?;
             xmp = Some(raw.into_owned());
         }
     }
@@ -719,7 +762,7 @@ pub fn parse_info(data: &[u8]) -> Result<AvifInfo> {
     })
 }
 
-fn check_pixel_and_byte_budget(
+pub(crate) fn check_pixel_and_byte_budget(
     width: u32,
     height: u32,
     bytes_needed: usize,
@@ -746,7 +789,7 @@ fn check_pixel_and_byte_budget(
 }
 
 /// 8-bit sınırlı aralık (`[16, 235]`) → tam aralık (`[0, 255]`) alfa genişletme arama tablosu.
-const LIMITED_TO_FULL_Y_8BIT: [u8; 256] = {
+pub(crate) const LIMITED_TO_FULL_Y_8BIT: [u8; 256] = {
     let mut lut = [0u8; 256];
     let mut i = 0usize;
     while i < 256 {
@@ -764,7 +807,7 @@ const LIMITED_TO_FULL_Y_8BIT: [u8; 256] = {
 };
 
 #[inline]
-fn limited_to_full_y_u16(bit_depth: BitDepth, v: u16) -> u16 {
+pub(crate) fn limited_to_full_y_u16(bit_depth: BitDepth, v: u16) -> u16 {
     let (min_y, max_y, full_y): (i32, i32, i32) = match bit_depth {
         BitDepth::Eight => (16, 235, 255),
         BitDepth::Ten => (64, 940, 1023),
@@ -775,7 +818,7 @@ fn limited_to_full_y_u16(bit_depth: BitDepth, v: u16) -> u16 {
     expanded.clamp(0, full_y) as u16
 }
 
-fn extract_plane(
+pub(crate) fn extract_plane(
     frame: &Frame,
     plane_type: PlaneType,
     allocation_limit: Option<usize>,
@@ -1032,7 +1075,7 @@ fn crop_storage(
     }
 }
 
-fn crop_planar(
+pub(crate) fn crop_planar(
     buf: &mut PlanarBuffer,
     x0: u32,
     y0: u32,
@@ -1194,7 +1237,7 @@ fn upsample_c422_to_c444(buf: &mut PlanarBuffer) {
     buf.chroma_format = ChromaFormat::C444;
 }
 
-fn apply_irot(buf: &mut PlanarBuffer, angle: u8) {
+pub(crate) fn apply_irot(buf: &mut PlanarBuffer, angle: u8) {
     let a = angle & 3;
     if a == 0 {
         return;
@@ -1253,7 +1296,7 @@ fn mirror_plane(plane: &mut PlaneStorage, w: usize, h: usize, axis: u8) {
     }
 }
 
-fn apply_imir(buf: &mut PlanarBuffer, axis: u8) {
+pub(crate) fn apply_imir(buf: &mut PlanarBuffer, axis: u8) {
     mirror_plane(
         &mut buf.y_plane,
         buf.width as usize,
