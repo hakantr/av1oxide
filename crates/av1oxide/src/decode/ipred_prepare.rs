@@ -116,6 +116,73 @@ pub(crate) struct Prepared {
     pub angle: i32,
 }
 
+/// Blok döngüsü boyunca sabit kalan intra kenar hazırlama bağlamı (`5.D.1`).
+#[derive(Clone, Copy)]
+pub(crate) struct EdgeCtx {
+    pub col_start: usize,
+    pub row_start: usize,
+    pub col_end: usize,
+    pub row_end: usize,
+    pub stride: usize,
+    pub mode_in: u8,
+    pub angle_in: i32,
+    pub tw: usize,
+    pub th: usize,
+    pub filter_edge: bool,
+    pub topleft_off: usize,
+    pub bd: BitDepth,
+}
+
+/// Blok döngüsünde düşük çağrı maliyetli `prepare_intra_edges` girişi.
+#[inline(always)]
+pub(crate) fn prepare_intra_edges_ctx(
+    ctx: &EdgeCtx,
+    dst: &[u8],
+    x: usize,
+    y: usize,
+    edge_flags: u8,
+    dst_off: usize,
+    edge: &mut [u8],
+) -> Prepared {
+    if ctx.bd.bytes_per_sample() == 1 {
+        prepare_intra_edges_ctx_bpp::<1>(ctx, dst, x, y, edge_flags, dst_off, edge)
+    } else {
+        prepare_intra_edges_ctx_bpp::<2>(ctx, dst, x, y, edge_flags, dst_off, edge)
+    }
+}
+
+#[inline(never)]
+fn prepare_intra_edges_ctx_bpp<const BPP: usize>(
+    ctx: &EdgeCtx,
+    dst: &[u8],
+    x: usize,
+    y: usize,
+    edge_flags: u8,
+    dst_off: usize,
+    edge: &mut [u8],
+) -> Prepared {
+    prepare_intra_edges_core::<BPP>(
+        x,
+        x > ctx.col_start,
+        y,
+        y > ctx.row_start,
+        ctx.col_end,
+        ctx.row_end,
+        edge_flags,
+        dst,
+        dst_off,
+        ctx.stride,
+        ctx.mode_in,
+        ctx.angle_in,
+        ctx.tw,
+        ctx.th,
+        ctx.filter_edge,
+        edge,
+        ctx.topleft_off,
+        ctx.bd,
+    )
+}
+
 /// `dav1d_prepare_intra_edges` (C yolu).
 ///
 /// - `x`, `y`: blok konumu (4px birimi), `have_left` = `x > tile_col_start`,
@@ -124,7 +191,7 @@ pub(crate) struct Prepared {
 /// - `dst`, `dst_off`, `stride`: düzlem baytları ve blok sol-üstü,
 /// - `edge`, `topleft_off`: kenar tamponu ve `[0]` pikselinin bayt ofseti.
 #[allow(clippy::too_many_arguments)]
-#[inline]
+#[inline(always)]
 pub(crate) fn prepare_intra_edges(
     x: usize,
     have_left: bool,
@@ -145,7 +212,118 @@ pub(crate) fn prepare_intra_edges(
     topleft_off: usize,
     bd: BitDepth,
 ) -> Prepared {
-    let bpp = bd.bytes_per_sample();
+    if bd.bytes_per_sample() == 1 {
+        prepare_intra_edges_bpp::<1>(
+            x,
+            have_left,
+            y,
+            have_top,
+            w,
+            h,
+            edge_flags,
+            dst,
+            dst_off,
+            stride,
+            mode_in,
+            angle_in,
+            tw,
+            th,
+            filter_edge,
+            edge,
+            topleft_off,
+            bd,
+        )
+    } else {
+        prepare_intra_edges_bpp::<2>(
+            x,
+            have_left,
+            y,
+            have_top,
+            w,
+            h,
+            edge_flags,
+            dst,
+            dst_off,
+            stride,
+            mode_in,
+            angle_in,
+            tw,
+            th,
+            filter_edge,
+            edge,
+            topleft_off,
+            bd,
+        )
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+#[inline(never)]
+fn prepare_intra_edges_bpp<const BPP: usize>(
+    x: usize,
+    have_left: bool,
+    y: usize,
+    have_top: bool,
+    w: usize,
+    h: usize,
+    edge_flags: u8,
+    dst: &[u8],
+    dst_off: usize,
+    stride: usize,
+    mode_in: u8,
+    angle_in: i32,
+    tw: usize,
+    th: usize,
+    filter_edge: bool,
+    edge: &mut [u8],
+    topleft_off: usize,
+    bd: BitDepth,
+) -> Prepared {
+    prepare_intra_edges_core::<BPP>(
+        x,
+        have_left,
+        y,
+        have_top,
+        w,
+        h,
+        edge_flags,
+        dst,
+        dst_off,
+        stride,
+        mode_in,
+        angle_in,
+        tw,
+        th,
+        filter_edge,
+        edge,
+        topleft_off,
+        bd,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+#[inline(always)]
+fn prepare_intra_edges_core<const BPP: usize>(
+    x: usize,
+    have_left: bool,
+    y: usize,
+    have_top: bool,
+    w: usize,
+    h: usize,
+    edge_flags: u8,
+    dst: &[u8],
+    dst_off: usize,
+    stride: usize,
+    mode_in: u8,
+    angle_in: i32,
+    tw: usize,
+    th: usize,
+    filter_edge: bool,
+    edge: &mut [u8],
+    topleft_off: usize,
+    bd: BitDepth,
+) -> Prepared {
+    let bpp = BPP;
     let bitdepth_max = bd.max_sample() as u16;
     let mid = (bitdepth_max as i32 + 1) >> 1;
     let mut mode = mode_in;
@@ -179,38 +357,76 @@ pub(crate) fn prepare_intra_edges(
         _ => {}
     }
 
+    if mode == 5 {
+        return Prepared { mode, angle };
+    }
+
     let need = EDGE_NEEDS[mode as usize];
     let dst_top_off = dst_off.saturating_sub(stride);
-
-    if have_top && (need.top || need.topleft || (need.left && !have_left)) {
-        // `dst_top` = üst satır; prefilter (SB sınırı) filtresiz yolda
-        // doğrudan düzlem pikselidir (loop filter kapalı seçim kümesi).
-    }
 
     if need.left {
         let sz = th << 2;
         let left_off = topleft_off - sz * bpp;
         if have_left {
             let px_have = sz.min(h.saturating_sub(y) << 2);
-            if bpp == 1 {
-                let mut s = dst_off.saturating_sub(1);
-                for out in edge[left_off + (sz - px_have)..left_off + sz]
-                    .iter_mut()
-                    .rev()
-                {
-                    *out = dst[s];
-                    s += stride;
+            if BPP == 1 {
+                let s = dst_off.saturating_sub(1);
+                if px_have == 4 && sz == 4 {
+                    let s1 = s + stride;
+                    let s2 = s1 + stride;
+                    let s3 = s2 + stride;
+                    let bytes = [dst[s3], dst[s2], dst[s1], dst[s]];
+                    edge[left_off..left_off + 4].copy_from_slice(&bytes);
+                } else if px_have == 8 && sz == 8 {
+                    let s1 = s + stride;
+                    let s2 = s1 + stride;
+                    let s3 = s2 + stride;
+                    let s4 = s3 + stride;
+                    let s5 = s4 + stride;
+                    let s6 = s5 + stride;
+                    let s7 = s6 + stride;
+                    let bytes = [
+                        dst[s7], dst[s6], dst[s5], dst[s4], dst[s3], dst[s2], dst[s1], dst[s],
+                    ];
+                    edge[left_off..left_off + 8].copy_from_slice(&bytes);
+                } else {
+                    let mut si = s;
+                    for out in edge[left_off + (sz - px_have)..left_off + sz]
+                        .iter_mut()
+                        .rev()
+                    {
+                        *out = dst[si];
+                        si += stride;
+                    }
                 }
             } else {
-                let mut s = dst_off.saturating_sub(2);
-                for out in edge[left_off + (sz - px_have) * 2..left_off + sz * 2]
-                    .as_chunks_mut::<2>()
-                    .0
-                    .iter_mut()
-                    .rev()
-                {
-                    *out = [dst[s], dst[s + 1]];
-                    s += stride;
+                let s = dst_off.saturating_sub(2);
+                if px_have == 4 && sz == 4 {
+                    let s1 = s + stride;
+                    let s2 = s1 + stride;
+                    let s3 = s2 + stride;
+                    let bytes = [
+                        dst[s3],
+                        dst[s3 + 1],
+                        dst[s2],
+                        dst[s2 + 1],
+                        dst[s1],
+                        dst[s1 + 1],
+                        dst[s],
+                        dst[s + 1],
+                    ];
+                    edge[left_off..left_off + 8].copy_from_slice(&bytes);
+                } else {
+                    let mut si = s;
+                    for out in edge[left_off + (sz - px_have) * 2..left_off + sz * 2]
+                        .as_chunks_mut::<2>()
+                        .0
+                        .iter_mut()
+                        .rev()
+                    {
+                        *out = [dst[si], dst[si + 1]];
+                        si += stride;
+                    }
                 }
             }
             if px_have < sz {
@@ -231,7 +447,7 @@ pub(crate) fn prepare_intra_edges(
                 have_left && y + th < h && edge_flags & EDGE_I444_LEFT_HAS_BOTTOM != 0;
             if have_bottomleft {
                 let px_have = sz.min((h - y - th) << 2);
-                if bpp == 1 {
+                if BPP == 1 {
                     let mut s = (dst_off + sz * stride).saturating_sub(1);
                     for out in edge[left_off - px_have..left_off].iter_mut().rev() {
                         *out = dst[s];
@@ -266,8 +482,21 @@ pub(crate) fn prepare_intra_edges(
         if have_top {
             let px_have = sz.min(w.saturating_sub(x) << 2);
             let nbytes = px_have * bpp;
-            edge[top_off..top_off + nbytes]
-                .copy_from_slice(&dst[dst_top_off..dst_top_off + nbytes]);
+            if BPP == 1 && nbytes == 4 {
+                let b = [
+                    dst[dst_top_off],
+                    dst[dst_top_off + 1],
+                    dst[dst_top_off + 2],
+                    dst[dst_top_off + 3],
+                ];
+                edge[top_off..top_off + 4].copy_from_slice(&b);
+            } else if BPP == 1 && nbytes == 8 {
+                let b: [u8; 8] = dst[dst_top_off..dst_top_off + 8].try_into().unwrap();
+                edge[top_off..top_off + 8].copy_from_slice(&b);
+            } else {
+                edge[top_off..top_off + nbytes]
+                    .copy_from_slice(&dst[dst_top_off..dst_top_off + nbytes]);
+            }
             if px_have < sz {
                 let src = if px_have == 0 {
                     topleft_off

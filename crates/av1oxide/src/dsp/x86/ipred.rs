@@ -194,37 +194,43 @@ fn dc_gen_avx2(edge: Edge<'_>, width: usize, height: usize) -> u32 {
 #[target_feature(enable = "avx2")]
 #[inline]
 fn splat_dc_avx2(dst: &mut [u8], stride: usize, width: usize, height: usize, dc: i8) {
+    let dst = &mut dst[..(height - 1) * stride + width];
+    let mut off = 0usize;
     match width {
         4 => {
-            let v = _mm_set1_epi8(dc);
-            for y in 0..height {
-                mem::store_u8x4(mem::chunk_mut::<u8, 4>(dst, y * stride), v);
+            let pat = (u32::from(dc as u8) * 0x0101_0101).to_ne_bytes();
+            for _ in 0..height {
+                dst[off..off + 4].copy_from_slice(&pat);
+                off += stride;
             }
         }
         8 => {
-            let v = _mm_set1_epi8(dc);
-            for y in 0..height {
-                mem::store_u8x8(mem::chunk_mut::<u8, 8>(dst, y * stride), v);
+            let pat = (u64::from(dc as u8) * 0x0101_0101_0101_0101).to_ne_bytes();
+            for _ in 0..height {
+                dst[off..off + 8].copy_from_slice(&pat);
+                off += stride;
             }
         }
         16 => {
             let v = _mm_set1_epi8(dc);
-            for y in 0..height {
-                mem::store_u8x16(mem::chunk_mut::<u8, 16>(dst, y * stride), v);
+            for _ in 0..height {
+                mem::store_u8x16(mem::chunk_mut::<u8, 16>(dst, off), v);
+                off += stride;
             }
         }
         32 => {
             let v = _mm256_set1_epi8(dc);
-            for y in 0..height {
-                mem::store_u8x32(mem::chunk_mut::<u8, 32>(dst, y * stride), v);
+            for _ in 0..height {
+                mem::store_u8x32(mem::chunk_mut::<u8, 32>(dst, off), v);
+                off += stride;
             }
         }
         64 => {
             let v = _mm256_set1_epi8(dc);
-            for y in 0..height {
-                let row = y * stride;
-                mem::store_u8x32(mem::chunk_mut::<u8, 32>(dst, row), v);
-                mem::store_u8x32(mem::chunk_mut::<u8, 32>(dst, row + 32), v);
+            for _ in 0..height {
+                mem::store_u8x32(mem::chunk_mut::<u8, 32>(dst, off), v);
+                mem::store_u8x32(mem::chunk_mut::<u8, 32>(dst, off + 32), v);
+                off += stride;
             }
         }
         _ => unreachable!(),
@@ -236,6 +242,7 @@ fn splat_dc_avx2(dst: &mut [u8], stride: usize, width: usize, height: usize, dc:
 // ---------------------------------------------------------------------------
 
 #[target_feature(enable = "avx2")]
+#[inline]
 fn ipred_dc_avx2_giris(
     dst: &mut [u8],
     dst_stride: usize,
@@ -248,6 +255,7 @@ fn ipred_dc_avx2_giris(
 }
 
 #[target_feature(enable = "avx2")]
+#[inline]
 fn ipred_top_dc_avx2_giris(
     dst: &mut [u8],
     dst_stride: usize,
@@ -260,6 +268,7 @@ fn ipred_top_dc_avx2_giris(
 }
 
 #[target_feature(enable = "avx2")]
+#[inline]
 fn ipred_left_dc_avx2_giris(
     dst: &mut [u8],
     dst_stride: usize,
@@ -272,11 +281,13 @@ fn ipred_left_dc_avx2_giris(
 }
 
 #[target_feature(enable = "avx2")]
+#[inline]
 fn ipred_dc_128_avx2_giris(dst: &mut [u8], dst_stride: usize, width: usize, height: usize) {
     splat_dc_avx2(dst, dst_stride, width, height, -128i8);
 }
 
 #[target_feature(enable = "avx2")]
+#[inline]
 fn ipred_vert_avx2_giris(
     dst: &mut [u8],
     dst_stride: usize,
@@ -285,38 +296,44 @@ fn ipred_vert_avx2_giris(
     height: usize,
 ) {
     let top = &edge.bytes[edge.topleft + 1..edge.topleft + 1 + width];
+    let dst = &mut dst[..(height - 1) * dst_stride + width];
+    let mut off = 0usize;
     match width {
         4 => {
-            let v = _mm_cvtsi32_si128(u32::from_le_bytes(*mem::chunk::<u8, 4>(top, 0)) as i32);
-            for y in 0..height {
-                mem::store_u8x4(mem::chunk_mut::<u8, 4>(dst, y * dst_stride), v);
+            let pat = *mem::chunk::<u8, 4>(top, 0);
+            for _ in 0..height {
+                dst[off..off + 4].copy_from_slice(&pat);
+                off += dst_stride;
             }
         }
         8 => {
-            let v = _mm_cvtsi64_si128(u64::from_le_bytes(*mem::chunk::<u8, 8>(top, 0)) as i64);
-            for y in 0..height {
-                mem::store_u8x8(mem::chunk_mut::<u8, 8>(dst, y * dst_stride), v);
+            let pat = *mem::chunk::<u8, 8>(top, 0);
+            for _ in 0..height {
+                dst[off..off + 8].copy_from_slice(&pat);
+                off += dst_stride;
             }
         }
         16 => {
             let v = mem::load_u8x16(mem::chunk::<u8, 16>(top, 0));
-            for y in 0..height {
-                mem::store_u8x16(mem::chunk_mut::<u8, 16>(dst, y * dst_stride), v);
+            for _ in 0..height {
+                mem::store_u8x16(mem::chunk_mut::<u8, 16>(dst, off), v);
+                off += dst_stride;
             }
         }
         32 => {
             let v = mem::load_u8x32(mem::chunk::<u8, 32>(top, 0));
-            for y in 0..height {
-                mem::store_u8x32(mem::chunk_mut::<u8, 32>(dst, y * dst_stride), v);
+            for _ in 0..height {
+                mem::store_u8x32(mem::chunk_mut::<u8, 32>(dst, off), v);
+                off += dst_stride;
             }
         }
         64 => {
             let v0 = mem::load_u8x32(mem::chunk::<u8, 32>(top, 0));
             let v1 = mem::load_u8x32(mem::chunk::<u8, 32>(top, 32));
-            for y in 0..height {
-                let row = y * dst_stride;
-                mem::store_u8x32(mem::chunk_mut::<u8, 32>(dst, row), v0);
-                mem::store_u8x32(mem::chunk_mut::<u8, 32>(dst, row + 32), v1);
+            for _ in 0..height {
+                mem::store_u8x32(mem::chunk_mut::<u8, 32>(dst, off), v0);
+                mem::store_u8x32(mem::chunk_mut::<u8, 32>(dst, off + 32), v1);
+                off += dst_stride;
             }
         }
         _ => unreachable!(),
@@ -324,6 +341,7 @@ fn ipred_vert_avx2_giris(
 }
 
 #[target_feature(enable = "avx2")]
+#[inline]
 fn ipred_hor_avx2_giris(
     dst: &mut [u8],
     dst_stride: usize,
@@ -332,34 +350,47 @@ fn ipred_hor_avx2_giris(
     height: usize,
 ) {
     let left = &edge.bytes[edge.topleft - height..edge.topleft];
-    let shuf3 = _mm256_set1_epi8(3);
-    let shuf2 = _mm256_set1_epi8(2);
-    let shuf1 = _mm256_set1_epi8(1);
-    let shuf0 = _mm256_set1_epi8(0);
-    let mut y = 0;
-    while y < height {
-        let chunk4 = u32::from_le_bytes(*mem::chunk::<u8, 4>(left, height - 4 - y));
-        let base = _mm256_set1_epi64x(i64::from(chunk4));
-        let r0 = _mm256_shuffle_epi8(base, shuf3);
-        let r1 = _mm256_shuffle_epi8(base, shuf2);
-        let r2 = _mm256_shuffle_epi8(base, shuf1);
-        let r3 = _mm256_shuffle_epi8(base, shuf0);
-        for (dy, rv) in [(0, r0), (1, r1), (2, r2), (3, r3)] {
-            let row = (y + dy) * dst_stride;
-            let rv128 = _mm256_castsi256_si128(rv);
-            match width {
-                4 => mem::store_u8x4(mem::chunk_mut::<u8, 4>(dst, row), rv128),
-                8 => mem::store_u8x8(mem::chunk_mut::<u8, 8>(dst, row), rv128),
-                16 => mem::store_u8x16(mem::chunk_mut::<u8, 16>(dst, row), rv128),
-                32 => mem::store_u8x32(mem::chunk_mut::<u8, 32>(dst, row), rv),
-                64 => {
-                    mem::store_u8x32(mem::chunk_mut::<u8, 32>(dst, row), rv);
-                    mem::store_u8x32(mem::chunk_mut::<u8, 32>(dst, row + 32), rv);
-                }
-                _ => unreachable!(),
+    let dst = &mut dst[..(height - 1) * dst_stride + width];
+    let mut off = 0usize;
+    match width {
+        4 => {
+            for &b in left.iter().rev() {
+                let pat = (u32::from(b) * 0x0101_0101).to_ne_bytes();
+                dst[off..off + 4].copy_from_slice(&pat);
+                off += dst_stride;
             }
         }
-        y += 4;
+        8 => {
+            for &b in left.iter().rev() {
+                let pat = (u64::from(b) * 0x0101_0101_0101_0101).to_ne_bytes();
+                dst[off..off + 8].copy_from_slice(&pat);
+                off += dst_stride;
+            }
+        }
+        16 => {
+            for &b in left.iter().rev() {
+                mem::store_u8x16(mem::chunk_mut::<u8, 16>(dst, off), _mm_set1_epi8(b as i8));
+                off += dst_stride;
+            }
+        }
+        32 => {
+            for &b in left.iter().rev() {
+                mem::store_u8x32(
+                    mem::chunk_mut::<u8, 32>(dst, off),
+                    _mm256_set1_epi8(b as i8),
+                );
+                off += dst_stride;
+            }
+        }
+        64 => {
+            for &b in left.iter().rev() {
+                let v = _mm256_set1_epi8(b as i8);
+                mem::store_u8x32(mem::chunk_mut::<u8, 32>(dst, off), v);
+                mem::store_u8x32(mem::chunk_mut::<u8, 32>(dst, off + 32), v);
+                off += dst_stride;
+            }
+        }
+        _ => unreachable!(),
     }
 }
 
@@ -461,11 +492,7 @@ fn ipred_paeth_avx2_giris(
     let mut ldiff256 = [_mm256_setzero_si256(); 4];
     let chunks16 = width / 16;
     for c in 0..chunks16 {
-        let mut raw16 = [0i16; 16];
-        for i in 0..16 {
-            raw16[i] = i16::from(top_slice[c * 16 + i]);
-        }
-        let t16 = mem::load_i16x16(&raw16);
+        let t16 = _mm256_cvtepu8_epi16(mem::load_u8x16(mem::chunk::<u8, 16>(top_slice, c * 16)));
         top256[c] = t16;
         ldiff256[c] = _mm256_abs_epi16(_mm256_sub_epi16(t16, tl256));
     }

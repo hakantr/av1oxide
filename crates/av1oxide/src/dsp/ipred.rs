@@ -480,6 +480,7 @@ const fn gecerli_blok_boyutu(width: usize, height: usize, max_dim: usize) -> boo
 /// Paniksiz kenar okuma aralığı `(geri, ileri)` piksel; geçersiz açı veya
 /// `FILTER_PRED` parametresinde `None`.
 #[must_use]
+#[inline(always)]
 pub fn kenar_okuma_araligi(
     mode: IntraPredMode,
     width: usize,
@@ -580,6 +581,7 @@ const fn z3_filtre_etkin_mi(wh: usize, angle: usize, is_sm: bool) -> bool {
 
 /// P45: `intra_pred[mode]` SIMD girişinin O(1) sözleşmesi.
 #[must_use]
+#[inline(always)]
 #[allow(clippy::too_many_arguments)]
 pub fn angular_sozlesmesi<const BPC: u32>(
     mode: IntraPredMode,
@@ -628,6 +630,7 @@ pub fn angular_sozlesmesi<const BPC: u32>(
 /// P45: `cfl_ac[layout]` SIMD girişinin O(1) sözleşmesi (`layout`: 0 = 4:2:0,
 /// 1 = 4:2:2, 2 = 4:4:4).
 #[must_use]
+#[inline(always)]
 #[allow(clippy::too_many_arguments)]
 pub fn cfl_ac_sozlesmesi<const BPC: u32>(
     layout: usize,
@@ -676,6 +679,7 @@ pub fn cfl_ac_sozlesmesi<const BPC: u32>(
 
 /// P45: `cfl_pred[mode]` SIMD girişinin O(1) sözleşmesi.
 #[must_use]
+#[inline(always)]
 #[allow(clippy::too_many_arguments)]
 pub fn cfl_pred_sozlesmesi<const BPC: u32>(
     mode: CflPredMode,
@@ -715,6 +719,7 @@ pub fn cfl_pred_sozlesmesi<const BPC: u32>(
 
 /// P45: `pal_pred` SIMD girişinin O(1) sözleşmesi.
 #[must_use]
+#[inline(always)]
 pub fn pal_pred_sozlesmesi<const BPC: u32>(
     dst_len: usize,
     dst_stride: usize,

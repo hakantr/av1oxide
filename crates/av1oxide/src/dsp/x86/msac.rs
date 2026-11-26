@@ -13,7 +13,7 @@
 
 use crate::cpu::Sse2Token;
 use crate::dsp::x86::mem::{chunk, chunk_mut, load_u16x4, load_u16x8, store_u16x4, store_u16x8};
-use crate::entropy::msac::{MsacContext, ctx_norm_fast, ctx_refill_fast};
+use crate::entropy::msac::{MsacContext, ctx_norm_ctx, ctx_refill_fast};
 use core::arch::x86_64::{
     _mm_add_epi16, _mm_and_si128, _mm_avg_epu16, _mm_cmpeq_epi16, _mm_cvtsi32_si128,
     _mm_cvtsi128_si64, _mm_movemask_epi8, _mm_mulhi_epu16, _mm_packs_epi16, _mm_set1_epi16,
@@ -95,9 +95,7 @@ fn adapt4_sse2(s: &mut MsacContext<'_>, cdf: &mut [u16; 4], n_symbols: usize) ->
 
     let new_dif = s.dif.wrapping_sub(u64::from(v_val) << 48);
     let new_rng = u_val.wrapping_sub(v_val);
-    ctx_norm_fast(
-        s.buf, &mut s.pos, &mut s.dif, &mut s.rng, &mut s.cnt, new_dif, new_rng,
-    );
+    ctx_norm_ctx(s, new_dif, new_rng);
     val
 }
 
@@ -140,9 +138,7 @@ fn adapt8_sse2(s: &mut MsacContext<'_>, cdf: &mut [u16; 8], n_symbols: usize) ->
 
     let new_dif = s.dif.wrapping_sub(u64::from(v_val) << 48);
     let new_rng = u_val.wrapping_sub(v_val);
-    ctx_norm_fast(
-        s.buf, &mut s.pos, &mut s.dif, &mut s.rng, &mut s.cnt, new_dif, new_rng,
-    );
+    ctx_norm_ctx(s, new_dif, new_rng);
     val
 }
 
@@ -199,9 +195,7 @@ fn adapt16_sse2(s: &mut MsacContext<'_>, cdf: &mut [u16; 16], n_symbols: usize) 
 
     let new_dif = s.dif.wrapping_sub(u64::from(v_val) << 48);
     let new_rng = u_val.wrapping_sub(v_val);
-    ctx_norm_fast(
-        s.buf, &mut s.pos, &mut s.dif, &mut s.rng, &mut s.cnt, new_dif, new_rng,
-    );
+    ctx_norm_ctx(s, new_dif, new_rng);
     val
 }
 
@@ -248,9 +242,7 @@ fn hi_tok_sse2(s: &mut MsacContext<'_>, cdf: &mut [u16; 4]) -> usize {
 
         let new_dif = s.dif.wrapping_sub(u64::from(v_val) << 48);
         let new_rng = u_val.wrapping_sub(v_val);
-        ctx_norm_fast(
-            s.buf, &mut s.pos, &mut s.dif, &mut s.rng, &mut s.cnt, new_dif, new_rng,
-        );
+        ctx_norm_ctx(s, new_dif, new_rng);
 
         tok = 3 * (round + 1) + val;
         if val < 3 {
@@ -278,8 +270,10 @@ fn bool_adapt_sse2(s: &mut MsacContext<'_>, cdf: &mut [u16; 2]) -> u32 {
     let new_dif = if ge { dif.wrapping_sub(vw) } else { dif };
     let new_rng = if ge { r.wrapping_sub(v) } else { v };
     let bit = u32::from(!ge);
+    let update = s.allow_update_cdf;
+    ctx_norm_ctx(s, new_dif, new_rng);
 
-    if s.allow_update_cdf {
+    if update {
         let count = u32::from(cdf[1]);
         let rate = 4 + (count >> 4);
         let c0_i = c0 as i32;
@@ -291,9 +285,6 @@ fn bool_adapt_sse2(s: &mut MsacContext<'_>, cdf: &mut [u16; 2]) -> u32 {
         cdf[1] = (count + u32::from(count < 32)) as u16;
     }
 
-    ctx_norm_fast(
-        s.buf, &mut s.pos, &mut s.dif, &mut s.rng, &mut s.cnt, new_dif, new_rng,
-    );
     bit
 }
 
@@ -334,9 +325,7 @@ fn bool_sse2(s: &mut MsacContext<'_>, f: u32) -> u32 {
     let new_rng = if ge { r.wrapping_sub(v) } else { v };
     let bit = u32::from(!ge);
 
-    ctx_norm_fast(
-        s.buf, &mut s.pos, &mut s.dif, &mut s.rng, &mut s.cnt, new_dif, new_rng,
-    );
+    ctx_norm_ctx(s, new_dif, new_rng);
     bit
 }
 

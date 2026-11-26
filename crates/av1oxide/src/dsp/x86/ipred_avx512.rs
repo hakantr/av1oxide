@@ -173,35 +173,42 @@ fn dc_gen_avx512(edge: Edge<'_>, width: usize, height: usize) -> u32 {
 #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vbmi,avx512vnni")]
 #[inline]
 fn splat_dc_avx512(dst: &mut [u8], stride: usize, width: usize, height: usize, dc: i8) {
+    let dst = &mut dst[..(height - 1) * stride + width];
+    let mut off = 0usize;
     match width {
         4 => {
-            let v = _mm_set1_epi8(dc);
-            for y in 0..height {
-                mem::store_u8x4(mem::chunk_mut::<u8, 4>(dst, y * stride), v);
+            let pat = (u32::from(dc as u8) * 0x0101_0101).to_ne_bytes();
+            for _ in 0..height {
+                dst[off..off + 4].copy_from_slice(&pat);
+                off += stride;
             }
         }
         8 => {
-            let v = _mm_set1_epi8(dc);
-            for y in 0..height {
-                mem::store_u8x8(mem::chunk_mut::<u8, 8>(dst, y * stride), v);
+            let pat = (u64::from(dc as u8) * 0x0101_0101_0101_0101).to_ne_bytes();
+            for _ in 0..height {
+                dst[off..off + 8].copy_from_slice(&pat);
+                off += stride;
             }
         }
         16 => {
             let v = _mm_set1_epi8(dc);
-            for y in 0..height {
-                mem::store_u8x16(mem::chunk_mut::<u8, 16>(dst, y * stride), v);
+            for _ in 0..height {
+                mem::store_u8x16(mem::chunk_mut::<u8, 16>(dst, off), v);
+                off += stride;
             }
         }
         32 => {
             let v = _mm256_set1_epi8(dc);
-            for y in 0..height {
-                mem::store_u8x32(mem::chunk_mut::<u8, 32>(dst, y * stride), v);
+            for _ in 0..height {
+                mem::store_u8x32(mem::chunk_mut::<u8, 32>(dst, off), v);
+                off += stride;
             }
         }
         64 => {
             let v = _mm512_set1_epi8(dc);
-            for y in 0..height {
-                mem::store_u8x64(mem::chunk_mut::<u8, 64>(dst, y * stride), v);
+            for _ in 0..height {
+                mem::store_u8x64(mem::chunk_mut::<u8, 64>(dst, off), v);
+                off += stride;
             }
         }
         _ => unreachable!(),
@@ -213,6 +220,7 @@ fn splat_dc_avx512(dst: &mut [u8], stride: usize, width: usize, height: usize, d
 // ---------------------------------------------------------------------------
 
 #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vbmi,avx512vnni")]
+#[inline]
 fn ipred_dc_avx512_giris(
     dst: &mut [u8],
     dst_stride: usize,
@@ -225,6 +233,7 @@ fn ipred_dc_avx512_giris(
 }
 
 #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vbmi,avx512vnni")]
+#[inline]
 fn ipred_top_dc_avx512_giris(
     dst: &mut [u8],
     dst_stride: usize,
@@ -237,6 +246,7 @@ fn ipred_top_dc_avx512_giris(
 }
 
 #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vbmi,avx512vnni")]
+#[inline]
 fn ipred_left_dc_avx512_giris(
     dst: &mut [u8],
     dst_stride: usize,
@@ -249,11 +259,13 @@ fn ipred_left_dc_avx512_giris(
 }
 
 #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vbmi,avx512vnni")]
+#[inline]
 fn ipred_dc_128_avx512_giris(dst: &mut [u8], dst_stride: usize, width: usize, height: usize) {
     splat_dc_avx512(dst, dst_stride, width, height, -128i8);
 }
 
 #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vbmi,avx512vnni")]
+#[inline]
 fn ipred_vert_avx512_giris(
     dst: &mut [u8],
     dst_stride: usize,
@@ -262,35 +274,42 @@ fn ipred_vert_avx512_giris(
     height: usize,
 ) {
     let top = &edge.bytes[edge.topleft + 1..edge.topleft + 1 + width];
+    let dst = &mut dst[..(height - 1) * dst_stride + width];
+    let mut off = 0usize;
     match width {
         4 => {
-            let v = _mm_cvtsi32_si128(u32::from_le_bytes(*mem::chunk::<u8, 4>(top, 0)) as i32);
-            for y in 0..height {
-                mem::store_u8x4(mem::chunk_mut::<u8, 4>(dst, y * dst_stride), v);
+            let pat = *mem::chunk::<u8, 4>(top, 0);
+            for _ in 0..height {
+                dst[off..off + 4].copy_from_slice(&pat);
+                off += dst_stride;
             }
         }
         8 => {
-            let v = _mm_cvtsi64_si128(u64::from_le_bytes(*mem::chunk::<u8, 8>(top, 0)) as i64);
-            for y in 0..height {
-                mem::store_u8x8(mem::chunk_mut::<u8, 8>(dst, y * dst_stride), v);
+            let pat = *mem::chunk::<u8, 8>(top, 0);
+            for _ in 0..height {
+                dst[off..off + 8].copy_from_slice(&pat);
+                off += dst_stride;
             }
         }
         16 => {
             let v = mem::load_u8x16(mem::chunk::<u8, 16>(top, 0));
-            for y in 0..height {
-                mem::store_u8x16(mem::chunk_mut::<u8, 16>(dst, y * dst_stride), v);
+            for _ in 0..height {
+                mem::store_u8x16(mem::chunk_mut::<u8, 16>(dst, off), v);
+                off += dst_stride;
             }
         }
         32 => {
             let v = mem::load_u8x32(mem::chunk::<u8, 32>(top, 0));
-            for y in 0..height {
-                mem::store_u8x32(mem::chunk_mut::<u8, 32>(dst, y * dst_stride), v);
+            for _ in 0..height {
+                mem::store_u8x32(mem::chunk_mut::<u8, 32>(dst, off), v);
+                off += dst_stride;
             }
         }
         64 => {
             let v = mem::load_u8x64(mem::chunk::<u8, 64>(top, 0));
-            for y in 0..height {
-                mem::store_u8x64(mem::chunk_mut::<u8, 64>(dst, y * dst_stride), v);
+            for _ in 0..height {
+                mem::store_u8x64(mem::chunk_mut::<u8, 64>(dst, off), v);
+                off += dst_stride;
             }
         }
         _ => unreachable!(),
@@ -298,6 +317,7 @@ fn ipred_vert_avx512_giris(
 }
 
 #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vbmi,avx512vnni")]
+#[inline]
 fn ipred_hor_avx512_giris(
     dst: &mut [u8],
     dst_stride: usize,
@@ -306,17 +326,48 @@ fn ipred_hor_avx512_giris(
     height: usize,
 ) {
     let left = &edge.bytes[edge.topleft - height..edge.topleft];
-    for y in 0..height {
-        let b = left[height - 1 - y] as i8;
-        let row = y * dst_stride;
-        match width {
-            4 => mem::store_u8x4(mem::chunk_mut::<u8, 4>(dst, row), _mm_set1_epi8(b)),
-            8 => mem::store_u8x8(mem::chunk_mut::<u8, 8>(dst, row), _mm_set1_epi8(b)),
-            16 => mem::store_u8x16(mem::chunk_mut::<u8, 16>(dst, row), _mm_set1_epi8(b)),
-            32 => mem::store_u8x32(mem::chunk_mut::<u8, 32>(dst, row), _mm256_set1_epi8(b)),
-            64 => mem::store_u8x64(mem::chunk_mut::<u8, 64>(dst, row), _mm512_set1_epi8(b)),
-            _ => unreachable!(),
+    let dst = &mut dst[..(height - 1) * dst_stride + width];
+    let mut off = 0usize;
+    match width {
+        4 => {
+            for &b in left.iter().rev() {
+                let pat = (u32::from(b) * 0x0101_0101).to_ne_bytes();
+                dst[off..off + 4].copy_from_slice(&pat);
+                off += dst_stride;
+            }
         }
+        8 => {
+            for &b in left.iter().rev() {
+                let pat = (u64::from(b) * 0x0101_0101_0101_0101).to_ne_bytes();
+                dst[off..off + 8].copy_from_slice(&pat);
+                off += dst_stride;
+            }
+        }
+        16 => {
+            for &b in left.iter().rev() {
+                mem::store_u8x16(mem::chunk_mut::<u8, 16>(dst, off), _mm_set1_epi8(b as i8));
+                off += dst_stride;
+            }
+        }
+        32 => {
+            for &b in left.iter().rev() {
+                mem::store_u8x32(
+                    mem::chunk_mut::<u8, 32>(dst, off),
+                    _mm256_set1_epi8(b as i8),
+                );
+                off += dst_stride;
+            }
+        }
+        64 => {
+            for &b in left.iter().rev() {
+                mem::store_u8x64(
+                    mem::chunk_mut::<u8, 64>(dst, off),
+                    _mm512_set1_epi8(b as i8),
+                );
+                off += dst_stride;
+            }
+        }
+        _ => unreachable!(),
     }
 }
 
@@ -397,6 +448,7 @@ fn paeth_row32_avx512(
 }
 
 #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vbmi,avx512vnni")]
+#[inline]
 fn ipred_paeth_avx512_giris(
     dst: &mut [u8],
     dst_stride: usize,
@@ -411,21 +463,34 @@ fn ipred_paeth_avx512_giris(
     if width <= 8 {
         let zero = _mm_setzero_si128();
         let tl16 = _mm_set1_epi16(tl);
-        let mut top_buf = [0u8; 8];
-        top_buf[..width].copy_from_slice(top_slice);
-        let t16 = _mm_unpacklo_epi8(_mm_cvtsi64_si128(u64::from_le_bytes(top_buf) as i64), zero);
+        let raw = if width == 4 {
+            _mm_cvtsi32_si128(u32::from_le_bytes(*mem::chunk::<u8, 4>(top_slice, 0)) as i32)
+        } else {
+            _mm_cvtsi64_si128(u64::from_le_bytes(*mem::chunk::<u8, 8>(top_slice, 0)) as i64)
+        };
+        let t16 = _mm_unpacklo_epi8(raw, zero);
         let ldiff16 = _mm_abs_epi16(_mm_sub_epi16(t16, tl16));
-        for y in 0..height {
-            let l = i16::from(left_slice[height - 1 - y]);
-            let l16 = _mm_set1_epi16(l);
-            let tdiff16 = _mm_set1_epi16((l - tl).abs());
-            let p0 = paeth_row8_avx512(t16, ldiff16, l16, tl16, tdiff16);
-            let packed = _mm_packus_epi16(p0, p0);
-            let row = y * dst_stride;
-            if width == 4 {
-                mem::store_u8x4(mem::chunk_mut::<u8, 4>(dst, row), packed);
-            } else {
-                mem::store_u8x8(mem::chunk_mut::<u8, 8>(dst, row), packed);
+        let dst = &mut dst[..(height - 1) * dst_stride + width];
+        let mut off = 0usize;
+        if width == 4 {
+            for &lb in left_slice.iter().rev() {
+                let l = i16::from(lb);
+                let l16 = _mm_set1_epi16(l);
+                let tdiff16 = _mm_set1_epi16((l - tl).abs());
+                let p0 = paeth_row8_avx512(t16, ldiff16, l16, tl16, tdiff16);
+                let packed = _mm_packus_epi16(p0, p0);
+                mem::store_u8x4(mem::chunk_mut::<u8, 4>(dst, off), packed);
+                off += dst_stride;
+            }
+        } else {
+            for &lb in left_slice.iter().rev() {
+                let l = i16::from(lb);
+                let l16 = _mm_set1_epi16(l);
+                let tdiff16 = _mm_set1_epi16((l - tl).abs());
+                let p0 = paeth_row8_avx512(t16, ldiff16, l16, tl16, tdiff16);
+                let packed = _mm_packus_epi16(p0, p0);
+                mem::store_u8x8(mem::chunk_mut::<u8, 8>(dst, off), packed);
+                off += dst_stride;
             }
         }
         return;
@@ -433,22 +498,21 @@ fn ipred_paeth_avx512_giris(
 
     if width == 16 {
         let tl256 = _mm256_set1_epi16(tl);
-        let mut raw16 = [0i16; 16];
-        for i in 0..16 {
-            raw16[i] = i16::from(top_slice[i]);
-        }
-        let top256 = mem::load_i16x16(&raw16);
+        let top256 = _mm256_cvtepu8_epi16(mem::load_u8x16(mem::chunk::<u8, 16>(top_slice, 0)));
         let ldiff256 = _mm256_abs_epi16(_mm256_sub_epi16(top256, tl256));
-        for y in 0..height {
-            let l = i16::from(left_slice[height - 1 - y]);
+        let dst = &mut dst[..(height - 1) * dst_stride + 16];
+        let mut off = 0usize;
+        for &lb in left_slice.iter().rev() {
+            let l = i16::from(lb);
             let l256 = _mm256_set1_epi16(l);
             let tdiff256 = _mm256_set1_epi16((l - tl).abs());
             let p0 = paeth_row16_avx512(top256, ldiff256, l256, tl256, tdiff256);
             let packed = _mm256_permute4x64_epi64::<0xD8>(_mm256_packus_epi16(p0, p0));
             mem::store_u8x16(
-                mem::chunk_mut::<u8, 16>(dst, y * dst_stride),
+                mem::chunk_mut::<u8, 16>(dst, off),
                 _mm256_castsi256_si128(packed),
             );
+            off += dst_stride;
         }
         return;
     }
@@ -459,11 +523,7 @@ fn ipred_paeth_avx512_giris(
     let mut ldiff512 = [_mm512_setzero_si512(); 2];
     let chunks32 = width / 32;
     for c in 0..chunks32 {
-        let mut raw32 = [0i16; 32];
-        for i in 0..32 {
-            raw32[i] = i16::from(top_slice[c * 32 + i]);
-        }
-        let t16 = mem::load_i16x32(&raw32);
+        let t16 = _mm512_cvtepu8_epi16(mem::load_u8x32(mem::chunk::<u8, 32>(top_slice, c * 32)));
         top512[c] = t16;
         ldiff512[c] = _mm512_abs_epi16(_mm512_sub_epi16(t16, tl512));
     }
@@ -529,6 +589,7 @@ fn smooth_term32_avx512(
 }
 
 #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vbmi,avx512vnni")]
+#[inline]
 fn ipred_smooth_v_avx512_giris(
     dst: &mut [u8],
     dst_stride: usize,
@@ -544,22 +605,37 @@ fn ipred_smooth_v_avx512_giris(
         let zero = _mm_setzero_si128();
         let bottom16 = _mm_set1_epi16(bottom);
         let bias128 = _mm_set1_epi16(128);
-        let mut top_buf = [0u8; 8];
-        top_buf[..width].copy_from_slice(top_slice);
-        let top16 = _mm_unpacklo_epi8(_mm_cvtsi64_si128(u64::from_le_bytes(top_buf) as i64), zero);
-        for y in 0..height {
-            let wv = i16::from(weights_ver[y]);
-            let wv16 = _mm_set1_epi16(wv);
-            let inv_wv16 = _mm_set1_epi16(256 - wv);
-            let s0 = _mm_srli_epi16::<8>(smooth_term8_avx512(
-                top16, bottom16, wv16, inv_wv16, bias128,
-            ));
-            let packed = _mm_packus_epi16(s0, s0);
-            let row = y * dst_stride;
-            if width == 4 {
-                mem::store_u8x4(mem::chunk_mut::<u8, 4>(dst, row), packed);
-            } else {
-                mem::store_u8x8(mem::chunk_mut::<u8, 8>(dst, row), packed);
+        let raw = if width == 4 {
+            _mm_cvtsi32_si128(u32::from_le_bytes(*mem::chunk::<u8, 4>(top_slice, 0)) as i32)
+        } else {
+            _mm_cvtsi64_si128(u64::from_le_bytes(*mem::chunk::<u8, 8>(top_slice, 0)) as i64)
+        };
+        let top16 = _mm_unpacklo_epi8(raw, zero);
+        let dst = &mut dst[..(height - 1) * dst_stride + width];
+        let mut off = 0usize;
+        if width == 4 {
+            for &wvb in weights_ver {
+                let wv = i16::from(wvb);
+                let wv16 = _mm_set1_epi16(wv);
+                let inv_wv16 = _mm_set1_epi16(256 - wv);
+                let s0 = _mm_srli_epi16::<8>(smooth_term8_avx512(
+                    top16, bottom16, wv16, inv_wv16, bias128,
+                ));
+                let packed = _mm_packus_epi16(s0, s0);
+                mem::store_u8x4(mem::chunk_mut::<u8, 4>(dst, off), packed);
+                off += dst_stride;
+            }
+        } else {
+            for &wvb in weights_ver {
+                let wv = i16::from(wvb);
+                let wv16 = _mm_set1_epi16(wv);
+                let inv_wv16 = _mm_set1_epi16(256 - wv);
+                let s0 = _mm_srli_epi16::<8>(smooth_term8_avx512(
+                    top16, bottom16, wv16, inv_wv16, bias128,
+                ));
+                let packed = _mm_packus_epi16(s0, s0);
+                mem::store_u8x8(mem::chunk_mut::<u8, 8>(dst, off), packed);
+                off += dst_stride;
             }
         }
         return;
@@ -618,6 +694,7 @@ fn ipred_smooth_v_avx512_giris(
 }
 
 #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vbmi,avx512vnni")]
+#[inline]
 fn ipred_smooth_h_avx512_giris(
     dst: &mut [u8],
     dst_stride: usize,
@@ -634,20 +711,32 @@ fn ipred_smooth_h_avx512_giris(
         let right16 = _mm_set1_epi16(right);
         let bias128 = _mm_set1_epi16(128);
         let c256 = _mm_set1_epi16(256);
-        let mut wh_buf = [0u8; 8];
-        wh_buf[..width].copy_from_slice(weights_hor);
-        let wh16 = _mm_unpacklo_epi8(_mm_cvtsi64_si128(u64::from_le_bytes(wh_buf) as i64), zero);
+        let raw_w = if width == 4 {
+            _mm_cvtsi32_si128(u32::from_le_bytes(*mem::chunk::<u8, 4>(weights_hor, 0)) as i32)
+        } else {
+            _mm_cvtsi64_si128(u64::from_le_bytes(*mem::chunk::<u8, 8>(weights_hor, 0)) as i64)
+        };
+        let wh16 = _mm_unpacklo_epi8(raw_w, zero);
         let inv_wh16 = _mm_sub_epi16(c256, wh16);
-        for y in 0..height {
-            let l16 = _mm_set1_epi16(i16::from(left_slice[height - 1 - y]));
-            let s0 =
-                _mm_srli_epi16::<8>(smooth_term8_avx512(l16, right16, wh16, inv_wh16, bias128));
-            let packed = _mm_packus_epi16(s0, s0);
-            let row = y * dst_stride;
-            if width == 4 {
-                mem::store_u8x4(mem::chunk_mut::<u8, 4>(dst, row), packed);
-            } else {
-                mem::store_u8x8(mem::chunk_mut::<u8, 8>(dst, row), packed);
+        let dst = &mut dst[..(height - 1) * dst_stride + width];
+        let mut off = 0usize;
+        if width == 4 {
+            for &lb in left_slice.iter().rev() {
+                let l16 = _mm_set1_epi16(i16::from(lb));
+                let s0 =
+                    _mm_srli_epi16::<8>(smooth_term8_avx512(l16, right16, wh16, inv_wh16, bias128));
+                let packed = _mm_packus_epi16(s0, s0);
+                mem::store_u8x4(mem::chunk_mut::<u8, 4>(dst, off), packed);
+                off += dst_stride;
+            }
+        } else {
+            for &lb in left_slice.iter().rev() {
+                let l16 = _mm_set1_epi16(i16::from(lb));
+                let s0 =
+                    _mm_srli_epi16::<8>(smooth_term8_avx512(l16, right16, wh16, inv_wh16, bias128));
+                let packed = _mm_packus_epi16(s0, s0);
+                mem::store_u8x8(mem::chunk_mut::<u8, 8>(dst, off), packed);
+                off += dst_stride;
             }
         }
         return;
@@ -716,6 +805,7 @@ fn ipred_smooth_h_avx512_giris(
 }
 
 #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vbmi,avx512vnni")]
+#[inline]
 fn ipred_smooth_avx512_giris(
     dst: &mut [u8],
     dst_stride: usize,
@@ -736,27 +826,47 @@ fn ipred_smooth_avx512_giris(
         let bottom16 = _mm_set1_epi16(bottom);
         let bias255 = _mm_set1_epi16(255);
         let c256 = _mm_set1_epi16(256);
-        let mut top_buf = [0u8; 8];
-        top_buf[..width].copy_from_slice(top_slice);
-        let top16 = _mm_unpacklo_epi8(_mm_cvtsi64_si128(u64::from_le_bytes(top_buf) as i64), zero);
-        let mut wh_buf = [0u8; 8];
-        wh_buf[..width].copy_from_slice(weights_hor);
-        let wh16 = _mm_unpacklo_epi8(_mm_cvtsi64_si128(u64::from_le_bytes(wh_buf) as i64), zero);
+        let (raw_t, raw_w) = if width == 4 {
+            (
+                _mm_cvtsi32_si128(u32::from_le_bytes(*mem::chunk::<u8, 4>(top_slice, 0)) as i32),
+                _mm_cvtsi32_si128(u32::from_le_bytes(*mem::chunk::<u8, 4>(weights_hor, 0)) as i32),
+            )
+        } else {
+            (
+                _mm_cvtsi64_si128(u64::from_le_bytes(*mem::chunk::<u8, 8>(top_slice, 0)) as i64),
+                _mm_cvtsi64_si128(u64::from_le_bytes(*mem::chunk::<u8, 8>(weights_hor, 0)) as i64),
+            )
+        };
+        let top16 = _mm_unpacklo_epi8(raw_t, zero);
+        let wh16 = _mm_unpacklo_epi8(raw_w, zero);
         let inv_wh16 = _mm_sub_epi16(c256, wh16);
-        for y in 0..height {
-            let wv = i16::from(weights_ver[y]);
-            let wv16 = _mm_set1_epi16(wv);
-            let inv_wv16 = _mm_set1_epi16(256 - wv);
-            let l16 = _mm_set1_epi16(i16::from(left_slice[height - 1 - y]));
-            let v = smooth_term8_avx512(top16, bottom16, wv16, inv_wv16, bias255);
-            let h = smooth_term8_avx512(l16, right16, wh16, inv_wh16, zero);
-            let s0 = _mm_srli_epi16::<8>(_mm_avg_epu16(v, h));
-            let packed = _mm_packus_epi16(s0, s0);
-            let row = y * dst_stride;
-            if width == 4 {
-                mem::store_u8x4(mem::chunk_mut::<u8, 4>(dst, row), packed);
-            } else {
-                mem::store_u8x8(mem::chunk_mut::<u8, 8>(dst, row), packed);
+        let dst = &mut dst[..(height - 1) * dst_stride + width];
+        let mut off = 0usize;
+        if width == 4 {
+            for (&wvb, &lb) in weights_ver.iter().zip(left_slice.iter().rev()) {
+                let wv = i16::from(wvb);
+                let wv16 = _mm_set1_epi16(wv);
+                let inv_wv16 = _mm_set1_epi16(256 - wv);
+                let l16 = _mm_set1_epi16(i16::from(lb));
+                let v = smooth_term8_avx512(top16, bottom16, wv16, inv_wv16, bias255);
+                let h = smooth_term8_avx512(l16, right16, wh16, inv_wh16, zero);
+                let s0 = _mm_srli_epi16::<8>(_mm_avg_epu16(v, h));
+                let packed = _mm_packus_epi16(s0, s0);
+                mem::store_u8x4(mem::chunk_mut::<u8, 4>(dst, off), packed);
+                off += dst_stride;
+            }
+        } else {
+            for (&wvb, &lb) in weights_ver.iter().zip(left_slice.iter().rev()) {
+                let wv = i16::from(wvb);
+                let wv16 = _mm_set1_epi16(wv);
+                let inv_wv16 = _mm_set1_epi16(256 - wv);
+                let l16 = _mm_set1_epi16(i16::from(lb));
+                let v = smooth_term8_avx512(top16, bottom16, wv16, inv_wv16, bias255);
+                let h = smooth_term8_avx512(l16, right16, wh16, inv_wh16, zero);
+                let s0 = _mm_srli_epi16::<8>(_mm_avg_epu16(v, h));
+                let packed = _mm_packus_epi16(s0, s0);
+                mem::store_u8x8(mem::chunk_mut::<u8, 8>(dst, off), packed);
+                off += dst_stride;
             }
         }
         return;
@@ -837,6 +947,7 @@ fn ipred_smooth_avx512_giris(
 // ---------------------------------------------------------------------------
 
 #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vbmi,avx512vnni")]
+#[inline]
 fn ipred_filter_avx512_giris(
     dst: &mut [u8],
     stride: usize,
@@ -1066,6 +1177,7 @@ fn upsample_edge8(
 }
 
 #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vbmi,avx512vnni")]
+#[inline]
 fn ipred_z1_avx512_giris(
     dst: &mut [u8],
     stride: usize,
@@ -1228,6 +1340,7 @@ fn ipred_z1_avx512_giris(
 }
 
 #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vbmi,avx512vnni")]
+#[inline]
 fn ipred_z2_avx512_giris(
     dst: &mut [u8],
     stride: usize,
@@ -1549,6 +1662,7 @@ fn transpose_store_8x8_u8(
 }
 
 #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vbmi,avx512vnni")]
+#[inline]
 fn ipred_z3_avx512_giris(
     dst: &mut [u8],
     stride: usize,
@@ -1994,6 +2108,9 @@ macro_rules! avx512_angular_entry {
                 );
                 return;
             }
+            if fast_pred_small_8b($mode, dst, dst_stride, edge, width, height) {
+                return;
+            }
             let call_fn = $call;
             // SAFETY: (1) ISA: bu işlevin adresi yalnız `Avx512IclToken` ile verilir
             // (`intra_pred_fn`); belirteç AVX512ICL tespiti + maske izninin kanıtıdır.
@@ -2191,6 +2308,114 @@ fn call_filter(
     _mh: usize,
 ) {
     ipred_filter_avx512_giris(dst, s, e, w, h, a);
+}
+
+#[inline(always)]
+fn sum_bytes_small(src: &[u8]) -> u32 {
+    let mut s = 0u32;
+    for &b in src {
+        s += u32::from(b);
+    }
+    s
+}
+
+#[inline(always)]
+fn splat_small_gpr(dst: &mut [u8], stride: usize, width: usize, height: usize, dc: u8) {
+    let dst = &mut dst[..(height - 1) * stride + width];
+    let mut off = 0usize;
+    if width == 4 {
+        let pat = (u32::from(dc) * 0x0101_0101).to_ne_bytes();
+        for _ in 0..height {
+            dst[off..off + 4].copy_from_slice(&pat);
+            off += stride;
+        }
+    } else {
+        let pat = (u64::from(dc) * 0x0101_0101_0101_0101).to_ne_bytes();
+        for _ in 0..height {
+            dst[off..off + 8].copy_from_slice(&pat);
+            off += stride;
+        }
+    }
+}
+
+#[inline(always)]
+fn fast_pred_small_8b(
+    mode: IntraPredMode,
+    dst: &mut [u8],
+    dst_stride: usize,
+    edge: Edge<'_>,
+    width: usize,
+    height: usize,
+) -> bool {
+    match mode {
+        IntraPredMode::Dc if width <= 8 && height <= 8 => {
+            let top = &edge.bytes[edge.topleft + 1..edge.topleft + 1 + width];
+            let left = &edge.bytes[edge.topleft - height..edge.topleft];
+            let mut dc =
+                sum_bytes_small(top) + sum_bytes_small(left) + ((width + height) as u32 >> 1);
+            dc >>= (width + height).trailing_zeros();
+            if width != height {
+                dc = ((u64::from(dc) * 0x5556u64) >> 16) as u32;
+            }
+            splat_small_gpr(dst, dst_stride, width, height, dc as u8);
+            true
+        }
+        IntraPredMode::Vert if width <= 8 => {
+            let top = &edge.bytes[edge.topleft + 1..edge.topleft + 1 + width];
+            let dst = &mut dst[..(height - 1) * dst_stride + width];
+            let mut off = 0usize;
+            if width == 4 {
+                let pat: [u8; 4] = top[..4].try_into().unwrap();
+                for _ in 0..height {
+                    dst[off..off + 4].copy_from_slice(&pat);
+                    off += dst_stride;
+                }
+            } else {
+                let pat: [u8; 8] = top[..8].try_into().unwrap();
+                for _ in 0..height {
+                    dst[off..off + 8].copy_from_slice(&pat);
+                    off += dst_stride;
+                }
+            }
+            true
+        }
+        IntraPredMode::Hor if width <= 8 => {
+            let left = &edge.bytes[edge.topleft - height..edge.topleft];
+            let dst = &mut dst[..(height - 1) * dst_stride + width];
+            let mut off = 0usize;
+            if width == 4 {
+                for &b in left.iter().rev() {
+                    let pat = (u32::from(b) * 0x0101_0101).to_ne_bytes();
+                    dst[off..off + 4].copy_from_slice(&pat);
+                    off += dst_stride;
+                }
+            } else {
+                for &b in left.iter().rev() {
+                    let pat = (u64::from(b) * 0x0101_0101_0101_0101).to_ne_bytes();
+                    dst[off..off + 8].copy_from_slice(&pat);
+                    off += dst_stride;
+                }
+            }
+            true
+        }
+        IntraPredMode::LeftDc if width <= 8 && height <= 8 => {
+            let left = &edge.bytes[edge.topleft - height..edge.topleft];
+            let dc = (sum_bytes_small(left) + (height as u32 >> 1)) >> height.trailing_zeros();
+            splat_small_gpr(dst, dst_stride, width, height, dc as u8);
+            true
+        }
+        IntraPredMode::TopDc if width <= 8 => {
+            let top = &edge.bytes[edge.topleft + 1..edge.topleft + 1 + width];
+            let dc = (sum_bytes_small(top) + (width as u32 >> 1)) >> width.trailing_zeros();
+            splat_small_gpr(dst, dst_stride, width, height, dc as u8);
+            true
+        }
+        IntraPredMode::Dc128 if width <= 8 => {
+            splat_small_gpr(dst, dst_stride, width, height, 128u8);
+            true
+        }
+        _ => false,
+    }
 }
 
 avx512_angular_entry!(ipred_dc_avx512, IntraPredMode::Dc, call_dc);

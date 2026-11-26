@@ -45,7 +45,9 @@ use crate::decode::edge_tree::{
     EDGE_ALL_LEFT_HAS_BOTTOM, EDGE_ALL_TOP_HAS_RIGHT, EDGE_ALL_TR_AND_BL,
     EDGE_I444_LEFT_HAS_BOTTOM, EDGE_I444_TOP_HAS_RIGHT, EdgeTree, NodeId,
 };
-use crate::decode::ipred_prepare::{chroma_edge_masks, prepare_intra_edges};
+use crate::decode::ipred_prepare::{
+    EdgeCtx, chroma_edge_masks, prepare_intra_edges, prepare_intra_edges_ctx,
+};
 use crate::decode::probe;
 use crate::decode::refmvs::{Candidate, Mv, RefMvs, TileBounds, get_gmv_2d};
 use crate::decode::refmvs_tmvs::TemporalBlock;
@@ -3761,6 +3763,18 @@ impl<'a> Dec<'a> {
     }
 }
 
+struct TxLoopCtx<'a> {
+    env: CoefEnv<'a>,
+    tx_size: TxSize,
+    bs: u8,
+    y_mode_nofilt: u8,
+    uv_mode: u8,
+    plane: usize,
+    tx: u8,
+    txw: usize,
+    txh: usize,
+}
+
 impl<'a> Dec<'a> {
     /// `dsp_trace.c` `P` satırının bağlam alanları — dav1d `t->a`/`t->l`
     /// **güncel** blok konumundan (`t->bx`/`t->by`, recon sırasında parça
@@ -3831,6 +3845,50 @@ impl<'a> Dec<'a> {
         let bw = self.bw;
         let bh = self.bh;
         let bd = self.bd;
+        let seg_id = usize::from(b.seg_id);
+        let dq_seg = self.dq[seg_id];
+        let y_mode_nofilt = if b.y_mode == FILTER_PRED {
+            t::FILTER_MODE_TO_Y_MODE[b.y_angle.clamp(0, 4) as usize]
+        } else {
+            b.y_mode
+        };
+        let fast_tx = !b.skip && !trace_frame_ok && !probe_on;
+        let tx_size_y = if fast_tx {
+            Some(
+                TxSize::from_index(usize::from(b.tx))
+                    .ok_or(Error::InvalidData("geçersiz tx boyutu"))?,
+            )
+        } else {
+            None
+        };
+        let tx_size_uv = if fast_tx && has_chroma {
+            Some(
+                TxSize::from_index(usize::from(b.uvtx))
+                    .ok_or(Error::InvalidData("geçersiz tx boyutu"))?,
+            )
+        } else {
+            None
+        };
+        let env_base = CoefEnv {
+            lossless: self.hdr.segmentation.lossless[seg_id],
+            reduced_txtp: self.hdr.reduced_txtp_set,
+            seg_qidx: self.hdr.segmentation.qidx[seg_id],
+            bit_depth: bd,
+            ss_ver: ss_ver != 0,
+            ss_hor: ss_hor != 0,
+            dq: &dq_seg,
+            qm: if self.hdr.quant.qm {
+                Some(crate::decode::coef::QmSel {
+                    level: self.hdr.quant.qm_y,
+                    class: 0,
+                    tx: b.tx,
+                })
+            } else {
+                None
+            },
+            inter: !b.intra,
+            txtp_hint: 0,
+        };
 
         // --- luma ----------------------------------------------------------
         // --- luma + kroma: dav1d parça (chunk) düzeni -----------------------
@@ -3839,7 +3897,33 @@ impl<'a> Dec<'a> {
         // katsayıları çözülür. Önceki sürüm bütün luma'yı, sonra bütün
         // kroma'yı çözüyordu: bu, 64x64'ten büyük bloklarda MSAC sembol
         // sırasını (ve CDF uyarlamasını) dav1d'den kaydırıyordu.
+        let y_stride = self.pic.stride[0];
         let uv_stride = self.pic.stride[1];
+        let edge_ctx_y = EdgeCtx {
+            col_start,
+            row_start,
+            col_end,
+            row_end,
+            stride: y_stride,
+            mode_in: b.y_mode,
+            angle_in: b.y_angle,
+            tw: txw,
+            th: txh,
+            filter_edge: self.seq.intra_edge_filter,
+            topleft_off: 128 * bpp,
+            bd,
+        };
+        let tx_ctx_y = TxLoopCtx {
+            env: env_base,
+            tx_size: tx_size_y.unwrap_or(TxSize::Tx4x4),
+            bs,
+            y_mode_nofilt,
+            uv_mode: b.uv_mode,
+            plane: 0,
+            tx: b.tx,
+            txw,
+            txh,
+        };
         let sm_uv = sm_uv_flag(&self.blocks.above[self.above_base + ai], cbx4)
             | sm_uv_flag(&self.blocks.left, cby4);
         let mut init_y = 0usize;
@@ -3901,15 +3985,13 @@ impl<'a> Dec<'a> {
                 if b.pal_sz[0] == 0 || !b.skip || probe_on {
                     let mut y = init_y;
                     self.by = by0 + init_y;
+                    let step_x_y = txw * 4 * bpp;
                     while y < sub_h4 {
                         let mut x = init_x;
                         self.bx = bx0 + init_x;
+                        let mut dst_off = self.pic.off(0, 4 * self.bx, 4 * self.by);
                         while x < sub_w4 {
-                            let dst_x = 4 * self.bx;
-                            let dst_y = 4 * self.by;
-                            let dst_off = self.pic.off(0, dst_x, dst_y);
                             if b.pal_sz[0] == 0 {
-                                let mut angle = b.y_angle;
                                 let tr = if (y > init_y || sb_has_tr == 0) && x + txw >= sub_w4 {
                                     0
                                 } else {
@@ -3921,35 +4003,23 @@ impl<'a> Dec<'a> {
                                     EDGE_I444_LEFT_HAS_BOTTOM
                                 };
                                 let edge_flags2 = tr | bl;
-                                let prepared = prepare_intra_edges(
-                                    self.bx,
-                                    self.bx > col_start,
-                                    self.by,
-                                    self.by > row_start,
-                                    col_end,
-                                    row_end,
-                                    edge_flags2,
+                                let prepared = prepare_intra_edges_ctx(
+                                    &edge_ctx_y,
                                     &self.pic.data[0],
+                                    self.bx,
+                                    self.by,
+                                    edge_flags2,
                                     dst_off,
-                                    self.pic.stride[0],
-                                    b.y_mode,
-                                    angle,
-                                    txw,
-                                    txh,
-                                    self.seq.intra_edge_filter,
                                     &mut self.scratch.edge,
-                                    128 * bpp,
-                                    bd,
                                 );
-                                angle = prepared.angle;
-                                let stride = self.pic.stride[0];
+                                let angle = prepared.angle;
                                 let dst = &mut self.pic.data[0];
                                 let edge_bytes = &self.scratch.edge;
                                 crate::dsp::profil_olc!(
                                     IntraPred,
                                     ipred.intra_pred[usize::from(prepared.mode)](
                                         &mut dst[dst_off..],
-                                        stride,
+                                        y_stride,
                                         Edge::new(edge_bytes, 128 * bpp),
                                         txw * 4,
                                         txh * 4,
@@ -3964,7 +4034,7 @@ impl<'a> Dec<'a> {
                                     let hash = pred_hash(
                                         &self.pic.data[0],
                                         dst_off,
-                                        self.pic.stride[0],
+                                        y_stride,
                                         txw * 4,
                                         txh * 4,
                                         bpp,
@@ -4000,8 +4070,8 @@ impl<'a> Dec<'a> {
                                     self.probe_pred(
                                         0,
                                         0,
-                                        dst_x,
-                                        dst_y,
+                                        4 * self.bx,
+                                        4 * self.by,
                                         txw * 4,
                                         txh * 4,
                                         i32::from(prepared.mode),
@@ -4013,13 +4083,28 @@ impl<'a> Dec<'a> {
                                     );
                                 }
                             }
-                            if !b.skip || probe_on {
+                            if fast_tx {
+                                self.decode_tx_coefs_fast(
+                                    msac, cdf, &tx_ctx_y, dst_off, self.bx, self.by,
+                                )?;
+                            } else if !b.skip || probe_on {
                                 self.decode_tx_coefs(
-                                    msac, cdf, bs, b, 0, b.tx, dst_off, self.bx, self.by,
+                                    msac,
+                                    cdf,
+                                    bs,
+                                    b,
+                                    0,
+                                    b.tx,
+                                    dst_off,
+                                    self.bx,
+                                    self.by,
+                                    trace_frame_ok,
+                                    probe_on,
                                 )?;
                             }
                             x += txw;
                             self.bx += txw;
+                            dst_off += step_x_y;
                         }
                         self.bx = bx0 + init_x;
                         y += txh;
@@ -4192,24 +4277,72 @@ impl<'a> Dec<'a> {
                         u8::from(has_bl) | (intra_edge_flags & chroma_bl_mask)
                     };
                     let sub_cw4 = cw4.min((init_x + 16) >> ss_hor);
+                    let uv_mode_eff = if b.uv_mode == CFL_PRED {
+                        DC_PRED
+                    } else {
+                        b.uv_mode
+                    };
+                    let edge_ctx_uv = EdgeCtx {
+                        col_start: col_start >> ss_hor,
+                        row_start: row_start >> ss_ver,
+                        col_end: col_end >> ss_hor,
+                        row_end: row_end >> ss_ver,
+                        stride: uv_stride,
+                        mode_in: uv_mode_eff,
+                        angle_in: b.uv_angle,
+                        tw: uv_txw,
+                        th: uv_txh,
+                        filter_edge: self.seq.intra_edge_filter,
+                        topleft_off: 128 * bpp,
+                        bd,
+                    };
+                    let step_x_uv = uv_txw * 4 * bpp;
                     for pl in 0..2 {
                         let has_pred =
                             !(b.uv_mode == CFL_PRED && b.cfl_alpha[pl] != 0) && b.pal_sz[1] == 0;
                         if !has_pred && b.skip && !probe_on {
                             continue;
                         }
+                        let env_uv = CoefEnv {
+                            qm: if self.hdr.quant.qm {
+                                Some(crate::decode::coef::QmSel {
+                                    level: if pl == 0 {
+                                        self.hdr.quant.qm_u
+                                    } else {
+                                        self.hdr.quant.qm_v
+                                    },
+                                    class: 1,
+                                    tx: b.uvtx,
+                                })
+                            } else {
+                                None
+                            },
+                            ..env_base
+                        };
+                        let tx_ctx_uv = TxLoopCtx {
+                            env: env_uv,
+                            tx_size: tx_size_uv.unwrap_or(TxSize::Tx4x4),
+                            bs,
+                            y_mode_nofilt,
+                            uv_mode: b.uv_mode,
+                            plane: 1 + pl,
+                            tx: b.uvtx,
+                            txw: uv_txw,
+                            txh: uv_txh,
+                        };
                         let mut y = init_y >> ss_ver;
                         self.by = by0 + init_y;
                         self.bx = bx0;
                         while y < sub_ch4 {
                             let mut x = init_x >> ss_hor;
                             self.bx = bx0 + init_x;
+                            let mut dst_off = self.pic.off(
+                                1 + pl,
+                                4 * (self.bx >> ss_hor),
+                                4 * (self.by >> ss_ver),
+                            );
                             while x < sub_cw4 {
-                                let dst_x = 4 * (self.bx >> ss_hor);
-                                let dst_y = 4 * (self.by >> ss_ver);
-                                let dst_off = self.pic.off(1 + pl, dst_x, dst_y);
                                 if has_pred {
-                                    let mut angle = b.uv_angle;
                                     let edge_flags2 = (if (y > (init_y >> ss_ver)
                                         || uv_sb_has_tr == 0)
                                         && (x + uv_txw >= sub_cw4)
@@ -4224,34 +4357,18 @@ impl<'a> Dec<'a> {
                                     } else {
                                         EDGE_I444_LEFT_HAS_BOTTOM
                                     });
-                                    let uv_mode = if b.uv_mode == CFL_PRED {
-                                        DC_PRED
-                                    } else {
-                                        b.uv_mode
-                                    };
                                     let px = self.bx >> ss_hor;
                                     let py = self.by >> ss_ver;
-                                    let prepared = prepare_intra_edges(
-                                        px,
-                                        px > (col_start >> ss_hor),
-                                        py,
-                                        py > (row_start >> ss_ver),
-                                        col_end >> ss_hor,
-                                        row_end >> ss_ver,
-                                        edge_flags2,
+                                    let prepared = prepare_intra_edges_ctx(
+                                        &edge_ctx_uv,
                                         &self.pic.data[1 + pl],
+                                        px,
+                                        py,
+                                        edge_flags2,
                                         dst_off,
-                                        uv_stride,
-                                        uv_mode,
-                                        angle,
-                                        uv_txw,
-                                        uv_txh,
-                                        self.seq.intra_edge_filter,
                                         &mut self.scratch.edge,
-                                        128 * bpp,
-                                        bd,
                                     );
-                                    angle = prepared.angle;
+                                    let angle = prepared.angle;
                                     let edge_bytes = &self.scratch.edge;
                                     let dst = &mut self.pic.data[1 + pl];
                                     crate::dsp::profil_olc!(
@@ -4309,8 +4426,8 @@ impl<'a> Dec<'a> {
                                         self.probe_pred(
                                             0,
                                             1 + pl,
-                                            dst_x,
-                                            dst_y,
+                                            4 * px,
+                                            4 * py,
                                             uv_txw * 4,
                                             uv_txh * 4,
                                             i32::from(prepared.mode),
@@ -4324,7 +4441,11 @@ impl<'a> Dec<'a> {
                                         );
                                     }
                                 }
-                                if !b.skip || probe_on {
+                                if fast_tx {
+                                    self.decode_tx_coefs_fast(
+                                        msac, cdf, &tx_ctx_uv, dst_off, self.bx, self.by,
+                                    )?;
+                                } else if !b.skip || probe_on {
                                     self.decode_tx_coefs(
                                         msac,
                                         cdf,
@@ -4335,10 +4456,13 @@ impl<'a> Dec<'a> {
                                         dst_off,
                                         self.bx,
                                         self.by,
+                                        trace_frame_ok,
+                                        probe_on,
                                     )?;
                                 }
                                 x += uv_txw;
                                 self.bx += uv_txw << ss_hor;
+                                dst_off += step_x_uv;
                             }
                             self.bx = bx0 + init_x;
                             y += uv_txh;
@@ -4564,8 +4688,125 @@ impl<'a> Dec<'a> {
         out
     }
 
+    /// Hızlı intra katsayı çözüm yolu (`!b.skip && !trace && !probe`).
+    #[allow(clippy::too_many_arguments)]
+    fn decode_tx_coefs_fast(
+        &mut self,
+        msac: &mut MsacContext<'_>,
+        cdf: &mut CdfContext,
+        ctx: &TxLoopCtx<'_>,
+        dst_off: usize,
+        bx: usize,
+        by: usize,
+    ) -> Result<()> {
+        let bx4 = bx & 31;
+        let by4 = by & 31;
+        let ai = bx >> 5;
+        let plane = ctx.plane;
+        let chroma = plane != 0;
+        let (ctw, cth, cbx4, cby4) = if chroma {
+            (
+                ctx.txw.min((self.bw - bx + self.ss_hor) >> self.ss_hor),
+                ctx.txh.min((self.bh - by + self.ss_ver) >> self.ss_ver),
+                chroma_ctx4(bx4, self.ss_hor),
+                chroma_ctx4(by4, self.ss_ver),
+            )
+        } else {
+            (
+                ctx.txw.min(self.bw - bx),
+                ctx.txh.min(self.bh - by),
+                bx4,
+                by4,
+            )
+        };
+        let (a, l): (&[u8], &[u8]) = if chroma {
+            let pl = plane - 1;
+            (
+                &self.blocks.above[self.above_base + ai].ccoef[pl][cbx4..],
+                &self.blocks.left.ccoef[pl][cby4..],
+            )
+        } else {
+            (
+                &self.blocks.above[self.above_base + ai].lcoef[bx4..],
+                &self.blocks.left.lcoef[by4..],
+            )
+        };
+        #[cfg(feature = "msac-trace")]
+        crate::trace::mark("tx", plane as i32, bx as i32, by as i32, i32::from(ctx.tx));
+        let result = crate::dsp::profil_olc!(
+            KatsayiCozme,
+            decode_coefs(
+                msac,
+                cdf,
+                &ctx.env,
+                ctx.tx,
+                ctx.bs,
+                ctx.y_mode_nofilt,
+                ctx.uv_mode,
+                plane,
+                a,
+                l,
+                &mut self.scratch.cf,
+                &mut self.scratch.levels,
+            )
+        );
+        let res_ctx = result.res_ctx;
+        let eob = result.eob;
+        if chroma {
+            let pl = plane - 1;
+            let a_c = &mut self.blocks.above[self.above_base + ai].ccoef[pl];
+            let l_c = &mut self.blocks.left.ccoef[pl];
+            if ctw == 1 {
+                a_c[cbx4] = res_ctx;
+            } else {
+                a_c[cbx4..cbx4 + ctw].fill(res_ctx);
+            }
+            if cth == 1 {
+                l_c[cby4] = res_ctx;
+            } else {
+                l_c[cby4..cby4 + cth].fill(res_ctx);
+            }
+        } else {
+            let a_l = &mut self.blocks.above[self.above_base + ai].lcoef;
+            let l_l = &mut self.blocks.left.lcoef;
+            if ctw == 1 {
+                a_l[bx4] = res_ctx;
+            } else {
+                a_l[bx4..bx4 + ctw].fill(res_ctx);
+            }
+            if cth == 1 {
+                l_l[by4] = res_ctx;
+            } else {
+                l_l[by4..by4 + cth].fill(res_ctx);
+            }
+        }
+        if eob >= 0 {
+            let Some(tx_type) = TxType::from_index(usize::from(result.txtp)) else {
+                return Err(Error::InvalidData("geçersiz tx türü"));
+            };
+            let itx = self.bdsp.itx().itxfm_add[ctx.tx_size.index()][tx_type.index()];
+            let stride = self.pic.stride[plane];
+            let dst = &mut self.pic.data[plane];
+            crate::dsp::profil_olc!(
+                ItxfmAdd,
+                itx(
+                    &mut dst[dst_off..],
+                    stride,
+                    &mut self.scratch.cf,
+                    eob as usize,
+                    ctx.tx_size,
+                    tx_type,
+                    self.bd,
+                )
+            );
+        }
+        Ok(())
+    }
+
     /// Tek bir tx bloğunun katsayılarını çözer, dequant eder ve itx uygular.
     #[allow(clippy::too_many_arguments)]
+    #[cold]
+    #[inline(never)]
     fn decode_tx_coefs(
         &mut self,
         msac: &mut MsacContext<'_>,
@@ -4577,6 +4818,8 @@ impl<'a> Dec<'a> {
         dst_off: usize,
         bx: usize,
         by: usize,
+        trace_on: bool,
+        probe_on: bool,
     ) -> Result<()> {
         let bx4 = bx & 31;
         let by4 = by & 31;
@@ -4600,13 +4843,33 @@ impl<'a> Dec<'a> {
         if b.skip {
             if chroma {
                 let pl = plane - 1;
-                self.blocks.above[self.above_base + ai].ccoef[pl][cbx4..cbx4 + ctw].fill(0x40);
-                self.blocks.left.ccoef[pl][cby4..cby4 + cth].fill(0x40);
+                let a_c = &mut self.blocks.above[self.above_base + ai].ccoef[pl];
+                let l_c = &mut self.blocks.left.ccoef[pl];
+                if ctw == 1 {
+                    a_c[cbx4] = 0x40;
+                } else {
+                    a_c[cbx4..cbx4 + ctw].fill(0x40);
+                }
+                if cth == 1 {
+                    l_c[cby4] = 0x40;
+                } else {
+                    l_c[cby4..cby4 + cth].fill(0x40);
+                }
             } else {
-                self.blocks.above[self.above_base + ai].lcoef[bx4..bx4 + ctw].fill(0x40);
-                self.blocks.left.lcoef[by4..by4 + cth].fill(0x40);
+                let a_l = &mut self.blocks.above[self.above_base + ai].lcoef;
+                let l_l = &mut self.blocks.left.lcoef;
+                if ctw == 1 {
+                    a_l[bx4] = 0x40;
+                } else {
+                    a_l[bx4..bx4 + ctw].fill(0x40);
+                }
+                if cth == 1 {
+                    l_l[by4] = 0x40;
+                } else {
+                    l_l[by4..by4 + cth].fill(0x40);
+                }
             }
-            if probe::enabled() {
+            if probe_on {
                 let (px, py) = if chroma {
                     ((bx >> self.ss_hor) * 4, (by >> self.ss_ver) * 4)
                 } else {
@@ -4692,7 +4955,7 @@ impl<'a> Dec<'a> {
             decode_coefs(
                 msac,
                 cdf,
-                env,
+                &env,
                 tx,
                 bs,
                 y_mode_nofilt,
@@ -4709,11 +4972,31 @@ impl<'a> Dec<'a> {
         let txtp = result.txtp;
         if chroma {
             let pl = plane - 1;
-            self.blocks.above[self.above_base + ai].ccoef[pl][cbx4..cbx4 + ctw].fill(res_ctx);
-            self.blocks.left.ccoef[pl][cby4..cby4 + cth].fill(res_ctx);
+            let a_c = &mut self.blocks.above[self.above_base + ai].ccoef[pl];
+            let l_c = &mut self.blocks.left.ccoef[pl];
+            if ctw == 1 {
+                a_c[cbx4] = res_ctx;
+            } else {
+                a_c[cbx4..cbx4 + ctw].fill(res_ctx);
+            }
+            if cth == 1 {
+                l_c[cby4] = res_ctx;
+            } else {
+                l_c[cby4..cby4 + cth].fill(res_ctx);
+            }
         } else {
-            self.blocks.above[self.above_base + ai].lcoef[bx4..bx4 + ctw].fill(res_ctx);
-            self.blocks.left.lcoef[by4..by4 + cth].fill(res_ctx);
+            let a_l = &mut self.blocks.above[self.above_base + ai].lcoef;
+            let l_l = &mut self.blocks.left.lcoef;
+            if ctw == 1 {
+                a_l[bx4] = res_ctx;
+            } else {
+                a_l[bx4..bx4 + ctw].fill(res_ctx);
+            }
+            if cth == 1 {
+                l_l[by4] = res_ctx;
+            } else {
+                l_l[by4..by4 + cth].fill(res_ctx);
+            }
         }
         if eob >= 0 {
             let Some(tx_size) = TxSize::from_index(usize::from(tx)) else {
@@ -4723,7 +5006,7 @@ impl<'a> Dec<'a> {
                 return Err(Error::InvalidData("geçersiz tx türü"));
             };
             let itx = self.bdsp.itx().itxfm_add[tx_size.index()][tx_type.index()];
-            if !dsp_trace().on && !probe::enabled() {
+            if !trace_on && !probe_on {
                 let stride = self.pic.stride[plane];
                 let dst = &mut self.pic.data[plane];
                 crate::dsp::profil_olc!(
@@ -4821,7 +5104,7 @@ impl<'a> Dec<'a> {
                     &after,
                 );
             }
-        } else if probe::enabled() {
+        } else if probe_on {
             // Atlanan blok: itx yok, hedef = nihai piksel (eob = -1).
             let (px, py) = if chroma {
                 ((bx >> self.ss_hor) * 4, (by >> self.ss_ver) * 4)
@@ -5940,7 +6223,7 @@ impl<'a> Dec<'a> {
             decode_coefs(
                 msac,
                 cdf,
-                env,
+                &env,
                 tx,
                 bs,
                 b.y_mode,

@@ -145,6 +145,8 @@ impl QmSel {
 /// (`attempt to add with overflow`). Bu yüzden toplama `wrapping_add`'tir;
 /// sonuç `wrapping_sub(1)` C'nin `return val - 1` (işaretsiz) karşılığıdır.
 /// Uç değer testleri: `tests::golomb_uc_degerler`.
+#[cold]
+#[inline(never)]
 fn read_golomb(msac: &mut MsacContext<'_>) -> u32 {
     let mut len = 0u32;
     let mut val = 1u32;
@@ -399,32 +401,56 @@ fn decode_ac_2d<const SLH: usize>(
         #[cfg(target_arch = "x86_64")]
         {
             use crate::entropy::msac::MsacIsa;
-            rc = match msac.isa() {
-                MsacIsa::Sse2(t) | MsacIsa::Avx2(t, _) => run_ac_2d_loop::<SLH>(
-                    msac,
-                    lo_cdf,
-                    hi_cdf,
-                    levels,
-                    cf,
-                    scan_rev,
-                    lo_ctx_offsets,
-                    rc,
-                    |m, c| crate::dsp::x86::msac::decode_symbol_adapt4_sse2(t, m, c, 3),
-                    |m, c| crate::dsp::x86::msac::decode_hi_tok_sse2(t, m, c),
-                ),
-                MsacIsa::Scalar => run_ac_2d_loop::<SLH>(
-                    msac,
-                    lo_cdf,
-                    hi_cdf,
-                    levels,
-                    cf,
-                    scan_rev,
-                    lo_ctx_offsets,
-                    rc,
-                    |m, c| m.decode_symbol_adapt_scalar(c, 3),
-                    |m, c| m.decode_hi_tok_scalar(c),
-                ),
-            };
+            #[allow(clippy::too_many_arguments)]
+            #[cold]
+            #[inline(never)]
+            fn run_ac_2d_fallback<const SLH: usize>(
+                msac: &mut MsacContext<'_>,
+                lo_cdf: &mut [[u16; 4]; 41],
+                hi_cdf: &mut [[u16; 4]; 21],
+                levels: &mut [u8; 32 * 34 + 64],
+                cf: &mut [i32; 1024],
+                scan_rev: &[u16],
+                lo_ctx_offsets: &[[u8; 5]; 5],
+                rc: usize,
+            ) -> usize {
+                match msac.isa() {
+                    MsacIsa::Sse2(t) | MsacIsa::Avx2(t, _) => run_ac_2d_loop::<SLH>(
+                        msac,
+                        lo_cdf,
+                        hi_cdf,
+                        levels,
+                        cf,
+                        scan_rev,
+                        lo_ctx_offsets,
+                        rc,
+                        |m, c| crate::dsp::x86::msac::decode_symbol_adapt4_sse2(t, m, c, 3),
+                        |m, c| crate::dsp::x86::msac::decode_hi_tok_sse2(t, m, c),
+                    ),
+                    MsacIsa::Scalar => run_ac_2d_loop::<SLH>(
+                        msac,
+                        lo_cdf,
+                        hi_cdf,
+                        levels,
+                        cf,
+                        scan_rev,
+                        lo_ctx_offsets,
+                        rc,
+                        |m, c| m.decode_symbol_adapt_scalar(c, 3),
+                        |m, c| m.decode_hi_tok_scalar(c),
+                    ),
+                }
+            }
+            rc = run_ac_2d_fallback::<SLH>(
+                msac,
+                lo_cdf,
+                hi_cdf,
+                levels,
+                cf,
+                scan_rev,
+                lo_ctx_offsets,
+                rc,
+            );
         }
         #[cfg(target_arch = "aarch64")]
         {
@@ -581,7 +607,7 @@ fn uv_inter_txtp(uv_dim: &[u8; 8], ytxtp: u8) -> u8 {
 pub(crate) fn decode_coefs(
     msac: &mut MsacContext<'_>,
     cdf: &mut CdfContext,
-    env: CoefEnv<'_>,
+    env: &CoefEnv<'_>,
     tx: u8,
     bs: u8,
     y_mode_nofilt: u8,
@@ -702,7 +728,6 @@ pub(crate) fn decode_coefs(
     let hi_cdf_off = layout::COEF_br_tok + (ctx.min(3) * 2 + usize::from(chroma)) * 21 * 4;
     let lo_cdf_off = layout::COEF_base_tok + (ctx * 2 + usize::from(chroma)) * 41 * 4;
     let mut rc = 0usize;
-    let dc_tok;
 
     if eob > 0 {
         let levels: &mut [u8; 32 * 34 + 64] = (&mut levels[..32 * 34 + 64])
@@ -735,68 +760,158 @@ pub(crate) fn decode_coefs(
             .try_into()
             .expect("hi_cdf 21");
 
+        #[allow(unused_mut)]
+        let mut dc_tok_fused: Option<usize> = None;
         if tx_class == 0 {
-            levels[..stride * ((4usize << slw) + 2)].fill(0);
             let scan = scan_table(usize::from(t::SCAN_INDEX[usize::from(tx)]));
-            let lo_ctx_offsets = &t::LO_CTX_OFFSETS[lo_ctx_idx];
-            rc = match slh {
-                0 => decode_ac_2d::<0>(
-                    msac,
-                    lo_cdf,
-                    hi_cdf,
-                    levels,
-                    cf,
-                    scan,
-                    lo_ctx_offsets,
-                    eob_idx,
-                    eob_tok,
-                    eob,
-                    lo_cdf_off,
-                    hi_cdf_off,
-                ),
-                1 => decode_ac_2d::<1>(
-                    msac,
-                    lo_cdf,
-                    hi_cdf,
-                    levels,
-                    cf,
-                    scan,
-                    lo_ctx_offsets,
-                    eob_idx,
-                    eob_tok,
-                    eob,
-                    lo_cdf_off,
-                    hi_cdf_off,
-                ),
-                2 => decode_ac_2d::<2>(
-                    msac,
-                    lo_cdf,
-                    hi_cdf,
-                    levels,
-                    cf,
-                    scan,
-                    lo_ctx_offsets,
-                    eob_idx,
-                    eob_tok,
-                    eob,
-                    lo_cdf_off,
-                    hi_cdf_off,
-                ),
-                _ => decode_ac_2d::<3>(
-                    msac,
-                    lo_cdf,
-                    hi_cdf,
-                    levels,
-                    cf,
-                    scan,
-                    lo_ctx_offsets,
-                    eob_idx,
-                    eob_tok,
-                    eob,
-                    lo_cdf_off,
-                    hi_cdf_off,
-                ),
-            };
+            if eob_idx == 1 {
+                let rc1 = usize::from(scan[1]) & 0x3ff;
+                let mut tok = eob_tok + 1;
+                let mut level_tok = tok * 0x41;
+                if eob_tok == 2 {
+                    let x = rc1 >> shift2;
+                    let y = rc1 & (stride - 1);
+                    let hi_ctx = if x | y > 1 { 14 } else { 7 };
+                    #[cfg(feature = "msac-trace")]
+                    crate::trace::mark(
+                        "coef.hi_tok0",
+                        (hi_cdf_off + hi_ctx * 4) as i32,
+                        hi_ctx as i32,
+                        eob,
+                        0,
+                    );
+                    tok = msac.decode_hi_tok(&mut hi_cdf[hi_ctx]);
+                    level_tok = tok + (3 << 6);
+                }
+                cf[rc1] = (tok << 11) as i32;
+                levels[1] = 0;
+                levels[stride] = 0;
+                levels[stride + 1] = 0;
+                levels[rc1] = level_tok as u8;
+                rc = rc1;
+            } else {
+                let lo_ctx_offsets = &t::LO_CTX_OFFSETS[lo_ctx_idx];
+                #[cfg(all(target_arch = "x86_64", not(feature = "msac-trace")))]
+                if let crate::entropy::msac::MsacIsa::Avx2(_, t_avx2) = msac.isa() {
+                    let (rc_out, dc_out) = match slh {
+                        0 => crate::dsp::x86::msac_avx2::decode_ac_2d_avx2::<0>(
+                            t_avx2,
+                            msac,
+                            lo_cdf,
+                            hi_cdf,
+                            levels,
+                            cf,
+                            scan,
+                            lo_ctx_offsets,
+                            slw,
+                            eob_idx,
+                            eob_tok,
+                        ),
+                        1 => crate::dsp::x86::msac_avx2::decode_ac_2d_avx2::<1>(
+                            t_avx2,
+                            msac,
+                            lo_cdf,
+                            hi_cdf,
+                            levels,
+                            cf,
+                            scan,
+                            lo_ctx_offsets,
+                            slw,
+                            eob_idx,
+                            eob_tok,
+                        ),
+                        2 => crate::dsp::x86::msac_avx2::decode_ac_2d_avx2::<2>(
+                            t_avx2,
+                            msac,
+                            lo_cdf,
+                            hi_cdf,
+                            levels,
+                            cf,
+                            scan,
+                            lo_ctx_offsets,
+                            slw,
+                            eob_idx,
+                            eob_tok,
+                        ),
+                        _ => crate::dsp::x86::msac_avx2::decode_ac_2d_avx2::<3>(
+                            t_avx2,
+                            msac,
+                            lo_cdf,
+                            hi_cdf,
+                            levels,
+                            cf,
+                            scan,
+                            lo_ctx_offsets,
+                            slw,
+                            eob_idx,
+                            eob_tok,
+                        ),
+                    };
+                    rc = rc_out;
+                    dc_tok_fused = Some(dc_out);
+                }
+                if dc_tok_fused.is_none() {
+                    levels[..stride * ((4usize << slw) + 2)].fill(0);
+                    rc = match slh {
+                        0 => decode_ac_2d::<0>(
+                            msac,
+                            lo_cdf,
+                            hi_cdf,
+                            levels,
+                            cf,
+                            scan,
+                            lo_ctx_offsets,
+                            eob_idx,
+                            eob_tok,
+                            eob,
+                            lo_cdf_off,
+                            hi_cdf_off,
+                        ),
+                        1 => decode_ac_2d::<1>(
+                            msac,
+                            lo_cdf,
+                            hi_cdf,
+                            levels,
+                            cf,
+                            scan,
+                            lo_ctx_offsets,
+                            eob_idx,
+                            eob_tok,
+                            eob,
+                            lo_cdf_off,
+                            hi_cdf_off,
+                        ),
+                        2 => decode_ac_2d::<2>(
+                            msac,
+                            lo_cdf,
+                            hi_cdf,
+                            levels,
+                            cf,
+                            scan,
+                            lo_ctx_offsets,
+                            eob_idx,
+                            eob_tok,
+                            eob,
+                            lo_cdf_off,
+                            hi_cdf_off,
+                        ),
+                        _ => decode_ac_2d::<3>(
+                            msac,
+                            lo_cdf,
+                            hi_cdf,
+                            levels,
+                            cf,
+                            scan,
+                            lo_ctx_offsets,
+                            eob_idx,
+                            eob_tok,
+                            eob,
+                            lo_cdf_off,
+                            hi_cdf_off,
+                        ),
+                    };
+                }
+            }
         } else {
             let mut tok = eob_tok + 1;
             let mut level_tok = tok * 0x41;
@@ -875,7 +990,43 @@ pub(crate) fn decode_coefs(
                 {
                     use crate::entropy::msac::MsacIsa;
                     rc = match (is_h, msac.isa()) {
-                        (true, MsacIsa::Sse2(t) | MsacIsa::Avx2(t, _)) => run_ac_1d_loop::<true>(
+                        (true, MsacIsa::Avx2(_, t_avx2)) => run_ac_1d_loop::<true>(
+                            msac,
+                            lo_cdf,
+                            hi_cdf,
+                            levels,
+                            cf,
+                            eob_idx,
+                            mask_1d,
+                            shift_1d,
+                            shift2,
+                            rc,
+                            |m, c| {
+                                crate::dsp::x86::msac_avx2::decode_symbol_adapt4_avx2(
+                                    t_avx2, m, c, 3,
+                                )
+                            },
+                            |m, c| crate::dsp::x86::msac_avx2::decode_hi_tok_avx2(t_avx2, m, c),
+                        ),
+                        (false, MsacIsa::Avx2(_, t_avx2)) => run_ac_1d_loop::<false>(
+                            msac,
+                            lo_cdf,
+                            hi_cdf,
+                            levels,
+                            cf,
+                            eob_idx,
+                            mask_1d,
+                            shift_1d,
+                            shift2,
+                            rc,
+                            |m, c| {
+                                crate::dsp::x86::msac_avx2::decode_symbol_adapt4_avx2(
+                                    t_avx2, m, c, 3,
+                                )
+                            },
+                            |m, c| crate::dsp::x86::msac_avx2::decode_hi_tok_avx2(t_avx2, m, c),
+                        ),
+                        (true, MsacIsa::Sse2(t)) => run_ac_1d_loop::<true>(
                             msac,
                             lo_cdf,
                             hi_cdf,
@@ -889,7 +1040,7 @@ pub(crate) fn decode_coefs(
                             |m, c| crate::dsp::x86::msac::decode_symbol_adapt4_sse2(t, m, c, 3),
                             |m, c| crate::dsp::x86::msac::decode_hi_tok_sse2(t, m, c),
                         ),
-                        (false, MsacIsa::Sse2(t) | MsacIsa::Avx2(t, _)) => run_ac_1d_loop::<false>(
+                        (false, MsacIsa::Sse2(t)) => run_ac_1d_loop::<false>(
                             msac,
                             lo_cdf,
                             hi_cdf,
@@ -1072,39 +1223,45 @@ pub(crate) fn decode_coefs(
                 }
             }
         }
-        let dc_ctx = if tx_class == 0 {
-            0
+        let dc_tok = if let Some(tok) = dc_tok_fused {
+            tok
         } else {
-            get_lo_ctx_1d(levels, 0, 0).0
-        };
-        #[cfg(feature = "msac-trace")]
-        crate::trace::mark(
-            "coef.dc_tok",
-            (lo_cdf_off + dc_ctx * 4) as i32,
-            dc_ctx as i32,
-            eob,
-            i32::from(tx_class),
-        );
-        dc_tok = msac.decode_symbol_adapt4(&mut lo_cdf[dc_ctx], 3);
-        let mut dc_tok = dc_tok;
-        if dc_tok == 3 {
-            let mag = if tx_class == 0 {
-                (u32::from(levels[1]) + u32::from(levels[stride]) + u32::from(levels[stride + 1]))
-                    & 63
+            let dc_ctx = if tx_class == 0 {
+                0
             } else {
-                get_lo_ctx_1d(levels, 0, 0).1 & 63
+                get_lo_ctx_1d(levels, 0, 0).0
             };
-            let hi_ctx = if mag > 12 { 6 } else { (mag as usize + 1) >> 1 };
             #[cfg(feature = "msac-trace")]
             crate::trace::mark(
-                "coef.dc_hi_tok",
-                (hi_cdf_off + hi_ctx * 4) as i32,
-                hi_ctx as i32,
+                "coef.dc_tok",
+                (lo_cdf_off + dc_ctx * 4) as i32,
+                dc_ctx as i32,
                 eob,
-                0,
+                i32::from(tx_class),
             );
-            dc_tok = msac.decode_hi_tok(&mut hi_cdf[hi_ctx]);
-        }
+            let mut dc_tok = msac.decode_symbol_adapt4(&mut lo_cdf[dc_ctx], 3);
+            if dc_tok == 3 {
+                let mag = if tx_class == 0 {
+                    (u32::from(levels[1])
+                        + u32::from(levels[stride])
+                        + u32::from(levels[stride + 1]))
+                        & 63
+                } else {
+                    get_lo_ctx_1d(levels, 0, 0).1 & 63
+                };
+                let hi_ctx = if mag > 12 { 6 } else { (mag as usize + 1) >> 1 };
+                #[cfg(feature = "msac-trace")]
+                crate::trace::mark(
+                    "coef.dc_hi_tok",
+                    (hi_cdf_off + hi_ctx * 4) as i32,
+                    hi_ctx as i32,
+                    eob,
+                    0,
+                );
+                dc_tok = msac.decode_hi_tok(&mut hi_cdf[hi_ctx]);
+            }
+            dc_tok
+        };
         // dc işareti (C: :600-607)
         let (dc_sign, dc_sign_level) = if dc_tok == 0 {
             (0u32, 1u32 << 6)
@@ -1186,7 +1343,7 @@ fn dq_shift_of(ctx: usize) -> u32 {
 }
 
 #[inline(always)]
-fn cf_max_of(env: CoefEnv<'_>) -> u32 {
+fn cf_max_of(env: &CoefEnv<'_>) -> u32 {
     let bpc = env.bit_depth.bits();
     !(!127u32 << if bpc == 8 { 8 } else { bpc })
 }
@@ -1219,7 +1376,7 @@ fn dc_sign_off(chroma: bool, tx: u8, a: &[u8], l: &[u8]) -> usize {
 #[inline(always)]
 fn dequant_block(
     msac: &mut MsacContext<'_>,
-    env: CoefEnv<'_>,
+    env: &CoefEnv<'_>,
     plane: usize,
     cf: &mut [i32],
     dq_shift: u32,
@@ -1295,7 +1452,16 @@ fn dequant_block(
                 {
                     use crate::entropy::msac::MsacIsa;
                     cul_level = match msac.isa() {
-                        MsacIsa::Sse2(t) | MsacIsa::Avx2(t, _) => run_dequant_no_qm(
+                        MsacIsa::Avx2(_, t_avx2) => {
+                            if rc == 0 {
+                                cul_level
+                            } else {
+                                crate::dsp::x86::msac_avx2::dequant_no_qm_avx2(
+                                    t_avx2, msac, cf, rc, ac_dq, dq_shift, cf_max, cul_level,
+                                )
+                            }
+                        }
+                        MsacIsa::Sse2(t) => run_dequant_no_qm(
                             msac,
                             cf,
                             rc,
@@ -1812,7 +1978,7 @@ mod oracle_diff {
                 decode_coefs(
                     &mut mc,
                     &mut cdf,
-                    env,
+                    &env,
                     tx as u8,
                     bs as u8,
                     y_mode_nofilt,

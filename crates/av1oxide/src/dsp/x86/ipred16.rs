@@ -191,24 +191,29 @@ fn dc_gen_avx2(edge: Edge<'_>, width: usize, height: usize) -> u32 {
 #[target_feature(enable = "avx2")]
 #[inline]
 fn splat_dc_avx2(dst: &mut [u8], dst_stride: usize, width: usize, height: usize, dc: i16) {
+    let row_bytes = width * 2;
+    let dst = &mut dst[..(height - 1) * dst_stride + row_bytes];
+    let mut off = 0usize;
     if width == 4 {
-        let v = _mm_set1_epi16(dc);
-        for y in 0..height {
-            mem::store_u8x8(mem::chunk_mut(dst, y * dst_stride), v);
+        let pat = (u64::from(dc as u16) * 0x0001_0001_0001_0001).to_le_bytes();
+        for _ in 0..height {
+            dst[off..off + 8].copy_from_slice(&pat);
+            off += dst_stride;
         }
     } else if width == 8 {
         let v = _mm_set1_epi16(dc);
-        for y in 0..height {
-            mem::store_u8x16(mem::chunk_mut(dst, y * dst_stride), v);
+        for _ in 0..height {
+            mem::store_u8x16(mem::chunk_mut(dst, off), v);
+            off += dst_stride;
         }
     } else {
         let v = _mm256_set1_epi16(dc);
-        let row_bytes = width * 2;
-        for y in 0..height {
-            let row = &mut dst[y * dst_stride..y * dst_stride + row_bytes];
+        for _ in 0..height {
+            let row = &mut dst[off..off + row_bytes];
             for d in row.as_chunks_mut::<32>().0 {
                 mem::store_u8x32(d, v);
             }
+            off += dst_stride;
         }
     }
 }

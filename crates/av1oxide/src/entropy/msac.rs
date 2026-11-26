@@ -102,11 +102,14 @@ pub(crate) fn ctx_refill_fast(buf: &[u8], pos: &mut usize, dif: &mut u64, cnt: &
     let c: i32 = EC_WIN_BITS - *cnt - 24;
     debug_assert!((0..=55).contains(&c), "ctx_refill kaydırması: {c}");
     let p = *pos;
-    if let Some(c8) = buf.get(p..).and_then(|s| s.first_chunk::<8>()) {
-        let raw = u64::from_be_bytes(*c8);
-        let num_bytes = ((c as u32) >> 3) + 1;
-        let keep_mask = u64::MAX << (64 - num_bytes * 8);
-        *dif |= ((!raw) & keep_mask) >> (56 - c as u32);
+    if p <= buf.len().saturating_sub(8) {
+        let c8: [u8; 8] = buf[p..p + 8].try_into().unwrap();
+        let raw = u64::from_be_bytes(c8);
+        let cu = c as u32;
+        let num_bytes = (cu >> 3) + 1;
+        let shift_r = 56 - (cu & !7);
+        let shift_l = cu & 7;
+        *dif |= ((!raw) >> shift_r) << shift_l;
         *pos = p + num_bytes as usize;
         *cnt += (num_bytes * 8) as i32;
     } else {
@@ -136,7 +139,7 @@ fn ctx_refill_tail(buf: &[u8], pos: &mut usize, dif: &mut u64, cnt: &mut i32, mu
 
 /// `ctx_norm` (`msac.c:85-97`): `32768 <= rng < 65536` olacak biçimde yeniden
 /// ölçekler; gerekirse [`ctx_refill_fast`] ile dolgu yapar.
-#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+#[cfg(target_arch = "aarch64")]
 #[inline(always)]
 pub(crate) fn ctx_norm_fast(
     buf: &[u8],
@@ -155,6 +158,22 @@ pub(crate) fn ctx_norm_fast(
     *cnt = old_cnt - d as i32;
     if (old_cnt as u32) < d {
         ctx_refill_fast(buf, pos, dif, cnt);
+    }
+}
+
+/// `ctx_norm_fast` doğrudan `&mut MsacContext` üzerinde: `s.buf` yalnız dolgu
+/// gerektiğinde (`(old_cnt as u32) < d`) yüklenir.
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+pub(crate) fn ctx_norm_ctx(s: &mut MsacContext<'_>, new_dif: u64, new_rng: u32) {
+    debug_assert!(new_rng <= 65535);
+    let d = 15 ^ (31 ^ new_rng.leading_zeros());
+    let old_cnt = s.cnt;
+    s.dif = new_dif << d;
+    s.rng = new_rng << d;
+    s.cnt = old_cnt - d as i32;
+    if (old_cnt as u32) < d {
+        ctx_refill_fast(s.buf, &mut s.pos, &mut s.dif, &mut s.cnt);
     }
 }
 
@@ -298,7 +317,15 @@ impl<'a> MsacContext<'a> {
         out
     }
 
-    #[inline(always)]
+    #[cfg_attr(
+        any(target_arch = "x86_64", target_arch = "aarch64"),
+        cold,
+        inline(never)
+    )]
+    #[cfg_attr(
+        not(any(target_arch = "x86_64", target_arch = "aarch64")),
+        inline(always)
+    )]
     pub(crate) fn decode_bool_equi_scalar(&mut self) -> u32 {
         let r = self.rng;
         let mut dif = self.dif;
@@ -336,7 +363,15 @@ impl<'a> MsacContext<'a> {
         out
     }
 
-    #[inline(always)]
+    #[cfg_attr(
+        any(target_arch = "x86_64", target_arch = "aarch64"),
+        cold,
+        inline(never)
+    )]
+    #[cfg_attr(
+        not(any(target_arch = "x86_64", target_arch = "aarch64")),
+        inline(always)
+    )]
     fn decode_bool_scalar(&mut self, f: u32) -> u32 {
         let r = self.rng;
         let mut dif = self.dif;
@@ -362,7 +397,10 @@ impl<'a> MsacContext<'a> {
         let (trace_c0, trace_cn) = (u32::from(cdf[0]), u32::from(cdf[n_symbols]));
         #[cfg(target_arch = "x86_64")]
         let val = match (self.isa, cdf.first_chunk_mut::<4>()) {
-            (MsacIsa::Sse2(t) | MsacIsa::Avx2(t, _), Some(c4)) => {
+            (MsacIsa::Avx2(_, t_avx2), Some(c4)) => {
+                crate::dsp::x86::msac_avx2::decode_symbol_adapt4_avx2(t_avx2, self, c4, n_symbols)
+            }
+            (MsacIsa::Sse2(t), Some(c4)) => {
                 crate::dsp::x86::msac::decode_symbol_adapt4_sse2(t, self, c4, n_symbols)
             }
             _ => self.decode_symbol_adapt_scalar(cdf, n_symbols),
@@ -392,7 +430,10 @@ impl<'a> MsacContext<'a> {
         let (trace_c0, trace_cn) = (u32::from(cdf[0]), u32::from(cdf[n_symbols]));
         #[cfg(target_arch = "x86_64")]
         let val = match (self.isa, cdf.first_chunk_mut::<8>()) {
-            (MsacIsa::Sse2(t) | MsacIsa::Avx2(t, _), Some(c8)) => {
+            (MsacIsa::Avx2(_, t_avx2), Some(c8)) => {
+                crate::dsp::x86::msac_avx2::decode_symbol_adapt8_avx2(t_avx2, self, c8, n_symbols)
+            }
+            (MsacIsa::Sse2(t), Some(c8)) => {
                 crate::dsp::x86::msac::decode_symbol_adapt8_sse2(t, self, c8, n_symbols)
             }
             _ => self.decode_symbol_adapt_scalar(cdf, n_symbols),
@@ -477,15 +518,19 @@ impl<'a> MsacContext<'a> {
                     self.decode_symbol_adapt_scalar(cdf, n_symbols)
                 }
             }
-            MsacIsa::Avx2(t_sse2, t_avx2) => {
+            MsacIsa::Avx2(_, t_avx2) => {
                 if n_symbols <= 3
                     && let Some(c4) = cdf.first_chunk_mut::<4>()
                 {
-                    crate::dsp::x86::msac::decode_symbol_adapt4_sse2(t_sse2, self, c4, n_symbols)
+                    crate::dsp::x86::msac_avx2::decode_symbol_adapt4_avx2(
+                        t_avx2, self, c4, n_symbols,
+                    )
                 } else if n_symbols <= 7
                     && let Some(c8) = cdf.first_chunk_mut::<8>()
                 {
-                    crate::dsp::x86::msac::decode_symbol_adapt8_sse2(t_sse2, self, c8, n_symbols)
+                    crate::dsp::x86::msac_avx2::decode_symbol_adapt8_avx2(
+                        t_avx2, self, c8, n_symbols,
+                    )
                 } else if let Some(c16) = cdf.first_chunk_mut::<16>() {
                     crate::dsp::x86::msac_avx2::decode_symbol_adapt16_avx2(
                         t_avx2, self, c16, n_symbols,
@@ -524,7 +569,15 @@ impl<'a> MsacContext<'a> {
         val
     }
 
-    #[inline(always)]
+    #[cfg_attr(
+        any(target_arch = "x86_64", target_arch = "aarch64"),
+        cold,
+        inline(never)
+    )]
+    #[cfg_attr(
+        not(any(target_arch = "x86_64", target_arch = "aarch64")),
+        inline(always)
+    )]
     pub(crate) fn decode_symbol_adapt_scalar(
         &mut self,
         cdf: &mut [u16],
@@ -604,7 +657,15 @@ impl<'a> MsacContext<'a> {
         bit
     }
 
-    #[inline(always)]
+    #[cfg_attr(
+        any(target_arch = "x86_64", target_arch = "aarch64"),
+        cold,
+        inline(never)
+    )]
+    #[cfg_attr(
+        not(any(target_arch = "x86_64", target_arch = "aarch64")),
+        inline(always)
+    )]
     fn decode_bool_adapt_scalar(&mut self, cdf: &mut [u16]) -> u32 {
         let bit = self.decode_bool_scalar(cdf[0] as u32);
         if self.allow_update_cdf {
@@ -630,9 +691,10 @@ impl<'a> MsacContext<'a> {
         let (trace_c0, trace_cn) = (u32::from(cdf[0]), u32::from(cdf[3]));
         #[cfg(target_arch = "x86_64")]
         let tok = match (self.isa, cdf.first_chunk_mut::<4>()) {
-            (MsacIsa::Sse2(t) | MsacIsa::Avx2(t, _), Some(c4)) => {
-                crate::dsp::x86::msac::decode_hi_tok_sse2(t, self, c4)
+            (MsacIsa::Avx2(_, t_avx2), Some(c4)) => {
+                crate::dsp::x86::msac_avx2::decode_hi_tok_avx2(t_avx2, self, c4)
             }
+            (MsacIsa::Sse2(t), Some(c4)) => crate::dsp::x86::msac::decode_hi_tok_sse2(t, self, c4),
             _ => self.decode_hi_tok_scalar(cdf),
         };
         #[cfg(target_arch = "aarch64")]
@@ -649,7 +711,15 @@ impl<'a> MsacContext<'a> {
         tok
     }
 
-    #[inline(always)]
+    #[cfg_attr(
+        any(target_arch = "x86_64", target_arch = "aarch64"),
+        cold,
+        inline(never)
+    )]
+    #[cfg_attr(
+        not(any(target_arch = "x86_64", target_arch = "aarch64")),
+        inline(always)
+    )]
     pub(crate) fn decode_hi_tok_scalar(&mut self, cdf: &mut [u16]) -> usize {
         let mut tok_br = self.decode_symbol_adapt_scalar(cdf, 3);
         let mut tok = 3 + tok_br;
