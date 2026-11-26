@@ -10,7 +10,10 @@
 
 #![forbid(unsafe_code)]
 
-#[cfg(all(feature = "std", not(target_arch = "wasm32")))]
+#[cfg(all(feature = "std", not(target_arch = "wasm32"), miri))]
+use parking_lot as _;
+
+#[cfg(all(feature = "std", not(target_arch = "wasm32"), not(miri)))]
 mod imp {
     pub(crate) use std::sync::OnceLock;
 
@@ -32,6 +35,12 @@ mod imp {
         #[inline]
         pub(crate) fn lock(&self) -> MutexGuard<'_, T> {
             self.0.lock()
+        }
+
+        /// Kilidi tüketerek iç değeri kilitsiz biçimde döndürür.
+        #[inline]
+        pub(crate) fn into_inner(self) -> T {
+            self.0.into_inner()
         }
     }
 
@@ -68,7 +77,7 @@ mod imp {
     }
 }
 
-#[cfg(all(feature = "std", target_arch = "wasm32"))]
+#[cfg(all(feature = "std", any(target_arch = "wasm32", miri)))]
 mod imp {
     pub(crate) use std::sync::OnceLock;
 
@@ -91,6 +100,14 @@ mod imp {
         pub(crate) fn lock(&self) -> MutexGuard<'_, T> {
             self.0
                 .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+        }
+
+        /// Kilidi tüketerek iç değeri döndürür.
+        #[inline]
+        pub(crate) fn into_inner(self) -> T {
+            self.0
+                .into_inner()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
         }
     }
@@ -208,6 +225,12 @@ mod imp {
                 }
                 backoff.snooze();
             }
+        }
+
+        /// Kilidi tüketerek iç değeri döndürür.
+        #[inline]
+        pub(crate) fn into_inner(self) -> T {
+            self.cell.into_inner().expect("Mutex invariant")
         }
     }
 

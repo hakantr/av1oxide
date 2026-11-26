@@ -309,11 +309,16 @@ impl LfFrame {
         sb128: bool,
         butce: &crate::frame::butce::Butce,
     ) -> crate::error::Result<Self> {
-        Self::new_with_reuse(hdr, bw, bh, ss_hor, ss_ver, sb128, None, butce)
+        Self::new_with_reuse(hdr, bw, bh, ss_hor, ss_ver, sb128, None, butce, false)
     }
 
     /// Havuzdan geri dönüştürülmüş `old` varsa kapasiteleri eşleştiğinde yeniden
     /// kullanarak `LfFrame` kurar (`F8b-1`).
+    ///
+    /// `skip_grid_fill == true` ise (paralel çok-karolu birleştirmede tüm
+    /// `w4 × h4` ve `cw × ch` ızgarasının üstüne kopyalanacağı biliniyorken)
+    /// geri dönüştürülen seviye ve kenar maskesi vektörleri sıfırlanmadan
+    /// alınır (`5.C.1`).
     #[allow(clippy::too_many_arguments)]
     pub fn new_with_reuse(
         hdr: &FrameHeader,
@@ -324,6 +329,7 @@ impl LfFrame {
         sb128: bool,
         old: Option<Self>,
         butce: &crate::frame::butce::Butce,
+        skip_grid_fill: bool,
     ) -> crate::error::Result<Self> {
         let cw = (bw + ss_hor) >> ss_hor;
         let ch = (bh + ss_ver) >> ss_ver;
@@ -374,11 +380,31 @@ impl LfFrame {
             n_cols,
             n_rows,
             tile_local: false,
-            level: butce.reuse_vec(old_level, bw * bh, [0u8; 4])?,
-            mask_y_col: butce.reuse_vec(old_myc, bw * bh, 0u8)?,
-            mask_y_row: butce.reuse_vec(old_myr, bw * bh, 0u8)?,
-            mask_uv_col: butce.reuse_vec(old_muc, cw * ch, 0u8)?,
-            mask_uv_row: butce.reuse_vec(old_mur, cw * ch, 0u8)?,
+            level: if skip_grid_fill {
+                butce.reuse_vec_dirty(old_level, bw * bh, [0u8; 4])?.0
+            } else {
+                butce.reuse_vec(old_level, bw * bh, [0u8; 4])?
+            },
+            mask_y_col: if skip_grid_fill {
+                butce.reuse_vec_dirty(old_myc, bw * bh, 0u8)?.0
+            } else {
+                butce.reuse_vec(old_myc, bw * bh, 0u8)?
+            },
+            mask_y_row: if skip_grid_fill {
+                butce.reuse_vec_dirty(old_myr, bw * bh, 0u8)?.0
+            } else {
+                butce.reuse_vec(old_myr, bw * bh, 0u8)?
+            },
+            mask_uv_col: if skip_grid_fill {
+                butce.reuse_vec_dirty(old_muc, cw * ch, 0u8)?.0
+            } else {
+                butce.reuse_vec(old_muc, cw * ch, 0u8)?
+            },
+            mask_uv_row: if skip_grid_fill {
+                butce.reuse_vec_dirty(old_mur, cw * ch, 0u8)?.0
+            } else {
+                butce.reuse_vec(old_mur, cw * ch, 0u8)?
+            },
             tx_right_y: butce.reuse_vec(old_try, n_cols * align_h, 0u8)?,
             tx_right_uv: butce.reuse_vec(old_truv, n_cols * (align_h >> ss_ver), 0u8)?,
             row_lpf_y: butce.reuse_vec(old_rly, n_rows * sb128w, [2u8; 32])?,
@@ -1149,6 +1175,22 @@ impl LfFrame {
             }
         }
         let trace = trace_on() && frame_no < 12;
+        #[cfg(all(feature = "std", not(target_arch = "wasm32")))]
+        if pool.is_parallel()
+            && !trace
+            && self.sbh >= 4
+            && self.bw.saturating_mul(self.bh) >= 16_384
+            && self.apply_parallel_striped(
+                pic,
+                hdr,
+                &start_of_tile_row,
+                dsp,
+                pool,
+                has_chroma && uv_lvl,
+            )
+        {
+            return;
+        }
         if pool.is_parallel() && !trace && self.sbh > 0 && (has_chroma && uv_lvl) {
             self.apply_parallel_planes(pic, hdr, &start_of_tile_row, dsp, pool);
             return;
@@ -1321,6 +1363,363 @@ impl LfFrame {
         }
     }
 
+    /// Karo sütun ve satır sınırlarındaki filtre boyu maske düzeltmelerini uygular.
+    fn fixup_tile_boundaries(
+        &mut self,
+        hdr: &FrameHeader,
+        start_of_tile_row: &[u8],
+        has_chroma: bool,
+    ) {
+        if self.n_cols <= 1 && self.n_rows <= 1 {
+            return;
+        }
+        for (sby, &tr_raw) in start_of_tile_row.iter().enumerate().take(self.sbh) {
+            let y0 = sby * self.sb_step;
+            let count = (self.bh - y0).min(self.sb_step);
+            for tile_col in 1..self.n_cols {
+                let gx = usize::from(hdr.tiling.col_start_sb[tile_col]) * self.sb_step;
+                if gx >= self.bw {
+                    break;
+                }
+                let base = (tile_col - 1) * self.align_h + y0;
+                for i in 0..count {
+                    let gy = y0 + i;
+                    let v = self.mask_y_col[gy * self.bw + gx];
+                    let idx = if v > 0 { usize::from(v - 1) } else { 0 };
+                    let lp = usize::from(self.tx_right_y[base + i]);
+                    self.mask_y_col[gy * self.bw + gx] = idx.min(lp) as u8 + 1;
+                }
+                if has_chroma {
+                    let cgx = gx >> self.ss_hor;
+                    let cy0 = y0 >> self.ss_ver;
+                    let ccount = ((y0 + count + self.ss_ver) >> self.ss_ver) - cy0;
+                    let base = (tile_col - 1) * (self.align_h >> self.ss_ver) + cy0;
+                    for i in 0..ccount {
+                        let cy = cy0 + i;
+                        let v = self.mask_uv_col[cy * self.cw + cgx];
+                        let idx = if v > 0 { usize::from(v - 1) } else { 0 };
+                        let lp = usize::from(self.tx_right_uv[base + i]);
+                        self.mask_uv_col[cy * self.cw + cgx] = idx.min(lp) as u8 + 1;
+                    }
+                }
+            }
+            let tr = usize::from(tr_raw);
+            if tr != 0 {
+                let prev = (tr - 1) * self.sb128w;
+                for x in 0..self.sb128w {
+                    let w = 32.min(self.bw - x * 32);
+                    for i in 0..w {
+                        let gx = x * 32 + i;
+                        let v = self.mask_y_row[y0 * self.bw + gx];
+                        let idx = if v > 0 { usize::from(v - 1) } else { 0 };
+                        let lp = usize::from(self.row_lpf_y[prev + x][i]);
+                        self.mask_y_row[y0 * self.bw + gx] = idx.min(lp) as u8 + 1;
+                    }
+                    if has_chroma {
+                        let cw = (w + self.ss_hor) >> self.ss_hor;
+                        let cgy = y0 >> self.ss_ver;
+                        let cbx = (x * 32) >> self.ss_hor;
+                        for i in 0..cw {
+                            let cgx = cbx + i;
+                            let v = self.mask_uv_row[cgy * self.cw + cgx];
+                            let idx = if v > 0 { usize::from(v - 1) } else { 0 };
+                            let lp = usize::from(self.row_lpf_uv[prev + x][i]);
+                            self.mask_uv_row[cgy * self.cw + cgx] = idx.min(lp) as u8 + 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Büyük karelerde (`bw * bh >= 16_384`, `sbh >= 4`) `Y`, `U` ve `V`
+    /// düzlemlerini `split_at_mut` ile sıfır-kopya, sıfır-ekstra-RAM SB satır
+    /// şeritlerine bölerek paralel süzer (`5.C.1`).
+    ///
+    /// Her şerit kendi `[y0..y1]` aralığında tüm dikey kenarları (`h`) ve üst
+    /// şerit sınırına dokunmayan iç yatay kenarları (`v`, `y0 == 0` hariç ilk
+    /// `2` 4×4 satır atlanır) süzüp ardından tüm şeritler bittiğinde yalnızca
+    /// `y0..min(y0 + 2, bh)` dikiş kenarlarını tamamlar. AV1 dönüşüm bloğu
+    /// bölme kısıtı gereği iki farklı yatay kenarın destek pikselleri çakışmaz;
+    /// çıktı tek-iş-parçacıklı sıralamayla bit-birebir özdeştir.
+    #[cfg(all(feature = "std", not(target_arch = "wasm32")))]
+    fn apply_parallel_striped(
+        &mut self,
+        pic: &mut crate::decode::intra::PicBuf,
+        hdr: &FrameHeader,
+        start_of_tile_row: &[u8],
+        dsp: &LoopFilterDsp,
+        pool: &crate::thread::WorkerPool,
+        do_chroma: bool,
+    ) -> bool {
+        let ch = (self.bh + self.ss_ver) >> self.ss_ver;
+        let y_stride = pic.stride[0];
+        let uv_stride = pic.stride[1];
+        if pic.data[0].len() < self.bh * 4 * y_stride {
+            return false;
+        }
+        if do_chroma
+            && (pic.data[1].len() < ch * 4 * uv_stride || pic.data[2].len() < ch * 4 * uv_stride)
+        {
+            return false;
+        }
+
+        let guard = pool.acquire_scope_workers(pool.n_threads().saturating_sub(1));
+        let total_threads = guard.total_threads();
+        if total_threads <= 1 {
+            return false;
+        }
+
+        self.fixup_tile_boundaries(hdr, start_of_tile_row, pic.has_chroma);
+
+        struct StripJob<'a> {
+            pl: usize,
+            stride: usize,
+            dst: &'a mut [u8],
+            y0: usize,
+            rows: usize,
+        }
+
+        let sbh = self.sbh;
+        let sb_step = self.sb_step;
+        let bw = self.bw;
+        let bh = self.bh;
+        let cw = self.cw;
+        let ss_ver = self.ss_ver;
+        let lim = self.lim;
+        let [[h_y, v_y], [h_uv, v_uv]] = dsp.loop_filter_sb;
+
+        let y_bands = (sbh / 2).clamp(2, (total_threads * 2).min(sbh));
+        let uv_bands = (sbh / 4).clamp(2, total_threads.min(sbh));
+
+        let mut jobs: Vec<StripJob<'_>> =
+            Vec::with_capacity(y_bands + if do_chroma { uv_bands * 2 } else { 0 });
+        let mut y_seams: Vec<(usize, usize)> = Vec::with_capacity(y_bands);
+        let mut uv_seams: Vec<(usize, usize)> = Vec::with_capacity(uv_bands);
+
+        let [y_plane, u_plane, v_plane] = &mut pic.data;
+
+        // Önce kroma (U ve V), sonra luma (Y) eklenir; işçiler `pop()` ile
+        // sondan çektiğinde en ağır Y şeritleri ilk başlar (düşük kuyruk gecikmesi).
+        if do_chroma {
+            for (pl_idx, plane_vec) in [
+                (1usize, u_plane.as_mut_slice()),
+                (2usize, v_plane.as_mut_slice()),
+            ] {
+                let mut rem = plane_vec;
+                for b in 0..uv_bands {
+                    let sby0 = (b * sbh) / uv_bands;
+                    let sby1 = ((b + 1) * sbh) / uv_bands;
+                    if sby0 >= sby1 {
+                        continue;
+                    }
+                    let y0 = (sby0 * sb_step).min(bh);
+                    let cy0 = y0 >> ss_ver;
+                    let cy1 = if sby1 == sbh {
+                        ch
+                    } else {
+                        ((sby1 * sb_step).min(bh)) >> ss_ver
+                    };
+                    if cy0 >= cy1 {
+                        continue;
+                    }
+                    let crows = cy1 - cy0;
+                    let split_bytes = if sby1 == sbh {
+                        rem.len()
+                    } else {
+                        crows * 4 * uv_stride
+                    };
+                    let (band, rest) = rem.split_at_mut(split_bytes);
+                    rem = rest;
+                    if pl_idx == 1 && cy0 > 0 {
+                        uv_seams.push((cy0, 2.min(ch - cy0)));
+                    }
+                    jobs.push(StripJob {
+                        pl: pl_idx,
+                        stride: uv_stride,
+                        dst: band,
+                        y0: cy0,
+                        rows: crows,
+                    });
+                }
+            }
+        }
+
+        {
+            let mut rem = y_plane.as_mut_slice();
+            for b in 0..y_bands {
+                let sby0 = (b * sbh) / y_bands;
+                let sby1 = ((b + 1) * sbh) / y_bands;
+                if sby0 >= sby1 {
+                    continue;
+                }
+                let y0 = (sby0 * sb_step).min(bh);
+                let y1 = if sby1 == sbh {
+                    bh
+                } else {
+                    (sby1 * sb_step).min(bh)
+                };
+                if y0 >= y1 {
+                    continue;
+                }
+                let rows = y1 - y0;
+                let split_bytes = if sby1 == sbh {
+                    rem.len()
+                } else {
+                    rows * 4 * y_stride
+                };
+                let (band, rest) = rem.split_at_mut(split_bytes);
+                rem = rest;
+                if y0 > 0 {
+                    y_seams.push((y0, 2.min(bh - y0)));
+                }
+                jobs.push(StripJob {
+                    pl: 0,
+                    stride: y_stride,
+                    dst: band,
+                    y0,
+                    rows,
+                });
+            }
+        }
+
+        let level = self.level.as_slice();
+        let mask_y_col = self.mask_y_col.as_slice();
+        let mask_y_row = self.mask_y_row.as_slice();
+        let mask_uv_col = self.mask_uv_col.as_slice();
+        let mask_uv_row = self.mask_uv_row.as_slice();
+
+        let n_jobs = jobs.len();
+        let queue = crate::sync::Mutex::new(jobs);
+        let run_worker = || loop {
+            let Some(job) = queue.lock().pop() else {
+                break;
+            };
+            if job.pl == 0 {
+                let mask_c = &mask_y_col[job.y0 * bw..];
+                let mask_r = &mask_y_row[job.y0 * bw..];
+                let lvl = &level[job.y0 * bw..];
+                crate::dsp::profil_olc!(
+                    LoopFilterSb,
+                    h_y(
+                        job.dst, job.stride, mask_c, bw, lvl, bw, 0, &lim, bw, 0, job.rows
+                    )
+                );
+                let skip = if job.y0 == 0 { 0 } else { 2 };
+                if job.rows > skip {
+                    crate::dsp::profil_olc!(
+                        LoopFilterSb,
+                        v_y(
+                            job.dst,
+                            job.stride,
+                            mask_r,
+                            bw,
+                            lvl,
+                            bw,
+                            1,
+                            &lim,
+                            bw,
+                            skip,
+                            job.rows - skip,
+                        )
+                    );
+                }
+            } else {
+                let mask_c = &mask_uv_col[job.y0 * cw..];
+                let mask_r = &mask_uv_row[job.y0 * cw..];
+                let lvl = &level[job.y0 * bw..];
+                crate::dsp::profil_olc!(
+                    LoopFilterSb,
+                    h_uv(
+                        job.dst,
+                        job.stride,
+                        mask_c,
+                        cw,
+                        lvl,
+                        bw,
+                        job.pl + 1,
+                        &lim,
+                        cw,
+                        0,
+                        job.rows,
+                    )
+                );
+                let skip = if job.y0 == 0 { 0 } else { 2 };
+                if job.rows > skip {
+                    crate::dsp::profil_olc!(
+                        LoopFilterSb,
+                        v_uv(
+                            job.dst,
+                            job.stride,
+                            mask_r,
+                            cw,
+                            lvl,
+                            bw,
+                            job.pl + 1,
+                            &lim,
+                            cw,
+                            skip,
+                            job.rows - skip,
+                        )
+                    );
+                }
+            }
+        };
+
+        let n_spawn = total_threads.min(n_jobs).saturating_sub(1);
+        std::thread::scope(|s| {
+            for _ in 0..n_spawn {
+                s.spawn(run_worker);
+            }
+            run_worker();
+        });
+        drop(queue);
+        drop(guard);
+
+        // Aşama 2: Şerit sınırlarındaki 2 adet 4×4 satırlık yatay kenar dikişleri.
+        for &(sy, scount) in &y_seams {
+            crate::dsp::profil_olc!(
+                LoopFilterSb,
+                v_y(
+                    &mut pic.data[0],
+                    y_stride,
+                    &self.mask_y_row,
+                    bw,
+                    &self.level,
+                    bw,
+                    1,
+                    &lim,
+                    bw,
+                    sy,
+                    scount,
+                )
+            );
+        }
+        if do_chroma {
+            for pl in 1..3 {
+                for &(scy, scount) in &uv_seams {
+                    crate::dsp::profil_olc!(
+                        LoopFilterSb,
+                        v_uv(
+                            &mut pic.data[pl],
+                            uv_stride,
+                            &self.mask_uv_row,
+                            cw,
+                            &self.level,
+                            bw,
+                            pl + 1,
+                            &lim,
+                            cw,
+                            scy,
+                            scount,
+                        )
+                    );
+                }
+            }
+        }
+        true
+    }
+
     /// Karo sınırı maske düzeltmelerini uyguladıktan sonra `Y`, `U` ve `V`
     /// düzlemlerini sıfır-kopya (`core::mem::take(&mut pic.data[pl])`) olarak
     /// `WorkerPool` üzerinde paralel süzer (`F8b-3`).
@@ -1334,66 +1733,7 @@ impl LfFrame {
     ) {
         use alloc::sync::Arc;
 
-        let has_chroma = pic.has_chroma;
-        if self.n_cols > 1 || self.n_rows > 1 {
-            for (sby, &tr_raw) in start_of_tile_row.iter().enumerate().take(self.sbh) {
-                let y0 = sby * self.sb_step;
-                let count = (self.bh - y0).min(self.sb_step);
-                for tile_col in 1..self.n_cols {
-                    let gx = usize::from(hdr.tiling.col_start_sb[tile_col]) * self.sb_step;
-                    if gx >= self.bw {
-                        break;
-                    }
-                    let base = (tile_col - 1) * self.align_h + y0;
-                    for i in 0..count {
-                        let gy = y0 + i;
-                        let v = self.mask_y_col[gy * self.bw + gx];
-                        let idx = if v > 0 { usize::from(v - 1) } else { 0 };
-                        let lp = usize::from(self.tx_right_y[base + i]);
-                        self.mask_y_col[gy * self.bw + gx] = idx.min(lp) as u8 + 1;
-                    }
-                    if has_chroma {
-                        let cgx = gx >> self.ss_hor;
-                        let cy0 = y0 >> self.ss_ver;
-                        let ccount = ((y0 + count + self.ss_ver) >> self.ss_ver) - cy0;
-                        let base = (tile_col - 1) * (self.align_h >> self.ss_ver) + cy0;
-                        for i in 0..ccount {
-                            let cy = cy0 + i;
-                            let v = self.mask_uv_col[cy * self.cw + cgx];
-                            let idx = if v > 0 { usize::from(v - 1) } else { 0 };
-                            let lp = usize::from(self.tx_right_uv[base + i]);
-                            self.mask_uv_col[cy * self.cw + cgx] = idx.min(lp) as u8 + 1;
-                        }
-                    }
-                }
-                let tr = usize::from(tr_raw);
-                if tr != 0 {
-                    let prev = (tr - 1) * self.sb128w;
-                    for x in 0..self.sb128w {
-                        let w = 32.min(self.bw - x * 32);
-                        for i in 0..w {
-                            let gx = x * 32 + i;
-                            let v = self.mask_y_row[y0 * self.bw + gx];
-                            let idx = if v > 0 { usize::from(v - 1) } else { 0 };
-                            let lp = usize::from(self.row_lpf_y[prev + x][i]);
-                            self.mask_y_row[y0 * self.bw + gx] = idx.min(lp) as u8 + 1;
-                        }
-                        if has_chroma {
-                            let cw = (w + self.ss_hor) >> self.ss_hor;
-                            let cgy = y0 >> self.ss_ver;
-                            let cbx = (x * 32) >> self.ss_hor;
-                            for i in 0..cw {
-                                let cgx = cbx + i;
-                                let v = self.mask_uv_row[cgy * self.cw + cgx];
-                                let idx = if v > 0 { usize::from(v - 1) } else { 0 };
-                                let lp = usize::from(self.row_lpf_uv[prev + x][i]);
-                                self.mask_uv_row[cgy * self.cw + cgx] = idx.min(lp) as u8 + 1;
-                            }
-                        }
-                    }
-                }
-            }
-        }
+        self.fixup_tile_boundaries(hdr, start_of_tile_row, pic.has_chroma);
 
         struct PlaneLfJob {
             pl: usize,

@@ -179,23 +179,33 @@ impl RefMvs {
         dsp: RefmvsDsp,
         butce: &crate::frame::butce::Butce,
     ) -> crate::error::Result<Self> {
-        Self::new_with_reuse(width, height, dsp, Vec::new(), butce)
+        Self::new_with_reuse(width, height, dsp, Vec::new(), butce, false)
     }
 
     /// Havuzdan geri dönüştürülmüş `old_grid` varsa kapasitesi eşleştiğinde
     /// yeniden kullanarak `RefMvs` kurar (`F8b-1`).
+    ///
+    /// `skip_grid_fill == true` ise paralel çok-karolu birleştirmede tüm
+    /// `iw4 × ih4` ızgarası üzerine yazılacağından gereksiz `INVALID_BLOCK`
+    /// doldurması atlanır (`5.C.1`).
     pub(crate) fn new_with_reuse(
         width: usize,
         height: usize,
         dsp: RefmvsDsp,
         old_grid: Vec<RefBlock>,
         butce: &crate::frame::butce::Butce,
+        skip_grid_fill: bool,
     ) -> crate::error::Result<Self> {
         let iw4 = ((width + 7) >> 3) << 1;
         let ih4 = ((height + 7) >> 3) << 1;
+        let grid = if skip_grid_fill {
+            butce.reuse_vec_dirty(old_grid, iw4 * ih4, INVALID_BLOCK)?.0
+        } else {
+            butce.reuse_vec(old_grid, iw4 * ih4, INVALID_BLOCK)?
+        };
         Ok(Self {
             dsp,
-            grid: butce.reuse_vec(old_grid, iw4 * ih4, INVALID_BLOCK)?,
+            grid,
             iw4,
             ih4,
             x_base: 0,

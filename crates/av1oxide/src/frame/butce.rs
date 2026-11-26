@@ -400,6 +400,39 @@ impl Butce {
         }
     }
 
+    /// `old` vektörünün kapasitesi `[n, 2*n]` aralığındaysa ve `old.len() >= n`
+    /// ise (`allocation_limit` kapalıyken) içeriği sıfırlamadan `truncate(n)` ile
+    /// geri döndürür (`(_, true)`). Aksi hâlde `deger` ile dolu taze vektör döner
+    /// (`(_, false)`).
+    ///
+    /// Yalnızca çağıranın etkin alanın tamamını üzerine yazacağı ve hizalama/kuyruk
+    /// dolgusunu ayrıca temizleyeceği durumlar içindir (`5.C.1`).
+    pub(crate) fn reuse_vec_dirty<T: Clone>(
+        &self,
+        mut old: Vec<T>,
+        n: usize,
+        deger: T,
+    ) -> Result<(Vec<T>, bool)> {
+        let bayt = dizi_bayti::<T>(n)?;
+        self.ayir(bayt)?;
+        if n == 0 {
+            drop(old);
+            return Ok((Vec::new(), false));
+        }
+        if !self.has_limit()
+            && old.len() >= n
+            && old.capacity() >= n
+            && old.capacity() <= n.saturating_mul(2)
+        {
+            old.truncate(n);
+            Ok((old, true))
+        } else {
+            drop(old);
+            let v = dolu_vec(n, deger).inspect_err(|_| self.birak(bayt))?;
+            Ok((v, false))
+        }
+    }
+
     /// Dilimin düşebilir kopyası (`to_vec` eşdeğeri); defterde kalır.
     pub(crate) fn kopya<T: Clone>(&self, kaynak: &[T]) -> Result<Vec<T>> {
         let bayt = dizi_bayti::<T>(kaynak.len())?;

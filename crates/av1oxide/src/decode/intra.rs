@@ -269,12 +269,41 @@ impl PicBuf {
         };
         let uv_len = if has_chroma { uv_len } else { 0 };
         let [old_y, old_u, old_v] = old_data;
+        let (mut y_buf, y_dirty) = butce.reuse_vec_dirty(old_y, y_len, 0u8)?;
+        if y_dirty {
+            let active_row_bytes = width * bpp;
+            if active_row_bytes < y_stride {
+                for row in 0..height {
+                    let base = row * y_stride;
+                    y_buf[base + active_row_bytes..base + y_stride].fill(0);
+                }
+            }
+            let tail_off = height * y_stride;
+            if tail_off < y_len {
+                y_buf[tail_off..y_len].fill(0);
+            }
+        }
+        let (mut u_buf, u_dirty) = butce.reuse_vec_dirty(old_u, uv_len, 0u8)?;
+        let (mut v_buf, v_dirty) = butce.reuse_vec_dirty(old_v, uv_len, 0u8)?;
+        if has_chroma {
+            let active_uv_bytes = cw * bpp;
+            let uv_tail_off = ch * uv_stride;
+            for (buf, dirty) in [(&mut u_buf, u_dirty), (&mut v_buf, v_dirty)] {
+                if dirty {
+                    if active_uv_bytes < uv_stride {
+                        for row in 0..ch {
+                            let base = row * uv_stride;
+                            buf[base + active_uv_bytes..base + uv_stride].fill(0);
+                        }
+                    }
+                    if uv_tail_off < uv_len {
+                        buf[uv_tail_off..uv_len].fill(0);
+                    }
+                }
+            }
+        }
         Ok(Self {
-            data: [
-                butce.reuse_vec(old_y, y_len, 0u8)?,
-                butce.reuse_vec(old_u, uv_len, 0u8)?,
-                butce.reuse_vec(old_v, uv_len, 0u8)?,
-            ],
+            data: [y_buf, u_buf, v_buf],
             stride: [y_stride, uv_stride, uv_stride],
             x_base: [0; 3],
             y_base: [0; 3],
@@ -676,6 +705,22 @@ impl Blocks {
             left_pal_uv_sz: [0u8; 32],
         })
     }
+
+    /// Geri dönüştürülen tile `Blocks` bağlamının yalnızca ilgili sütun aralığını sıfırlar.
+    fn reset_for_tile(&mut self, col_start_sb128: usize, col_end_sb128: usize, keyframe: bool) {
+        let mut ctx = BlockContext::default();
+        reset_context(&mut ctx, keyframe);
+        let lo = col_start_sb128.min(self.above.len());
+        let hi = col_end_sb128.min(self.above.len());
+        if lo < hi {
+            self.above[lo..hi].fill(ctx);
+            self.above_pal[lo..hi].fill([[[0u16; 8]; 3]; 32]);
+            self.above_pal_uv_sz[lo..hi].fill([0u8; 32]);
+        }
+        self.left = BlockContext::default();
+        self.left_pal = [[[0u16; 8]; 3]; 32];
+        self.left_pal_uv_sz = [0u8; 32];
+    }
 }
 
 /// `struct ScalableMotionParams` (`src/internal.h:236-241`) — ölçekli referans.
@@ -956,22 +1001,22 @@ impl DecodeBufPool {
         let max_work_bufs = if n_threads <= 1 {
             2
         } else {
-            n_threads.clamp(2, 8)
+            n_threads.clamp(2, 4)
         };
         let max_u8_vecs = if n_threads <= 1 {
-            9
+            6
         } else {
-            (n_threads * 3).clamp(9, 24)
+            (n_threads * 3 / 2).clamp(6, 12)
         };
         let max_segmap_vecs = if n_threads <= 1 {
             4
         } else {
-            (n_threads * 2).clamp(4, 12)
+            n_threads.clamp(4, 8)
         };
         let max_tmvs_vecs = if n_threads <= 1 {
             2
         } else {
-            n_threads.clamp(2, 8)
+            n_threads.clamp(2, 4)
         };
         Self {
             max_work_bufs,
@@ -2045,6 +2090,7 @@ impl<'a> Dec<'a> {
         work_bufs: &mut WorkFrameBufs,
         buf_pool: &DecodeBufPool,
         butce: &'a Butce,
+        parallel_tiles: bool,
     ) -> Result<Self> {
         let bd = match seq.hbd {
             0 => BitDepth::Eight,
@@ -2090,10 +2136,25 @@ impl<'a> Dec<'a> {
         let old_pic_data = buf_pool.take_u8_triple(pic_lens, has_limit);
         let pic = PicBuf::new_with_reuse(width, height, chroma, bd, old_pic_data, butce)?;
         let frame_lflvl = crate::decode::loopfilter::calc_lf_values(hdr, [0; 4]);
+        let tiles_cover_frame = parallel_tiles
+            && hdr.tiling.cols > 0
+            && hdr.tiling.rows > 0
+            && usize::from(hdr.tiling.col_start_sb[usize::from(hdr.tiling.cols)]) * sb_step >= bw
+            && usize::from(hdr.tiling.row_start_sb[usize::from(hdr.tiling.rows)]) * sb_step >= bh;
+        let need_refmvs =
+            !matches!(hdr.frame_type, FrameType::Key | FrameType::Intra) || hdr.allow_intrabc;
         let old_lf = work_bufs.lf.take();
         let lf = if hdr.loopfilter.level_y[0] != 0 || hdr.loopfilter.level_y[1] != 0 {
             Some(crate::decode::loopfilter::LfFrame::new_with_reuse(
-                hdr, w4, h4, ss_hor, ss_ver, sb128, old_lf, butce,
+                hdr,
+                w4,
+                h4,
+                ss_hor,
+                ss_ver,
+                sb128,
+                old_lf,
+                butce,
+                tiles_cover_frame,
             )?)
         } else {
             work_bufs.lf = old_lf;
@@ -2175,6 +2236,7 @@ impl<'a> Dec<'a> {
                 *dsp.refmvs(),
                 core::mem::take(&mut work_bufs.refmvs_grid),
                 butce,
+                tiles_cover_frame && need_refmvs,
             )?,
             refs,
             prev_segmap,
@@ -9168,6 +9230,10 @@ pub(crate) fn decode_frame(
         }
     }
 
+    let dt = dsp_trace();
+    let trace_active = dt.on || dt.refmvs_trace || dt.lf_blk || cfg!(feature = "msac-trace");
+    let parallel_tiles = pool.is_parallel() && n_tiles > 1 && !trace_active;
+
     let mut dec = Dec::new(
         seq,
         hdr,
@@ -9177,6 +9243,7 @@ pub(crate) fn decode_frame(
         &mut work_bufs,
         buf_pool,
         butce,
+        parallel_tiles,
     )?;
     if hdr.primary_ref_frame != 7 {
         dec.tools.cdf_load = 1;
@@ -9196,9 +9263,7 @@ pub(crate) fn decode_frame(
     // Tanılama: refmvs çağrı izi kare sırası (`AV1OXIDE_REFMVS_TRACE`).
     dec.refmvs.set_frame(dec.frame_no);
     let mut tile_cdfs: Vec<CdfContext> = butce.kapasite(n_tiles)?;
-    let dt = dsp_trace();
-    let trace_active = dt.on || dt.refmvs_trace || dt.lf_blk || cfg!(feature = "msac-trace");
-    if pool.is_parallel() && n_tiles > 1 && !trace_active {
+    if parallel_tiles {
         decode_tiles_parallel(&mut dec, hdr, tiles, &cdf_in, &mut tile_cdfs, pool)?;
     } else {
         for tile_row in 0..usize::from(hdr.tiling.rows) {
@@ -9463,22 +9528,21 @@ fn decode_tiles_parallel(
         tile_segmap_stride: usize,
         data: Vec<u8>,
         cdf: CdfContext,
-        pic_data: [Mutex<Option<Vec<u8>>>; 3],
+        pic_data: [Vec<u8>; 3],
         pic_stride: [usize; 3],
         pic_x_base: [usize; 3],
         pic_y_base: [usize; 3],
-        lf: Mutex<Option<crate::decode::loopfilter::LfFrame>>,
-        cdef_state: Mutex<Option<crate::decode::cdef::CdefState>>,
+        lf: Option<crate::decode::loopfilter::LfFrame>,
+        cdef_state: Option<crate::decode::cdef::CdefState>,
         lr: Option<crate::decode::lr::LrState>,
         lr_counts: crate::decode::lr::LrSyntaxCounts,
-        segmap: Mutex<Option<Vec<u8>>>,
-        refmvs: Mutex<Option<RefMvs>>,
+        segmap: Vec<u8>,
+        refmvs: Option<RefMvs>,
         tools: ToolCounts,
     }
 
     let n_rows = usize::from(hdr.tiling.rows);
     let n_cols = usize::from(hdr.tiling.cols);
-    let n_tiles = n_rows * n_cols;
     let keyframe = matches!(hdr.frame_type, FrameType::Key | FrameType::Intra);
     let allow_intrabc = hdr.allow_intrabc;
     let need_refmvs = !keyframe || allow_intrabc;
@@ -9486,46 +9550,14 @@ fn decode_tiles_parallel(
     let max_sb_rows = (dec.bh + dec.sb_step - 1) >> dec.sb_shift;
     let max_sb_cols = (dec.bw + dec.sb_step - 1) >> dec.sb_shift;
 
-    let mut works: Vec<TileWork> = Vec::with_capacity(n_tiles);
+    let mut row_bounds_sb4: Vec<(usize, usize, usize)> = Vec::with_capacity(n_rows);
     for tile_row in 0..n_rows {
         let row_start_sb = usize::from(hdr.tiling.row_start_sb[tile_row]);
         let row_end_sb = usize::from(hdr.tiling.row_start_sb[tile_row + 1]).min(max_sb_rows);
         let row_start = row_start_sb << dec.sb_shift;
         let row_end_sb4 = row_end_sb << dec.sb_shift;
         let row_end = row_end_sb4.min(dec.bh);
-        for tile_col in 0..n_cols {
-            let col_start_sb = usize::from(hdr.tiling.col_start_sb[tile_col]);
-            let col_end_sb = usize::from(hdr.tiling.col_start_sb[tile_col + 1]).min(max_sb_cols);
-            let col_start = col_start_sb << dec.sb_shift;
-            let col_end_sb4 = col_end_sb << dec.sb_shift;
-            let col_end = col_end_sb4.min(dec.bw);
-            let idx = tile_row * n_cols + tile_col;
-            let tile_segmap_stride = col_end_sb4.saturating_sub(col_start).max(32);
-            works.push(TileWork {
-                tile_row,
-                tile_col,
-                row_start,
-                row_end_sb4,
-                row_end,
-                col_start,
-                col_end_sb4,
-                col_end,
-                tile_segmap_stride,
-                data: crate::frame::butce::kopya_vec(tiles[idx])?,
-                cdf: cdf_in.clone(),
-                pic_data: [Mutex::new(None), Mutex::new(None), Mutex::new(None)],
-                pic_stride: [0; 3],
-                pic_x_base: [0; 3],
-                pic_y_base: [0; 3],
-                lf: Mutex::new(None),
-                cdef_state: Mutex::new(None),
-                lr: None,
-                lr_counts: crate::decode::lr::LrSyntaxCounts::default(),
-                segmap: Mutex::new(None),
-                refmvs: Mutex::new(None),
-                tools: ToolCounts::default(),
-            });
-        }
+        row_bounds_sb4.push((row_start, row_end_sb4, row_end));
     }
 
     let seq_owned = Arc::new(dec.seq.clone());
@@ -9586,399 +9618,1036 @@ fn decode_tiles_parallel(
     let segmentation_frame = dec.segmentation_frame;
     let qmatrix_frame = dec.qmatrix_frame;
 
-    pool.execute_tasks(&mut works, move |_wid, _idx, w: &mut TileWork| {
-        let pic = pic_meta.fork_for_tile(
-            w.row_start,
-            w.row_end_sb4,
-            w.col_start,
-            w.col_end_sb4,
-            allow_intrabc,
-        )?;
-        let blocks = Blocks::fork_for_tile(sb128w, keyframe)?;
-        let lf = lf_meta
-            .as_ref()
-            .as_ref()
-            .map(|lf| lf.fork_for_tile(w.row_start, w.row_end_sb4, w.col_start, w.col_end_sb4))
-            .transpose()?;
-        let cdef_state =
-            cdef_meta.fork_for_tile(w.row_start, w.row_end_sb4, w.col_start, w.col_end_sb4)?;
-        let lr = lr_meta
-            .as_ref()
-            .as_ref()
-            .map(crate::decode::lr::LrState::fork_for_tile);
-        let scratch = Scratch::fork_for_tile(bd)?;
-        let segmap = if need_segmap {
-            let tile_seg_h = w.row_end_sb4.saturating_sub(w.row_start).max(32);
-            crate::frame::butce::dolu_vec(w.tile_segmap_stride * tile_seg_h, 0u8)?
-        } else {
-            Vec::new()
-        };
-        let refmvs = refmvs_meta.fork_for_tile(
-            TileBounds {
-                row_start: w.row_start,
-                row_end: w.row_end,
-                col_start: w.col_start,
-                col_end: w.col_end,
-            },
-            need_refmvs,
-        )?;
-        let mut tdec = Dec {
-            seq: &seq_owned,
-            hdr: &hdr_owned,
-            dsp: &dsp_owned,
-            bdsp: dsp_owned.for_bit_depth(bd),
-            bd,
-            chroma,
-            ss_hor,
-            ss_ver,
-            has_chroma,
-            bw,
-            bh,
-            w4,
-            h4,
-            sb128,
-            sb_shift,
-            sb_step,
-            pic,
-            blocks,
-            above_base: 0,
-            sb128w,
-            bx: 0,
-            by: 0,
-            col_start: 0,
-            col_end: 0,
-            row_start: 0,
-            row_end: 0,
-            last_qidx: i32::from(hdr_owned.quant.yac),
-            last_delta_lf: [0; 4],
-            frame_lflvl,
-            lflvl: frame_lflvl,
-            lf,
-            cdef_state,
-            lr,
-            lr_counts: w.lr_counts,
-            dq: frame_dq,
-            frame_dq,
-            cdef_idx: [-1; 4],
-            scratch,
-            segmap,
-            segmap_stride: w.tile_segmap_stride,
-            segmap_x_base: w.col_start,
-            segmap_y_base: w.row_start,
-            frame_segmap_stride,
-            pal: [[0u16; 8]; 3],
-            frame_no,
-            refmvs,
-            refs: &refs_owned,
-            prev_segmap: prev_segmap.as_ref().map(Arc::clone),
-            refpoc,
-            refrefpoc,
-            tl_4x4_filter: 0,
-            svc,
-            gmv_warp_allowed,
-            gmv_warp,
-            jnt_weights,
-            tools: ToolCounts::default(),
-            sb128_frame,
-            multi_tile_frame,
-            segmentation_frame,
-            qmatrix_frame,
-        };
-        let res = tdec.decode_tile(w.tile_row, w.tile_col, &w.data, &mut w.cdf);
-        w.data = Vec::new();
-        let [py, pu, pv] = tdec.pic.data;
-        w.pic_stride = tdec.pic.stride;
-        w.pic_x_base = tdec.pic.x_base;
-        w.pic_y_base = tdec.pic.y_base;
-        *w.pic_data[0].lock() = Some(py);
-        if has_chroma {
-            *w.pic_data[1].lock() = Some(pu);
-            *w.pic_data[2].lock() = Some(pv);
-        }
-        *w.lf.lock() = tdec.lf;
-        *w.cdef_state.lock() = Some(tdec.cdef_state);
-        w.lr = tdec.lr;
-        w.lr_counts = tdec.lr_counts;
-        if !tdec.segmap.is_empty() {
-            *w.segmap.lock() = Some(tdec.segmap);
-        }
-        if need_refmvs {
-            *w.refmvs.lock() = Some(tdec.refmvs);
-        }
-        w.tools = tdec.tools;
-        res
-    })?;
+    // Büyük çok-satırlı karelerde (`Y >= 4 MiB`, `n_rows >= 4`) karoları `tile_row`
+    // dalgaları hâlinde çözüp anında birleştir (`5.C.1`): 120 karoluk geçici
+    // tamponun tamamını aynı anda tutmak yerine dalga başına ~30 karo tutarak
+    // tepe bellek/RSS tüketimini belirgin biçimde düşürür.
+    #[cfg(all(feature = "std", not(target_arch = "wasm32")))]
+    let monotonic_rows = n_rows >= 2
+        && dec.pic.data[0].len() >= 512 * 1024
+        && row_bounds_sb4
+            .windows(2)
+            .all(|ab| ab[0].1 == ab[1].0 && ab[0].0 <= ab[0].1 && ab[0].2 == ab[1].0);
+    #[cfg(all(feature = "std", not(target_arch = "wasm32")))]
+    let wave_rows = if monotonic_rows && n_rows >= 4 && dec.pic.data[0].len() >= 4 * 1024 * 1024 {
+        let target_tiles = (pool.n_threads() * 3 / 2).max(16);
+        target_tiles.div_ceil(n_cols.max(1)).clamp(1, n_rows)
+    } else {
+        n_rows
+    };
+    #[cfg(not(all(feature = "std", not(target_arch = "wasm32"))))]
+    let wave_rows = n_rows;
 
-    // Faz 2 (`F8b-2`): 6 bağımsız hedef bileşeni (`Pic Y`, `Pic U`, `Pic V`,
-    // `RefMvs::grid`, `LfFrame`, `segmap + CdefState`) `core::mem::take` ile
-    // sıfır-kopya `WorkerPool` görevlerine taşı, paralel birleştir ve her
-    // karoya ait geçici tamponu birleştirildiği işçi iş parçacığında düşür.
-    #[allow(clippy::large_enum_variant)]
-    enum MergeComponent {
-        PicPlane {
-            plane: usize,
-            data: Vec<u8>,
-            dst_stride: usize,
-            bpp: usize,
-            sh: usize,
-            sv: usize,
-        },
-        RefMvsGrid {
-            grid: Vec<crate::decode::refmvs::RefBlock>,
-            iw4: usize,
-            ih4: usize,
-            hits: u64,
-        },
-        Lf {
-            lf: crate::decode::loopfilter::LfFrame,
-            w4: usize,
-            h4: usize,
-        },
-        SegmapAndCdef {
-            segmap: Vec<u8>,
-            segmap_stride: usize,
-            bh: usize,
-            cdef_state: crate::decode::cdef::CdefState,
-        },
-    }
+    // Faz 1 işçileri için `(Scratch, Blocks)` yeniden kullanım havuzu (`5.C.1`):
+    // tüm dalgalar boyunca paylaşılır; en fazla `n_threads` örnek oluşturulur.
+    let tile_scratch_pool: Arc<Mutex<Vec<(Scratch, Blocks)>>> =
+        Arc::new(Mutex::new(Vec::with_capacity(pool.n_threads())));
 
-    for w in &mut works {
-        if let (Some(dst_lr), Some(src_lr)) = (dec.lr.as_mut(), w.lr.take()) {
-            dst_lr.merge_tile_from(&src_lr);
-        }
-        dec.lr_counts.units += w.lr_counts.units;
-        dec.lr_counts.switchable_units += w.lr_counts.switchable_units;
-        dec.lr_counts.none_units += w.lr_counts.none_units;
-        dec.lr_counts.wiener_units += w.lr_counts.wiener_units;
-        dec.lr_counts.sgr_units += w.lr_counts.sgr_units;
-        dec.tools.merge_from(&w.tools);
-        tile_cdfs.push(w.cdf.clone());
-    }
-
-    let works_arc = Arc::new(works);
-    let mut jobs: Vec<MergeComponent> = Vec::with_capacity(6);
-    jobs.push(MergeComponent::PicPlane {
-        plane: 0,
-        data: core::mem::take(&mut dec.pic.data[0]),
-        dst_stride: dec.pic.stride[0],
-        bpp: dec.pic.bpp,
-        sh: 0,
-        sv: 0,
-    });
-    if dec.pic.has_chroma {
-        jobs.push(MergeComponent::PicPlane {
-            plane: 1,
-            data: core::mem::take(&mut dec.pic.data[1]),
-            dst_stride: dec.pic.stride[1],
-            bpp: dec.pic.bpp,
-            sh: dec.pic.ss_hor,
-            sv: dec.pic.ss_ver,
-        });
-        jobs.push(MergeComponent::PicPlane {
-            plane: 2,
-            data: core::mem::take(&mut dec.pic.data[2]),
-            dst_stride: dec.pic.stride[2],
-            bpp: dec.pic.bpp,
-            sh: dec.pic.ss_hor,
-            sv: dec.pic.ss_ver,
-        });
-    }
-    if need_refmvs {
-        jobs.push(MergeComponent::RefMvsGrid {
-            grid: core::mem::take(&mut dec.refmvs.grid),
-            iw4: dec.refmvs.iw4,
-            ih4: dec.refmvs.ih4,
-            hits: 0,
-        });
-    }
-    if let Some(lf) = dec.lf.take() {
-        jobs.push(MergeComponent::Lf {
-            lf,
-            w4: dec.w4,
-            h4: dec.h4,
-        });
-    }
-    jobs.push(MergeComponent::SegmapAndCdef {
-        segmap: core::mem::take(&mut dec.segmap),
-        segmap_stride: dec.segmap_stride,
-        bh: dec.bh,
-        cdef_state: core::mem::replace(
-            &mut dec.cdef_state,
-            crate::decode::cdef::CdefState {
-                noskip: Vec::new(),
-                noskip_stride: 1,
-                noskip_x_base: 0,
-                noskip_y_base: 0,
-                idx64: Vec::new(),
-                sb64w: 1,
-                sb64_x_base: 0,
-                sb64_y_base: 0,
-            },
-        ),
-    });
-
-    let works_for_workers = Arc::clone(&works_arc);
-    pool.execute_tasks(&mut jobs, move |_wid, _jidx, job: &mut MergeComponent| {
-        match job {
-            MergeComponent::PicPlane {
-                plane,
-                data,
-                dst_stride,
-                bpp,
-                sh,
-                sv,
-            } => {
-                let p = *plane;
-                let dst_stride = *dst_stride;
-                let bpp = *bpp;
-                let sh = *sh;
-                let sv = *sv;
-                if let Some(max_rows) = data.len().checked_div(dst_stride) {
-                    for w in works_for_workers.iter() {
-                        let Some(src_data) = w.pic_data[p].lock().take() else {
-                            continue;
-                        };
-                        let src_stride = w.pic_stride[p];
-                        if src_stride == 0 {
-                            continue;
-                        }
-                        let y0 = ((w.row_start * 4) >> sv).min(max_rows);
-                        let y1 = (((w.row_end_sb4 * 4) + sv) >> sv).min(max_rows);
-                        let x0_px = (w.col_start * 4) >> sh;
-                        let x1_px = ((w.col_end_sb4 * 4) + sh) >> sh;
-                        let dst_x0_bytes = (x0_px * bpp).min(dst_stride);
-                        let dst_x1_bytes = (x1_px * bpp).min(dst_stride);
-                        if dst_x0_bytes < dst_x1_bytes {
-                            let copy_bytes = dst_x1_bytes - dst_x0_bytes;
-                            let src_x0_bytes = (x0_px - w.pic_x_base[p]) * bpp;
-                            let y_base = w.pic_y_base[p];
-                            for y in y0..y1 {
-                                let dst_off = y * dst_stride + dst_x0_bytes;
-                                let src_off = (y - y_base) * src_stride + src_x0_bytes;
-                                data[dst_off..dst_off + copy_bytes]
-                                    .copy_from_slice(&src_data[src_off..src_off + copy_bytes]);
-                            }
-                        }
-                    }
-                }
+    let mut wave_r_start = 0usize;
+    while wave_r_start < n_rows {
+        let wave_r_end = (wave_r_start + wave_rows).min(n_rows);
+        let wave_r_count = wave_r_end - wave_r_start;
+        let mut works: Vec<TileWork> = Vec::with_capacity(wave_r_count * n_cols);
+        for (tile_row, &(row_start, row_end_sb4, row_end)) in row_bounds_sb4
+            .iter()
+            .enumerate()
+            .take(wave_r_end)
+            .skip(wave_r_start)
+        {
+            for tile_col in 0..n_cols {
+                let col_start_sb = usize::from(hdr.tiling.col_start_sb[tile_col]);
+                let col_end_sb =
+                    usize::from(hdr.tiling.col_start_sb[tile_col + 1]).min(max_sb_cols);
+                let col_start = col_start_sb << dec.sb_shift;
+                let col_end_sb4 = col_end_sb << dec.sb_shift;
+                let col_end = col_end_sb4.min(dec.bw);
+                let idx = tile_row * n_cols + tile_col;
+                let tile_segmap_stride = col_end_sb4.saturating_sub(col_start).max(32);
+                works.push(TileWork {
+                    tile_row,
+                    tile_col,
+                    row_start,
+                    row_end_sb4,
+                    row_end,
+                    col_start,
+                    col_end_sb4,
+                    col_end,
+                    tile_segmap_stride,
+                    data: crate::frame::butce::kopya_vec(tiles[idx])?,
+                    cdf: cdf_in.clone(),
+                    pic_data: [Vec::new(), Vec::new(), Vec::new()],
+                    pic_stride: [0; 3],
+                    pic_x_base: [0; 3],
+                    pic_y_base: [0; 3],
+                    lf: None,
+                    cdef_state: None,
+                    lr: None,
+                    lr_counts: crate::decode::lr::LrSyntaxCounts::default(),
+                    segmap: Vec::new(),
+                    refmvs: None,
+                    tools: ToolCounts::default(),
+                });
             }
-            MergeComponent::RefMvsGrid {
-                grid,
-                iw4,
-                ih4,
-                hits,
-            } => {
-                let iw4 = *iw4;
-                let ih4 = *ih4;
-                for w in works_for_workers.iter() {
-                    let Some(other_rmv) = w.refmvs.lock().take() else {
-                        continue;
-                    };
-                    if !other_rmv.grid.is_empty() && other_rmv.stride > 0 {
-                        let y0 = w.row_start.min(ih4);
-                        let y1 = w.row_end.min(ih4);
-                        let x0 = w.col_start.min(iw4);
-                        let x1 = w.col_end.min(iw4);
-                        if x0 < x1 {
-                            let copy_w = x1 - x0;
-                            let src_x0 = x0 - other_rmv.x_base;
-                            for y in y0..y1 {
-                                let dst_off = y * iw4 + x0;
-                                let src_off = (y - other_rmv.y_base) * other_rmv.stride + src_x0;
-                                grid[dst_off..dst_off + copy_w]
-                                    .copy_from_slice(&other_rmv.grid[src_off..src_off + copy_w]);
-                            }
-                        }
-                    }
-                    *hits += other_rmv
-                        .temporal_hits
-                        .load(core::sync::atomic::Ordering::Relaxed);
+        }
+
+        let seq_w = Arc::clone(&seq_owned);
+        let hdr_w = Arc::clone(&hdr_owned);
+        let dsp_w = Arc::clone(&dsp_owned);
+        let refs_w = Arc::clone(&refs_owned);
+        let prev_seg_w = prev_segmap.as_ref().map(Arc::clone);
+        let pic_meta_w = Arc::clone(&pic_meta);
+        let lf_meta_w = Arc::clone(&lf_meta);
+        let cdef_meta_w = Arc::clone(&cdef_meta);
+        let lr_meta_w = Arc::clone(&lr_meta);
+        let refmvs_meta_w = Arc::clone(&refmvs_meta);
+        let tile_scratch_pool_w = Arc::clone(&tile_scratch_pool);
+
+        pool.execute_tasks(&mut works, move |_wid, _idx, w: &mut TileWork| {
+            let pic = pic_meta_w.fork_for_tile(
+                w.row_start,
+                w.row_end_sb4,
+                w.col_start,
+                w.col_end_sb4,
+                allow_intrabc,
+            )?;
+            let (scratch, blocks) = match tile_scratch_pool_w.lock().pop() {
+                Some((s, mut b)) => {
+                    b.reset_for_tile(w.col_start >> 5, w.col_end_sb4.div_ceil(32), keyframe);
+                    (s, b)
                 }
-            }
-            MergeComponent::Lf { lf, w4, h4 } => {
-                let w4 = *w4;
-                let h4 = *h4;
-                for w in works_for_workers.iter() {
-                    let Some(src_lf) = w.lf.lock().take() else {
-                        continue;
-                    };
-                    lf.merge_tile_from(
-                        &src_lf,
-                        w.tile_row,
-                        w.tile_col,
-                        w.row_start.min(h4),
-                        w.row_end.min(h4),
-                        w.col_start.min(w4),
-                        w.col_end.min(w4),
-                    );
-                }
-            }
-            MergeComponent::SegmapAndCdef {
-                segmap,
-                segmap_stride,
+                None => (
+                    Scratch::fork_for_tile(bd)?,
+                    Blocks::fork_for_tile(sb128w, keyframe)?,
+                ),
+            };
+            let lf = lf_meta_w
+                .as_ref()
+                .as_ref()
+                .map(|lf| lf.fork_for_tile(w.row_start, w.row_end_sb4, w.col_start, w.col_end_sb4))
+                .transpose()?;
+            let cdef_state = cdef_meta_w.fork_for_tile(
+                w.row_start,
+                w.row_end_sb4,
+                w.col_start,
+                w.col_end_sb4,
+            )?;
+            let lr = lr_meta_w
+                .as_ref()
+                .as_ref()
+                .map(crate::decode::lr::LrState::fork_for_tile);
+            let segmap = if need_segmap {
+                let tile_seg_h = w.row_end_sb4.saturating_sub(w.row_start).max(32);
+                crate::frame::butce::dolu_vec(w.tile_segmap_stride * tile_seg_h, 0u8)?
+            } else {
+                Vec::new()
+            };
+            let refmvs = refmvs_meta_w.fork_for_tile(
+                TileBounds {
+                    row_start: w.row_start,
+                    row_end: w.row_end,
+                    col_start: w.col_start,
+                    col_end: w.col_end,
+                },
+                need_refmvs,
+            )?;
+            let mut tdec = Dec {
+                seq: &seq_w,
+                hdr: &hdr_w,
+                dsp: &dsp_w,
+                bdsp: dsp_w.for_bit_depth(bd),
+                bd,
+                chroma,
+                ss_hor,
+                ss_ver,
+                has_chroma,
+                bw,
                 bh,
+                w4,
+                h4,
+                sb128,
+                sb_shift,
+                sb_step,
+                pic,
+                blocks,
+                above_base: 0,
+                sb128w,
+                bx: 0,
+                by: 0,
+                col_start: 0,
+                col_end: 0,
+                row_start: 0,
+                row_end: 0,
+                last_qidx: i32::from(hdr_w.quant.yac),
+                last_delta_lf: [0; 4],
+                frame_lflvl,
+                lflvl: frame_lflvl,
+                lf,
                 cdef_state,
-            } => {
-                let segmap_stride = *segmap_stride;
-                let bh = *bh;
-                for w in works_for_workers.iter() {
-                    if let Some(other_seg) = w.segmap.lock().take() {
-                        let sy0 = w.row_start.min(bh);
-                        let sy1 = w.row_end.min(bh);
-                        let sx0 = w.col_start.min(segmap_stride);
-                        let sx1 = w.col_end.min(segmap_stride);
-                        if sx0 < sx1 {
-                            let copy_w = sx1 - sx0;
-                            let src_stride = w.tile_segmap_stride;
-                            for y in sy0..sy1 {
-                                let dst_off = y * segmap_stride + sx0;
-                                let src_off = (y - w.row_start) * src_stride;
-                                if dst_off + copy_w <= segmap.len()
-                                    && src_off + copy_w <= other_seg.len()
-                                {
-                                    segmap[dst_off..dst_off + copy_w]
-                                        .copy_from_slice(&other_seg[src_off..src_off + copy_w]);
+                lr,
+                lr_counts: w.lr_counts,
+                dq: frame_dq,
+                frame_dq,
+                cdef_idx: [-1; 4],
+                scratch,
+                segmap,
+                segmap_stride: w.tile_segmap_stride,
+                segmap_x_base: w.col_start,
+                segmap_y_base: w.row_start,
+                frame_segmap_stride,
+                pal: [[0u16; 8]; 3],
+                frame_no,
+                refmvs,
+                refs: &refs_w,
+                prev_segmap: prev_seg_w.as_ref().map(Arc::clone),
+                refpoc,
+                refrefpoc,
+                tl_4x4_filter: 0,
+                svc,
+                gmv_warp_allowed,
+                gmv_warp,
+                jnt_weights,
+                tools: ToolCounts::default(),
+                sb128_frame,
+                multi_tile_frame,
+                segmentation_frame,
+                qmatrix_frame,
+            };
+            let res = tdec.decode_tile(w.tile_row, w.tile_col, &w.data, &mut w.cdf);
+            w.data = Vec::new();
+            let Dec {
+                pic,
+                blocks,
+                lf,
+                cdef_state,
+                lr,
+                lr_counts,
+                scratch,
+                segmap,
+                refmvs,
+                tools,
+                ..
+            } = tdec;
+            tile_scratch_pool_w.lock().push((scratch, blocks));
+            let [py, pu, pv] = pic.data;
+            w.pic_stride = pic.stride;
+            w.pic_x_base = pic.x_base;
+            w.pic_y_base = pic.y_base;
+            w.pic_data[0] = py;
+            if has_chroma {
+                w.pic_data[1] = pu;
+                w.pic_data[2] = pv;
+            }
+            w.lf = lf;
+            w.cdef_state = Some(cdef_state);
+            w.lr = lr;
+            w.lr_counts = lr_counts;
+            w.segmap = segmap;
+            if need_refmvs {
+                w.refmvs = Some(refmvs);
+            }
+            w.tools = tools;
+            res
+        })?;
+
+        for w in &mut works {
+            if let (Some(dst_lr), Some(src_lr)) = (dec.lr.as_mut(), w.lr.take()) {
+                dst_lr.merge_tile_from(&src_lr);
+            }
+            dec.lr_counts.units += w.lr_counts.units;
+            dec.lr_counts.switchable_units += w.lr_counts.switchable_units;
+            dec.lr_counts.none_units += w.lr_counts.none_units;
+            dec.lr_counts.wiener_units += w.lr_counts.wiener_units;
+            dec.lr_counts.sgr_units += w.lr_counts.sgr_units;
+            dec.tools.merge_from(&w.tools);
+            tile_cdfs.push(w.cdf.clone());
+        }
+
+        // Faz 2 (`5.C.1`): bu dalganın karolarını `tile_row` şeritlerine `split_at_mut`
+        // ile bölerek sıfır-kopya paralel birleştir ve hemen serbest bırak.
+        #[cfg_attr(
+            not(all(feature = "std", not(target_arch = "wasm32"))),
+            allow(unused_mut)
+        )]
+        let mut merged_scoped = false;
+        #[cfg(all(feature = "std", not(target_arch = "wasm32")))]
+        if monotonic_rows {
+            let guard = pool.acquire_scope_workers(pool.n_threads().saturating_sub(1));
+            if guard.total_threads() > 1 {
+                merged_scoped = true;
+                struct PicTileSrc {
+                    data: Vec<u8>,
+                    src_stride: usize,
+                    x_base: usize,
+                    y_base: usize,
+                    row_start: usize,
+                    row_end_sb4: usize,
+                    col_start: usize,
+                    col_end_sb4: usize,
+                }
+                struct RefMvsTileSrc {
+                    rmv: RefMvs,
+                    row_start: usize,
+                    row_end: usize,
+                    col_start: usize,
+                    col_end: usize,
+                }
+                struct LfTileSrc {
+                    lf: crate::decode::loopfilter::LfFrame,
+                    tile_row: usize,
+                    tile_col: usize,
+                    row_start: usize,
+                    row_end: usize,
+                    col_start: usize,
+                    col_end: usize,
+                }
+                struct SegCdefTileSrc {
+                    segmap: Vec<u8>,
+                    tile_segmap_stride: usize,
+                    cdef_state: Option<crate::decode::cdef::CdefState>,
+                    row_start: usize,
+                    row_end: usize,
+                    col_start: usize,
+                    col_end: usize,
+                }
+
+                let mut plane_row_tiles: [Vec<Vec<PicTileSrc>>; 3] = [
+                    (0..wave_r_count)
+                        .map(|_| Vec::with_capacity(n_cols))
+                        .collect(),
+                    if dec.pic.has_chroma {
+                        (0..wave_r_count)
+                            .map(|_| Vec::with_capacity(n_cols))
+                            .collect()
+                    } else {
+                        Vec::new()
+                    },
+                    if dec.pic.has_chroma {
+                        (0..wave_r_count)
+                            .map(|_| Vec::with_capacity(n_cols))
+                            .collect()
+                    } else {
+                        Vec::new()
+                    },
+                ];
+                let mut refmvs_row_tiles: Vec<Vec<RefMvsTileSrc>> = if need_refmvs {
+                    (0..wave_r_count)
+                        .map(|_| Vec::with_capacity(n_cols))
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+                let mut lf_tiles: Vec<LfTileSrc> = if dec.lf.is_some() {
+                    Vec::with_capacity(works.len())
+                } else {
+                    Vec::new()
+                };
+                let mut seg_cdef_tiles: Vec<SegCdefTileSrc> = Vec::with_capacity(works.len());
+
+                for w in works.drain(..) {
+                    let local_r = w.tile_row - wave_r_start;
+                    let [py, pu, pv] = w.pic_data;
+                    plane_row_tiles[0][local_r].push(PicTileSrc {
+                        data: py,
+                        src_stride: w.pic_stride[0],
+                        x_base: w.pic_x_base[0],
+                        y_base: w.pic_y_base[0],
+                        row_start: w.row_start,
+                        row_end_sb4: w.row_end_sb4,
+                        col_start: w.col_start,
+                        col_end_sb4: w.col_end_sb4,
+                    });
+                    if dec.pic.has_chroma {
+                        plane_row_tiles[1][local_r].push(PicTileSrc {
+                            data: pu,
+                            src_stride: w.pic_stride[1],
+                            x_base: w.pic_x_base[1],
+                            y_base: w.pic_y_base[1],
+                            row_start: w.row_start,
+                            row_end_sb4: w.row_end_sb4,
+                            col_start: w.col_start,
+                            col_end_sb4: w.col_end_sb4,
+                        });
+                        plane_row_tiles[2][local_r].push(PicTileSrc {
+                            data: pv,
+                            src_stride: w.pic_stride[2],
+                            x_base: w.pic_x_base[2],
+                            y_base: w.pic_y_base[2],
+                            row_start: w.row_start,
+                            row_end_sb4: w.row_end_sb4,
+                            col_start: w.col_start,
+                            col_end_sb4: w.col_end_sb4,
+                        });
+                    }
+                    if need_refmvs && let Some(rmv) = w.refmvs {
+                        refmvs_row_tiles[local_r].push(RefMvsTileSrc {
+                            rmv,
+                            row_start: w.row_start,
+                            row_end: w.row_end,
+                            col_start: w.col_start,
+                            col_end: w.col_end,
+                        });
+                    }
+                    if let Some(lf) = w.lf {
+                        lf_tiles.push(LfTileSrc {
+                            lf,
+                            tile_row: w.tile_row,
+                            tile_col: w.tile_col,
+                            row_start: w.row_start,
+                            row_end: w.row_end,
+                            col_start: w.col_start,
+                            col_end: w.col_end,
+                        });
+                    }
+                    seg_cdef_tiles.push(SegCdefTileSrc {
+                        segmap: w.segmap,
+                        tile_segmap_stride: w.tile_segmap_stride,
+                        cdef_state: w.cdef_state,
+                        row_start: w.row_start,
+                        row_end: w.row_end,
+                        col_start: w.col_start,
+                        col_end: w.col_end,
+                    });
+                }
+
+                enum ScopedMergeTask<'a> {
+                    PicStrip {
+                        dst: &'a mut [u8],
+                        dst_y0: usize,
+                        dst_stride: usize,
+                        bpp: usize,
+                        sh: usize,
+                        sv: usize,
+                        tiles: Vec<PicTileSrc>,
+                    },
+                    RefMvsStrip {
+                        dst: &'a mut [crate::decode::refmvs::RefBlock],
+                        dst_y0: usize,
+                        iw4: usize,
+                        ih4: usize,
+                        tiles: Vec<RefMvsTileSrc>,
+                    },
+                    Lf {
+                        lf: &'a mut crate::decode::loopfilter::LfFrame,
+                        w4: usize,
+                        h4: usize,
+                        tiles: Vec<LfTileSrc>,
+                    },
+                    SegmapAndCdef {
+                        segmap: &'a mut [u8],
+                        segmap_stride: usize,
+                        bh: usize,
+                        cdef_state: &'a mut crate::decode::cdef::CdefState,
+                        tiles: Vec<SegCdefTileSrc>,
+                    },
+                }
+
+                let mut tasks: Vec<ScopedMergeTask<'_>> = Vec::with_capacity(wave_r_count * 4 + 2);
+                let total_hits = core::sync::atomic::AtomicU64::new(0);
+
+                tasks.push(ScopedMergeTask::SegmapAndCdef {
+                    segmap: dec.segmap.as_mut_slice(),
+                    segmap_stride: dec.segmap_stride,
+                    bh: dec.bh,
+                    cdef_state: &mut dec.cdef_state,
+                    tiles: seg_cdef_tiles,
+                });
+
+                if need_refmvs {
+                    let iw4 = dec.refmvs.iw4;
+                    let ih4 = dec.refmvs.ih4;
+                    let wave_y0 = row_bounds_sb4[wave_r_start].0.min(ih4);
+                    let start_elem = wave_y0.saturating_mul(iw4).min(dec.refmvs.grid.len());
+                    let mut rem = &mut dec.refmvs.grid[start_elem..];
+                    let mut cur_y = wave_y0;
+                    for (local_r, row_tiles) in refmvs_row_tiles.into_iter().enumerate() {
+                        let r = wave_r_start + local_r;
+                        let (_, _, r_end) = row_bounds_sb4[r];
+                        let y1 = r_end.min(ih4);
+                        let take_elems = if r + 1 == n_rows {
+                            rem.len()
+                        } else {
+                            y1.saturating_sub(cur_y).saturating_mul(iw4).min(rem.len())
+                        };
+                        let (band, rest) = rem.split_at_mut(take_elems);
+                        rem = rest;
+                        tasks.push(ScopedMergeTask::RefMvsStrip {
+                            dst: band,
+                            dst_y0: cur_y,
+                            iw4,
+                            ih4,
+                            tiles: row_tiles,
+                        });
+                        cur_y = y1;
+                    }
+                }
+
+                let [y_plane, u_plane, v_plane] = &mut dec.pic.data;
+                let [y_tiles_by_row, u_tiles_by_row, v_tiles_by_row] = plane_row_tiles;
+                let bpp = dec.pic.bpp;
+
+                if dec.pic.has_chroma {
+                    let sh = dec.pic.ss_hor;
+                    let sv = dec.pic.ss_ver;
+                    for (plane_slice, row_buckets, dst_stride) in [
+                        (u_plane.as_mut_slice(), u_tiles_by_row, dec.pic.stride[1]),
+                        (v_plane.as_mut_slice(), v_tiles_by_row, dec.pic.stride[2]),
+                    ] {
+                        let max_rows = plane_slice.len().checked_div(dst_stride).unwrap_or(0);
+                        let wave_y0 = ((row_bounds_sb4[wave_r_start].0 * 4) >> sv).min(max_rows);
+                        let start_byte = wave_y0.saturating_mul(dst_stride).min(plane_slice.len());
+                        let mut rem = &mut plane_slice[start_byte..];
+                        let mut cur_y = wave_y0;
+                        for (local_r, row_tiles) in row_buckets.into_iter().enumerate() {
+                            let r = wave_r_start + local_r;
+                            let (_, row_end_sb4, _) = row_bounds_sb4[r];
+                            let y1 = (((row_end_sb4 * 4) + sv) >> sv).min(max_rows);
+                            let take_bytes = if r + 1 == n_rows {
+                                rem.len()
+                            } else {
+                                y1.saturating_sub(cur_y)
+                                    .saturating_mul(dst_stride)
+                                    .min(rem.len())
+                            };
+                            let (band, rest) = rem.split_at_mut(take_bytes);
+                            rem = rest;
+                            tasks.push(ScopedMergeTask::PicStrip {
+                                dst: band,
+                                dst_y0: cur_y,
+                                dst_stride,
+                                bpp,
+                                sh,
+                                sv,
+                                tiles: row_tiles,
+                            });
+                            cur_y = y1;
+                        }
+                    }
+                }
+
+                {
+                    let dst_stride = dec.pic.stride[0];
+                    let max_rows = y_plane.len().checked_div(dst_stride).unwrap_or(0);
+                    let wave_y0 = (row_bounds_sb4[wave_r_start].0 * 4).min(max_rows);
+                    let start_byte = wave_y0.saturating_mul(dst_stride).min(y_plane.len());
+                    let mut rem = &mut y_plane[start_byte..];
+                    let mut cur_y = wave_y0;
+                    for (local_r, row_tiles) in y_tiles_by_row.into_iter().enumerate() {
+                        let r = wave_r_start + local_r;
+                        let (_, row_end_sb4, _) = row_bounds_sb4[r];
+                        let y1 = (row_end_sb4 * 4).min(max_rows);
+                        let take_bytes = if r + 1 == n_rows {
+                            rem.len()
+                        } else {
+                            y1.saturating_sub(cur_y)
+                                .saturating_mul(dst_stride)
+                                .min(rem.len())
+                        };
+                        let (band, rest) = rem.split_at_mut(take_bytes);
+                        rem = rest;
+                        tasks.push(ScopedMergeTask::PicStrip {
+                            dst: band,
+                            dst_y0: cur_y,
+                            dst_stride,
+                            bpp,
+                            sh: 0,
+                            sv: 0,
+                            tiles: row_tiles,
+                        });
+                        cur_y = y1;
+                    }
+                }
+
+                if let Some(lf) = dec.lf.as_mut() {
+                    tasks.push(ScopedMergeTask::Lf {
+                        lf,
+                        w4: dec.w4,
+                        h4: dec.h4,
+                        tiles: lf_tiles,
+                    });
+                }
+
+                let n_merge_tasks = tasks.len();
+                let queue = Mutex::new(tasks);
+                let run_merge = || loop {
+                    let Some(task) = queue.lock().pop() else {
+                        break;
+                    };
+                    match task {
+                        ScopedMergeTask::PicStrip {
+                            dst,
+                            dst_y0,
+                            dst_stride,
+                            bpp,
+                            sh,
+                            sv,
+                            tiles,
+                        } => {
+                            let strip_rows = dst.len().checked_div(dst_stride).unwrap_or(0);
+                            let strip_y1 = dst_y0 + strip_rows;
+                            for t in tiles {
+                                if t.src_stride == 0 {
+                                    continue;
+                                }
+                                let y0 = ((t.row_start * 4) >> sv).max(dst_y0).min(strip_y1);
+                                let y1 = (((t.row_end_sb4 * 4) + sv) >> sv).min(strip_y1);
+                                let x0_px = (t.col_start * 4) >> sh;
+                                let x1_px = ((t.col_end_sb4 * 4) + sh) >> sh;
+                                let dst_x0_bytes = (x0_px * bpp).min(dst_stride);
+                                let dst_x1_bytes = (x1_px * bpp).min(dst_stride);
+                                if dst_x0_bytes < dst_x1_bytes {
+                                    let copy_bytes = dst_x1_bytes - dst_x0_bytes;
+                                    let src_x0_bytes = (x0_px - t.x_base) * bpp;
+                                    for y in y0..y1 {
+                                        let dst_off = (y - dst_y0) * dst_stride + dst_x0_bytes;
+                                        let src_off = (y - t.y_base) * t.src_stride + src_x0_bytes;
+                                        dst[dst_off..dst_off + copy_bytes].copy_from_slice(
+                                            &t.data[src_off..src_off + copy_bytes],
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                        ScopedMergeTask::RefMvsStrip {
+                            dst,
+                            dst_y0,
+                            iw4,
+                            ih4,
+                            tiles,
+                        } => {
+                            let strip_rows = dst.len().checked_div(iw4).unwrap_or(0);
+                            let strip_y1 = (dst_y0 + strip_rows).min(ih4);
+                            let mut hits = 0u64;
+                            for t in tiles {
+                                let other_rmv = t.rmv;
+                                if !other_rmv.grid.is_empty() && other_rmv.stride > 0 {
+                                    let y0 = t.row_start.max(dst_y0).min(strip_y1);
+                                    let y1 = t.row_end.min(strip_y1);
+                                    let x0 = t.col_start.min(iw4);
+                                    let x1 = t.col_end.min(iw4);
+                                    if x0 < x1 {
+                                        let copy_w = x1 - x0;
+                                        let src_x0 = x0 - other_rmv.x_base;
+                                        for y in y0..y1 {
+                                            let dst_off = (y - dst_y0) * iw4 + x0;
+                                            let src_off =
+                                                (y - other_rmv.y_base) * other_rmv.stride + src_x0;
+                                            dst[dst_off..dst_off + copy_w].copy_from_slice(
+                                                &other_rmv.grid[src_off..src_off + copy_w],
+                                            );
+                                        }
+                                    }
+                                }
+                                hits += other_rmv
+                                    .temporal_hits
+                                    .load(core::sync::atomic::Ordering::Relaxed);
+                            }
+                            if hits > 0 {
+                                total_hits.fetch_add(hits, core::sync::atomic::Ordering::Relaxed);
+                            }
+                        }
+                        ScopedMergeTask::Lf { lf, w4, h4, tiles } => {
+                            for t in tiles {
+                                lf.merge_tile_from(
+                                    &t.lf,
+                                    t.tile_row,
+                                    t.tile_col,
+                                    t.row_start.min(h4),
+                                    t.row_end.min(h4),
+                                    t.col_start.min(w4),
+                                    t.col_end.min(w4),
+                                );
+                            }
+                        }
+                        ScopedMergeTask::SegmapAndCdef {
+                            segmap,
+                            segmap_stride,
+                            bh,
+                            cdef_state,
+                            tiles,
+                        } => {
+                            for t in tiles {
+                                if !t.segmap.is_empty() {
+                                    let sy0 = t.row_start.min(bh);
+                                    let sy1 = t.row_end.min(bh);
+                                    let sx0 = t.col_start.min(segmap_stride);
+                                    let sx1 = t.col_end.min(segmap_stride);
+                                    if sx0 < sx1 {
+                                        let copy_w = sx1 - sx0;
+                                        let src_stride = t.tile_segmap_stride;
+                                        for y in sy0..sy1 {
+                                            let dst_off = y * segmap_stride + sx0;
+                                            let src_off = (y - t.row_start) * src_stride;
+                                            if dst_off + copy_w <= segmap.len()
+                                                && src_off + copy_w <= t.segmap.len()
+                                            {
+                                                segmap[dst_off..dst_off + copy_w].copy_from_slice(
+                                                    &t.segmap[src_off..src_off + copy_w],
+                                                );
+                                            }
+                                        }
+                                    }
+                                }
+                                if let Some(other_cdef) = t.cdef_state {
+                                    cdef_state.merge_tile_from(
+                                        &other_cdef,
+                                        t.row_start,
+                                        t.row_end,
+                                        t.col_start,
+                                        t.col_end,
+                                    );
                                 }
                             }
                         }
                     }
-                    if let Some(other_cdef) = w.cdef_state.lock().take() {
-                        cdef_state.merge_tile_from(
-                            &other_cdef,
-                            w.row_start,
-                            w.row_end,
-                            w.col_start,
-                            w.col_end,
-                        );
+                };
+
+                let n_spawn = guard.total_threads().min(n_merge_tasks).saturating_sub(1);
+                std::thread::scope(|s| {
+                    for _ in 0..n_spawn {
+                        s.spawn(run_merge);
+                    }
+                    run_merge();
+                });
+                drop(queue);
+                drop(guard);
+
+                let hits = total_hits.into_inner();
+                if hits > 0 {
+                    dec.refmvs
+                        .temporal_hits
+                        .fetch_add(hits, core::sync::atomic::Ordering::Relaxed);
+                }
+            }
+        }
+
+        if !merged_scoped {
+            // Geri-düşüş yolu (küçük kareler, tek satırlı tile ızgaraları veya `no_std`/`wasm32`):
+            // 6 bağımsız hedef bileşeni (`Pic Y`, `Pic U`, `Pic V`, `RefMvs::grid`, `LfFrame`,
+            // `segmap + CdefState`) `WorkerPool` üzerinde paralel birleştir.
+            #[allow(clippy::large_enum_variant)]
+            enum MergeComponent {
+                PicPlane {
+                    plane: usize,
+                    data: Vec<u8>,
+                    dst_stride: usize,
+                    bpp: usize,
+                    sh: usize,
+                    sv: usize,
+                },
+                RefMvsGrid {
+                    grid: Vec<crate::decode::refmvs::RefBlock>,
+                    iw4: usize,
+                    ih4: usize,
+                    hits: u64,
+                },
+                Lf {
+                    lf: crate::decode::loopfilter::LfFrame,
+                    w4: usize,
+                    h4: usize,
+                },
+                SegmapAndCdef {
+                    segmap: Vec<u8>,
+                    segmap_stride: usize,
+                    bh: usize,
+                    cdef_state: crate::decode::cdef::CdefState,
+                },
+            }
+
+            let works_arc: Arc<Vec<Mutex<TileWork>>> =
+                Arc::new(works.into_iter().map(Mutex::new).collect());
+            let mut jobs: Vec<MergeComponent> = Vec::with_capacity(6);
+            jobs.push(MergeComponent::PicPlane {
+                plane: 0,
+                data: core::mem::take(&mut dec.pic.data[0]),
+                dst_stride: dec.pic.stride[0],
+                bpp: dec.pic.bpp,
+                sh: 0,
+                sv: 0,
+            });
+            if dec.pic.has_chroma {
+                jobs.push(MergeComponent::PicPlane {
+                    plane: 1,
+                    data: core::mem::take(&mut dec.pic.data[1]),
+                    dst_stride: dec.pic.stride[1],
+                    bpp: dec.pic.bpp,
+                    sh: dec.pic.ss_hor,
+                    sv: dec.pic.ss_ver,
+                });
+                jobs.push(MergeComponent::PicPlane {
+                    plane: 2,
+                    data: core::mem::take(&mut dec.pic.data[2]),
+                    dst_stride: dec.pic.stride[2],
+                    bpp: dec.pic.bpp,
+                    sh: dec.pic.ss_hor,
+                    sv: dec.pic.ss_ver,
+                });
+            }
+            if need_refmvs {
+                jobs.push(MergeComponent::RefMvsGrid {
+                    grid: core::mem::take(&mut dec.refmvs.grid),
+                    iw4: dec.refmvs.iw4,
+                    ih4: dec.refmvs.ih4,
+                    hits: 0,
+                });
+            }
+            if let Some(lf) = dec.lf.take() {
+                jobs.push(MergeComponent::Lf {
+                    lf,
+                    w4: dec.w4,
+                    h4: dec.h4,
+                });
+            }
+            jobs.push(MergeComponent::SegmapAndCdef {
+                segmap: core::mem::take(&mut dec.segmap),
+                segmap_stride: dec.segmap_stride,
+                bh: dec.bh,
+                cdef_state: core::mem::replace(
+                    &mut dec.cdef_state,
+                    crate::decode::cdef::CdefState {
+                        noskip: Vec::new(),
+                        noskip_stride: 1,
+                        noskip_x_base: 0,
+                        noskip_y_base: 0,
+                        idx64: Vec::new(),
+                        sb64w: 1,
+                        sb64_x_base: 0,
+                        sb64_y_base: 0,
+                    },
+                ),
+            });
+
+            let works_for_workers = Arc::clone(&works_arc);
+            pool.execute_tasks(&mut jobs, move |_wid, _jidx, job: &mut MergeComponent| {
+                match job {
+                    MergeComponent::PicPlane {
+                        plane,
+                        data,
+                        dst_stride,
+                        bpp,
+                        sh,
+                        sv,
+                    } => {
+                        let p = *plane;
+                        let dst_stride = *dst_stride;
+                        let bpp = *bpp;
+                        let sh = *sh;
+                        let sv = *sv;
+                        if let Some(max_rows) = data.len().checked_div(dst_stride) {
+                            for w_lock in works_for_workers.iter() {
+                                let (
+                                    src_data,
+                                    src_stride,
+                                    x_base,
+                                    y_base,
+                                    row_start,
+                                    row_end_sb4,
+                                    col_start,
+                                    col_end_sb4,
+                                ) = {
+                                    let mut w = w_lock.lock();
+                                    (
+                                        core::mem::take(&mut w.pic_data[p]),
+                                        w.pic_stride[p],
+                                        w.pic_x_base[p],
+                                        w.pic_y_base[p],
+                                        w.row_start,
+                                        w.row_end_sb4,
+                                        w.col_start,
+                                        w.col_end_sb4,
+                                    )
+                                };
+                                if src_data.is_empty() || src_stride == 0 {
+                                    continue;
+                                }
+                                let y0 = ((row_start * 4) >> sv).min(max_rows);
+                                let y1 = (((row_end_sb4 * 4) + sv) >> sv).min(max_rows);
+                                let x0_px = (col_start * 4) >> sh;
+                                let x1_px = ((col_end_sb4 * 4) + sh) >> sh;
+                                let dst_x0_bytes = (x0_px * bpp).min(dst_stride);
+                                let dst_x1_bytes = (x1_px * bpp).min(dst_stride);
+                                if dst_x0_bytes < dst_x1_bytes {
+                                    let copy_bytes = dst_x1_bytes - dst_x0_bytes;
+                                    let src_x0_bytes = (x0_px - x_base) * bpp;
+                                    for y in y0..y1 {
+                                        let dst_off = y * dst_stride + dst_x0_bytes;
+                                        let src_off = (y - y_base) * src_stride + src_x0_bytes;
+                                        data[dst_off..dst_off + copy_bytes].copy_from_slice(
+                                            &src_data[src_off..src_off + copy_bytes],
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    MergeComponent::RefMvsGrid {
+                        grid,
+                        iw4,
+                        ih4,
+                        hits,
+                    } => {
+                        let iw4 = *iw4;
+                        let ih4 = *ih4;
+                        for w_lock in works_for_workers.iter() {
+                            let (other_rmv, row_start, row_end, col_start, col_end) = {
+                                let mut w = w_lock.lock();
+                                let Some(r) = w.refmvs.take() else {
+                                    continue;
+                                };
+                                (r, w.row_start, w.row_end, w.col_start, w.col_end)
+                            };
+                            if !other_rmv.grid.is_empty() && other_rmv.stride > 0 {
+                                let y0 = row_start.min(ih4);
+                                let y1 = row_end.min(ih4);
+                                let x0 = col_start.min(iw4);
+                                let x1 = col_end.min(iw4);
+                                if x0 < x1 {
+                                    let copy_w = x1 - x0;
+                                    let src_x0 = x0 - other_rmv.x_base;
+                                    for y in y0..y1 {
+                                        let dst_off = y * iw4 + x0;
+                                        let src_off =
+                                            (y - other_rmv.y_base) * other_rmv.stride + src_x0;
+                                        grid[dst_off..dst_off + copy_w].copy_from_slice(
+                                            &other_rmv.grid[src_off..src_off + copy_w],
+                                        );
+                                    }
+                                }
+                            }
+                            *hits += other_rmv
+                                .temporal_hits
+                                .load(core::sync::atomic::Ordering::Relaxed);
+                        }
+                    }
+                    MergeComponent::Lf { lf, w4, h4 } => {
+                        let w4 = *w4;
+                        let h4 = *h4;
+                        for w_lock in works_for_workers.iter() {
+                            let (
+                                src_lf,
+                                tile_row,
+                                tile_col,
+                                row_start,
+                                row_end,
+                                col_start,
+                                col_end,
+                            ) = {
+                                let mut w = w_lock.lock();
+                                let Some(l) = w.lf.take() else {
+                                    continue;
+                                };
+                                (
+                                    l,
+                                    w.tile_row,
+                                    w.tile_col,
+                                    w.row_start,
+                                    w.row_end,
+                                    w.col_start,
+                                    w.col_end,
+                                )
+                            };
+                            lf.merge_tile_from(
+                                &src_lf,
+                                tile_row,
+                                tile_col,
+                                row_start.min(h4),
+                                row_end.min(h4),
+                                col_start.min(w4),
+                                col_end.min(w4),
+                            );
+                        }
+                    }
+                    MergeComponent::SegmapAndCdef {
+                        segmap,
+                        segmap_stride,
+                        bh,
+                        cdef_state,
+                    } => {
+                        let segmap_stride = *segmap_stride;
+                        let bh = *bh;
+                        for w_lock in works_for_workers.iter() {
+                            let (
+                                other_seg,
+                                other_cdef,
+                                tile_segmap_stride,
+                                row_start,
+                                row_end,
+                                col_start,
+                                col_end,
+                            ) = {
+                                let mut w = w_lock.lock();
+                                (
+                                    core::mem::take(&mut w.segmap),
+                                    w.cdef_state.take(),
+                                    w.tile_segmap_stride,
+                                    w.row_start,
+                                    w.row_end,
+                                    w.col_start,
+                                    w.col_end,
+                                )
+                            };
+                            if !other_seg.is_empty() {
+                                let sy0 = row_start.min(bh);
+                                let sy1 = row_end.min(bh);
+                                let sx0 = col_start.min(segmap_stride);
+                                let sx1 = col_end.min(segmap_stride);
+                                if sx0 < sx1 {
+                                    let copy_w = sx1 - sx0;
+                                    let src_stride = tile_segmap_stride;
+                                    for y in sy0..sy1 {
+                                        let dst_off = y * segmap_stride + sx0;
+                                        let src_off = (y - row_start) * src_stride;
+                                        if dst_off + copy_w <= segmap.len()
+                                            && src_off + copy_w <= other_seg.len()
+                                        {
+                                            segmap[dst_off..dst_off + copy_w].copy_from_slice(
+                                                &other_seg[src_off..src_off + copy_w],
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                            if let Some(other_cdef) = other_cdef {
+                                cdef_state.merge_tile_from(
+                                    &other_cdef,
+                                    row_start,
+                                    row_end,
+                                    col_start,
+                                    col_end,
+                                );
+                            }
+                        }
+                    }
+                }
+                Ok(())
+            })?;
+
+            for job in jobs {
+                match job {
+                    MergeComponent::PicPlane { plane, data, .. } => {
+                        dec.pic.data[plane] = data;
+                    }
+                    MergeComponent::RefMvsGrid { grid, hits, .. } => {
+                        dec.refmvs.grid = grid;
+                        dec.refmvs
+                            .temporal_hits
+                            .fetch_add(hits, core::sync::atomic::Ordering::Relaxed);
+                    }
+                    MergeComponent::Lf { lf, .. } => {
+                        dec.lf = Some(lf);
+                    }
+                    MergeComponent::SegmapAndCdef {
+                        segmap, cdef_state, ..
+                    } => {
+                        dec.segmap = segmap;
+                        dec.cdef_state = cdef_state;
                     }
                 }
             }
         }
-        Ok(())
-    })?;
 
-    for job in jobs {
-        match job {
-            MergeComponent::PicPlane { plane, data, .. } => {
-                dec.pic.data[plane] = data;
-            }
-            MergeComponent::RefMvsGrid { grid, hits, .. } => {
-                dec.refmvs.grid = grid;
-                dec.refmvs
-                    .temporal_hits
-                    .fetch_add(hits, core::sync::atomic::Ordering::Relaxed);
-            }
-            MergeComponent::Lf { lf, .. } => {
-                dec.lf = Some(lf);
-            }
-            MergeComponent::SegmapAndCdef {
-                segmap, cdef_state, ..
-            } => {
-                dec.segmap = segmap;
-                dec.cdef_state = cdef_state;
-            }
-        }
+        wave_r_start = wave_r_end;
     }
+    drop(tile_scratch_pool);
     Ok(())
 }
 

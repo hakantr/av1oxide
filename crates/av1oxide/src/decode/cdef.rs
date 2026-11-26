@@ -468,6 +468,35 @@ pub(crate) fn apply(
 
     let n_bands = (bh + 1) >> 1;
     if pool.is_parallel() && n_bands > 1 && trace.is_none() {
+        #[cfg(all(feature = "std", not(target_arch = "wasm32")))]
+        if n_bands >= 8 && bw.saturating_mul(bh) >= 4096 {
+            return apply_parallel_inplace(
+                pic,
+                cdef,
+                chroma,
+                bit_depth,
+                bpp,
+                bitdepth_min_8,
+                damping,
+                has_chroma,
+                ss_hor,
+                ss_ver,
+                uv_size,
+                uv_dir,
+                dir_fn,
+                fb_y,
+                fb_uv,
+                bw,
+                bh,
+                n_planes,
+                y_stride,
+                uv_stride,
+                n_bands,
+                state,
+                tools,
+                pool,
+            );
+        }
         return apply_parallel_bands(
             pic,
             cdef,
@@ -783,6 +812,685 @@ pub(crate) fn apply(
         }
 
         core::mem::swap(&mut top_cur, &mut top_next);
+    }
+    Ok(())
+}
+
+/// Dilim sonundaki sağ-alt köşe bloğunda (`dst_slice.len() < (h - 1) * stride + (w + 2) * bpp`)
+/// CDEF SIMD sözleşmesini bozmadan küçük yığın tamponu üzerinden filtreler;
+/// diğer tüm bloklarda doğrudan `fb(dst_slice, stride, ...)` çağırır (`5.C.1`).
+#[cfg(all(feature = "std", not(target_arch = "wasm32")))]
+#[inline]
+#[allow(clippy::too_many_arguments)]
+fn filter_block_inplace(
+    fb: CdefFilterFn,
+    dst_slice: &mut [u8],
+    stride: usize,
+    left_s: &[u8],
+    top_s: &[u8],
+    bot_s: &[u8],
+    have_top: bool,
+    have_bottom: bool,
+    bpp: usize,
+    params: CdefFilterParams,
+) {
+    let w = params.size.w();
+    let h = params.size.h();
+    let need = (h - 1) * stride + (w + 2) * bpp;
+    if dst_slice.len() >= need {
+        crate::dsp::profil_olc!(CdefFb, fb(dst_slice, stride, left_s, top_s, bot_s, params));
+        return;
+    }
+    const C_STRIDE: usize = 32;
+    let row_bytes = w * bpp;
+    let ctx_bytes = (w + 2) * bpp;
+    let mut corner_dst = [0u8; 8 * C_STRIDE + 4];
+    let mut corner_top = [0u8; 2 * C_STRIDE + 4];
+    let mut corner_bot = [0u8; 2 * C_STRIDE + 4];
+    for r in 0..h {
+        let so = r * stride;
+        let dof = r * C_STRIDE;
+        corner_dst[dof..dof + row_bytes].copy_from_slice(&dst_slice[so..so + row_bytes]);
+    }
+    if have_top {
+        for r in 0..2 {
+            let so = r * stride;
+            let dof = r * C_STRIDE;
+            let avail = top_s.len().saturating_sub(so).min(ctx_bytes);
+            corner_top[dof..dof + avail].copy_from_slice(&top_s[so..so + avail]);
+        }
+    }
+    if have_bottom {
+        for r in 0..2 {
+            let so = r * stride;
+            let dof = r * C_STRIDE;
+            let avail = bot_s.len().saturating_sub(so).min(ctx_bytes);
+            corner_bot[dof..dof + avail].copy_from_slice(&bot_s[so..so + avail]);
+        }
+    }
+    crate::dsp::profil_olc!(
+        CdefFb,
+        fb(
+            &mut corner_dst,
+            C_STRIDE,
+            left_s,
+            if have_top { &corner_top } else { &[] },
+            if have_bottom { &corner_bot } else { &[] },
+            params,
+        )
+    );
+    for r in 0..h {
+        let so = r * C_STRIDE;
+        let dof = r * stride;
+        dst_slice[dof..dof + row_bytes].copy_from_slice(&corner_dst[so..so + row_bytes]);
+    }
+}
+
+/// 8-satırlık CDEF bantlarını `pic.data` üzerinde doğrudan yerinde (`in-place`)
+/// ve sıfır-kopya `split_at_mut` şeritleriyle paralel süzer (`5.C.1`).
+///
+/// Yalnızca şerit sınırlarındaki 2+2 komşu satır (`~2 MiB`) önceden yedeklenir;
+/// tam kare kopyası (`~99 MiB`) ve seri geri birleştirme tamamen ortadan kalkar.
+#[cfg(all(feature = "std", not(target_arch = "wasm32")))]
+#[allow(clippy::too_many_arguments)]
+fn apply_parallel_inplace(
+    pic: &mut PicBuf,
+    cdef: &crate::bitstream::frame_header::CdefParams,
+    chroma: ChromaFormat,
+    bit_depth: CdefBitDepth,
+    bpp: usize,
+    bitdepth_min_8: u32,
+    damping: u32,
+    has_chroma: bool,
+    ss_hor: usize,
+    ss_ver: usize,
+    uv_size: CdefBlockSize,
+    uv_dir: &'static [u8; 8],
+    dir_fn: crate::dsp::cdef::CdefDirFn,
+    fb_y: CdefFilterFn,
+    fb_uv: CdefFilterFn,
+    bw: usize,
+    bh: usize,
+    n_planes: usize,
+    y_stride: usize,
+    uv_stride: usize,
+    n_bands: usize,
+    state: &CdefState,
+    tools: &mut ToolCounts,
+    pool: &crate::thread::WorkerPool,
+) -> crate::error::Result<()> {
+    use crate::frame::butce::dolu_vec;
+
+    let guard = pool.acquire_scope_workers(pool.n_threads().saturating_sub(1));
+    let total_threads = guard.total_threads();
+    if total_threads <= 1 {
+        drop(guard);
+        return apply_parallel_bands(
+            pic,
+            cdef,
+            chroma,
+            bit_depth,
+            bpp,
+            bitdepth_min_8,
+            damping,
+            has_chroma,
+            ss_hor,
+            ss_ver,
+            uv_size,
+            uv_dir,
+            dir_fn,
+            fb_y,
+            fb_uv,
+            bw,
+            bh,
+            n_planes,
+            y_stride,
+            uv_stride,
+            n_bands,
+            state,
+            tools,
+            pool,
+        );
+    }
+
+    let n_chunks = (total_threads * 2).clamp(2, n_bands);
+    let prefix = 2 * bpp;
+    let plane_stride = |p: usize| if p == 0 { y_stride } else { uv_stride };
+    let plane_h = |p: usize| if p == 0 { 8usize } else { 8usize >> ss_ver };
+    let plane_y = |p: usize, by4: usize| {
+        if p == 0 { by4 * 4 } else { (by4 * 4) >> ss_ver }
+    };
+
+    // Düzlem dilim uzunluklarını doğrula.
+    for p in 0..n_planes {
+        let need_bytes = n_bands * plane_h(p) * plane_stride(p);
+        if pic.data[p].len() < need_bytes {
+            drop(guard);
+            return apply_parallel_bands(
+                pic,
+                cdef,
+                chroma,
+                bit_depth,
+                bpp,
+                bitdepth_min_8,
+                damping,
+                has_chroma,
+                ss_hor,
+                ss_ver,
+                uv_size,
+                uv_dir,
+                dir_fn,
+                fb_y,
+                fb_uv,
+                bw,
+                bh,
+                n_planes,
+                y_stride,
+                uv_stride,
+                n_bands,
+                state,
+                tools,
+                pool,
+            );
+        }
+    }
+
+    struct InplaceChunk<'a> {
+        band_start: usize,
+        band_end: usize,
+        dst: [&'a mut [u8]; 3],
+        seam_top: [&'a [u8]; 3],
+        seam_bot: [&'a [u8]; 3],
+    }
+
+    // 1. Paralel yerinde yazma başlamadan önce şerit sınırlarının 2 üst + 2 alt
+    // filtre öncesi satırlarını kaydet (kalıcı thread'de yaşar ve düşer; scoped
+    // işçilerde 0 alloc / 0 free).
+    let mut ranges: Vec<(usize, usize)> = Vec::with_capacity(n_chunks);
+    let mut seam_tops: Vec<[Vec<u8>; 3]> = Vec::with_capacity(n_chunks);
+    let mut seam_bots: Vec<[Vec<u8>; 3]> = Vec::with_capacity(n_chunks);
+    for c in 0..n_chunks {
+        let band_start = (c * n_bands) / n_chunks;
+        let band_end = ((c + 1) * n_bands) / n_chunks;
+        if band_start >= band_end {
+            continue;
+        }
+        ranges.push((band_start, band_end));
+        let by0 = band_start * 2;
+        let by1 = band_end * 2;
+        let mut st = [Vec::new(), Vec::new(), Vec::new()];
+        let mut sb = [Vec::new(), Vec::new(), Vec::new()];
+        if by0 > 0 {
+            for p in 0..n_planes {
+                let stride = plane_stride(p);
+                let y0 = plane_y(p, by0);
+                let mut buf = dolu_vec(prefix + 2 * stride, 0u8)?;
+                let src = &pic.data[p];
+                for r in 0..2 {
+                    let so = (y0 - 2 + r) * stride;
+                    let dof = prefix + r * stride;
+                    buf[dof..dof + stride].copy_from_slice(&src[so..so + stride]);
+                }
+                st[p] = buf;
+            }
+        }
+        if by1 < bh {
+            for p in 0..n_planes {
+                let stride = plane_stride(p);
+                let y1 = plane_y(p, by1);
+                let mut buf = dolu_vec(prefix + 2 * stride, 0u8)?;
+                let src = &pic.data[p];
+                for r in 0..2 {
+                    let so = (y1 + r) * stride;
+                    let dof = prefix + r * stride;
+                    buf[dof..dof + stride].copy_from_slice(&src[so..so + stride]);
+                }
+                sb[p] = buf;
+            }
+        }
+        seam_tops.push(st);
+        seam_bots.push(sb);
+    }
+
+    // 2. `pic.data[0..3]` düzlemlerini `split_at_mut` ile ayrık şeritlere böl.
+    let actual_chunks = ranges.len();
+    let [y_plane, u_plane, v_plane] = &mut pic.data;
+    let mut rem_y = y_plane.as_mut_slice();
+    let mut rem_u = u_plane.as_mut_slice();
+    let mut rem_v = v_plane.as_mut_slice();
+
+    let mut chunks: Vec<InplaceChunk<'_>> = Vec::with_capacity(actual_chunks);
+    for (ci, ((band_start, band_end), (st, sb))) in ranges
+        .into_iter()
+        .zip(seam_tops.iter().zip(seam_bots.iter()))
+        .enumerate()
+    {
+        let chunk_bands = band_end - band_start;
+        let is_last = ci + 1 == actual_chunks;
+        let y_bytes = if is_last {
+            rem_y.len()
+        } else {
+            chunk_bands * 8 * y_stride
+        };
+        let (dy, ry) = rem_y.split_at_mut(y_bytes);
+        rem_y = ry;
+        let (du, dv) = if has_chroma {
+            let uv_bytes = if is_last {
+                rem_u.len()
+            } else {
+                chunk_bands * (8 >> ss_ver) * uv_stride
+            };
+            let (bu, ru) = rem_u.split_at_mut(uv_bytes);
+            rem_u = ru;
+            let (bv, rv) = rem_v.split_at_mut(if is_last { rem_v.len() } else { uv_bytes });
+            rem_v = rv;
+            (bu, bv)
+        } else {
+            (&mut [][..], &mut [][..])
+        };
+        chunks.push(InplaceChunk {
+            band_start,
+            band_end,
+            dst: [dy, du, dv],
+            seam_top: [st[0].as_slice(), st[1].as_slice(), st[2].as_slice()],
+            seam_bot: [sb[0].as_slice(), sb[1].as_slice(), sb[2].as_slice()],
+        });
+    }
+
+    let noskip = state.noskip.as_slice();
+    let idx64 = state.idx64.as_slice();
+    let sb64w = state.sb64w;
+    let noskip_stride = state.noskip_stride;
+    let cdef_hdr = *cdef;
+
+    // İşçi başına geçici satır tamponlarını çağıran (kalıcı) iş parçacığında
+    // önceden ayır: scoped işçiler `0 alloc / 0 free` çalıştığından yeni
+    // glibc malloc arenası açılmaz (RSS kararlılığı).
+    struct WorkerScratchBufs {
+        top_cur: [Vec<u8>; 3],
+        top_next: [Vec<u8>; 3],
+        bot_buf: [Vec<u8>; 3],
+        tools: ToolCounts,
+    }
+    let n_workers = total_threads.min(actual_chunks).max(1);
+    let mut worker_bufs: Vec<WorkerScratchBufs> = Vec::with_capacity(n_workers);
+    for _ in 0..n_workers {
+        worker_bufs.push(WorkerScratchBufs {
+            top_cur: [
+                dolu_vec(prefix + 2 * y_stride, 0u8)?,
+                dolu_vec(prefix + 2 * uv_stride, 0u8)?,
+                dolu_vec(prefix + 2 * uv_stride, 0u8)?,
+            ],
+            top_next: [
+                dolu_vec(prefix + 2 * y_stride, 0u8)?,
+                dolu_vec(prefix + 2 * uv_stride, 0u8)?,
+                dolu_vec(prefix + 2 * uv_stride, 0u8)?,
+            ],
+            bot_buf: [
+                dolu_vec(prefix + 2 * y_stride, 0u8)?,
+                dolu_vec(prefix + 2 * uv_stride, 0u8)?,
+                dolu_vec(prefix + 2 * uv_stride, 0u8)?,
+            ],
+            tools: ToolCounts::default(),
+        });
+    }
+
+    let queue = crate::sync::Mutex::new(chunks);
+
+    let run_worker = |wb: &mut WorkerScratchBufs| {
+        let local_tools = &mut wb.tools;
+        let top_cur = &mut wb.top_cur;
+        let top_next = &mut wb.top_next;
+        let bot_buf = &mut wb.bot_buf;
+        let mut left_bak = [[0u8; 32]; 3];
+        let mut right_save = [[0u8; 32]; 3];
+
+        loop {
+            let Some(chunk) = queue.lock().pop() else {
+                break;
+            };
+            // İlk bandın üst iki satırı: chunk başlangıç dikiş yedeğinden yükle.
+            if chunk.band_start > 0 {
+                for p in 0..n_planes {
+                    top_cur[p].copy_from_slice(chunk.seam_top[p]);
+                }
+            }
+
+            for band in chunk.band_start..chunk.band_end {
+                let local_band = band - chunk.band_start;
+                let band_y_off = [
+                    local_band * 8 * y_stride,
+                    local_band * (8 >> ss_ver) * uv_stride,
+                    local_band * (8 >> ss_ver) * uv_stride,
+                ];
+                let by = band * 2;
+                let have_top = by > 0;
+                let have_bottom = by + 2 < bh;
+                let is_last_in_chunk = band + 1 == chunk.band_end;
+
+                // Sonraki bant için bu bandın filtre öncesi son iki satırını yedekle;
+                // alt iki satır chunk içindeyse canlıdan, son bantta ise dikiş yedeğinden al.
+                for p in 0..n_planes {
+                    let stride = if p == 0 { y_stride } else { uv_stride };
+                    let h = if p == 0 { 8usize } else { 8usize >> ss_ver };
+                    if !is_last_in_chunk {
+                        let base = band_y_off[p];
+                        for r in 0..2 {
+                            let so = base + (h - 2 + r) * stride;
+                            let dof = prefix + r * stride;
+                            top_next[p][dof..dof + stride]
+                                .copy_from_slice(&chunk.dst[p][so..so + stride]);
+                        }
+                        if have_bottom {
+                            for r in 0..2 {
+                                let so = base + (h + r) * stride;
+                                let dof = prefix + r * stride;
+                                bot_buf[p][dof..dof + stride]
+                                    .copy_from_slice(&chunk.dst[p][so..so + stride]);
+                            }
+                        }
+                    } else if have_bottom {
+                        bot_buf[p].copy_from_slice(chunk.seam_bot[p]);
+                    }
+                }
+
+                let mut band_edges = CdefEdgeFlags::NONE;
+                if have_top {
+                    band_edges = band_edges.union(CdefEdgeFlags::HAVE_TOP);
+                }
+                if have_bottom {
+                    band_edges = band_edges.union(CdefEdgeFlags::HAVE_BOTTOM);
+                }
+
+                let sb64y = by >> 4;
+                let mut prev_saved = [false; 2];
+                for sbx in 0..sb64w {
+                    let row = sb64y * sb64w + sbx;
+                    let idx_raw = idx64.get(row).copied().unwrap_or(-1);
+                    let Some(idx) = usize::try_from(idx_raw)
+                        .ok()
+                        .filter(|&i| i < cdef_hdr.y_strength.len())
+                    else {
+                        local_tools.cdef_skipped64 += 1;
+                        prev_saved = [false; 2];
+                        continue;
+                    };
+                    let y_lvl = cdef_hdr.y_strength[idx];
+                    let uv_lvl = if has_chroma {
+                        cdef_hdr.uv_strength[idx]
+                    } else {
+                        0
+                    };
+                    if y_lvl == 0 && uv_lvl == 0 {
+                        local_tools.cdef_skipped64 += 1;
+                        prev_saved = [false; 2];
+                        continue;
+                    }
+                    let y_pri_lvl = (i32::from(y_lvl) >> 2) << bitdepth_min_8;
+                    let mut y_sec_lvl = i32::from(y_lvl & 3);
+                    y_sec_lvl += i32::from(y_sec_lvl == 3);
+                    y_sec_lvl <<= bitdepth_min_8;
+                    let uv_pri_lvl = (i32::from(uv_lvl) >> 2) << bitdepth_min_8;
+                    let mut uv_sec_lvl = i32::from(uv_lvl & 3);
+                    uv_sec_lvl += i32::from(uv_sec_lvl == 3);
+                    uv_sec_lvl <<= bitdepth_min_8;
+
+                    let bx_end = ((sbx + 1) << 4).min(bw);
+                    let mut bx = sbx << 4;
+                    while bx < bx_end {
+                        let have_left = bx > 0;
+                        let have_right = bx + 2 < bw;
+                        let noskip_ok = noskip
+                            .get((by >> 1) * noskip_stride + (bx >> 1))
+                            .copied()
+                            .unwrap_or(0)
+                            != 0;
+                        if !noskip_ok {
+                            local_tools.cdef_skipped8 += 1;
+                            prev_saved = [false; 2];
+                            bx += 2;
+                            continue;
+                        }
+
+                        let flag = [y_lvl != 0, has_chroma && uv_lvl != 0];
+                        if have_left {
+                            for p in 0..n_planes {
+                                let group = usize::from(p != 0);
+                                let h = if p == 0 { 8usize } else { 8usize >> ss_ver };
+                                if prev_saved[group] {
+                                    left_bak[p][..h * 2 * bpp]
+                                        .copy_from_slice(&right_save[p][..h * 2 * bpp]);
+                                } else {
+                                    let stride = if p == 0 { y_stride } else { uv_stride };
+                                    let x0 = (if p == 0 { bx * 4 } else { (bx * 4) >> ss_hor }) - 2;
+                                    for r in 0..h {
+                                        let so = band_y_off[p] + r * stride + x0 * bpp;
+                                        let dof = r * 2 * bpp;
+                                        left_bak[p][dof..dof + 2 * bpp]
+                                            .copy_from_slice(&chunk.dst[p][so..so + 2 * bpp]);
+                                    }
+                                }
+                            }
+                        }
+
+                        let mut new_saved = [false; 2];
+                        if have_right {
+                            for p in 0..n_planes {
+                                let group = usize::from(p != 0);
+                                if !flag[group] {
+                                    continue;
+                                }
+                                let stride = if p == 0 { y_stride } else { uv_stride };
+                                let x0 = (if p == 0 { bx * 4 } else { (bx * 4) >> ss_hor })
+                                    + (if p == 0 { 8usize } else { 8usize >> ss_hor })
+                                    - 2;
+                                let h = if p == 0 { 8usize } else { 8usize >> ss_ver };
+                                for r in 0..h {
+                                    let so = band_y_off[p] + r * stride + x0 * bpp;
+                                    let dof = r * 2 * bpp;
+                                    right_save[p][dof..dof + 2 * bpp]
+                                        .copy_from_slice(&chunk.dst[p][so..so + 2 * bpp]);
+                                }
+                                new_saved[group] = true;
+                            }
+                        }
+
+                        let mut dir = 0u8;
+                        let mut variance = 0u32;
+                        if y_pri_lvl != 0 || uv_pri_lvl != 0 {
+                            let off = band_y_off[0] + (bx * 4) * bpp;
+                            let res = crate::dsp::profil_olc!(
+                                CdefDir,
+                                dir_fn(&chunk.dst[0][off..], y_stride, bit_depth)
+                            );
+                            dir = res.dir;
+                            variance = res.var;
+                            local_tools.cdef_dir_hist[usize::from(dir & 7)] += 1;
+                        }
+
+                        let mut edges = band_edges;
+                        if have_left {
+                            edges = edges.union(CdefEdgeFlags::HAVE_LEFT);
+                        }
+                        if have_right {
+                            edges = edges.union(CdefEdgeFlags::HAVE_RIGHT);
+                        }
+
+                        let mut any = false;
+                        let x_y = bx * 4;
+                        if y_pri_lvl != 0 {
+                            let adj = adjust_strength(y_pri_lvl, variance);
+                            if adj != 0 || y_sec_lvl != 0 {
+                                let left_s = if have_left {
+                                    &left_bak[0][..8 * 2 * bpp]
+                                } else {
+                                    &[]
+                                };
+                                let top_s = if have_top {
+                                    &top_cur[0][x_y * bpp..]
+                                } else {
+                                    &[]
+                                };
+                                let bot_s = if have_bottom {
+                                    &bot_buf[0][x_y * bpp..]
+                                } else {
+                                    &[]
+                                };
+                                let params = CdefFilterParams {
+                                    bit_depth,
+                                    size: CdefBlockSize::W8H8,
+                                    pri_strength: adj as u8,
+                                    sec_strength: y_sec_lvl as u8,
+                                    dir: dir & 7,
+                                    damping: damping as u8,
+                                    edges,
+                                };
+                                filter_block_inplace(
+                                    fb_y,
+                                    &mut chunk.dst[0][band_y_off[0] + x_y * bpp..],
+                                    y_stride,
+                                    left_s,
+                                    top_s,
+                                    bot_s,
+                                    have_top,
+                                    have_bottom,
+                                    bpp,
+                                    params,
+                                );
+                                local_tools.cdef_luma_blocks += 1;
+                                any = true;
+                            } else {
+                                local_tools.cdef_adj_zero += 1;
+                            }
+                        } else if y_sec_lvl != 0 {
+                            let left_s = if have_left {
+                                &left_bak[0][..8 * 2 * bpp]
+                            } else {
+                                &[]
+                            };
+                            let top_s = if have_top {
+                                &top_cur[0][x_y * bpp..]
+                            } else {
+                                &[]
+                            };
+                            let bot_s = if have_bottom {
+                                &bot_buf[0][x_y * bpp..]
+                            } else {
+                                &[]
+                            };
+                            let params = CdefFilterParams {
+                                bit_depth,
+                                size: CdefBlockSize::W8H8,
+                                pri_strength: 0,
+                                sec_strength: y_sec_lvl as u8,
+                                dir: 0,
+                                damping: damping as u8,
+                                edges,
+                            };
+                            filter_block_inplace(
+                                fb_y,
+                                &mut chunk.dst[0][band_y_off[0] + x_y * bpp..],
+                                y_stride,
+                                left_s,
+                                top_s,
+                                bot_s,
+                                have_top,
+                                have_bottom,
+                                bpp,
+                                params,
+                            );
+                            local_tools.cdef_luma_blocks += 1;
+                            any = true;
+                        }
+
+                        if has_chroma && uv_lvl != 0 {
+                            let uvdir = if uv_pri_lvl != 0 {
+                                uv_dir[usize::from(dir & 7)]
+                            } else {
+                                0
+                            };
+                            if uv_pri_lvl != 0 && chroma == ChromaFormat::C422 {
+                                local_tools.cdef_uv422_pri += 1;
+                            }
+                            let x_uv = (bx * 4) >> ss_hor;
+                            let h_uv = uv_size.h();
+                            for p in 1..3 {
+                                let left_s = if have_left {
+                                    &left_bak[p][..h_uv * 2 * bpp]
+                                } else {
+                                    &[]
+                                };
+                                let top_s = if have_top {
+                                    &top_cur[p][x_uv * bpp..]
+                                } else {
+                                    &[]
+                                };
+                                let bot_s = if have_bottom {
+                                    &bot_buf[p][x_uv * bpp..]
+                                } else {
+                                    &[]
+                                };
+                                let params = CdefFilterParams {
+                                    bit_depth,
+                                    size: uv_size,
+                                    pri_strength: uv_pri_lvl as u8,
+                                    sec_strength: uv_sec_lvl as u8,
+                                    dir: uvdir & 7,
+                                    damping: (damping - 1) as u8,
+                                    edges,
+                                };
+                                filter_block_inplace(
+                                    fb_uv,
+                                    &mut chunk.dst[p][band_y_off[p] + x_uv * bpp..],
+                                    uv_stride,
+                                    left_s,
+                                    top_s,
+                                    bot_s,
+                                    have_top,
+                                    have_bottom,
+                                    bpp,
+                                    params,
+                                );
+                                local_tools.cdef_chroma_blocks += 1;
+                                any = true;
+                            }
+                        }
+                        if any {
+                            local_tools.cdef_8x8_filtered += 1;
+                        }
+                        prev_saved = new_saved;
+                        bx += 2;
+                    }
+                }
+                if !is_last_in_chunk {
+                    core::mem::swap(top_cur, top_next);
+                }
+            }
+        }
+    };
+
+    if let Some((first_wb, rest_wbs)) = worker_bufs.split_first_mut() {
+        std::thread::scope(|s| {
+            for wb in rest_wbs {
+                s.spawn(|| run_worker(wb));
+            }
+            run_worker(first_wb);
+        });
+    }
+    drop(queue);
+    drop(guard);
+
+    for wb in &worker_bufs {
+        tools.cdef_skipped64 += wb.tools.cdef_skipped64;
+        tools.cdef_skipped8 += wb.tools.cdef_skipped8;
+        tools.cdef_8x8_filtered += wb.tools.cdef_8x8_filtered;
+        tools.cdef_luma_blocks += wb.tools.cdef_luma_blocks;
+        tools.cdef_chroma_blocks += wb.tools.cdef_chroma_blocks;
+        tools.cdef_adj_zero += wb.tools.cdef_adj_zero;
+        tools.cdef_uv422_pri += wb.tools.cdef_uv422_pri;
+        for d in 0..8 {
+            tools.cdef_dir_hist[d] += wb.tools.cdef_dir_hist[d];
+        }
     }
     Ok(())
 }

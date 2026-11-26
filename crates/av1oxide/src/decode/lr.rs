@@ -779,6 +779,409 @@ fn apply_parallel_sbrows(
         let _lpf_budget_token = butce.gecici(8 * max_lpf_stride, 0u8)?;
     }
 
+    // Büyük karelerde (`std` + non-wasm32) `pic.data` şeritlerini doğrudan
+    // `split_at_mut` ile yerinde (`in-place`) paralel süz (`5.C.1`): sıfır
+    // ara düzlem kopyası, sıfır ekstra RAM, `mask` klonlaması yok.
+    #[cfg(all(feature = "std", not(target_arch = "wasm32")))]
+    if sbh >= 2 && pic.data[0].len() >= 256 * 1024 {
+        let guard = pool.acquire_scope_workers(pool.n_threads().saturating_sub(1));
+        let total_threads = guard.total_threads();
+        if total_threads > 1 {
+            let restore_planes = st.restore_planes;
+            let sb128w = st.sb128w;
+            let unit_size_arr = st.unit_size;
+            let width = st.width;
+            let height = st.height;
+            let ss_hor = st.ss_hor;
+            let ss_ver = st.ss_ver;
+            let strides = pic.stride;
+            let pre_strides = pre_cdef.stride;
+            let bpp = bd.bytes_per_sample();
+            let hbd = bd != BitDepth::Eight;
+            let wiener_fns = kernels.wiener;
+            let sgr_fns = kernels.sgr;
+
+            let mut ranges: Vec<[(usize, usize); 3]> = Vec::with_capacity(sbh);
+            let mut valid = true;
+            for sby in 0..sbh {
+                let offset_y = if sby != 0 { 8 } else { 0 };
+                let not_last = usize::from(sby + 1 < sbh);
+                let mut yr = [(0usize, 0usize); 3];
+                if restore_planes & 1 != 0 {
+                    let h = height;
+                    let next_row_y = (sby + 1) << (6 + sb128);
+                    let row_h = (next_row_y - 8 * not_last).min(h);
+                    let y_stripe = (sby << (6 + sb128)) - offset_y;
+                    yr[0] = (y_stripe, row_h);
+                }
+                if restore_planes & 6 != 0 {
+                    let h = (height + ss_ver) >> ss_ver;
+                    let next_row_y = (sby + 1) << ((6 - ss_ver) + sb128);
+                    let row_h = (next_row_y - (8 >> ss_ver) * not_last).min(h);
+                    let offset_uv = offset_y >> ss_ver;
+                    let y_stripe = (sby << ((6 - ss_ver) + sb128)) - offset_uv;
+                    for (p, slot) in yr.iter_mut().enumerate().skip(1) {
+                        if (restore_planes >> p) & 1 != 0 {
+                            *slot = (y_stripe, row_h);
+                        }
+                    }
+                }
+                if let Some(prev) = ranges.last() {
+                    for p in 0..3 {
+                        if (restore_planes >> p) & 1 != 0
+                            && (yr[p].0 < prev[p].1 || yr[p].1 < yr[p].0)
+                        {
+                            valid = false;
+                        }
+                    }
+                }
+                ranges.push(yr);
+            }
+            for p in 0..3 {
+                if (restore_planes >> p) & 1 != 0
+                    && let Some(last) = ranges.last()
+                    && last[p].1.saturating_mul(strides[p]) > pic.data[p].len()
+                {
+                    valid = false;
+                }
+            }
+
+            if valid {
+                struct InplaceSbRow<'a> {
+                    sby: usize,
+                    y_range: [(usize, usize); 3],
+                    dst: [&'a mut [u8]; 3],
+                }
+
+                let [y_plane, u_plane, v_plane] = &mut pic.data;
+                let mut rem_planes: [&mut [u8]; 3] = [
+                    y_plane.as_mut_slice(),
+                    u_plane.as_mut_slice(),
+                    v_plane.as_mut_slice(),
+                ];
+                let mut cur_y = [0usize; 3];
+                let mut rows: Vec<InplaceSbRow<'_>> = Vec::with_capacity(sbh);
+                for (sby, yr) in ranges.into_iter().enumerate() {
+                    let mut slices: [&mut [u8]; 3] = [&mut [][..], &mut [][..], &mut [][..]];
+                    for p in 0..3 {
+                        if (restore_planes >> p) & 1 == 0 {
+                            continue;
+                        }
+                        let (y0, y1) = yr[p];
+                        let stride = strides[p];
+                        let skip_bytes = y0.saturating_sub(cur_y[p]) * stride;
+                        let rem = core::mem::take(&mut rem_planes[p]);
+                        let (_, after_skip) = rem.split_at_mut(skip_bytes);
+                        let take_bytes = if sby + 1 == sbh {
+                            after_skip.len()
+                        } else {
+                            y1.saturating_sub(y0) * stride
+                        };
+                        let (band, rest) = after_skip.split_at_mut(take_bytes);
+                        slices[p] = band;
+                        rem_planes[p] = rest;
+                        cur_y[p] = y1;
+                    }
+                    rows.push(InplaceSbRow {
+                        sby,
+                        y_range: yr,
+                        dst: slices,
+                    });
+                }
+
+                let pre_planes: [&[u8]; 3] = [
+                    pre_cdef.data[0].as_slice(),
+                    pre_cdef.data[1].as_slice(),
+                    pre_cdef.data[2].as_slice(),
+                ];
+                let mask = st.mask.as_slice();
+                let mut max_backup_h = 0usize;
+                for row in &rows {
+                    for (p, &(y0, y1)) in row.y_range.iter().enumerate() {
+                        if (restore_planes >> p) & 1 != 0 {
+                            max_backup_h = max_backup_h.max(y1.saturating_sub(y0));
+                        }
+                    }
+                }
+                let max_border_len = max_backup_h * 4 * bpp;
+                let max_lpf_len = 8 * max_lpf_stride;
+                struct LrWorkerScratch {
+                    border: [Vec<u8>; 2],
+                    lpf: Vec<u8>,
+                    tools: ToolCounts,
+                }
+                let n_workers = total_threads.min(sbh).max(1);
+                let mut worker_bufs: Vec<LrWorkerScratch> = Vec::with_capacity(n_workers);
+                for _ in 0..n_workers {
+                    worker_bufs.push(LrWorkerScratch {
+                        border: [
+                            dolu_vec(max_border_len, 0u8)?,
+                            dolu_vec(max_border_len, 0u8)?,
+                        ],
+                        lpf: dolu_vec(max_lpf_len, 0u8)?,
+                        tools: ToolCounts::default(),
+                    });
+                }
+
+                let queue = crate::sync::Mutex::new(rows);
+
+                let run_worker = |wb: &mut LrWorkerScratch| {
+                    let local_tools = &mut wb.tools;
+                    let border = &mut wb.border;
+                    let lpf = &mut wb.lpf;
+                    loop {
+                        let Some(job) = queue.lock().pop() else {
+                            break;
+                        };
+                        for p in 0..3 {
+                            if (restore_planes >> p) & 1 == 0 {
+                                continue;
+                            }
+                            let (y_stripe, row_h) = job.y_range[p];
+                            if y_stripe >= row_h {
+                                continue;
+                            }
+                            let stride = strides[p];
+                            let ps = pre_strides[p];
+                            let (psh, psv) = if p == 0 { (0, 0) } else { (ss_hor, ss_ver) };
+                            let w = if p == 0 { width } else { (width + psh) >> psh };
+                            let h = if p == 0 {
+                                height
+                            } else {
+                                (height + psv) >> psv
+                            };
+                            let unit_size_log2 = usize::from(unit_size_arr[usize::from(p != 0)]);
+                            let unit_size = 1usize << unit_size_log2;
+                            let half_unit_size = unit_size >> 1;
+                            let max_unit_size = unit_size + half_unit_size;
+                            let row_y = y_stripe + if y_stripe != 0 { 8 >> psv } else { 0 };
+                            let shift_hor = 7 - psh;
+                            let mut edges = LrEdgeFlags::HAVE_RIGHT;
+                            if y_stripe > 0 {
+                                edges = edges.union(LrEdgeFlags::HAVE_TOP);
+                            }
+                            let mut aligned_unit_pos = row_y & !(unit_size - 1);
+                            if aligned_unit_pos != 0 && aligned_unit_pos + half_unit_size > h {
+                                aligned_unit_pos -= unit_size;
+                            }
+                            aligned_unit_pos <<= psv;
+                            let sb_idx = (aligned_unit_pos >> 7) * sb128w;
+                            let unit_idx = ((aligned_unit_pos >> 6) & 1) << 1;
+                            let unit_at = |sb: usize, u: usize| {
+                                mask.get(sb).map_or(LrUnit::default(), |s| s[p][u])
+                            };
+                            let mut lr = [unit_at(sb_idx, unit_idx), LrUnit::default()];
+                            let mut restore = lr[0].kind != LR_NONE;
+                            let mut x = 0usize;
+                            let mut bit = 0usize;
+                            let backup_h = row_h - y_stripe;
+                            let border_need = backup_h * 4 * bpp;
+                            let lpf_need = 8 * stride;
+
+                            let mut run_unit =
+                                |dst_buf: &mut [u8],
+                                 tools_out: &mut ToolCounts,
+                                 left_buf: &[u8],
+                                 ux: usize,
+                                 uw: usize,
+                                 u_lr: &LrUnit,
+                                 mut u_edges: LrEdgeFlags| {
+                                    let mut stripe_h = ((64 - if y_stripe == 0 { 8 } else { 0 })
+                                        >> psv)
+                                        .min(row_h - y_stripe);
+                                    let (params, func, kind_no) = if u_lr.kind == LR_WIENER {
+                                        let mut filter = [[0i16; 8]; 2];
+                                        let fh = u_lr.filter_h.map(i16::from);
+                                        let fv = u_lr.filter_v.map(i16::from);
+                                        filter[0][0] = fh[0];
+                                        filter[0][6] = fh[0];
+                                        filter[0][1] = fh[1];
+                                        filter[0][5] = fh[1];
+                                        filter[0][2] = fh[2];
+                                        filter[0][4] = fh[2];
+                                        filter[0][3] = -(fh[0] + fh[1] + fh[2]) * 2;
+                                        if hbd {
+                                            filter[0][3] += 128;
+                                        }
+                                        filter[1][0] = fv[0];
+                                        filter[1][6] = fv[0];
+                                        filter[1][1] = fv[1];
+                                        filter[1][5] = fv[1];
+                                        filter[1][2] = fv[2];
+                                        filter[1][4] = fv[2];
+                                        filter[1][3] = 128 - (fv[0] + fv[1] + fv[2]) * 2;
+                                        let idx = usize::from((filter[0][0] | filter[1][0]) == 0);
+                                        (LrParams::Wiener { filter }, wiener_fns[idx], idx)
+                                    } else {
+                                        let sgr_idx = usize::from(u_lr.kind - LR_SGRPROJ);
+                                        let sgr = SGR_PARAMS[sgr_idx];
+                                        let w0 = i32::from(u_lr.sgr_weights[0]);
+                                        let w1 = 128 - (w0 + i32::from(u_lr.sgr_weights[1]));
+                                        let idx = usize::from(sgr[0] != 0)
+                                            + usize::from(sgr[1] != 0) * 2
+                                            - 1;
+                                        (
+                                            LrParams::Sgr {
+                                                s0: u32::from(sgr[0]),
+                                                s1: u32::from(sgr[1]),
+                                                w0,
+                                                w1,
+                                            },
+                                            sgr_fns[idx],
+                                            2 + idx,
+                                        )
+                                    };
+
+                                    let mut y = y_stripe;
+                                    let mut left_off = 0usize;
+                                    let pre = pre_planes[p];
+                                    while y + stripe_h <= row_h {
+                                        let have_bottom =
+                                            job.sby + 1 != sbh || y + stripe_h != row_h;
+                                        u_edges = LrEdgeFlags::from_bits(
+                                            (u_edges.bits() & !LrEdgeFlags::HAVE_BOTTOM.bits())
+                                                | if have_bottom {
+                                                    LrEdgeFlags::HAVE_BOTTOM.bits()
+                                                } else {
+                                                    0
+                                                },
+                                        );
+                                        let col_lo = ux.saturating_sub(16) * bpp;
+                                        let col_hi = ((ux + uw + 32) * bpp).min(stride);
+                                        if u_edges.contains(LrEdgeFlags::HAVE_TOP) {
+                                            LrCdefBackup::copy_top_slices(
+                                                pre,
+                                                ps,
+                                                y,
+                                                psv,
+                                                &mut lpf[..lpf_need],
+                                                stride,
+                                                col_lo,
+                                                col_hi,
+                                            );
+                                        }
+                                        if have_bottom {
+                                            let b = y + stripe_h;
+                                            LrCdefBackup::copy_bottom_slices(
+                                                pre,
+                                                ps,
+                                                b,
+                                                psv,
+                                                &mut lpf[..lpf_need],
+                                                stride,
+                                                col_lo,
+                                                col_hi,
+                                            );
+                                        }
+                                        let local_off = (y - y_stripe) * stride + ux * bpp;
+                                        crate::dsp::profil_olc!(
+                                            @ if kind_no < 2 {
+                                                crate::dsp::profil::Islev::LrWiener
+                                            } else {
+                                                crate::dsp::profil::Islev::LrSgr
+                                            },
+                                            (func)(
+                                                &mut dst_buf[local_off..],
+                                                stride,
+                                                &left_buf[left_off * 4 * bpp..],
+                                                &lpf[..lpf_need],
+                                                stride,
+                                                ux,
+                                                uw,
+                                                stripe_h,
+                                                &params,
+                                                u_edges,
+                                                lbd,
+                                            )
+                                        );
+                                        match kind_no {
+                                            0 => tools_out.lr_wiener7 += 1,
+                                            1 => tools_out.lr_wiener5 += 1,
+                                            2 => tools_out.lr_sgr5x5 += 1,
+                                            3 => tools_out.lr_sgr3x3 += 1,
+                                            _ => tools_out.lr_sgrmix += 1,
+                                        }
+                                        left_off += stripe_h;
+                                        y += stripe_h;
+                                        u_edges = u_edges.union(LrEdgeFlags::HAVE_TOP);
+                                        stripe_h = (64 >> psv).min(row_h - y);
+                                        if stripe_h == 0 {
+                                            break;
+                                        }
+                                    }
+                                };
+
+                            while x + max_unit_size <= w {
+                                let next_x = x + unit_size;
+                                let next_u_idx = unit_idx + ((next_x >> (shift_hor - 1)) & 1);
+                                lr[bit ^ 1] = unit_at(sb_idx + (next_x >> shift_hor), next_u_idx);
+                                let restore_next = lr[bit ^ 1].kind != LR_NONE;
+                                if restore_next {
+                                    let col = (x + unit_size - 4) * bpp;
+                                    for r in 0..backup_h {
+                                        let so = r * stride + col;
+                                        border[bit][r * 4 * bpp..(r + 1) * 4 * bpp]
+                                            .copy_from_slice(&job.dst[p][so..so + 4 * bpp]);
+                                    }
+                                }
+                                if restore {
+                                    run_unit(
+                                        job.dst[p],
+                                        local_tools,
+                                        &border[bit ^ 1][..border_need],
+                                        x,
+                                        unit_size,
+                                        &lr[bit],
+                                        edges,
+                                    );
+                                }
+                                x = next_x;
+                                restore = restore_next;
+                                edges = edges.union(LrEdgeFlags::HAVE_LEFT);
+                                bit ^= 1;
+                            }
+                            if restore {
+                                edges = LrEdgeFlags::from_bits(
+                                    edges.bits() & !LrEdgeFlags::HAVE_RIGHT.bits(),
+                                );
+                                let unit_w = w - x;
+                                run_unit(
+                                    job.dst[p],
+                                    local_tools,
+                                    &border[bit ^ 1][..border_need],
+                                    x,
+                                    unit_w,
+                                    &lr[bit],
+                                    edges,
+                                );
+                            }
+                        }
+                    }
+                };
+
+                if let Some((first_wb, rest_wbs)) = worker_bufs.split_first_mut() {
+                    std::thread::scope(|s| {
+                        for wb in rest_wbs {
+                            s.spawn(|| run_worker(wb));
+                        }
+                        run_worker(first_wb);
+                    });
+                }
+                drop(queue);
+                drop(guard);
+
+                for wb in &worker_bufs {
+                    tools.lr_wiener7 += wb.tools.lr_wiener7;
+                    tools.lr_wiener5 += wb.tools.lr_wiener5;
+                    tools.lr_sgr5x5 += wb.tools.lr_sgr5x5;
+                    tools.lr_sgr3x3 += wb.tools.lr_sgr3x3;
+                    tools.lr_sgrmix += wb.tools.lr_sgrmix;
+                }
+                return Ok(());
+            }
+        }
+    }
+
     struct SbRowJob {
         sby: usize,
         y_range: [(usize, usize); 3],

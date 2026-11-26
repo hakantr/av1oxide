@@ -107,8 +107,66 @@ impl ScratchPool {
 }
 
 type TaskRunnerFn = Box<dyn Fn(usize, usize, &TaskBatch) + Send + Sync>;
-type TaskSlotList<T> = Arc<Vec<Mutex<(Option<T>, Option<Error>)>>>;
+type TaskSlotList<T> = Arc<Vec<Mutex<Option<T>>>>;
+type FirstErrorSlot = Arc<Mutex<Option<(usize, Error)>>>;
 type AsyncTaskFn = Box<dyn FnOnce() + Send + 'static>;
+
+#[inline]
+fn record_first_error(
+    slot: &Mutex<Option<(usize, Error)>>,
+    batch_ref: &TaskBatch,
+    idx: usize,
+    err: Error,
+) {
+    // ORDERING: Hata veren en küçük görev indeksini atomik olarak kaydeder;
+    // `AcqRel` ile diğer işçilerin erken iptal (`Acquire`) okumasını sıralar.
+    // Yalnızca bu görev mevcut en küçük hata indeksini iyileştirdiğinde kilit
+    // alınır; mutlu yolda (hata yokken) kilit hiç alınmaz.
+    let prev = batch_ref.first_error_idx.fetch_min(idx, Ordering::AcqRel);
+    if idx < prev {
+        let mut guard = slot.lock();
+        let replace = match &*guard {
+            Some((cur_idx, _)) => idx < *cur_idx,
+            None => true,
+        };
+        if replace {
+            *guard = Some((idx, err));
+        }
+    }
+}
+
+/// `std::thread::scope` tabanlı sıfır-kopya paralel şerit aşamaları için
+/// eşzamanlı ek iş parçacığı bütçesi tutan RAII bekçisi (`5.C.1`).
+///
+/// Birden çok kare `max_frame_delay > 1` altında eşzamanlı çözüldüğünde
+/// toplam aktif ek iş parçacığı sayısını `n_threads - 1` sınırında tutarak
+/// aşırı abonelik (`oversubscription`) ve bağlam değiştirme maliyetini önler.
+#[cfg(all(feature = "std", not(target_arch = "wasm32")))]
+pub(crate) struct ScopeWorkersGuard<'a> {
+    counter: Option<&'a AtomicUsize>,
+    extra_workers: usize,
+}
+
+#[cfg(all(feature = "std", not(target_arch = "wasm32")))]
+impl ScopeWorkersGuard<'_> {
+    /// Çağıran iş parçacığı dâhil toplam paralel yürütücü sayısı (`>= 1`).
+    #[inline]
+    pub(crate) const fn total_threads(&self) -> usize {
+        1 + self.extra_workers
+    }
+}
+
+#[cfg(all(feature = "std", not(target_arch = "wasm32")))]
+impl Drop for ScopeWorkersGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(counter) = self.counter
+            && self.extra_workers > 0
+        {
+            // ORDERING: Serbest bırakılan işçi bütçesini diğer karelere yayınlar.
+            counter.fetch_sub(self.extra_workers, Ordering::Release);
+        }
+    }
+}
 
 /// Tek bir `execute_tasks` / `execute_indexed` çağrısına (kuşağına) özel,
 /// diğer kuşaklardan tamamen yalıtılmış görev partisi durumu.
@@ -178,6 +236,9 @@ impl TaskBatch {
 struct SharedQueue {
     state: Mutex<QueueState>,
     work_cv: Condvar,
+    /// Etkin `std::thread::scope` şerit aşamalarının tuttuğu ek iş parçacığı sayısı.
+    #[cfg(all(feature = "std", not(target_arch = "wasm32")))]
+    scoped_active: CachePadded<AtomicUsize>,
 }
 
 struct QueueState {
@@ -411,6 +472,7 @@ impl WorkerPool {
                     async_tasks: VecDeque::new(),
                 }),
                 work_cv: Condvar::new(),
+                scoped_active: CachePadded::new(AtomicUsize::new(0)),
             });
             let mut workers = Vec::with_capacity(n_threads - 1);
             for worker_id in 1..n_threads {
@@ -566,6 +628,52 @@ impl WorkerPool {
         }
     }
 
+    /// `std::thread::scope` şerit aşaması için en çok `max_extra` ek iş parçacığı
+    /// rezerve eder; toplam eşzamanlı ek işçi sayısını `n_threads - 1` sınırında tutar.
+    #[cfg(all(feature = "std", not(target_arch = "wasm32")))]
+    pub(crate) fn acquire_scope_workers(&self, max_extra: usize) -> ScopeWorkersGuard<'_> {
+        let budget = self.n_threads.saturating_sub(1);
+        let cap = max_extra.min(budget);
+        if cap == 0 {
+            return ScopeWorkersGuard {
+                counter: None,
+                extra_workers: 0,
+            };
+        }
+        let Some(shared) = &self.shared else {
+            return ScopeWorkersGuard {
+                counter: None,
+                extra_workers: 0,
+            };
+        };
+        let counter = &*shared.scoped_active;
+        let mut cur = counter.load(Ordering::Relaxed);
+        loop {
+            let avail = budget.saturating_sub(cur);
+            let take = avail.min(cap);
+            if take == 0 {
+                return ScopeWorkersGuard {
+                    counter: None,
+                    extra_workers: 0,
+                };
+            }
+            match counter.compare_exchange_weak(
+                cur,
+                cur + take,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => {
+                    return ScopeWorkersGuard {
+                        counter: Some(counter),
+                        extra_workers: take,
+                    };
+                }
+                Err(actual) => cur = actual,
+            }
+        }
+    }
+
     /// `tasks` vektöründeki her `&mut T` öğesini kalıcı `WorkerPool` iş
     /// parçacıkları üzerinde paralel (veya `n_threads == 1` / `tasks.len() <= 1`
     /// iken doğrudan çağıran iş parçacığında) `op(worker_id, task_idx, &mut T)`
@@ -597,13 +705,11 @@ impl WorkerPool {
             return Ok(());
         };
 
-        let slots: TaskSlotList<T> = Arc::new(
-            tasks
-                .drain(..)
-                .map(|item| Mutex::new((Some(item), None)))
-                .collect(),
-        );
+        let slots: TaskSlotList<T> =
+            Arc::new(tasks.drain(..).map(|item| Mutex::new(Some(item))).collect());
         let slots_worker = Arc::clone(&slots);
+        let first_error: FirstErrorSlot = Arc::new(Mutex::new(None));
+        let first_error_worker = Arc::clone(&first_error);
 
         let batch = Arc::new(TaskBatch {
             n_tasks,
@@ -612,14 +718,10 @@ impl WorkerPool {
             first_error_idx: CachePadded::new(AtomicUsize::new(usize::MAX)),
             runner: Box::new(move |worker_id: usize, idx: usize, batch_ref: &TaskBatch| {
                 let mut guard = slots_worker[idx].lock();
-                if let Some(ref mut item) = guard.0
+                if let Some(ref mut item) = *guard
                     && let Err(err) = op(worker_id, idx, item)
                 {
-                    guard.1 = Some(err);
-                    // ORDERING: Hata veren en küçük görev indeksini atomik olarak
-                    // kaydeder; `AcqRel` ile `guard.1` yazımının görünürlüğünü ve
-                    // diğer işçilerin erken iptal (`Acquire`) okumasını sıralar.
-                    batch_ref.first_error_idx.fetch_min(idx, Ordering::AcqRel);
+                    record_first_error(&first_error_worker, batch_ref, idx, err);
                 }
             }),
             done_lock: Mutex::new(false),
@@ -627,22 +729,28 @@ impl WorkerPool {
         });
 
         self.dispatch_and_wait(shared, &batch);
+        let had_error = batch.first_error_idx.load(Ordering::Acquire) != usize::MAX;
+        drop(batch);
 
         // Bariyer tamamlandı: öğeleri orijinal sırada `tasks` vektörüne geri
-        // koy ve ilk (en küçük indeksli) hatayı deterministik sırada döndür.
-        let mut first_err: Option<Error> = None;
-        for slot in slots.iter() {
-            let mut guard = slot.lock();
-            if let Some(item) = guard.0.take() {
-                tasks.push(item);
+        // koy; tek sahip isek (`Arc::try_unwrap`) hiç kilit almadan taşı.
+        match Arc::try_unwrap(slots) {
+            Ok(slot_vec) => {
+                for slot in slot_vec {
+                    if let Some(item) = slot.into_inner() {
+                        tasks.push(item);
+                    }
+                }
             }
-            if first_err.is_none()
-                && let Some(err) = guard.1.take()
-            {
-                first_err = Some(err);
+            Err(slots_arc) => {
+                for slot in slots_arc.iter() {
+                    if let Some(item) = slot.lock().take() {
+                        tasks.push(item);
+                    }
+                }
             }
         }
-        if let Some(err) = first_err {
+        if had_error && let Some((_, err)) = first_error.lock().take() {
             return Err(err);
         }
         Ok(())
@@ -670,9 +778,8 @@ impl WorkerPool {
             return Ok(());
         };
 
-        let errors: Arc<Vec<Mutex<Option<Error>>>> =
-            Arc::new((0..n_tasks).map(|_| Mutex::new(None)).collect());
-        let errors_worker = Arc::clone(&errors);
+        let first_error: FirstErrorSlot = Arc::new(Mutex::new(None));
+        let first_error_worker = Arc::clone(&first_error);
 
         let batch = Arc::new(TaskBatch {
             n_tasks,
@@ -681,10 +788,7 @@ impl WorkerPool {
             first_error_idx: CachePadded::new(AtomicUsize::new(usize::MAX)),
             runner: Box::new(move |worker_id: usize, idx: usize, batch_ref: &TaskBatch| {
                 if let Err(err) = op(worker_id, idx) {
-                    let mut slot = errors_worker[idx].lock();
-                    *slot = Some(err);
-                    // ORDERING: Bkz. `execute_tasks` `first_error_idx` açıklaması.
-                    batch_ref.first_error_idx.fetch_min(idx, Ordering::AcqRel);
+                    record_first_error(&first_error_worker, batch_ref, idx, err);
                 }
             }),
             done_lock: Mutex::new(false),
@@ -692,12 +796,11 @@ impl WorkerPool {
         });
 
         self.dispatch_and_wait(shared, &batch);
+        let had_error = batch.first_error_idx.load(Ordering::Acquire) != usize::MAX;
+        drop(batch);
 
-        for slot in errors.iter() {
-            let mut guard = slot.lock();
-            if let Some(err) = guard.take() {
-                return Err(err);
-            }
+        if had_error && let Some((_, err)) = first_error.lock().take() {
+            return Err(err);
         }
         Ok(())
     }
@@ -894,5 +997,47 @@ mod tests {
                 assert_eq!(total, expected);
             }
         }
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn execute_indexed_en_kucuk_indeksli_hatayi_belirlenimli_dondurur() {
+        let pool = WorkerPool::new(4);
+        let tekrar = if cfg!(miri) { 4 } else { 16 };
+        for _ in 0..tekrar {
+            let res = pool.execute_indexed(24, |_wid, idx| {
+                if idx == 11 {
+                    return Err(Error::InvalidData("idx-11"));
+                }
+                if idx == 4 {
+                    return Err(Error::InvalidData("idx-4"));
+                }
+                if idx == 19 {
+                    return Err(Error::InvalidData("idx-19"));
+                }
+                Ok(())
+            });
+            assert_eq!(res, Err(Error::InvalidData("idx-4")));
+        }
+    }
+
+    #[cfg(all(feature = "std", not(target_arch = "wasm32")))]
+    #[test]
+    fn scope_workers_butcesi_n_threads_sinirini_asmaz_ve_drop_ile_iade_edilir() {
+        let pool = WorkerPool::new(4);
+        let g1 = pool.acquire_scope_workers(2);
+        assert_eq!(g1.total_threads(), 3);
+        let g2 = pool.acquire_scope_workers(3);
+        assert_eq!(g2.total_threads(), 2);
+        let g3 = pool.acquire_scope_workers(2);
+        assert_eq!(g3.total_threads(), 1);
+        drop(g2);
+        let g4 = pool.acquire_scope_workers(2);
+        assert_eq!(g4.total_threads(), 2);
+        drop(g1);
+        drop(g3);
+        drop(g4);
+        let g_full = pool.acquire_scope_workers(8);
+        assert_eq!(g_full.total_threads(), 4);
     }
 }
