@@ -159,13 +159,20 @@ fn decode_untrusted(payload: &[u8]) -> Result<()> {
 
 ### 3. `libdav1d` Uyumlu C-ABI Kullanımı (`--features capi`)
 
-19 `dav1d_*` C sembolünü dışa aktaran paylaşımlı (`libav1oxide.so` / `.dylib` / `.dll`) ve statik (`libav1oxide.a`) kütüphaneleri üretmek için (`[package.metadata.capi]` üzerinden `dav1d.pc` ile drop-in kurulum desteklenir):
+6 resmî C başlığını (`include/dav1d/*.h`), `SONAME`/`install_name` tanımlı paylaşımlı kütüphaneyi (`libdav1d.so.7` / `libdav1d.7.dylib`), statik kütüphaneyi (`libdav1d.a`) ve `lib/pkgconfig/dav1d.pc` dosyasını içeren eksiksiz bir drop-in `libdav1d` (`1.5.4` / API `7.0.0`) öneki kurmak için resmî kurulum aracını kullanın:
+
+```bash
+cargo run --locked --release -p av1oxide --example install_capi_prefix -- /hedef/prefix
+PKG_CONFIG_PATH=/hedef/prefix/lib/pkgconfig pkg-config --modversion --cflags --libs dav1d
+```
+
+İsterseniz ham paylaşımlı (`libav1oxide.so` / `.dylib` / `.dll`) ve statik (`libav1oxide.a`) kütüphaneleri doğrudan da üretebilirsiniz:
 
 ```bash
 cargo rustc --release -p av1oxide --features capi --crate-type cdylib,staticlib
 ```
 
-Herhangi bir C/C++ programını `crates/av1oxide/include` (`#include <dav1d/dav1d.h>`) ve `libav1oxide.a` / `libav1oxide.so` (veya `pkg-config --cflags --libs dav1d`) ile doğrudan bağlayabilirsiniz:
+Herhangi bir C/C++ programını `<prefix>/include` (`#include <dav1d/dav1d.h>`) ve `pkg-config --cflags --libs dav1d` (veya `libdav1d.a` / `-ldav1d`) ile doğrudan bağlayabilirsiniz:
 
 ```c
 #include <dav1d/dav1d.h>
@@ -290,6 +297,10 @@ Depoda doğrudan çalıştırılabilen beş kullanım örneği bulunur:
 - **[`examples/c_abi_decode.rs`](crates/av1oxide/examples/c_abi_decode.rs):** `libdav1d` (`7.0.0`) C-ABI üzerinden uçtan uca çözme (`dav1d_default_settings` → `dav1d_open` → `dav1d_data_create` → `dav1d_send_data` → `dav1d_get_picture` → `dav1d_picture_unref` → `dav1d_close`):
   ```bash
   cargo run --release -p av1oxide --example c_abi_decode
+  ```
+- **[`examples/install_capi_prefix.rs`](crates/av1oxide/examples/install_capi_prefix.rs):** Drop-in `libdav1d` (`1.5.4` / API `7.0.0`) öneki (`include/dav1d/*.h`, `libdav1d.so.7` / `libdav1d.7.dylib`, `libdav1d.a`, `lib/pkgconfig/dav1d.pc`) kurulumu:
+  ```bash
+  cargo run --locked --release -p av1oxide --example install_capi_prefix -- /hedef/prefix
   ```
 - **[`examples/decode_avif.rs`](crates/av1oxide/examples/decode_avif.rs):** `avif::parse_info` ile `.avif` başlıklarını inceleme ve `avif::decode` / `avif::decode_rgba8` ile düzlemsel ve 8-bit RGBA pikselleri çözme:
   ```bash

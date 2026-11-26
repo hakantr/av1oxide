@@ -4,6 +4,7 @@ use core::ffi::{CStr, c_int, c_void};
 use core::mem::{MaybeUninit, offset_of, size_of};
 use core::ptr;
 use core::sync::atomic::{AtomicUsize, Ordering};
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::process::Command;
 
@@ -685,42 +686,189 @@ int main(void) {
         "DAV1D_ERR(EAGAIN) uyuşmazlığı: beklenen `{eagain_line}`, C çıktısı:\n{stdout}"
     );
 
-    // 2. `--features capi --crate-type cdylib,staticlib` ile gerçek C programı bağlama ve çalıştırma testi
+    // 2. Resmî drop-in önek kurulum aracı (`examples/install_capi_prefix.rs`) ile temiz `prefix/`
+    //    üzerinde 6 başlık, `dav1d.pc` / `pkg-config`, gerçek `DT_SONAME` / `install_name`,
+    //    zorunlu `nm` tam sembol eşleşmesi ve hem statik hem dinamik C istemci doğrulaması.
+    let prefix_dir = scratch_dir.join("prefix");
     let target_dir = scratch_dir.join("target");
-    let cargo_status = Command::new("cargo")
+    let install_status = Command::new("cargo")
         .current_dir(workspace_root)
-        .arg("rustc")
+        .arg("run")
+        .arg("--locked")
         .arg("--release")
         .arg("-p")
         .arg("av1oxide")
-        .arg("--features")
-        .arg("capi")
-        .arg("--crate-type")
-        .arg("cdylib,staticlib")
+        .arg("--example")
+        .arg("install_capi_prefix")
+        .arg("--")
+        .arg(&prefix_dir)
         .arg("--target-dir")
         .arg(&target_dir)
         .status()
-        .expect("cargo rustc --features capi çalışmalı");
+        .expect("resmî install_capi_prefix örneği çalışmalı");
     assert!(
-        cargo_status.success(),
-        "cdylib/staticlib derlemesi başarısız"
+        install_status.success(),
+        "install_capi_prefix kurulumu başarısız"
     );
 
-    let staticlib_path = target_dir.join("release/libav1oxide.a");
-    #[cfg(target_os = "macos")]
-    let (cdylib_name, nm_flag) = ("libav1oxide.dylib", "-gU");
-    #[cfg(not(target_os = "macos"))]
-    let (cdylib_name, nm_flag) = ("libav1oxide.so", "-D");
-    let cdylib_path = target_dir.join("release").join(cdylib_name);
-    assert!(staticlib_path.exists(), "libav1oxide.a üretilmeli");
-    #[cfg(unix)]
-    assert!(cdylib_path.exists(), "{cdylib_name} üretilmeli");
-    if cdylib_path.exists()
-        && let Ok(nm_out) = Command::new("nm").arg(nm_flag).arg(&cdylib_path).output()
-        && nm_out.status.success()
+    // 2a. 6 resmî C başlık dosyasının varlığı ve kaynakla birebir eşleşmesi
+    let prefix_inc_root = prefix_dir.join("include");
+    let prefix_inc_dav1d = prefix_inc_root.join("dav1d");
+    for hdr in [
+        "common.h",
+        "data.h",
+        "dav1d.h",
+        "headers.h",
+        "picture.h",
+        "version.h",
+    ] {
+        let installed = prefix_inc_dav1d.join(hdr);
+        assert!(installed.is_file(), "eksik kurulu başlık: {hdr}");
+        let expected_bytes = std::fs::read(include_dir.join("dav1d").join(hdr)).unwrap();
+        let actual_bytes = std::fs::read(&installed).unwrap();
+        assert_eq!(actual_bytes, expected_bytes, "başlık içeriği farklı: {hdr}");
+    }
+
+    // 2b. `dav1d.pc` içeriği ve (varsa) `pkg-config --modversion --cflags --libs dav1d`
+    let prefix_lib = prefix_dir.join("lib");
+    let pc_dir = prefix_lib.join("pkgconfig");
+    let pc_path = pc_dir.join("dav1d.pc");
+    let pc_text = std::fs::read_to_string(&pc_path).expect("dav1d.pc okunmalı");
+    assert!(pc_text.contains("Version: 1.5.4"));
+    assert!(pc_text.contains("Libs: -L${libdir} -ldav1d"));
+    assert!(pc_text.contains("Cflags: -I${includedir}"));
+    if let Ok(pc_ver) = Command::new("pkg-config")
+        .env("PKG_CONFIG_PATH", &pc_dir)
+        .args(["--modversion", "dav1d"])
+        .output()
     {
+        assert!(
+            pc_ver.status.success(),
+            "pkg-config --modversion dav1d başarısız"
+        );
+        assert_eq!(String::from_utf8_lossy(&pc_ver.stdout).trim(), "1.5.4");
+        let pc_cflags = Command::new("pkg-config")
+            .env("PKG_CONFIG_PATH", &pc_dir)
+            .args(["--cflags", "dav1d"])
+            .output()
+            .expect("pkg-config --cflags çalışmalı");
+        assert!(pc_cflags.status.success());
+        assert!(
+            String::from_utf8_lossy(&pc_cflags.stdout)
+                .contains(&prefix_inc_root.to_string_lossy().into_owned()),
+            "pkg-config --cflags önek include yolunu içermeli"
+        );
+        let pc_libs = Command::new("pkg-config")
+            .env("PKG_CONFIG_PATH", &pc_dir)
+            .args(["--libs", "dav1d"])
+            .output()
+            .expect("pkg-config --libs çalışmalı");
+        assert!(pc_libs.status.success());
+        assert!(
+            String::from_utf8_lossy(&pc_libs.stdout).contains("-ldav1d"),
+            "pkg-config --libs -ldav1d içermeli"
+        );
+    }
+
+    let staticlib_path = prefix_lib.join("libdav1d.a");
+    assert!(staticlib_path.is_file(), "libdav1d.a üretilmeli");
+
+    // 2c. Gerçek paylaşımlı kütüphane, SONAME / install_name ve zorunlu `nm` 19 tam sembol denetimi
+    #[cfg(target_os = "macos")]
+    let (cdylib_path, nm_args): (PathBuf, &[&str]) =
+        (prefix_lib.join("libdav1d.7.dylib"), &["-gU"]);
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let (cdylib_path, nm_args): (PathBuf, &[&str]) =
+        (prefix_lib.join("libdav1d.so.7"), &["-D", "--defined-only"]);
+
+    #[cfg(target_os = "macos")]
+    {
+        assert!(cdylib_path.is_file(), "libdav1d.7.dylib üretilmeli");
+        assert!(
+            prefix_lib.join("libdav1d.dylib").exists(),
+            "libdav1d.dylib bağı mevcut olmalı"
+        );
+        let otool_out = Command::new("otool")
+            .arg("-D")
+            .arg(&cdylib_path)
+            .output()
+            .expect("macOS üzerinde otool -D çalıştırılmalı");
+        assert!(otool_out.status.success(), "otool -D başarısız");
+        let install_name = String::from_utf8_lossy(&otool_out.stdout)
+            .lines()
+            .last()
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        assert_eq!(
+            install_name, "@rpath/libdav1d.7.dylib",
+            "Mach-O install_name beklenenden farklı"
+        );
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        assert!(
+            prefix_lib.join("libdav1d.so.7.0.0").is_file(),
+            "libdav1d.so.7.0.0 üretilmeli"
+        );
+        assert!(cdylib_path.exists(), "libdav1d.so.7 bağı mevcut olmalı");
+        assert!(
+            prefix_lib.join("libdav1d.so").exists(),
+            "libdav1d.so bağı mevcut olmalı"
+        );
+        let readelf_out = Command::new("readelf")
+            .arg("-d")
+            .arg(&cdylib_path)
+            .output()
+            .expect("Linux üzerinde readelf -d çalıştırılmalı");
+        assert!(readelf_out.status.success(), "readelf -d başarısız");
+        let readelf_text = String::from_utf8_lossy(&readelf_out.stdout);
+        assert!(
+            readelf_text
+                .lines()
+                .any(|l| l.contains("(SONAME)") && l.contains("[libdav1d.so.7]")),
+            "ELF DT_SONAME [libdav1d.so.7] bulunamadı:\n{readelf_text}"
+        );
+    }
+
+    #[cfg(unix)]
+    {
+        let nm_out = Command::new("nm")
+            .args(nm_args)
+            .arg(&cdylib_path)
+            .output()
+            .expect("Unix hedefinde nm çalıştırılması zorunludur");
+        assert!(
+            nm_out.status.success(),
+            "nm çalıştırması başarısız: {}",
+            String::from_utf8_lossy(&nm_out.stderr)
+        );
         let nm_text = String::from_utf8_lossy(&nm_out.stdout);
-        for sym in [
+        let mut exported_syms: HashSet<String> = HashSet::new();
+        for line in nm_text.lines() {
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() < 2 {
+                continue;
+            }
+            let (sym_type, raw_name) = if parts.len() >= 3 {
+                (parts[1], parts[2])
+            } else {
+                (parts[0], parts[1])
+            };
+            if sym_type == "U" || sym_type == "u" {
+                continue;
+            }
+            let base_name = raw_name.split('@').next().unwrap_or(raw_name);
+            let normalized = if cfg!(target_os = "macos") {
+                base_name.strip_prefix('_').unwrap_or(base_name)
+            } else {
+                base_name
+            };
+            exported_syms.insert(normalized.to_string());
+        }
+
+        let expected_syms = [
             "dav1d_version",
             "dav1d_version_api",
             "dav1d_default_settings",
@@ -740,12 +888,24 @@ int main(void) {
             "dav1d_data_unref",
             "dav1d_data_props_unref",
             "dav1d_picture_unref",
-        ] {
+        ];
+        for sym in expected_syms {
             assert!(
-                nm_text.contains(sym),
-                "{cdylib_name} içinde `{sym}` sembolü dışa aktarılmalı"
+                exported_syms.contains(sym),
+                "{} içinde `{sym}` sembolü tam ad eşleşmesiyle dışa aktarılmalı",
+                cdylib_path.display()
             );
         }
+        let exported_dav1d: HashSet<&str> = exported_syms
+            .iter()
+            .filter(|s| s.starts_with("dav1d_"))
+            .map(String::as_str)
+            .collect();
+        let expected_set: HashSet<&str> = expected_syms.into_iter().collect();
+        assert_eq!(
+            exported_dav1d, expected_set,
+            "dışa aktarılan dav1d_* sembol kümesi tam olarak 19 resmî sembolle eşleşmeli"
+        );
     }
 
     let c_app_src = r#"
@@ -806,31 +966,59 @@ int main(void) {
 }
 "#;
     let c_app_path = scratch_dir.join("c_app.c");
-    let c_app_bin = scratch_dir.join("c_app");
+    let c_app_static_bin = scratch_dir.join("c_app_static");
+    let c_app_dynamic_bin = scratch_dir.join("c_app_dynamic");
     std::fs::write(&c_app_path, c_app_src).unwrap();
 
-    let link_status = Command::new("cc")
+    // 2d. Statik (`libdav1d.a`) bağlama ve çalıştırma
+    let link_static = Command::new("cc")
         .arg("-I")
-        .arg(&include_dir)
+        .arg(&prefix_inc_root)
         .arg(&c_app_path)
         .arg(&staticlib_path)
         .arg("-lpthread")
         .arg("-ldl")
         .arg("-lm")
         .arg("-o")
-        .arg(&c_app_bin)
+        .arg(&c_app_static_bin)
         .status()
-        .expect("cc c_app.c + libav1oxide.a bağlanmalı");
+        .expect("cc c_app.c + libdav1d.a bağlanmalı");
     assert!(
-        link_status.success(),
-        "C programı libav1oxide.a ile bağlanamadı"
+        link_static.success(),
+        "C programı libdav1d.a ile bağlanamadı"
+    );
+    let run_static = Command::new(&c_app_static_bin).status().unwrap();
+    assert!(
+        run_static.success(),
+        "statik bağlı C programı çalışma zamanı doğrulaması başarısız"
     );
 
-    let run_app = Command::new(&c_app_bin).status().unwrap();
-    assert!(
-        run_app.success(),
-        "C programı çalışma zamanı doğrulaması başarısız"
-    );
+    // 2e. Dinamik (`-L<prefix>/lib -ldav1d -Wl,-rpath,<prefix>/lib`) bağlama ve çalıştırma
+    #[cfg(unix)]
+    {
+        let rpath_arg = format!("-Wl,-rpath,{}", prefix_lib.display());
+        let link_dynamic = Command::new("cc")
+            .arg("-I")
+            .arg(&prefix_inc_root)
+            .arg(&c_app_path)
+            .arg("-L")
+            .arg(&prefix_lib)
+            .arg("-ldav1d")
+            .arg(&rpath_arg)
+            .arg("-o")
+            .arg(&c_app_dynamic_bin)
+            .status()
+            .expect("cc c_app.c + -ldav1d dinamik bağlanmalı");
+        assert!(
+            link_dynamic.success(),
+            "C programı -ldav1d ile dinamik bağlanamadı"
+        );
+        let run_dynamic = Command::new(&c_app_dynamic_bin).status().unwrap();
+        assert!(
+            run_dynamic.success(),
+            "dinamik bağlı C programı çalışma zamanı doğrulaması başarısız"
+        );
+    }
 
     let _ = std::fs::remove_dir_all(&scratch_dir);
 }

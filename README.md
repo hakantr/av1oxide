@@ -159,13 +159,20 @@ fn decode_untrusted(payload: &[u8]) -> Result<()> {
 
 ### 3. `libdav1d`-Compatible C-ABI Usage (`--features capi`)
 
-Build shared (`libav1oxide.so` / `.dylib` / `.dll`) and static (`libav1oxide.a`) libraries exporting the 19 `dav1d_*` symbols (or install as a drop-in `libdav1d` prefix with `dav1d.pc` via `[package.metadata.capi]`):
+Install a complete drop-in `libdav1d` (`1.5.4` / API `7.0.0`) prefix (`include/dav1d/*.h`, versioned `libdav1d.so.7` / `libdav1d.7.dylib` with proper `SONAME`/`install_name`, `libdav1d.a`, and `lib/pkgconfig/dav1d.pc`) using the official installer example:
+
+```bash
+cargo run --locked --release -p av1oxide --example install_capi_prefix -- /path/to/prefix
+PKG_CONFIG_PATH=/path/to/prefix/lib/pkgconfig pkg-config --modversion --cflags --libs dav1d
+```
+
+Alternatively, build raw shared (`libav1oxide.so` / `.dylib` / `.dll`) and static (`libav1oxide.a`) libraries directly:
 
 ```bash
 cargo rustc --release -p av1oxide --features capi --crate-type cdylib,staticlib
 ```
 
-Link any C/C++ program against `crates/av1oxide/include` (`#include <dav1d/dav1d.h>`) and `libav1oxide.a` / `libav1oxide.so` (or `pkg-config --cflags --libs dav1d`):
+Link any C/C++ program against `<prefix>/include` (`#include <dav1d/dav1d.h>`) and `pkg-config --cflags --libs dav1d` (or `libdav1d.a` / `-ldav1d`):
 
 ```c
 #include <dav1d/dav1d.h>
@@ -290,6 +297,10 @@ Five standalone examples are included in the crate:
 - **[`examples/c_abi_decode.rs`](crates/av1oxide/examples/c_abi_decode.rs):** End-to-end decoding through the `libdav1d` (`7.0.0`) C-ABI (`dav1d_default_settings` → `dav1d_open` → `dav1d_data_create` → `dav1d_send_data` → `dav1d_get_picture` → `dav1d_picture_unref` → `dav1d_close`):
   ```bash
   cargo run --release -p av1oxide --example c_abi_decode
+  ```
+- **[`examples/install_capi_prefix.rs`](crates/av1oxide/examples/install_capi_prefix.rs):** Build and install a drop-in `libdav1d` (`1.5.4` / API `7.0.0`) prefix (`include/dav1d/*.h`, `libdav1d.so.7` / `libdav1d.7.dylib`, `libdav1d.a`, `lib/pkgconfig/dav1d.pc`):
+  ```bash
+  cargo run --locked --release -p av1oxide --example install_capi_prefix -- /path/to/prefix
   ```
 - **[`examples/decode_avif.rs`](crates/av1oxide/examples/decode_avif.rs):** Inspect `.avif` headers via `avif::parse_info` and decode planar and 8-bit RGBA pixels via `avif::decode` / `avif::decode_rgba8`:
   ```bash
