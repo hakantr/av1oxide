@@ -1,37 +1,40 @@
-# av1oxide (`v0.4.0`)
+# av1oxide (`v0.5.0`)
 
 **English** | [Türkçe](README.tr.md)
 
-`av1oxide` is a **100% stable-Rust** (`rustc 1.100.0`, Edition 2024) reimplementation of the VideoLAN [`dav1d`](https://code.videolan.org/videolan/dav1d) (`1.5.4`) AV1 video decoder with **no external codec or media dependencies**, a **`libdav1d` (`7.0.0`) binary-compatible C-ABI layer**, and a **pure-Rust `.avif` image decoder layer**.
+`av1oxide` is a **100% stable-Rust** (`rustc 1.100.0`, Edition 2024) reimplementation of the VideoLAN [`dav1d`](https://code.videolan.org/videolan/dav1d) (`1.5.4`) AV1 video decoder with **no external codec or media dependencies**, optional **`#![no_std] + alloc`** support, a **`libdav1d` (`1.5.4` / API `7.0.0`) drop-in binary-compatible C-ABI layer**, and a **pure-Rust `.avif` / `.avis` image and sequence decoder layer**.
 
 - **Profiles & Bit Depths:** Main (`0`), High (`1`), Professional (`2`); `8-bit`, `10-bit`, `12-bit`; `4:2:0`, `4:2:2`, `4:4:4`, and `Monochrome` (`4:0:0`).
-- **AV1 Pipeline:** OBU parsing, Sequence/Frame Headers, MSAC arithmetic entropy decoder, inverse transforms (`ITX`), intra prediction (`IPRED`, CfL, Palette), motion compensation (`MC`, Warp, Superres/Resize, IntraBC, `REFMVS`), in-loop filters (`LF`, `CDEF`, `LR` Wiener/SGR), and Film Grain (`FG`) synthesis.
+- **AV1 Pipeline:** OBU parsing, Sequence/Frame Headers, MSAC arithmetic entropy decoder, inverse transforms (`ITX`), intra prediction (`IPRED`, CfL, Palette), motion compensation (`MC`, Warp, Superres/Resize, IntraBC, `REFMVS`), in-loop filters (`LF`, `CDEF`, `LR` Wiener/SGR with `4`-row `LrCdefBackup`), and strip-based (`32`-row) Film Grain (`FG`) synthesis.
 - **Bit-Exact Conformance:** Verified 100% MD5 bit-exact parity against `dav1d 1.5.4` across **`2,781 / 2,781` streams (`37,664 / 37,664` frames)** — covering `dav1d-test-data` (`19/19` streams, `964` frames) and Argon Streams `v2.1.1` (`2,762/2,762` streams, `36,700` frames) across all CPU capability masks and multithreaded configurations.
 - **Capability-Token SIMD (`767` DSP Slots):**
-  - `x86_64` (`SSE2`, `SSSE3`, `SSE4.1`, `AVX2`, `AVX-512ICL`): `756 / 767` SIMD slots
-  - `aarch64` (`NEON`, `DOTPROD`): `701 / 767` SIMD slots
-  - `wasm32` (`+simd128`): `31 / 767` SIMD slots under `100% #![forbid(unsafe_code)]`
+  - `x86_64` (`SSE2`, `SSSE3`, `SSE4.1`, `AVX2`, `AVX-512ICL`): `767 / 767` (`100%`) SIMD slots
+  - `aarch64` (`NEON`, `DOTPROD`): `767 / 767` (`100%`) SIMD slots
+  - `wasm32` (`+simd128`): `682 / 767` (`88.9%`) SIMD slots under `100% #![forbid(unsafe_code)]` (`1.88×–2.40×` speedup vs. scalar WASM in Node.js and Deno; `0` `v128` instructions in scalar builds)
   - Secondary architectures (`arm32`, `riscv64`, `loongarch64`, `powerpc64le`): `100%` safe bit-exact scalar fallback
-- **Multithreading & Memory Budgets:** Intra-frame (`Tile`, superblock row, in-loop filter) and inter-frame (`FrameSlot`) parallelism (`Config::n_threads`, `Config::max_frame_delay`); pre-allocation pixel and memory limits (`Config::frame_size_limit`, `Config::allocation_limit`).
-- **`libdav1d` (`7.0.0`) Compatible C-ABI (`capi`):** Implements all 19 official `DAV1D_API` functions (`dav1d_open`, `dav1d_send_data`, `dav1d_get_picture`, `dav1d_apply_grain`, `dav1d_parse_sequence_header`, etc.) and ships the official `include/dav1d/*.h` C headers.
-- **Pure-Rust `.avif` Image Reader (`avif`):** `100% #![forbid(unsafe_code)]` ISOBMFF/HEIF/MIAF/AVIF container parser supporting single `av01` items, multithreaded `grid` tile stitching, `iden` derived chains, auxiliary alpha (`auxl`/`auxC`), `clap`/`irot`/`imir` transforms, `ICC`/`Exif`/`XMP` metadata (including `defl`/`zlib`/`gzip` compressed HEIF metadata items and `cmin` boxes with bounded decompression guards), and ITU-T H.273 conversions (`RGB8`/`RGBA8`/`RGB16`/`RGBA16`) — verified `100%` MD5 bit-exact parity (`156 / 156` valid `.avif` images across planar `Y`, `U`, `V`, `Alpha`, `RGBA8`, and `RGBA16`) against reference C `libavif` on the license-audited `AOMediaCodec/av1-avif` and `AOMediaCodec/libavif` corpora.
+- **Multithreading & Memory Budgets:** Intra-frame (`Tile`, superblock row, in-loop filter) and inter-frame (`FrameSlot`) parallelism (`Config::n_threads`, `Config::max_frame_delay`), recycled plane pools (`DecodeBufPool`), and pre-allocation pixel and memory limits (`Config::frame_size_limit`, `Config::allocation_limit`).
+- **Optional `#![no_std] + alloc` (`default = ["std"]`):** Compiling with `--no-default-features` builds the complete single-thread AV1 + AVIF decoder against `core + alloc` with zero `std` dependencies (verified on `wasm32-unknown-unknown`, `aarch64`, `armv7`, and `riscv64gc`).
+- **Container Helpers (`container`):** `100% #![forbid(unsafe_code)]` zero-copy IVF (`container::ivf::{IvfParser, IvfReader}`) and AV1 Annex-B (`container::annexb::{AnnexBDemuxer, read_leb128}`) demuxers.
+- **`libdav1d` (`1.5.4` / API `7.0.0`) Drop-In C-ABI (`capi`):** Implements all 19 official `DAV1D_API` functions (`dav1d_open`, `dav1d_send_data`, `dav1d_get_picture`, `dav1d_apply_grain`, `dav1d_parse_sequence_header`, etc.), ships the official `include/dav1d/*.h` headers, and declares `[package.metadata.capi]` / `dav1d.pc` metadata — verified by dynamically linking unmodified C `libavif 1.4.2` against `libdav1d.so.7` (`162 / 162` corpus parity) and an independent multithreaded C IVF client.
+- **Pure-Rust `.avif` / `.avis` Reader (`avif`):** `100% #![forbid(unsafe_code)]` ISOBMFF/HEIF/MIAF/AVIF parser with native `u8` 8-bit plane storage (`AvifPlane::U8`/`U16`) and strip-parallel YUVA→RGB conversion, single `av01` items, multithreaded `grid` tile stitching, `iden` chains, auxiliary alpha (`auxl`/`auxC`), `clap`/`irot`/`imir` transforms, ISO 21496-1 / Ultra HDR `tmap` Gain-Map (`9 / 9` parity), streaming animated `.avis` decoding (`AvifSequenceDecoder`, `6 / 6` animated streams + `nth_frame` seeking), `ICC`/`Exif`/`XMP` metadata (including bounded `defl`/`zlib`/`gzip` compressed HEIF metadata and `cmin` boxes under `std`), and linear + nonlinear ITU-T H.273 conversions (`ICtCp` `mc = 14` PQ/HLG and `BT.2020 CL` `mc = 10`, alongside `RGB8`/`RGBA8`/`RGB16`/`RGBA16`) — verified `100%` MD5 bit-exact parity against reference C `libavif 1.4.2` across `162 / 162` still files (`156` valid + `6` negative, `9 / 9` Gain-Map) and `6 / 6` animated `.avif` sequences.
+- **Separate `image` Ecosystem Adapter (`av1oxide-image`):** Workspace crate [`crates/av1oxide-image`](crates/av1oxide-image/README.md) (`v0.1.0`, `100% #![forbid(unsafe_code)]`) provides `image::ImageDecoder` (`Rgb8`/`Rgba8`/`Rgb16`/`Rgba16`, `icc_profile`, `exif_metadata`, `xmp_metadata`, `Limits`) and `register_decoding_hook` without adding `image` to `av1oxide`'s dependency graph.
 
 ---
 
 ## Dependency Policy
 
-`av1oxide` does not depend on any third-party codec, image, multimedia, or C media library crates; all AV1 bitstream/entropy/DSP decoding, ISOBMFF/AVIF container parsing, ITU-T H.273 color conversion, and `libdav1d` C-ABI layers are implemented in-tree. All external dependencies are strictly isolated as internal implementation details (`pub(crate)` / private); no types from any dependency crate are re-exported or exposed in `av1oxide`'s public (`pub`) API.
+`av1oxide` does not depend on any third-party codec, image, multimedia, or C media library crates; all AV1 bitstream/entropy/DSP decoding, ISOBMFF/AVIF/IVF/Annex-B container parsing, ITU-T H.273 color conversion, and `libdav1d` C-ABI layers are implemented in-tree. All external dependencies are strictly isolated as internal implementation details (`pub(crate)` / private); no types from any dependency crate are re-exported or exposed in `av1oxide`'s public (`pub`) API.
 
 For low-level concurrency, memory layout, and decompression primitives, `av1oxide` uses only foundational crates maintained by the `rust-lang` organization and Rust Core Team members with `default-features = false`:
 
 | Crate | Version | License | Source | Features (`default-features = false`) | Purpose in `av1oxide` | Unsafe / Native Code |
 |---|---|---|---|---|---|---|
-| `crossbeam-utils` | `0.8` (`0.8.23`) | `MIT OR Apache-2.0` | [crossbeam-rs/crossbeam](https://github.com/crossbeam-rs/crossbeam) | `["std"]` | `CachePadded` cache-line isolation of shared atomic counters/slots (`thread::TaskBatch`, `thread::ScratchPool`, `frame::butce::Butce`) and `Backoff` in lock-free CAS loops | Pure Rust (internal atomic/alignment `unsafe`, `0` C code) |
-| `parking_lot` | `0.12` (`0.12.5`) | `MIT OR Apache-2.0` | [Amanieu/parking_lot](https://github.com/Amanieu/parking_lot) | `[]` (`not(target_arch = "wasm32")`) | Non-poisoning compact userspace `Mutex` and `Condvar` (`sync`) across `thread::WorkerPool`, `thread::FrameSlot`, `api::Decoder`, and `decode::intra` | Pure Rust + OS futex / `libc` syscall binding on non-Wasm (`0` compiled C files) |
+| `crossbeam-utils` | `0.8` (`0.8.23`) | `MIT OR Apache-2.0` | [crossbeam-rs/crossbeam](https://github.com/crossbeam-rs/crossbeam) | `[]` (`std` enabled via `av1oxide/std`) | `CachePadded` cache-line isolation (`thread::TaskBatch`, `thread::ScratchPool`, `frame::butce::Butce`), `AtomicCell` (`no_std` sync), and `Backoff` in lock-free CAS loops | Pure Rust (internal atomic/alignment `unsafe`, `0` C code) |
+| `parking_lot` | `0.12` (`0.12.5`) | `MIT OR Apache-2.0` | [Amanieu/parking_lot](https://github.com/Amanieu/parking_lot) | `[]` (optional: `std` & `not(target_arch = "wasm32")`) | Non-poisoning compact userspace `Mutex` and `Condvar` (`sync`) across `thread::WorkerPool`, `thread::FrameSlot`, `api::Decoder`, and `decode::intra` | Pure Rust + OS futex / `libc` syscall binding on non-Wasm (`0` compiled C files) |
 | `memchr` | `2` (`2.8.3`) | `Unlicense OR MIT` | [BurntSushi/memchr](https://github.com/BurntSushi/memchr) | `[]` | SIMD/SWAR byte scanning (`memchr`, `memrchr`) for ISOBMFF NUL-terminated string parsing (`avif::boxes`) and OBU metadata trailing-byte locating (`api::Decoder`) | Pure Rust (internal SIMD/pointer `unsafe`, `0` C code) |
 | `rustc-hash` | `2` (`2.1.3`) | `Apache-2.0 OR MIT` | [rust-lang/rustc-hash](https://github.com/rust-lang/rustc-hash) | `[]` | Fast deterministic integer/tuple hashing (`FxBuildHasher`) for ISOBMFF `item_id` tables (`avif`) and DSP dispatch setup (`dsp`) | Safe Rust (`0` `unsafe` blocks, `0` C code) |
 | `indexmap` | `2` (`2.14.2`) | `Apache-2.0 OR MIT` | [indexmap-rs/indexmap](https://github.com/indexmap-rs/indexmap) | `[]` | Order-preserving $O(1)$ hash tables and sets (`IndexMap`, `IndexSet` over Miri-verified `hashbrown`) as the single hash table engine (`avif::boxes`, `avif::decode`, `dsp`) | Pure Rust (`indexmap` `#![forbid(unsafe_code)]` over Miri-verified `hashbrown`, `0` C code) |
-| `flate2` | `1.1` (`1.1.11`) | `MIT OR Apache-2.0` | [rust-lang/flate2-rs](https://github.com/rust-lang/flate2-rs) | `["rust_backend"]` | Pure-Rust bounded `deflate`/`zlib`/`gzip` decompression for HEIF compressed metadata items (`infe` `content_encoding`, `cmpC`) and `cmin` boxes (`avif::boxes`) | Safe Rust (`miniz_oxide` `#![forbid(unsafe_code)]` backend + `crc32fast`, `0` C/`libz-sys` code) |
+| `flate2` | `1.1` (`1.1.11`) | `MIT OR Apache-2.0` | [rust-lang/flate2-rs](https://github.com/rust-lang/flate2-rs) | `["rust_backend"]` (optional: `std`) | Pure-Rust bounded `deflate`/`zlib`/`gzip` decompression for HEIF compressed metadata items (`infe` `content_encoding`, `cmpC`) and `cmin` boxes (`avif::boxes`) | Safe Rust (`miniz_oxide` `#![forbid(unsafe_code)]` backend + `crc32fast`, `0` C/`libz-sys` code) |
 
 ---
 
@@ -41,8 +44,17 @@ Add `av1oxide` to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-av1oxide = "0.4"
+av1oxide = "0.5"
 ```
+
+For `#![no_std] + alloc` environments (single-thread AV1 + AVIF without `std`, `parking_lot`, or `flate2`):
+
+```toml
+[dependencies]
+av1oxide = { version = "0.5", default-features = false }
+```
+
+To integrate `av1oxide::avif` with the `image` (`0.25`) crate without altering `av1oxide`'s dependency tree, use the separate `av1oxide-image` crate ([`crates/av1oxide-image/README.md`](crates/av1oxide-image/README.md)).
 
 To build and browse the local API documentation (`rustdoc`):
 
@@ -147,13 +159,13 @@ fn decode_untrusted(payload: &[u8]) -> Result<()> {
 
 ### 3. `libdav1d`-Compatible C-ABI Usage (`--features capi`)
 
-Build shared (`libav1oxide.so` / `.dylib` / `.dll`) and static (`libav1oxide.a`) libraries exporting the 19 `dav1d_*` symbols:
+Build shared (`libav1oxide.so` / `.dylib` / `.dll`) and static (`libav1oxide.a`) libraries exporting the 19 `dav1d_*` symbols (or install as a drop-in `libdav1d` prefix with `dav1d.pc` via `[package.metadata.capi]`):
 
 ```bash
 cargo rustc --release -p av1oxide --features capi --crate-type cdylib,staticlib
 ```
 
-Link any C/C++ program against `crates/av1oxide/include` (`#include <dav1d/dav1d.h>`) and `libav1oxide.a` / `libav1oxide.so`:
+Link any C/C++ program against `crates/av1oxide/include` (`#include <dav1d/dav1d.h>`) and `libav1oxide.a` / `libav1oxide.so` (or `pkg-config --cflags --libs dav1d`):
 
 ```c
 #include <dav1d/dav1d.h>
@@ -187,42 +199,77 @@ int decode_obu_c(const uint8_t *obu_buf, size_t obu_len) {
 }
 ```
 
-### 4. `.avif` Image Decoding (`av1oxide::avif`)
+### 4. `.avif` Still, Gain-Map, and Animated `.avis` Decoding (`av1oxide::avif`)
 
 ```rust
 use av1oxide::Result;
-use av1oxide::avif::{AvifDecodeConfig, decode_rgba8, decode_with, parse_info, probe};
+use av1oxide::avif::{
+    AvifDecodeConfig, AvifSequenceDecoder, decode_rgba8, decode_with, parse_info, probe,
+};
 
 fn read_avif(avif_bytes: &[u8]) -> Result<()> {
     if !probe(avif_bytes) {
         return Ok(());
     }
 
-    // Inspect image dimensions, color descriptors, alpha, and metadata without decoding pixels.
+    // Inspect image dimensions, color descriptors, alpha, gain map, and metadata without decoding pixels.
     let info = parse_info(avif_bytes)?;
     println!(
-        "AVIF header: {}x{}, {:?}, {:?}, alpha={}",
-        info.width, info.height, info.bit_depth, info.chroma_format, info.has_alpha
+        "AVIF header: {}x{}, {:?}, {:?}, alpha={}, gain_map={}",
+        info.width, info.height, info.bit_depth, info.chroma_format, info.has_alpha, info.has_gain_map
     );
 
     // Decode directly to tightly packed 8-bit RGBA ([R, G, B, A, ...]).
     let rgba = decode_rgba8(avif_bytes)?;
     assert_eq!(rgba.pixels.len(), (rgba.width as usize) * (rgba.height as usize) * 4);
 
-    // Or decode with explicit thread and memory limits to planar 8/10/12-bit samples.
+    // Decode with explicit thread/memory limits and optional ISO 21496-1 gain map.
     let cfg = AvifDecodeConfig {
         n_threads: 4,
         max_pixels: 8192 * 8192,
         allocation_limit: Some(256 * 1024 * 1024),
+        decode_gain_map: true,
         ..AvifDecodeConfig::default()
     };
     let planar = decode_with(avif_bytes, &cfg)?;
     let _rgb16 = planar.to_rgb16()?;
+    let _gain_map = planar.gain_map();
+
+    // Stream animated .avis frames without buffering the full sequence in memory.
+    let mut seq = AvifSequenceDecoder::with_config(avif_bytes, cfg)?;
+    while let Some(frame) = seq.next_frame()? {
+        let _frame_rgba = frame.image.to_rgba8()?;
+    }
     Ok(())
 }
 ```
 
-### 5. Runnable Examples (`examples/`)
+### 5. IVF and Annex-B Demuxing (`av1oxide::container`)
+
+```rust
+use av1oxide::container::annexb::AnnexBDemuxer;
+use av1oxide::container::ivf::IvfParser;
+use av1oxide::{Config, Decoder, Packet, Result};
+
+fn decode_ivf_slice(ivf_bytes: &[u8]) -> Result<()> {
+    let mut parser = IvfParser::new(ivf_bytes)?;
+    let mut decoder = Decoder::new(Config::default())?;
+    for pkt in &mut parser {
+        let pkt = pkt?;
+        decoder.send_packet(&Packet::with_timestamp(pkt.data, pkt.timestamp as i64))?;
+        while let Some(_frame) = decoder.receive_frame()? {}
+    }
+    decoder.flush();
+    while let Some(_frame) = decoder.receive_frame()? {}
+    Ok(())
+}
+
+fn demux_annexb(annexb_bytes: &[u8]) -> Result<Vec<Vec<u8>>> {
+    AnnexBDemuxer::new(annexb_bytes).demux_all()
+}
+```
+
+### 6. Runnable Examples (`examples/`)
 
 Five standalone examples are included in the crate:
 
@@ -231,7 +278,7 @@ Five standalone examples are included in the crate:
   cargo run --release -p av1oxide --example decode_obu
   cargo run --release -p av1oxide --example decode_obu -- <file.obu>
   ```
-- **[`examples/decode_ivf.rs`](crates/av1oxide/examples/decode_ivf.rs):** Decode an `.ivf` stream frame-by-frame with a multithreaded (`n_threads: 4, max_frame_delay: 2`) decoder and optionally write planar YUV output:
+- **[`examples/decode_ivf.rs`](crates/av1oxide/examples/decode_ivf.rs):** Decode an `.ivf` stream frame-by-frame via `container::ivf::IvfParser` with a multithreaded (`n_threads: 4, max_frame_delay: 2`) decoder and optionally write planar YUV output:
   ```bash
   cargo run --release -p av1oxide --example decode_ivf
   cargo run --release -p av1oxide --example decode_ivf -- <input.ivf> [output.yuv]
@@ -254,54 +301,56 @@ Five standalone examples are included in the crate:
 
 ## Performance & Memory Comparison vs. `dav1d 1.5.4` and `libavif 1.4.2`
 
-All benchmarks were measured under `100%` MD5 bit-exact output parity between `av1oxide` (`v0.4.0`, `rustc 1.100.0 --release`, `opt-level = 3`, `lto = "thin"`, `strip = "symbols"`), the reference C/ASM `dav1d 1.5.4` (`99f3354ed0b9b4bf3c7c9347318dbcc522c94af5`), and reference C `libavif 1.4.2` (`b8551fe61aaf92733234efc5e11cdfac5a5f54b3`, built with `-DAVIF_LIBYUV=OFF -DAVIF_LIBSHARPYUV=OFF` over `dav1d 1.5.4`). File I/O, container demuxing, and MD5 verification execute outside the timed decode window; each workload and decoder runs in an isolated subprocess across `5–7` interleaved runs, reporting median (`p50`) wall time, OS Peak RSS (`MiB`), and `av1oxide` live heap peak (`MiB`).
+All benchmarks were measured under `100%` MD5 bit-exact output parity between `av1oxide` (`rustc 1.100.0 --release`, `opt-level = 3`, `lto = "thin"`, `strip = "symbols"`), the reference C/ASM `dav1d 1.5.4` (`99f3354ed0b9b4bf3c7c9347318dbcc522c94af5`), and reference C `libavif 1.4.2` (`b8551fe61aaf92733234efc5e11cdfac5a5f54b3`, built with `-DAVIF_LIBYUV=OFF -DAVIF_LIBSHARPYUV=OFF` over `dav1d 1.5.4`). File I/O, container demuxing, and MD5 verification execute outside the timed decode window; each workload and decoder runs in an isolated subprocess across `5–7` interleaved runs, reporting median (`p50`) wall time, OS Peak RSS (`MiB`), and `av1oxide` live heap peak (`MiB`). The `x86_64` tables below report **`v0.5.0`** measurements; the Apple M4 Pro (`aarch64`) tables report the **`v0.4.0` baseline** pending `v0.5.0` measurement on Apple M4 Pro hardware.
 
-### 1. `x86_64` — AMD Ryzen 9 9950X3D (Zen 5, `16C / 32T`, `AVX-512ICL`)
+### 1. `x86_64` — AMD Ryzen 9 9950X3D (Zen 5, `16C / 32T`, `AVX-512ICL`, `v0.5.0`)
 
 #### Single-Thread (`n_threads = 1`, `max_frame_delay = 1`) Suite Summary
 
 | Suite | Streams / Frames | `av1oxide` Total (`ms`) | `dav1d` Total (`ms`) | Wall-Time Ratio (`av1oxide / dav1d`) | Geometric Mean | Median (`p50`) | Suite Max `av1oxide` Peak RSS (`MiB`) | Suite Max `dav1d` Peak RSS (`MiB`) | RSS Ratio (`av1oxide / dav1d`) | MD5 Parity |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| **`korpus`** | `19` streams / `950` decoded frames | `645.5 ms` | `430.0 ms` | **`1.501×`** | `1.552×` | `1.741×` | `19.01 MiB` (`10.90 MiB` live heap) | `9.16 MiB` | `2.08×` | `19 / 19` (`100%`) |
-| **`temsilci`** | `8` streams / `485` decoded frames | `1,963.6 ms` | `1,063.1 ms` | **`1.847×`** | `1.593×` | `1.704×` | `1,231.36 MiB` (`1,212.62 MiB` live heap) | `608.98 MiB` | `2.02×` | `8 / 8` (`100%`) |
+| **`korpus`** | `19` streams / `950` decoded frames | `641.8 ms` | `431.1 ms` | **`1.489×`** | `1.539×` | `1.717×` | `15.04 MiB` (`6.42 MiB` live heap) | `9.16 MiB` | `1.64×` | `19 / 19` (`100%`) |
+| **`temsilci`** | `8` streams / `485` decoded frames | `1,900.3 ms` | `1,075.9 ms` | **`1.766×`** | `1.565×` | `1.676×` | `667.45 MiB` (`644.76 MiB` live heap) | `608.98 MiB` | `1.10×` | `8 / 8` (`100%`) |
 
 #### Single-Thread (`n_threads = 1`) Representative Streams Breakdown
 
 | Stream | Resolution | Bit / Chroma | Frames | `av1oxide` (`ms/frame`) | `av1oxide` (`FPS`) | `dav1d` (`ms/frame`) | `dav1d` (`FPS`) | Time Ratio (`av1oxide / dav1d`) | Speedup vs. Scalar | `av1oxide` Peak RSS / Live Heap (`MiB`) | `dav1d` Peak RSS (`MiB`) | RSS Ratio (`av1oxide / dav1d`) |
 |---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| `422_oddheight_8b` | `64×63` | `8b` `4:2:2` | `80` | `0.293` | `3,415.8` | `0.253` | `3,951.8` | **`1.157×`** | `2.60×` | `6.92` / `0.37` | `3.66` | `1.89×` |
-| `422_oddheight_10b` | `64×63` | `10b` `4:2:2` | `80` | `0.296` | `3,373.9` | `0.255` | `3,919.0` | **`1.162×`** | `2.79×` | `7.48` / `0.56` | `3.91` | `1.91×` |
-| `vq002_inter_432x240` | `432×240` | `8b` `4:2:0` | `50` | `2.845` | `351.5` | `2.169` | `461.0` | **`1.312×`** | `4.08×` | `11.20` / `3.40` | `5.41` | `2.07×` |
-| `test10755_cdef10_sb64` | `1024×512` | `10b` `4:2:0` | `24` | `2.674` | `374.0` | `1.649` | `606.5` | **`1.622×`** | `4.17×` | `23.41` / `13.29` | `11.39` | `2.05×` |
-| `fg10_film_grain_50` | `352×288` | `10b` `4:2:0` | `100` | `0.835` | `1,197.8` | `0.467` | `2,139.8` | **`1.786×`** | `4.48×` | `14.66` / `6.79` | `6.40` | `2.29×` |
-| `test25_8k_444_fg` | `7680×4320` | `8b` `4:4:4` | `6` | `246.217` | `4.1` | `125.826` | `8.0` | **`1.957×`** | `1.89×` | `1,231.36` / `1,212.62` | `608.98` | `2.02×` |
-| `test1472_lr8_444` | `306×255` | `8b` `4:4:4` | `45` | `0.308` | `3,243.4` | `0.153` | `6,532.7` | **`2.014×`** | `4.12×` | `10.45` / `2.90` | `5.41` | `1.93×` |
-| `ccvb_film_grain` | `640×480` | `8b` `4:2:0` | `100` | `1.354` | `738.5` | `0.659` | `1,517.9` | **`2.055×`** | `5.42×` | `19.04` / `10.90` | `9.16` | `2.08×` |
+| `422_oddheight_8b` | `64×63` | `8b` `4:2:2` | `80` | `0.292` | `3,419.7` | `0.254` | `3,943.7` | **`1.153×`** | `2.62×` | `7.52` / `0.29` | `3.66` | `2.05×` |
+| `422_oddheight_10b` | `64×63` | `10b` `4:2:2` | `80` | `0.295` | `3,394.2` | `0.256` | `3,907.1` | **`1.151×`** | `2.84×` | `7.77` / `0.41` | `3.91` | `1.99×` |
+| `vq002_inter_432x240` | `432×240` | `8b` `4:2:0` | `50` | `2.843` | `351.7` | `2.172` | `460.4` | **`1.309×`** | `4.07×` | `10.53` / `2.22` | `5.41` | `1.95×` |
+| `test10755_cdef10_sb64` | `1024×512` | `10b` `4:2:0` | `24` | `2.634` | `379.6` | `1.649` | `606.4` | **`1.597×`** | `4.23×` | `17.02` / `8.25` | `11.39` | `1.49×` |
+| `fg10_film_grain_50` | `352×288` | `10b` `4:2:0` | `100` | `0.821` | `1,217.4` | `0.468` | `2,135.2` | **`1.754×`** | `4.56×` | `12.20` / `4.22` | `6.41` | `1.90×` |
+| `test25_8k_444_fg` | `7680×4320` | `8b` `4:4:4` | `6` | `236.363` | `4.2` | `127.867` | `7.8` | **`1.849×`** | `1.93×` | `667.45` / `644.76` | `608.98` | `1.10×` |
+| `test1472_lr8_444` | `306×255` | `8b` `4:4:4` | `45` | `0.301` | `3,317.3` | `0.153` | `6,534.6` | **`1.970×`** | `4.19×` | `9.85` / `1.78` | `5.39` | `1.83×` |
+| `ccvb_film_grain` | `640×480` | `8b` `4:2:0` | `100` | `1.341` | `745.6` | `0.660` | `1,514.7` | **`2.031×`** | `5.48×` | `14.84` / `6.42` | `9.16` | `1.62×` |
 
 #### Multi-Thread (`AMD Ryzen 9 9950X3D`) AV1 Comparison
 
 | Stream | Mode (`max_frame_delay`, `n_threads`) | `av1oxide` (`t=1`) | `av1oxide` (Multi-Thread) | `av1oxide` Self-Speedup | `dav1d` (Multi-Thread) | Time Ratio (`av1oxide / dav1d`) | `av1oxide` Peak RSS / Live Heap (`MiB`) | `dav1d` Peak RSS (`MiB`) | RSS Ratio (`av1oxide / dav1d`) | MD5 Parity |
 |---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| `vq002_inter_gop` (`432×240`, `8b`, `10×10=100` frames) | `mfd=1, t=8` | `272.9 ms` | `257.7 ms` | `1.06×` | `242.5 ms` | **`1.06×`** | `11.36` / `3.40` | `6.72` | `1.69×` | `100%` |
-| `fg10_film_grain_50` (`352×288`, `10b`, `10×15=150` frames) | `mfd=1, t=8` | `119.4 ms` | `103.4 ms` | `1.15×` | `71.5 ms` | **`1.45×`** | `14.81` / `7.14` | `7.46` | `1.98×` | `100%` |
-| `ccvb_film_grain` (`640×480`, `8b`, `100×3=300` frames) | `mfd=1, t=8` | `384.2 ms` | `298.4 ms` | `1.29×` | `182.2 ms` | **`1.64×`** | `19.46` / `11.39` | `9.97` | `1.95×` | `100%` |
-| `test10103_coklu_tile` (`1024×1024`, `10b`, `16` tiles, `8×15=120` frames) | `mfd=0, t=16` | `1,210.3 ms` | `258.6 ms` | **`4.68×`** | `141.1 ms` | **`1.83×`** | `196.18` / `94.59` | `315.22` | **`0.62×`** | `100%` |
-| `test10103_coklu_tile` (`1024×1024`, `10b`, `16` tiles, `8×15=120` frames) | `mfd=4, t=16` | `1,210.3 ms` | `241.6 ms` | **`5.01×`** | `145.3 ms` | **`1.66×`** | `219.47` / `95.27` | `306.50` | **`0.72×`** | `100%` |
-| `test25_8k_444_fg` (`7680×4320`, `8b` `4:4:4`, `120` tiles + FG, `6` frames) | `mfd=0, t=8` | `1,500.1 ms` | `429.5 ms` | **`3.49×`** | `186.9 ms` | **`2.30×`** (`t=4`: `2.58×`) | `1,990.94` / `1,416.23` | `1,416.41` | `1.41×` | `100%` |
-| `test25_8k_120_tile` (`7680×4320`, `12b`, `120` tiles, `10×2=20` frames) | `mfd=0, t=16` | `1,590.1 ms` | `570.0 ms` | **`2.79×`** | `165.5 ms` | **`3.44×`** | `1,321.86` / `811.50` | `1,020.45` | `1.30×` | `100%` |
+| `vq002_inter_gop` (`432×240`, `8b`, `10×10=100` frames) | `mfd=1, t=8` | `272.1 ms` | `256.7 ms` | `1.06×` | `248.8 ms` | **`1.03×`** | `10.26` / `2.31` | `6.70` | `1.53×` | `100%` |
+| `fg10_film_grain_50` (`352×288`, `10b`, `10×15=150` frames) | `mfd=1, t=8` | `118.8 ms` | `104.0 ms` | `1.14×` | `73.4 ms` | **`1.42×`** | `12.83` / `4.71` | `7.22` | `1.78×` | `100%` |
+| `ccvb_film_grain` (`640×480`, `8b`, `100×3=300` frames) | `mfd=1, t=8` | `382.3 ms` | `301.4 ms` | `1.27×` | `179.3 ms` | **`1.68×`** | `14.94` / `6.87` | `9.97` | `1.50×` | `100%` |
+| `test10103_coklu_tile` (`1024×1024`, `10b`, `16` tiles, `8×15=120` frames) | `mfd=0, t=16` | `1,163.9 ms` | `205.9 ms` | **`5.65×`** | `143.7 ms` | **`1.43×`** | `158.48` / `67.90` | `284.57` | **`0.56×`** | `100%` |
+| `test10103_coklu_tile` (`1024×1024`, `10b`, `16` tiles, `8×15=120` frames) | `mfd=4, t=16` | `1,163.9 ms` | `208.7 ms` | **`5.58×`** | `140.5 ms` | **`1.49×`** | `161.47` / `68.71` | `291.93` | **`0.55×`** | `100%` |
+| `test25_8k_444_fg` (`7680×4320`, `8b` `4:4:4`, `120` tiles + FG, `6` frames) | `mfd=0, t=8` | `1,406.9 ms` | `384.8 ms` | **`3.66×`** | `191.4 ms` | **`2.01×`** (`t=4`: `2.23×`) | `1,207.20` / `861.96` | `1,414.59` | **`0.85×`** (`t=4`: `0.96×`) | `100%` |
+| `test25_8k_120_tile` (`7680×4320`, `12b`, `120` tiles, `10×2=20` frames) | `mfd=0, t=16` | `1,445.1 ms` | `477.7 ms` | **`3.03×`** | `168.7 ms` | **`2.83×`** | `883.56` / `686.83` | `1,020.79` | **`0.87×`** | `100%` |
 
 #### `.avif` Image Decoding + `RGBA8` Conversion (`av1oxide::avif` vs. C `libavif 1.4.2 + dav1d 1.5.4`)
 
 | Workload | Images / Mode | `av1oxide` Time (`ms`) | C `libavif` Time (`ms`) | Time Ratio (`av1oxide / libavif`) | `av1oxide` Peak RSS (`MiB`) | `av1oxide` Live Heap (`MiB`) | C `libavif` Peak RSS (`MiB`) | RSS Ratio (`av1oxide / libavif`) | `RGBA8` MD5 Parity |
 |---|---|---:|---:|---:|---:|---:|---:|---:|---:|
-| **`avif_corpus_156_t4`** | `156` valid `.avif` images, `n_threads = 4` (`1` pass) | `3,617.2 ms` | `2,477.6 ms` | **`1.460×`** | `183.33 MiB` | `99.15 MiB` | `103.39 MiB` | **`1.77×`** | `156 / 156` (`100%`) |
-| **`avif_bbb_4k_t8`** | `bbb_4k.avif` (`3840×2160`), `n_threads = 8` (`5` repeats) | `407.2 ms` | `273.7 ms` | **`1.488×`** | `75.30 MiB` | `67.06 MiB` | `51.23 MiB` | **`1.47×`** | `5 / 5` (`100%`) |
+| **`avif_corpus_156_t4`** | `156` valid `.avif` images, `n_threads = 4` (`1` pass) | `2,362.4 ms` | `2,467.9 ms` | **`0.957×`** | `154.21 MiB` | `74.75 MiB` | `103.49 MiB` | **`1.49×`** | `156 / 156` (`100%`) |
+| **`avif_bbb_4k_t8`** | `bbb_4k.avif` (`3840×2160`), `n_threads = 8` (`5` repeats) | `126.9 ms` | `273.7 ms` | **`0.464×`** | `89.29 MiB` | `43.53 MiB` | `51.43 MiB` | **`1.74×`** | `5 / 5` (`100%`) |
 
 ---
 
-### 2. `aarch64` — Apple M4 Pro (`14C = 10P + 4E`, `NEON + DOTPROD`)
+### 2. `aarch64` — Apple M4 Pro (`14C = 10P + 4E`, `NEON + DOTPROD`, `v0.4.0` Baseline)
 
-#### Single-Thread (`n_threads = 1`, `max_frame_delay = 1`) Suite Summary
+> The tables in this section record the `v0.4.0` baseline measured on Apple M4 Pro hardware (`aarch64-apple-darwin`); `v0.5.0` Apple M4 Pro measurements will be synced separately on macOS hardware.
+
+#### Single-Thread (`n_threads = 1`, `max_frame_delay = 1`) Suite Summary (`v0.4.0`)
 
 | Suite | SIMD Mode | Streams / Frames | `av1oxide` Total (`ms`) | `dav1d` Total (`ms`) | Wall-Time Ratio (`av1oxide / dav1d`) | Geometric Mean | Median (`p50`) | Suite Max `av1oxide` Peak RSS (`MiB`) | Suite Max `dav1d` Peak RSS (`MiB`) | RSS Ratio (`av1oxide / dav1d`) | MD5 Parity |
 |---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
@@ -310,7 +359,7 @@ All benchmarks were measured under `100%` MD5 bit-exact output parity between `a
 | **`korpus`** | `tespit` (`dav1d` + `I8MM`) | `19` streams / `950` decoded frames | `734.2 ms` | `474.5 ms` | **`1.547×`** | `1.647×` | `1.585×` | `16.50 MiB` (`10.89 MiB` live heap) | `8.89 MiB` | `1.86×` | `19 / 19` (`100%`) |
 | **`temsilci`** | `tespit` (`dav1d` + `I8MM`) | `8` streams / `485` decoded frames | `1,982.5 ms` | `1,122.2 ms` | **`1.767×`** | `1.570×` | `1.622×` | `1,233.30 MiB` (`1,212.62 MiB` live heap) | `610.31 MiB` | `2.02×` | `8 / 8` (`100%`) |
 
-#### Single-Thread (`n_threads = 1`) Representative Streams Breakdown (`NEON + DOTPROD`)
+#### Single-Thread (`n_threads = 1`) Representative Streams Breakdown (`NEON + DOTPROD`, `v0.4.0`)
 
 | Stream | Resolution | Bit / Chroma | Frames | `av1oxide` (`ms/frame`) | `av1oxide` (`FPS`) | `dav1d` (`ms/frame`) | `dav1d` (`FPS`) | Time Ratio (`av1oxide / dav1d`) | Speedup vs. Scalar | `av1oxide` Peak RSS / Live Heap (`MiB`) | `dav1d` Peak RSS (`MiB`) | RSS Ratio (`av1oxide / dav1d`) |
 |---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
@@ -323,7 +372,7 @@ All benchmarks were measured under `100%` MD5 bit-exact output parity between `a
 | `test1472_lr8_444` | `306×255` | `8b` `4:4:4` | `45` | `0.366` | `2,735.2` | `0.182` | `5,501.9` | **`2.011×`** | `2.32×` | `8.34` / `2.90` | `4.95` | `1.68×` |
 | `ccvb_film_grain` | `640×480` | `8b` `4:2:0` | `100` | `1.938` | `516.0` | `0.845` | `1,183.6` | **`2.294×`** | `2.98×` | `16.44` / `10.89` | `8.91` | `1.85×` |
 
-#### Multi-Thread (`Apple M4 Pro`) AV1 Comparison
+#### Multi-Thread (`Apple M4 Pro`, `v0.4.0`) AV1 Comparison
 
 | Stream | Mode (`max_frame_delay`, `n_threads`) | `av1oxide` (`t=1`) | `av1oxide` (Multi-Thread) | `av1oxide` Self-Speedup | `dav1d` (Multi-Thread) | Time Ratio (`av1oxide / dav1d`) | `av1oxide` Peak RSS / Live Heap (`MiB`) | `dav1d` Peak RSS (`MiB`) | RSS Ratio (`av1oxide / dav1d`) | MD5 Parity |
 |---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
@@ -333,7 +382,7 @@ All benchmarks were measured under `100%` MD5 bit-exact output parity between `a
 | `test25_8k_444_fg` (`7680×4320`, `8b` `4:4:4`, `120` tiles + FG, `6` frames) | `mfd=0, t=14` | `1,418.8 ms` | `147.7 ms` | **`9.60×`** | `66.2 ms` | **`2.23×`** | `2,055.83` / `1,705.67` | `1,398.83` | `1.47×` | `100%` |
 | `test25_8k_120_tile` (`7680×4320`, `12b`, `120` tiles, `10×2=20` frames) | `mfd=0, t=14` | `1,694.6 ms` | `238.7 ms` | **`7.10×`** | `97.3 ms` | **`2.45×`** | `1,410.64` / `1,131.39` | `1,097.81` | `1.28×` | `100%` |
 
-#### `.avif` Image Decoding + `RGBA8` Conversion (`av1oxide::avif` vs. C `libavif 1.4.2 + dav1d 1.5.4`)
+#### `.avif` Image Decoding + `RGBA8` Conversion (`Apple M4 Pro`, `v0.4.0`)
 
 | Workload | Images / Mode | `av1oxide` Time (`ms`) | C `libavif` Time (`ms`) | Time Ratio (`av1oxide / libavif`) | `av1oxide` Peak RSS (`MiB`) | `av1oxide` Live Heap (`MiB`) | C `libavif` Peak RSS (`MiB`) | RSS Ratio (`av1oxide / libavif`) | `RGBA8` MD5 Parity |
 |---|---|---:|---:|---:|---:|---:|---:|---:|---:|
@@ -348,18 +397,18 @@ All benchmarks were measured under `100%` MD5 bit-exact output parity between `a
 
 - Memory budget and frame dimension checks (`Config::allocation_limit`, `Config::frame_size_limit`) execute only during frame and buffer allocation rather than inside pixel or block loops; they have no measurable impact on frame decoding speed.
 
-#### Measured Technical Factors Behind the Runtime Difference (`~1.50×–1.70×`)
+#### Measured Technical Factors Behind the AV1 Runtime Difference (`~1.49×–1.77×`)
 
 - **Slice Bounds Checking (`23%–50%` of decode time):** High-resolution frames traverse millions of `4×4` / `8×8` blocks and neighbor tables. Whereas C `dav1d` accesses these structures through unchecked raw pointer arithmetic (`ptr += offset`), the entire non-DSP decoder core in `av1oxide` is compiled under `#![forbid(unsafe_code)]` and performs runtime bounds checks on every slice index (`slice[i]`). This accounts for the primary portion of the `~1.65×–1.71×` ratio measured between pure C and pure Rust when SIMD is disabled on both sides.
 - **SIMD Entry Validation and Zero Over-Read (`~2–5 ns` per call):** C `dav1d` Assembly routines perform no entry length checks and read 16–64 bytes past the end of buffers into padding regions (over-read). Every SIMD function in `av1oxide` validates slice length preconditions on entry and uses masked or bounded loads at edges to avoid reading past slice bounds; on short (`10–20 ns`) small-block (`4×4`) calls, this validation adds `15%–25%` execution time.
 - **Hand-Written Assembly vs. Compiler (`LLVM`) Code Generation:** `dav1d` uses approximately `265,000` lines of hand-written NASM/GAS Assembly that bypass standard function calling conventions (ABI) and manage CPU flag registers and 32 `zmm` registers directly, whereas `av1oxide` compiles stable Rust `core::arch` intrinsics through the standard LLVM ABI frame.
 
-#### Measured Technical Factors Behind the Memory (`Peak RSS`) Behavior
+#### Measured Technical Factors Behind the Memory (`Peak RSS`) and `.avif` Behavior
 
-- **Single-Thread Baseline and High-Resolution Planar Buffers (`~1.85×–2.08×` RSS):** On low- and medium-resolution streams (`16×16` to `640×480`), `av1oxide` live heap usage is `0.21–10.90 MiB`, while process resident set size (`6.9–19.0 MiB` on Linux `x86_64`, `4.2–16.5 MiB` on macOS `aarch64` vs. `2.9–9.2 MiB` for C `dav1d`) reflects the statically linked Rust runtime and multi-ISA SIMD dispatch code pages (`9.7 MiB` ELF on `x86_64`, `2.8 MiB` Mach-O on `aarch64`) compared to `dav1d`'s shared library mapping. On `8K` `4:4:4` streams with Film Grain (`test25_8k_444_fg`, `1,231–1,234 MiB` vs. `609–610 MiB`, `2.02×`), `av1oxide` allocates separate owned reference frame planes, loop-restoration stripe/CDEF staging buffers, and a separate Film Grain output copy so reference frame buffers remain immutable without aliasing raw pointers.
-- **8K Multi-Thread Frame-Delay Scaling (`~1.28×–1.47×` RSS):** Under multi-threaded frame-delay decoding on `8K` `120`-tile streams (`test25_8k_120_tile` `1.28×–1.30×` RSS; `test25_8k_444_fg` `1.41×–1.47×` RSS), both decoders maintain `n_fc = 3..4` concurrent frame contexts while sharing reference frames across threads (`Arc` + `DecodeBufPool` recycling in `av1oxide`), reducing the relative RSS gap compared to single-thread execution.
-- **16-Thread Multi-Tile Scratch Reuse (`0.62×–0.72×` RSS on `x86_64`):** On `1024×1024` `16`-tile `10-bit` streams at `n_threads = 16` (`test10103_coklu_tile`), `av1oxide` records `196.2–219.5 MiB` Peak RSS (`94.6–95.3 MiB` live heap) vs. `306.5–315.2 MiB` for `dav1d` (`0.62×–0.72×`) on Linux `x86_64`, because `av1oxide` reuses bounded worker scratch slots (`ScratchPool`) and recycled plane buffers (`DecodeBufPool`) on demand rather than pre-allocating full per-frame-thread tile and coefficient arenas upfront. On macOS `aarch64` (`t=14`), `16 KiB` virtual memory pages and system `libmalloc` thread-magazine caching result in `140.0 MiB` vs. `102.8 MiB` (`1.36×`, with `94.4 MiB` live heap).
-- **`.avif` Container and `RGBA8` Conversion (`1.47×–2.04×` RSS):** During `.avif` decoding (`67.1 MiB` live heap on `4K` `bbb_4k.avif`, `99.2–106.7 MiB` across the `156`-image corpus), `av1oxide::avif` stores decoded planar YUVA channels as `u16` slices prior to allocating the `RGBA8` output buffer (`31.64 MiB` at `3840×2160`), whereas C `libavif` stores `8-bit` planar channels as `uint8_t` buffers before `avifImageYUVToRGB`.
+- **Single-Thread Baseline and Binary Code Pages (`1.49×–2.05×` RSS on small streams):** On low- and medium-resolution streams (`16×16` to `640×480`), `av1oxide` `v0.5.0` live heap usage is `0.29–8.25 MiB` (`x86_64`), while process resident set size (`7.5–17.0 MiB` on Linux `x86_64` vs. `3.7–11.4 MiB` for C `dav1d`) reflects the statically linked Rust runtime and multi-ISA SIMD dispatch code pages (`10.2 MiB` ELF on `x86_64`, `2.8 MiB` Mach-O on `aarch64` `v0.4.0`) compared to `dav1d`'s shared library mapping.
+- **8K Strip-Based Film Grain and `LrCdefBackup` (`1.10×` single-thread, `0.85×–0.96×` multi-thread RSS on `x86_64`):** Replacing full-frame `pre_cdef` copies with a `4`-row `LrCdefBackup` boundary buffer and applying Film Grain in place over a `32`-row rolling strip buffer (`Frame::from_owned_pic` when `refresh_frame_flags == 0`) reduced `test25_8k_444_fg` (`7680×4320`, `4:4:4` + FG) single-thread Peak RSS from `1,231.4 MiB` (`2.02×`) in `v0.4.0` to `667.5 MiB` (`1.10×` vs. `dav1d` `609.0 MiB`) and multi-thread `t=8` Peak RSS from `1,990.9 MiB` (`1.41×`) to `1,207.2 MiB` (`0.85×`, `14.7%` lower than `dav1d` `1,414.6 MiB`; `t=4`: `0.96×`; `test25_8k_120_tile` `t=16`: `0.87×`).
+- **16-Thread Multi-Tile Scratch Reuse (`0.55×–0.56×` RSS on `x86_64`):** On `1024×1024` `16`-tile `10-bit` streams at `n_threads = 16` (`test10103_coklu_tile`), `av1oxide` records `158.5–161.5 MiB` Peak RSS (`67.9–68.7 MiB` live heap) vs. `284.6–291.9 MiB` for `dav1d` (`0.55×–0.56×`) on Linux `x86_64`, because `av1oxide` reuses bounded worker scratch slots (`ScratchPool`) and recycled plane buffers (`DecodeBufPool`) on demand rather than pre-allocating full per-frame-thread tile and coefficient arenas upfront.
+- **`.avif` Native `u8` Planes and Strip-Parallel YUVA→RGB (`0.464×–0.957×` Time on `x86_64`):** Storing `8-bit` AVIF channels natively as `u8` (`AvifPlane::U8`) and executing specialized `(9, 3, 3, 1)/16` row-pair YUVA→RGB conversion across `std::thread::scope` strips reduced `x86_64` `avif_corpus_156_t4` time from `3,617.2 ms` (`1.460×`) to `2,362.4 ms` (`0.957×`, `4.3%` faster than C `libavif 1.4.2 + dav1d 1.5.4`) and live heap from `99.15 MiB` to `74.75 MiB`; on `4K` `bbb_4k.avif` (`t=8`, `5` repeats), decode + `RGBA8` time dropped from `407.2 ms` (`1.488×`) to `126.9 ms` (`0.464×`, `2.16×` faster than C `libavif`, with `-DAVIF_LIBYUV=OFF`) and live heap fell from `67.06 MiB` to `43.53 MiB`.
 
 ---
 

@@ -1,4 +1,4 @@
-# av1oxide — AV1 video ve AVIF görüntü çözücü kütüphanesi (v0.4.0)
+# av1oxide — AV1 video ve AVIF görüntü çözücü kütüphanesi (v0.5.0)
 # Sıfır üçüncü taraf medya/kodek bağımlılığı; yalnızca çekirdek sistem kütüphaneleri kullanılır.
 
 [package]
