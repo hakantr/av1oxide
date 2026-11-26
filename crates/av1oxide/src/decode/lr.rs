@@ -524,11 +524,119 @@ fn fnv_block(data: &[u8], stride: usize, w: usize, h: usize, bpp: usize) -> u64 
     hash
 }
 
+/// Deblocking sonrası, CDEF öncesi LR şerit sınırı satırları yedeği (`dav1d_copy_lpf`).
+///
+/// Tam kare kopyası yerine yalnız `(restore_planes >> p) & 1 != 0` olan düzlemlerde
+/// her şerit sınırı `b_k = (56 >> ss_ver) + k * (64 >> ss_ver) < plane_h` için 4 satır
+/// (`b_k - 2`, `b_k - 1`, `b_k`, `(b_k + 1).min(plane_h - 1)`) saklar (`4.A.1`).
+#[derive(Default)]
+pub(crate) struct LrCdefBackup {
+    pub(crate) data: [Vec<u8>; 3],
+    pub(crate) stride: [usize; 3],
+    pub(crate) n_boundaries: [usize; 3],
+}
+
+impl LrCdefBackup {
+    /// Deblocking sonrası `pic` düzlemlerinden yalnız LR şerit sınırı satırlarını yakalar.
+    pub(crate) fn capture(
+        pic: &PicBuf,
+        restore_planes: u8,
+        old_data: [Vec<u8>; 3],
+        butce: &crate::frame::butce::Butce,
+    ) -> crate::error::Result<Self> {
+        let mut old_iter = old_data.into_iter();
+        let mut data = [Vec::new(), Vec::new(), Vec::new()];
+        let mut stride = [0usize; 3];
+        let mut n_boundaries = [0usize; 3];
+        for p in 0..3 {
+            let old_p = old_iter.next().unwrap_or_default();
+            if (restore_planes >> p) & 1 == 0 {
+                let _ = butce.reuse_vec(old_p, 0, 0u8)?;
+                continue;
+            }
+            let ss_ver = if p == 0 { 0 } else { pic.ss_ver };
+            let plane_h = if p == 0 { pic.height } else { pic.ch };
+            let first_b = 56 >> ss_ver;
+            let step_b = 64 >> ss_ver;
+            let n_b = if plane_h > first_b {
+                1 + (plane_h - 1 - first_b) / step_b
+            } else {
+                0
+            };
+            let s = pic.stride[p];
+            let mut buf = butce.reuse_vec(old_p, 4 * n_b * s, 0u8)?;
+            for k in 0..n_b {
+                let b = first_b + k * step_b;
+                let src_rows = [b - 2, b - 1, b, (b + 1).min(plane_h - 1)];
+                for (r, &sy) in src_rows.iter().enumerate() {
+                    let doff = (4 * k + r) * s;
+                    let soff = sy * s;
+                    buf[doff..doff + s].copy_from_slice(&pic.data[p][soff..soff + s]);
+                }
+            }
+            data[p] = buf;
+            stride[p] = s;
+            n_boundaries[p] = n_b;
+        }
+        Ok(Self {
+            data,
+            stride,
+            n_boundaries,
+        })
+    }
+
+    /// Yedek tamponlarının toplam bayt boyutu.
+    #[must_use]
+    pub(crate) fn bayt(&self) -> usize {
+        self.data.iter().map(Vec::len).sum()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    #[inline]
+    fn copy_top_slices(
+        pre: &[u8],
+        ps: usize,
+        y: usize,
+        ss_ver: usize,
+        lpf: &mut [u8],
+        stride: usize,
+        col_lo: usize,
+        col_hi: usize,
+    ) {
+        let k = (y - (56 >> ss_ver)) >> (6 - ss_ver);
+        for r in 0..2 {
+            let so = (4 * k + r) * ps;
+            lpf[r * stride + col_lo..r * stride + col_hi]
+                .copy_from_slice(&pre[so + col_lo..so + col_hi]);
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    #[inline]
+    fn copy_bottom_slices(
+        pre: &[u8],
+        ps: usize,
+        b: usize,
+        ss_ver: usize,
+        lpf: &mut [u8],
+        stride: usize,
+        col_lo: usize,
+        col_hi: usize,
+    ) {
+        let k = (b - (56 >> ss_ver)) >> (6 - ss_ver);
+        for r in 0..2 {
+            let so = (4 * k + 2 + r) * ps;
+            lpf[(6 + r) * stride + col_lo..(6 + r) * stride + col_hi]
+                .copy_from_slice(&pre[so + col_lo..so + col_hi]);
+        }
+    }
+}
+
 /// Kare düzeyi uygulama bağlamı (bir karelik).
 struct Apply<'a> {
     st: &'a LrState,
-    /// Deblocking sonrası, CDEF öncesi düzlemler (`dav1d_copy_lpf` girdisi).
-    pre_cdef: &'a [Vec<u8>; 3],
+    /// Deblocking sonrası, CDEF öncesi şerit sınırı satırları (`dav1d_copy_lpf`).
+    pre_cdef: &'a LrCdefBackup,
     kernels: &'a LrKernels,
     bpp: usize,
     lbd: LrBitDepth,
@@ -554,7 +662,7 @@ struct Apply<'a> {
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn apply(
     pic: &mut PicBuf,
-    pre_cdef: &mut [Vec<u8>; 3],
+    pre_cdef: &mut LrCdefBackup,
     st: &LrState,
     sb128: bool,
     bd: BitDepth,
@@ -629,12 +737,13 @@ pub(crate) fn apply(
     Ok(())
 }
 
-/// SB satırı şeritlerini (`sby = 0..sbh`) `WorkerPool` üzerinde paralel süzüp
-/// deterministik `sby` sırasıyla `pic.data` ve `tools` içine birleştirir.
+/// SB satırı şeritlerini (`sby = 0..sbh`) `WorkerPool` üzerinde sınırlı dalga
+/// tamponlarıyla (`wave_size = n_threads.min(sbh)`) paralel süzüp deterministik
+/// `sby` sırasıyla `pic.data` ve `tools` içine birleştirir.
 #[allow(clippy::too_many_arguments)]
 fn apply_parallel_sbrows(
     pic: &mut PicBuf,
-    pre_cdef: &mut [Vec<u8>; 3],
+    pre_cdef: &mut LrCdefBackup,
     st: &LrState,
     sb128: usize,
     sbh: usize,
@@ -667,46 +776,20 @@ fn apply_parallel_sbrows(
         tools: ToolCounts,
     }
 
-    let mut jobs: Vec<SbRowJob> = Vec::with_capacity(sbh);
-    for sby in 0..sbh {
-        let offset_y = if sby != 0 { 8 } else { 0 };
-        let not_last = usize::from(sby + 1 < sbh);
-        let mut y_range = [(0usize, 0usize); 3];
-
-        if st.restore_planes & 1 != 0 {
-            let h = st.height;
-            let next_row_y = (sby + 1) << (6 + sb128);
-            let row_h = (next_row_y - 8 * not_last).min(h);
-            let y_stripe = (sby << (6 + sb128)) - offset_y;
-            y_range[0] = (y_stripe, row_h);
-        }
-        if st.restore_planes & 6 != 0 {
-            let ss_ver = st.ss_ver;
-            let h = (st.height + ss_ver) >> ss_ver;
-            let next_row_y = (sby + 1) << ((6 - ss_ver) + sb128);
-            let row_h = (next_row_y - (8 >> ss_ver) * not_last).min(h);
-            let offset_uv = offset_y >> ss_ver;
-            let y_stripe = (sby << ((6 - ss_ver) + sb128)) - offset_uv;
-            for (p, yr) in y_range.iter_mut().enumerate().skip(1) {
-                if (st.restore_planes >> p) & 1 != 0 {
-                    *yr = (y_stripe, row_h);
-                }
-            }
-        }
-        jobs.push(SbRowJob {
-            sby,
-            y_range,
+    let wave_size = pool.n_threads().min(sbh).max(1);
+    let mut jobs: Vec<SbRowJob> = (0..wave_size)
+        .map(|_| SbRowJob {
+            sby: 0,
+            y_range: [(0, 0); 3],
             dst: [Vec::new(), Vec::new(), Vec::new()],
             tools: ToolCounts::default(),
-        });
-    }
+        })
+        .collect();
 
-    let pic0 = Arc::new(core::mem::take(&mut pic.data[0]));
-    let pic1 = Arc::new(core::mem::take(&mut pic.data[1]));
-    let pic2 = Arc::new(core::mem::take(&mut pic.data[2]));
-    let pre0 = Arc::new(core::mem::take(&mut pre_cdef[0]));
-    let pre1 = Arc::new(core::mem::take(&mut pre_cdef[1]));
-    let pre2 = Arc::new(core::mem::take(&mut pre_cdef[2]));
+    let pre0 = Arc::new(core::mem::take(&mut pre_cdef.data[0]));
+    let pre1 = Arc::new(core::mem::take(&mut pre_cdef.data[1]));
+    let pre2 = Arc::new(core::mem::take(&mut pre_cdef.data[2]));
+    let pre_strides = pre_cdef.stride;
     let mask_arc = Arc::new(st.mask.clone());
 
     let restore_planes = st.restore_planes;
@@ -722,257 +805,308 @@ fn apply_parallel_sbrows(
     let wiener_fns = kernels.wiener;
     let sgr_fns = kernels.sgr;
 
-    let pic0_w = Arc::clone(&pic0);
-    let pic1_w = Arc::clone(&pic1);
-    let pic2_w = Arc::clone(&pic2);
-    let pre0_w = Arc::clone(&pre0);
-    let pre1_w = Arc::clone(&pre1);
-    let pre2_w = Arc::clone(&pre2);
+    let mut wave_res: crate::error::Result<()> = Ok(());
+    for wave_start in (0..sbh).step_by(wave_size) {
+        let count = (sbh - wave_start).min(wave_size);
+        if jobs.len() > count {
+            jobs.truncate(count);
+        }
+        for (i, job) in jobs.iter_mut().enumerate() {
+            let sby = wave_start + i;
+            let offset_y = if sby != 0 { 8 } else { 0 };
+            let not_last = usize::from(sby + 1 < sbh);
+            let mut y_range = [(0usize, 0usize); 3];
 
-    let res = pool.execute_tasks(&mut jobs, move |_wid, _idx, job: &mut SbRowJob| {
-        let pic_planes: [&[u8]; 3] = [pic0_w.as_slice(), pic1_w.as_slice(), pic2_w.as_slice()];
-        let pre_planes: [&[u8]; 3] = [pre0_w.as_slice(), pre1_w.as_slice(), pre2_w.as_slice()];
-        for p in 0..3 {
-            if (restore_planes >> p) & 1 == 0 {
-                continue;
+            if restore_planes & 1 != 0 {
+                let h = height;
+                let next_row_y = (sby + 1) << (6 + sb128);
+                let row_h = (next_row_y - 8 * not_last).min(h);
+                let y_stripe = (sby << (6 + sb128)) - offset_y;
+                y_range[0] = (y_stripe, row_h);
             }
-            let (y_stripe, row_h) = job.y_range[p];
-            if y_stripe >= row_h {
-                continue;
-            }
-            let stride = strides[p];
-            let len = (row_h - y_stripe) * stride;
-            let mut buf = dolu_vec(len, 0u8)?;
-            buf.copy_from_slice(&pic_planes[p][y_stripe * stride..row_h * stride]);
-            job.dst[p] = buf;
-            let (psh, psv) = if p == 0 { (0, 0) } else { (ss_hor, ss_ver) };
-            let w = if p == 0 { width } else { (width + psh) >> psh };
-            let h = if p == 0 {
-                height
-            } else {
-                (height + psv) >> psv
-            };
-            let stride = strides[p];
-            let unit_size_log2 = usize::from(unit_size_arr[usize::from(p != 0)]);
-            let unit_size = 1usize << unit_size_log2;
-            let half_unit_size = unit_size >> 1;
-            let max_unit_size = unit_size + half_unit_size;
-            let row_y = y_stripe + if y_stripe != 0 { 8 >> psv } else { 0 };
-            let shift_hor = 7 - psh;
-            let mut edges = LrEdgeFlags::HAVE_RIGHT;
-            if y_stripe > 0 {
-                edges = edges.union(LrEdgeFlags::HAVE_TOP);
-            }
-            let mut aligned_unit_pos = row_y & !(unit_size - 1);
-            if aligned_unit_pos != 0 && aligned_unit_pos + half_unit_size > h {
-                aligned_unit_pos -= unit_size;
-            }
-            aligned_unit_pos <<= psv;
-            let sb_idx = (aligned_unit_pos >> 7) * sb128w;
-            let unit_idx = ((aligned_unit_pos >> 6) & 1) << 1;
-            let unit_at =
-                |sb: usize, u: usize| mask_arc.get(sb).map_or(LrUnit::default(), |s| s[p][u]);
-            let mut lr = [unit_at(sb_idx, unit_idx), LrUnit::default()];
-            let mut restore = lr[0].kind != LR_NONE;
-            let mut x = 0usize;
-            let mut bit = 0usize;
-            let backup_h = row_h - y_stripe;
-            let mut border = [
-                dolu_vec(backup_h * 4 * bpp, 0u8)?,
-                dolu_vec(backup_h * 4 * bpp, 0u8)?,
-            ];
-            let mut lpf = dolu_vec(8 * stride, 0u8)?;
-
-            let mut run_unit = |dst_buf: &mut [u8],
-                                tools_out: &mut ToolCounts,
-                                left_buf: &[u8],
-                                ux: usize,
-                                uw: usize,
-                                u_lr: &LrUnit,
-                                mut u_edges: LrEdgeFlags| {
-                let mut stripe_h =
-                    ((64 - if y_stripe == 0 { 8 } else { 0 }) >> psv).min(row_h - y_stripe);
-                let (params, func, kind_no) = if u_lr.kind == LR_WIENER {
-                    let mut filter = [[0i16; 8]; 2];
-                    let fh = u_lr.filter_h.map(i16::from);
-                    let fv = u_lr.filter_v.map(i16::from);
-                    filter[0][0] = fh[0];
-                    filter[0][6] = fh[0];
-                    filter[0][1] = fh[1];
-                    filter[0][5] = fh[1];
-                    filter[0][2] = fh[2];
-                    filter[0][4] = fh[2];
-                    filter[0][3] = -(fh[0] + fh[1] + fh[2]) * 2;
-                    if hbd {
-                        filter[0][3] += 128;
+            if restore_planes & 6 != 0 {
+                let h = (height + ss_ver) >> ss_ver;
+                let next_row_y = (sby + 1) << ((6 - ss_ver) + sb128);
+                let row_h = (next_row_y - (8 >> ss_ver) * not_last).min(h);
+                let offset_uv = offset_y >> ss_ver;
+                let y_stripe = (sby << ((6 - ss_ver) + sb128)) - offset_uv;
+                for (p, yr) in y_range.iter_mut().enumerate().skip(1) {
+                    if (restore_planes >> p) & 1 != 0 {
+                        *yr = (y_stripe, row_h);
                     }
-                    filter[1][0] = fv[0];
-                    filter[1][6] = fv[0];
-                    filter[1][1] = fv[1];
-                    filter[1][5] = fv[1];
-                    filter[1][2] = fv[2];
-                    filter[1][4] = fv[2];
-                    filter[1][3] = 128 - (fv[0] + fv[1] + fv[2]) * 2;
-                    let idx = usize::from((filter[0][0] | filter[1][0]) == 0);
-                    (LrParams::Wiener { filter }, wiener_fns[idx], idx)
+                }
+            }
+            job.sby = sby;
+            job.y_range = y_range;
+            job.tools = ToolCounts::default();
+            for p in 0..3 {
+                if (restore_planes >> p) & 1 != 0 {
+                    let (y0, y1) = y_range[p];
+                    let len = y1.saturating_sub(y0) * strides[p];
+                    if len > 0 {
+                        if job.dst[p].capacity() < len {
+                            job.dst[p] = match dolu_vec(len, 0u8) {
+                                Ok(v) => v,
+                                Err(e) => {
+                                    wave_res = Err(e);
+                                    break;
+                                }
+                            };
+                        } else {
+                            job.dst[p].resize(len, 0);
+                        }
+                        job.dst[p].copy_from_slice(&pic.data[p][y0 * strides[p]..y1 * strides[p]]);
+                    }
+                }
+            }
+            if wave_res.is_err() {
+                break;
+            }
+        }
+        if wave_res.is_err() {
+            break;
+        }
+
+        let pre0_w = Arc::clone(&pre0);
+        let pre1_w = Arc::clone(&pre1);
+        let pre2_w = Arc::clone(&pre2);
+        let mask_w = Arc::clone(&mask_arc);
+
+        let res = pool.execute_tasks(&mut jobs, move |_wid, _idx, job: &mut SbRowJob| {
+            let pre_planes: [&[u8]; 3] = [pre0_w.as_slice(), pre1_w.as_slice(), pre2_w.as_slice()];
+            for p in 0..3 {
+                if (restore_planes >> p) & 1 == 0 {
+                    continue;
+                }
+                let (y_stripe, row_h) = job.y_range[p];
+                if y_stripe >= row_h {
+                    continue;
+                }
+                let stride = strides[p];
+                let ps = pre_strides[p];
+                let (psh, psv) = if p == 0 { (0, 0) } else { (ss_hor, ss_ver) };
+                let w = if p == 0 { width } else { (width + psh) >> psh };
+                let h = if p == 0 {
+                    height
                 } else {
-                    let sgr_idx = usize::from(u_lr.kind - LR_SGRPROJ);
-                    let sgr = SGR_PARAMS[sgr_idx];
-                    let w0 = i32::from(u_lr.sgr_weights[0]);
-                    let w1 = 128 - (w0 + i32::from(u_lr.sgr_weights[1]));
-                    let idx = usize::from(sgr[0] != 0) + usize::from(sgr[1] != 0) * 2 - 1;
-                    (
-                        LrParams::Sgr {
-                            s0: u32::from(sgr[0]),
-                            s1: u32::from(sgr[1]),
-                            w0,
-                            w1,
-                        },
-                        sgr_fns[idx],
-                        2 + idx,
-                    )
+                    (height + psv) >> psv
+                };
+                let unit_size_log2 = usize::from(unit_size_arr[usize::from(p != 0)]);
+                let unit_size = 1usize << unit_size_log2;
+                let half_unit_size = unit_size >> 1;
+                let max_unit_size = unit_size + half_unit_size;
+                let row_y = y_stripe + if y_stripe != 0 { 8 >> psv } else { 0 };
+                let shift_hor = 7 - psh;
+                let mut edges = LrEdgeFlags::HAVE_RIGHT;
+                if y_stripe > 0 {
+                    edges = edges.union(LrEdgeFlags::HAVE_TOP);
+                }
+                let mut aligned_unit_pos = row_y & !(unit_size - 1);
+                if aligned_unit_pos != 0 && aligned_unit_pos + half_unit_size > h {
+                    aligned_unit_pos -= unit_size;
+                }
+                aligned_unit_pos <<= psv;
+                let sb_idx = (aligned_unit_pos >> 7) * sb128w;
+                let unit_idx = ((aligned_unit_pos >> 6) & 1) << 1;
+                let unit_at =
+                    |sb: usize, u: usize| mask_w.get(sb).map_or(LrUnit::default(), |s| s[p][u]);
+                let mut lr = [unit_at(sb_idx, unit_idx), LrUnit::default()];
+                let mut restore = lr[0].kind != LR_NONE;
+                let mut x = 0usize;
+                let mut bit = 0usize;
+                let backup_h = row_h - y_stripe;
+                let mut border = [
+                    dolu_vec(backup_h * 4 * bpp, 0u8)?,
+                    dolu_vec(backup_h * 4 * bpp, 0u8)?,
+                ];
+                let mut lpf = dolu_vec(8 * stride, 0u8)?;
+
+                let mut run_unit = |dst_buf: &mut [u8],
+                                    tools_out: &mut ToolCounts,
+                                    left_buf: &[u8],
+                                    ux: usize,
+                                    uw: usize,
+                                    u_lr: &LrUnit,
+                                    mut u_edges: LrEdgeFlags| {
+                    let mut stripe_h =
+                        ((64 - if y_stripe == 0 { 8 } else { 0 }) >> psv).min(row_h - y_stripe);
+                    let (params, func, kind_no) = if u_lr.kind == LR_WIENER {
+                        let mut filter = [[0i16; 8]; 2];
+                        let fh = u_lr.filter_h.map(i16::from);
+                        let fv = u_lr.filter_v.map(i16::from);
+                        filter[0][0] = fh[0];
+                        filter[0][6] = fh[0];
+                        filter[0][1] = fh[1];
+                        filter[0][5] = fh[1];
+                        filter[0][2] = fh[2];
+                        filter[0][4] = fh[2];
+                        filter[0][3] = -(fh[0] + fh[1] + fh[2]) * 2;
+                        if hbd {
+                            filter[0][3] += 128;
+                        }
+                        filter[1][0] = fv[0];
+                        filter[1][6] = fv[0];
+                        filter[1][1] = fv[1];
+                        filter[1][5] = fv[1];
+                        filter[1][2] = fv[2];
+                        filter[1][4] = fv[2];
+                        filter[1][3] = 128 - (fv[0] + fv[1] + fv[2]) * 2;
+                        let idx = usize::from((filter[0][0] | filter[1][0]) == 0);
+                        (LrParams::Wiener { filter }, wiener_fns[idx], idx)
+                    } else {
+                        let sgr_idx = usize::from(u_lr.kind - LR_SGRPROJ);
+                        let sgr = SGR_PARAMS[sgr_idx];
+                        let w0 = i32::from(u_lr.sgr_weights[0]);
+                        let w1 = 128 - (w0 + i32::from(u_lr.sgr_weights[1]));
+                        let idx = usize::from(sgr[0] != 0) + usize::from(sgr[1] != 0) * 2 - 1;
+                        (
+                            LrParams::Sgr {
+                                s0: u32::from(sgr[0]),
+                                s1: u32::from(sgr[1]),
+                                w0,
+                                w1,
+                            },
+                            sgr_fns[idx],
+                            2 + idx,
+                        )
+                    };
+
+                    let mut y = y_stripe;
+                    let mut left_off = 0usize;
+                    let pre = pre_planes[p];
+                    while y + stripe_h <= row_h {
+                        let have_bottom = job.sby + 1 != sbh || y + stripe_h != row_h;
+                        u_edges = LrEdgeFlags::from_bits(
+                            (u_edges.bits() & !LrEdgeFlags::HAVE_BOTTOM.bits())
+                                | if have_bottom {
+                                    LrEdgeFlags::HAVE_BOTTOM.bits()
+                                } else {
+                                    0
+                                },
+                        );
+                        let col_lo = ux.saturating_sub(16) * bpp;
+                        let col_hi = ((ux + uw + 32) * bpp).min(stride);
+                        if u_edges.contains(LrEdgeFlags::HAVE_TOP) {
+                            LrCdefBackup::copy_top_slices(
+                                pre, ps, y, psv, &mut lpf, stride, col_lo, col_hi,
+                            );
+                        }
+                        if have_bottom {
+                            let b = y + stripe_h;
+                            LrCdefBackup::copy_bottom_slices(
+                                pre, ps, b, psv, &mut lpf, stride, col_lo, col_hi,
+                            );
+                        }
+                        let local_off = (y - y_stripe) * stride + ux * bpp;
+                        crate::dsp::profil_olc!(
+                            @ if kind_no < 2 {
+                                crate::dsp::profil::Islev::LrWiener
+                            } else {
+                                crate::dsp::profil::Islev::LrSgr
+                            },
+                            (func)(
+                                &mut dst_buf[local_off..],
+                                stride,
+                                &left_buf[left_off * 4 * bpp..],
+                                &lpf,
+                                stride,
+                                ux,
+                                uw,
+                                stripe_h,
+                                &params,
+                                u_edges,
+                                lbd,
+                            )
+                        );
+                        match kind_no {
+                            0 => tools_out.lr_wiener7 += 1,
+                            1 => tools_out.lr_wiener5 += 1,
+                            2 => tools_out.lr_sgr5x5 += 1,
+                            3 => tools_out.lr_sgr3x3 += 1,
+                            _ => tools_out.lr_sgrmix += 1,
+                        }
+                        left_off += stripe_h;
+                        y += stripe_h;
+                        u_edges = u_edges.union(LrEdgeFlags::HAVE_TOP);
+                        stripe_h = (64 >> psv).min(row_h - y);
+                        if stripe_h == 0 {
+                            break;
+                        }
+                    }
                 };
 
-                let mut y = y_stripe;
-                let mut left_off = 0usize;
-                let pre = pre_planes[p];
-                while y + stripe_h <= row_h {
-                    let have_bottom = job.sby + 1 != sbh || y + stripe_h != row_h;
-                    u_edges = LrEdgeFlags::from_bits(
-                        (u_edges.bits() & !LrEdgeFlags::HAVE_BOTTOM.bits())
-                            | if have_bottom {
-                                LrEdgeFlags::HAVE_BOTTOM.bits()
-                            } else {
-                                0
-                            },
-                    );
-                    let col_lo = ux.saturating_sub(16) * bpp;
-                    let col_hi = ((ux + uw + 32) * bpp).min(stride);
-                    if u_edges.contains(LrEdgeFlags::HAVE_TOP) {
-                        for r in 0..2 {
-                            let so = (y - 2 + r) * stride;
-                            lpf[r * stride + col_lo..r * stride + col_hi]
-                                .copy_from_slice(&pre[so + col_lo..so + col_hi]);
+                while x + max_unit_size <= w {
+                    let next_x = x + unit_size;
+                    let next_u_idx = unit_idx + ((next_x >> (shift_hor - 1)) & 1);
+                    lr[bit ^ 1] = unit_at(sb_idx + (next_x >> shift_hor), next_u_idx);
+                    let restore_next = lr[bit ^ 1].kind != LR_NONE;
+                    if restore_next {
+                        let col = (x + unit_size - 4) * bpp;
+                        for r in 0..backup_h {
+                            let so = r * stride + col;
+                            border[bit][r * 4 * bpp..(r + 1) * 4 * bpp]
+                                .copy_from_slice(&job.dst[p][so..so + 4 * bpp]);
                         }
                     }
-                    if have_bottom {
-                        let b = y + stripe_h;
-                        for r in 0..2 {
-                            let src_row = if r == 1 && b + 1 == h { b } else { b + r };
-                            let so = src_row * stride;
-                            lpf[(6 + r) * stride + col_lo..(6 + r) * stride + col_hi]
-                                .copy_from_slice(&pre[so + col_lo..so + col_hi]);
-                        }
+                    if restore {
+                        run_unit(
+                            &mut job.dst[p],
+                            &mut job.tools,
+                            &border[bit ^ 1],
+                            x,
+                            unit_size,
+                            &lr[bit],
+                            edges,
+                        );
                     }
-                    let local_off = (y - y_stripe) * stride + ux * bpp;
-                    crate::dsp::profil_olc!(
-                        @ if kind_no < 2 {
-                            crate::dsp::profil::Islev::LrWiener
-                        } else {
-                            crate::dsp::profil::Islev::LrSgr
-                        },
-                        (func)(
-                            &mut dst_buf[local_off..],
-                            stride,
-                            &left_buf[left_off * 4 * bpp..],
-                            &lpf,
-                            stride,
-                            ux,
-                            uw,
-                            stripe_h,
-                            &params,
-                            u_edges,
-                            lbd,
-                        )
-                    );
-                    match kind_no {
-                        0 => tools_out.lr_wiener7 += 1,
-                        1 => tools_out.lr_wiener5 += 1,
-                        2 => tools_out.lr_sgr5x5 += 1,
-                        3 => tools_out.lr_sgr3x3 += 1,
-                        _ => tools_out.lr_sgrmix += 1,
-                    }
-                    left_off += stripe_h;
-                    y += stripe_h;
-                    u_edges = u_edges.union(LrEdgeFlags::HAVE_TOP);
-                    stripe_h = (64 >> psv).min(row_h - y);
-                    if stripe_h == 0 {
-                        break;
-                    }
-                }
-            };
-
-            while x + max_unit_size <= w {
-                let next_x = x + unit_size;
-                let next_u_idx = unit_idx + ((next_x >> (shift_hor - 1)) & 1);
-                lr[bit ^ 1] = unit_at(sb_idx + (next_x >> shift_hor), next_u_idx);
-                let restore_next = lr[bit ^ 1].kind != LR_NONE;
-                if restore_next {
-                    let col = (x + unit_size - 4) * bpp;
-                    for r in 0..backup_h {
-                        let so = r * stride + col;
-                        border[bit][r * 4 * bpp..(r + 1) * 4 * bpp]
-                            .copy_from_slice(&job.dst[p][so..so + 4 * bpp]);
-                    }
+                    x = next_x;
+                    restore = restore_next;
+                    edges = edges.union(LrEdgeFlags::HAVE_LEFT);
+                    bit ^= 1;
                 }
                 if restore {
+                    edges = LrEdgeFlags::from_bits(edges.bits() & !LrEdgeFlags::HAVE_RIGHT.bits());
+                    let unit_w = w - x;
                     run_unit(
                         &mut job.dst[p],
                         &mut job.tools,
                         &border[bit ^ 1],
                         x,
-                        unit_size,
+                        unit_w,
                         &lr[bit],
                         edges,
                     );
                 }
-                x = next_x;
-                restore = restore_next;
-                edges = edges.union(LrEdgeFlags::HAVE_LEFT);
-                bit ^= 1;
             }
-            if restore {
-                edges = LrEdgeFlags::from_bits(edges.bits() & !LrEdgeFlags::HAVE_RIGHT.bits());
-                let unit_w = w - x;
-                run_unit(
-                    &mut job.dst[p],
-                    &mut job.tools,
-                    &border[bit ^ 1],
-                    x,
-                    unit_w,
-                    &lr[bit],
-                    edges,
-                );
-            }
+            Ok(())
+        });
+
+        if let Err(e) = res {
+            wave_res = Err(e);
+            break;
         }
-        Ok(())
-    });
-
-    pic.data[0] = Arc::try_unwrap(pic0).unwrap_or_else(|a| (*a).clone());
-    pic.data[1] = Arc::try_unwrap(pic1).unwrap_or_else(|a| (*a).clone());
-    pic.data[2] = Arc::try_unwrap(pic2).unwrap_or_else(|a| (*a).clone());
-    pre_cdef[0] = Arc::try_unwrap(pre0).unwrap_or_else(|a| (*a).clone());
-    pre_cdef[1] = Arc::try_unwrap(pre1).unwrap_or_else(|a| (*a).clone());
-    pre_cdef[2] = Arc::try_unwrap(pre2).unwrap_or_else(|a| (*a).clone());
-    res?;
-
-    for job in jobs {
-        for p in 0..3 {
-            if (st.restore_planes >> p) & 1 != 0 {
-                let (y0, y1) = job.y_range[p];
-                if y0 < y1 {
-                    let stride = pic.stride[p];
-                    pic.data[p][y0 * stride..y1 * stride].copy_from_slice(&job.dst[p]);
+        for job in &jobs {
+            for p in 0..3 {
+                if (restore_planes >> p) & 1 != 0 {
+                    let (y0, y1) = job.y_range[p];
+                    if y0 < y1 {
+                        let stride = pic.stride[p];
+                        pic.data[p][y0 * stride..y1 * stride].copy_from_slice(&job.dst[p]);
+                    }
                 }
             }
+            tools.lr_wiener7 += job.tools.lr_wiener7;
+            tools.lr_wiener5 += job.tools.lr_wiener5;
+            tools.lr_sgr5x5 += job.tools.lr_sgr5x5;
+            tools.lr_sgr3x3 += job.tools.lr_sgr3x3;
+            tools.lr_sgrmix += job.tools.lr_sgrmix;
         }
-        tools.lr_wiener7 += job.tools.lr_wiener7;
-        tools.lr_wiener5 += job.tools.lr_wiener5;
-        tools.lr_sgr5x5 += job.tools.lr_sgr5x5;
-        tools.lr_sgr3x3 += job.tools.lr_sgr3x3;
-        tools.lr_sgrmix += job.tools.lr_sgrmix;
     }
-    Ok(())
+
+    pre_cdef.data[0] = Arc::try_unwrap(pre0).unwrap_or_else(|a| (*a).clone());
+    pre_cdef.data[1] = Arc::try_unwrap(pre1).unwrap_or_else(|a| (*a).clone());
+    pre_cdef.data[2] = Arc::try_unwrap(pre2).unwrap_or_else(|a| (*a).clone());
+    wave_res
 }
 
 impl Apply<'_> {
@@ -1165,6 +1299,8 @@ impl Apply<'_> {
         // satır 6,7 = altındaki iki satır (`lpf + 6 * stride`).
         let col_lo = x.saturating_sub(16) * bpp;
         let col_hi = ((x + unit_w + 32) * bpp).min(stride);
+        let pre = &self.pre_cdef.data[p];
+        let ps = self.pre_cdef.stride[p];
         while y + stripe_h <= row_h {
             let have_bottom = sby + 1 != self.sbh || y + stripe_h != row_h;
             edges = LrEdgeFlags::from_bits(
@@ -1175,25 +1311,14 @@ impl Apply<'_> {
                         0
                     },
             );
-            let pre = &self.pre_cdef[p];
             if edges.contains(LrEdgeFlags::HAVE_TOP) {
-                for r in 0..2 {
-                    let so = (y - 2 + r) * stride;
-                    lpf[r * stride + col_lo..r * stride + col_hi]
-                        .copy_from_slice(&pre[so + col_lo..so + col_hi]);
-                }
+                LrCdefBackup::copy_top_slices(pre, ps, y, ss_ver, lpf, stride, col_lo, col_hi);
             }
             if have_bottom {
-                // `backup_lpf`: sınır `b` için 4 satır (b-2..b+1); `b + 1 == h`
-                // ise dördüncü satır üçüncünün kopyasıdır (`lf_apply_tmpl.c:85-90`).
                 let b = y + stripe_h;
-                for r in 0..2 {
-                    let src_row = if r == 1 && b + 1 == plane_h { b } else { b + r };
-                    let so = src_row * stride;
-                    lpf[(6 + r) * stride + col_lo..(6 + r) * stride + col_hi]
-                        .copy_from_slice(&pre[so + col_lo..so + col_hi]);
-                }
+                LrCdefBackup::copy_bottom_slices(pre, ps, b, ss_ver, lpf, stride, col_lo, col_hi);
             }
+            let _ = plane_h;
             let off = y * stride + x * bpp;
             crate::dsp::profil_olc!(
                 @ if kind_no < 2 {

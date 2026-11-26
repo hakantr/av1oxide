@@ -150,43 +150,20 @@ fn rows_hash(data: &[u8], stride: usize, rows: usize, row_bytes: usize) -> u64 {
     h
 }
 
-/// Grain uygulanmış çıktı kopyası (`dav1d_apply_grain`).
-///
-/// `trace` verilirse (çıktı resmi sırası) dav1d iz aracıyla aynı biçimde
-/// çağrı satırları standart hataya yazılır (bkz. [`trace_picture`]).
-///
-/// P38: çıktı kopyası ve luma dolgu tamponu `butce` defterinden ayrılır
-/// (düşebilir); hata durumunda çıktı yoktur.
-pub(crate) fn apply_grain(
-    input: &Frame,
+struct GrainPrep {
+    luts: [GrainLut; 3],
+    scaling: [[u8; SCALING_SIZE_MAX]; 3],
+}
+
+fn prep_grain(
+    w: usize,
+    h: usize,
+    bd: FgBitDepth,
+    layout: Option<FgLayout>,
     data: &FilmGrainData,
-    is_id: bool,
     dsp: &FgDsp,
     trace: Option<u64>,
-    butce: &crate::frame::butce::Butce,
-    pool: &crate::thread::WorkerPool,
-) -> crate::error::Result<Frame> {
-    let lens = [
-        input
-            .plane(PlaneType::Y)
-            .map_or(0, |p| p.allocation_bytes()),
-        input
-            .plane(PlaneType::U)
-            .map_or(0, |p| p.allocation_bytes()),
-        input
-            .plane(PlaneType::V)
-            .map_or(0, |p| p.allocation_bytes()),
-    ];
-    let bufs = pool.buf_pool().take_u8_triple(lens, butce.has_limit());
-    let mut out = input.try_clone_with_bufs(bufs, butce)?;
-    let bd = fg_bd(input.bit_depth());
-    let layout = fg_layout(input.chroma_format());
-    let bpp = bd.bytes();
-    let w = input.width();
-    let h = input.height();
-    if w == 0 || h == 0 {
-        return Ok(out);
-    }
+) -> GrainPrep {
     if let Some(pic) = trace {
         eprintln!(
             "P {pic} {w} {h} {} {} {} {} {} {} {} {} {} {} {} {} {}",
@@ -207,7 +184,7 @@ pub(crate) fn apply_grain(
     }
 
     // --- `dav1d_prep_grain` (`src/fg_apply_tmpl.c:100-159`) ---------------
-    let mut luts: Vec<GrainLut> = vec![EMPTY_LUT; 3];
+    let mut luts: [GrainLut; 3] = [EMPTY_LUT; 3];
     crate::dsp::profil_olc!(FgGrainY, (dsp.generate_grain_y)(&mut luts[0], data, bd));
     if let Some(pic) = trace {
         eprintln!(
@@ -239,7 +216,7 @@ pub(crate) fn apply_grain(
             }
         }
     }
-    let mut scaling = vec![vec![0u8; SCALING_SIZE_MAX]; 3];
+    let mut scaling = [[0u8; SCALING_SIZE_MAX]; 3];
     if data.num_y_points != 0 || data.chroma_scaling_from_luma {
         generate_scaling(
             bd,
@@ -256,52 +233,202 @@ pub(crate) fn apply_grain(
             );
         }
     }
+    GrainPrep { luts, scaling }
+}
 
-    // --- `dav1d_apply_grain_row` (`src/fg_apply_tmpl.c:161-223`) ----------
+#[allow(clippy::too_many_arguments)]
+#[inline]
+fn fill_luma_strip(
+    dst: &mut [u8],
+    dst_stride: usize,
+    src_y: &[u8],
+    src_y_stride: usize,
+    y0: usize,
+    band: usize,
+    w: usize,
+    bpp: usize,
+    pad_last_col: bool,
+) {
+    let row_bytes = w * bpp;
+    for r in 0..band {
+        let s = (y0 + r) * src_y_stride;
+        let d = r * dst_stride;
+        dst[d..d + row_bytes].copy_from_slice(&src_y[s..s + row_bytes]);
+        if pad_last_col {
+            let (head, tail) = dst[d..d + row_bytes + bpp].split_at_mut(row_bytes);
+            tail.copy_from_slice(&head[row_bytes - bpp..]);
+        }
+    }
+}
+
+#[inline]
+fn copy_rows_to_frame(
+    dst_plane: &mut [u8],
+    dst_off: usize,
+    dst_stride: usize,
+    src_strip: &[u8],
+    rows_n: usize,
+    row_bytes: usize,
+) {
+    if dst_stride == row_bytes {
+        let n = rows_n * dst_stride;
+        dst_plane[dst_off..dst_off + n].copy_from_slice(&src_strip[..n]);
+    } else {
+        for r in 0..rows_n {
+            let d = dst_off + r * dst_stride;
+            let s = r * dst_stride;
+            dst_plane[d..d + row_bytes].copy_from_slice(&src_strip[s..s + row_bytes]);
+        }
+    }
+}
+
+/// Grain uygulanmış çıktı kopyası (`dav1d_apply_grain`, C-ABI ve birim testi yolu).
+///
+/// `trace` verilirse (çıktı resmi sırası) dav1d iz aracıyla aynı biçimde
+/// çağrı satırları standart hataya yazılır (bkz. [`trace_picture`]).
+///
+/// P38 / `4.A.1`: çıktı düzlemleri ön-kopyasız hazırlanır; tek genişlik luma
+/// dolgusu tam-kare yerine 32 satırlık şerit tamponuyla yapılır; paralel modda
+/// dalga tamponları (`wave_size = n_threads.min(rows)`) yeniden kullanılır.
+pub(crate) fn apply_grain(
+    input: &Frame,
+    data: &FilmGrainData,
+    is_id: bool,
+    dsp: &FgDsp,
+    trace: Option<u64>,
+    butce: &crate::frame::butce::Butce,
+    pool: &crate::thread::WorkerPool,
+) -> crate::error::Result<Frame> {
+    let bd = fg_bd(input.bit_depth());
+    let layout = fg_layout(input.chroma_format());
+    let lens = [
+        input
+            .plane(PlaneType::Y)
+            .map_or(0, |p| p.allocation_bytes()),
+        input
+            .plane(PlaneType::U)
+            .map_or(0, |p| p.allocation_bytes()),
+        input
+            .plane(PlaneType::V)
+            .map_or(0, |p| p.allocation_bytes()),
+    ];
+    let bufs = pool.buf_pool().take_u8_triple(lens, butce.has_limit());
+    let mut out = input.try_clone_with_bufs(bufs, butce)?;
+
+    let w = input.width();
+    let h = input.height();
+    if w == 0 || h == 0 {
+        return Ok(out);
+    }
     let Some(y_in) = input.plane(PlaneType::Y) else {
         return Ok(out);
     };
-    let y_stride = y_in.stride();
+    let src_data = [
+        y_in.data(),
+        input.plane(PlaneType::U).map_or(&[][..], |p| p.data()),
+        input.plane(PlaneType::V).map_or(&[][..], |p| p.data()),
+    ];
+    let src_stride = [
+        y_in.stride(),
+        input.plane(PlaneType::U).map_or(0, |p| p.stride()),
+        input.plane(PlaneType::V).map_or(0, |p| p.stride()),
+    ];
+    apply_grain_into_out_slices(
+        src_data, src_stride, &mut out, data, is_id, dsp, bd, layout, trace, butce, pool,
+    )?;
+    out.metadata_mut().film_grain_applied = true;
+    Ok(out)
+}
+
+/// Referans olarak saklanmayan (`refresh_frame_flags == 0`) görünür karelerde
+/// tam-kare ikincil [`Frame`] kopyası ayırmadan, 32 satırlık kayan şerit tamponları
+/// üzerinden doğrudan yerinde (`in-place`) Film Grain uygular (`4.A.1`).
+///
+/// Kroma sentezinin (`fguv_32x32xn`) grain'siz `luma` satırlarına bağımlılığı,
+/// her 32 satırlık şeritte `Y` düzlemi üzerine yazılmadan önce grain'siz `Y`
+/// şeridinin saklanmasıyla (veya paralel dalgada `U`/`V` şeritlerinin `Y`'den
+/// önce işlenmesiyle) `%100` bit-birebir korunur.
+pub(crate) fn apply_grain_in_place(
+    frame: &mut Frame,
+    data: &FilmGrainData,
+    is_id: bool,
+    dsp: &FgDsp,
+    trace: Option<u64>,
+    butce: &crate::frame::butce::Butce,
+    pool: &crate::thread::WorkerPool,
+) -> crate::error::Result<()> {
+    let w = frame.width();
+    let h = frame.height();
+    if w == 0 || h == 0 || frame.plane(PlaneType::Y).is_none() {
+        return Ok(());
+    }
+    let bd = fg_bd(frame.bit_depth());
+    let layout = fg_layout(frame.chroma_format());
+    let bpp = bd.bytes();
+    let (ss_x, ss_y) = layout.map_or((0, 0), |l| (l.ss_x(), l.ss_y()));
+    let do_y = data.num_y_points != 0;
     let do_uv = layout.is_some()
         && (data.num_uv_points[0] != 0
             || data.num_uv_points[1] != 0
             || data.chroma_scaling_from_luma);
-    let (ss_x, ss_y) = layout.map_or((0, 0), |l| (l.ss_x(), l.ss_y()));
-    // Luma dolgusu (`src/fg_apply_tmpl.c:195-202`): tek genişlikte yatay alt
-    // örneklemeli kroma, son sütun için luma `w`'yi okur.
-    let padded = if do_uv && (w & ss_x) != 0 {
-        // P38 (taşma sınıfı): AV1 sınırında `(w+1)·bpp·h` 8 590 065 664 bayt
-        // (32 bitlik `usize`'ı aşar); denetimli.
-        let lstride = (w + 1) * bpp;
-        let n = lstride
-            .checked_mul(h)
-            .ok_or(crate::error::Error::SizeOverflow {
-                stage: crate::error::SizeStage::PlaneArea,
-                lhs: lstride,
-                rhs: h,
-            })?;
-        let mut buf = butce.gecici(n, 0u8)?;
-        for y in 0..h {
-            let row = &y_in.data()[y * y_stride..y * y_stride + w * bpp];
-            let dst = &mut buf[y * lstride..(y + 1) * lstride];
-            dst[..w * bpp].copy_from_slice(row);
-            let (head, tail) = dst.split_at_mut(w * bpp);
-            tail.copy_from_slice(&head[(w - 1) * bpp..]);
-        }
-        Some((buf, lstride))
+    let do_u = do_uv && (data.chroma_scaling_from_luma || data.num_uv_points[0] != 0);
+    let do_v = do_uv && (data.chroma_scaling_from_luma || data.num_uv_points[1] != 0);
+
+    let prep = prep_grain(w, h, bd, layout, data, dsp, trace);
+    if !do_y && !do_u && !do_v {
+        frame.metadata_mut().film_grain_applied = true;
+        return Ok(());
+    }
+
+    let y_stride = frame.plane(PlaneType::Y).map_or(0, |p| p.stride());
+    let u_stride = frame.plane(PlaneType::U).map_or(0, |p| p.stride());
+    let v_stride = frame.plane(PlaneType::V).map_or(0, |p| p.stride());
+    let pad_luma = (do_u || do_v) && (w & ss_x) != 0;
+    let need_luma_save = (do_u || do_v) && (do_y || pad_luma);
+
+    let band_max = FG_BLOCK_SIZE.min(h);
+    let bh_max = (band_max + ss_y) >> ss_y;
+    let mut max_src_bytes = 0usize;
+    if do_y {
+        max_src_bytes = max_src_bytes.max(band_max * y_stride);
+    }
+    if do_u {
+        max_src_bytes = max_src_bytes.max(bh_max * u_stride);
+    }
+    if do_v {
+        max_src_bytes = max_src_bytes.max(bh_max * v_stride);
+    }
+    let luma_save_stride = if pad_luma {
+        w.checked_add(1).and_then(|wp| wp.checked_mul(bpp)).ok_or(
+            crate::error::Error::SizeOverflow {
+                stage: crate::error::SizeStage::RowBytes,
+                lhs: w,
+                rhs: bpp,
+            },
+        )?
+    } else {
+        y_stride
+    };
+    let mut src_strip = butce.gecici(max_src_bytes, 0u8)?;
+    let mut luma_strip = if need_luma_save {
+        let n =
+            luma_save_stride
+                .checked_mul(band_max)
+                .ok_or(crate::error::Error::SizeOverflow {
+                    stage: crate::error::SizeStage::PlaneArea,
+                    lhs: luma_save_stride,
+                    rhs: band_max,
+                })?;
+        Some(butce.gecici(n, 0u8)?)
     } else {
         None
     };
-    let (luma, luma_stride): (&[u8], usize) = match &padded {
-        Some((buf, s)) => (buf.as_slice(), *s),
-        None => (y_in.data(), y_stride),
-    };
+
     let cpw = (w + ss_x) >> ss_x;
     let rows = h.div_ceil(FG_BLOCK_SIZE);
     if pool.is_parallel() && rows > 1 && trace.is_none() {
-        apply_grain_parallel_rows(
-            input,
-            &mut out,
+        apply_grain_in_place_waves(
+            frame,
             data,
             is_id,
             dsp,
@@ -311,59 +438,89 @@ pub(crate) fn apply_grain(
             h,
             cpw,
             ss_y,
-            do_uv,
+            bpp,
+            do_y,
+            do_u,
+            do_v,
+            pad_luma,
             y_stride,
-            luma,
-            luma_stride,
-            &luts,
-            &scaling,
+            u_stride,
+            v_stride,
+            luma_save_stride,
+            &prep,
             rows,
             pool,
         )?;
-        out.metadata_mut().film_grain_applied = true;
-        return Ok(out);
+        frame.metadata_mut().film_grain_applied = true;
+        return Ok(());
     }
+
     for row in 0..rows {
-        let band = (h - row * FG_BLOCK_SIZE).min(FG_BLOCK_SIZE);
-        if data.num_y_points != 0
-            && let Some(y_out) = out.plane_mut(PlaneType::Y)
+        let y0 = row * FG_BLOCK_SIZE;
+        let band = (h - y0).min(FG_BLOCK_SIZE);
+        if let Some(lbuf) = luma_strip.as_deref_mut()
+            && let Some(y_pl) = frame.plane(PlaneType::Y)
         {
-            let off = row * FG_BLOCK_SIZE * y_stride;
+            fill_luma_strip(
+                lbuf,
+                luma_save_stride,
+                y_pl.data(),
+                y_stride,
+                y0,
+                band,
+                w,
+                bpp,
+                pad_luma,
+            );
+        }
+        if do_y && let Some(y_pl) = frame.plane_mut(PlaneType::Y) {
+            let off = y0 * y_stride;
+            let len = band * y_stride;
+            src_strip[..len].copy_from_slice(&y_pl.data()[off..off + len]);
             crate::dsp::profil_olc!(
                 FgY,
                 (dsp.fgy_32x32xn)(
-                    &mut y_out.data_mut()[off..],
-                    &y_in.data()[off..],
+                    &mut y_pl.data_mut()[off..off + len],
+                    &src_strip[..len],
                     y_stride,
                     data,
                     w,
-                    &scaling[0],
-                    &luts[0],
+                    &prep.scaling[0],
+                    &prep.luts[0],
                     band,
                     row,
                     bd,
                 )
             );
             if let Some(pic) = trace {
-                let hsh = rows_hash(&y_out.data()[off..], y_stride, band, w * bpp);
+                let hsh = rows_hash(&y_pl.data()[off..], y_stride, band, w * bpp);
                 eprintln!("Y {pic} {row} {band} {w} {hsh}");
             }
         }
-        let Some(l) = layout.filter(|_| do_uv) else {
+        let Some(l) = layout.filter(|_| do_u || do_v) else {
             continue;
         };
         let bh = (band + ss_y) >> ss_y;
-        let loff = row * FG_BLOCK_SIZE * luma_stride;
+        let planes = frame.planes_mut();
+        let Some((y_pl, uv_pls)) = planes.split_first_mut() else {
+            continue;
+        };
+        let (luma_ref, lstride_ref): (&[u8], usize) = match luma_strip.as_deref() {
+            Some(lbuf) => (lbuf, luma_save_stride),
+            None => (&y_pl.data()[y0 * y_stride..], y_stride),
+        };
         for pl in 0..2 {
-            if !data.chroma_scaling_from_luma && data.num_uv_points[pl] == 0 {
+            let active = if pl == 0 { do_u } else { do_v };
+            if !active {
                 continue;
             }
-            let ptype = if pl == 0 { PlaneType::U } else { PlaneType::V };
-            let (Some(c_in), Some(c_out)) = (input.plane(ptype), out.plane_mut(ptype)) else {
+            let Some(c_pl) = uv_pls.get_mut(pl) else {
                 continue;
             };
-            let c_stride = c_in.stride();
-            let uv_off = (row * FG_BLOCK_SIZE * c_stride) >> ss_y;
+            let c_stride = c_pl.stride();
+            let uv_off = (y0 * c_stride) >> ss_y;
+            let len = bh * c_stride;
+            src_strip[..len].copy_from_slice(&c_pl.data()[uv_off..uv_off + len]);
             let si = if data.chroma_scaling_from_luma {
                 0
             } else {
@@ -372,24 +529,24 @@ pub(crate) fn apply_grain(
             crate::dsp::profil_olc!(
                 FgUv,
                 (dsp.fguv_32x32xn[l.index()])(
-                    &mut c_out.data_mut()[uv_off..],
-                    &c_in.data()[uv_off..],
+                    &mut c_pl.data_mut()[uv_off..uv_off + len],
+                    &src_strip[..len],
                     c_stride,
                     data,
                     cpw,
-                    &scaling[si],
-                    &luts[1 + pl],
+                    &prep.scaling[si],
+                    &prep.luts[1 + pl],
                     bh,
                     row,
-                    &luma[loff..],
-                    luma_stride,
+                    luma_ref,
+                    lstride_ref,
                     pl,
                     is_id,
                     bd,
                 )
             );
             if let Some(pic) = trace {
-                let hsh = rows_hash(&c_out.data()[uv_off..], c_stride, bh, cpw * bpp);
+                let hsh = rows_hash(&c_pl.data()[uv_off..], c_stride, bh, cpw * bpp);
                 eprintln!(
                     "C {pic} {} {row} {bh} {cpw} {} {hsh}",
                     pl + 1,
@@ -398,14 +555,13 @@ pub(crate) fn apply_grain(
             }
         }
     }
-    out.metadata_mut().film_grain_applied = true;
-    Ok(out)
+    frame.metadata_mut().film_grain_applied = true;
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
-fn apply_grain_parallel_rows(
-    input: &Frame,
-    out: &mut Frame,
+fn apply_grain_in_place_waves(
+    frame: &mut Frame,
     data: &FilmGrainData,
     is_id: bool,
     dsp: &FgDsp,
@@ -415,179 +571,971 @@ fn apply_grain_parallel_rows(
     h: usize,
     cpw: usize,
     ss_y: usize,
-    do_uv: bool,
+    bpp: usize,
+    do_y: bool,
+    do_u: bool,
+    do_v: bool,
+    pad_luma: bool,
     y_stride: usize,
-    luma: &[u8],
-    luma_stride: usize,
-    luts: &[GrainLut],
-    scaling: &[Vec<u8>],
+    u_stride: usize,
+    v_stride: usize,
+    luma_pad_stride: usize,
+    prep: &GrainPrep,
     rows: usize,
     pool: &crate::thread::WorkerPool,
 ) -> crate::error::Result<()> {
     use crate::frame::butce::dolu_vec;
     use std::sync::Arc;
 
-    struct FgRowJob {
+    struct InPlaceWaveJob {
+        row: usize,
+        band: usize,
+        bh: usize,
+        y_buf: Vec<u8>,
+        u_buf: Vec<u8>,
+        v_buf: Vec<u8>,
+        luma_pad: Vec<u8>,
+    }
+
+    let need_y_in_job = do_y || do_u || do_v;
+    let bh_alloc = (FG_BLOCK_SIZE + ss_y) >> ss_y;
+    let wave_size = pool.n_threads().min(rows).max(1);
+    let mut jobs: Vec<InPlaceWaveJob> = (0..wave_size)
+        .map(|_| {
+            Ok(InPlaceWaveJob {
+                row: 0,
+                band: 0,
+                bh: 0,
+                y_buf: if need_y_in_job {
+                    dolu_vec(FG_BLOCK_SIZE * y_stride, 0u8)?
+                } else {
+                    Vec::new()
+                },
+                u_buf: if do_u {
+                    dolu_vec(bh_alloc * u_stride, 0u8)?
+                } else {
+                    Vec::new()
+                },
+                v_buf: if do_v {
+                    dolu_vec(bh_alloc * v_stride, 0u8)?
+                } else {
+                    Vec::new()
+                },
+                luma_pad: if pad_luma {
+                    dolu_vec(FG_BLOCK_SIZE * luma_pad_stride, 0u8)?
+                } else {
+                    Vec::new()
+                },
+            })
+        })
+        .collect::<crate::error::Result<Vec<_>>>()?;
+
+    let mut max_scratch = 0usize;
+    if do_y {
+        max_scratch = max_scratch.max(FG_BLOCK_SIZE * y_stride);
+    }
+    if do_u {
+        max_scratch = max_scratch.max(bh_alloc * u_stride);
+    }
+    if do_v {
+        max_scratch = max_scratch.max(bh_alloc * v_stride);
+    }
+
+    let luts_arc = Arc::new(prep.luts);
+    let scaling_arc = Arc::new(prep.scaling);
+    let fg_data = *data;
+    let fgy_fn = dsp.fgy_32x32xn;
+    let fguv_fns = dsp.fguv_32x32xn;
+    let scratch_pool = Arc::new(pool.handle());
+
+    for wave_start in (0..rows).step_by(wave_size) {
+        let count = (rows - wave_start).min(wave_size);
+        if jobs.len() > count {
+            jobs.truncate(count);
+        }
+        for (i, job) in jobs.iter_mut().enumerate() {
+            let row = wave_start + i;
+            let y0 = row * FG_BLOCK_SIZE;
+            let band = (h - y0).min(FG_BLOCK_SIZE);
+            let bh = (band + ss_y) >> ss_y;
+            job.row = row;
+            job.band = band;
+            job.bh = bh;
+            if need_y_in_job && let Some(y_pl) = frame.plane(PlaneType::Y) {
+                let off = y0 * y_stride;
+                let len = band * y_stride;
+                job.y_buf[..len].copy_from_slice(&y_pl.data()[off..off + len]);
+            }
+            if do_u && let Some(u_pl) = frame.plane(PlaneType::U) {
+                let off = (y0 * u_stride) >> ss_y;
+                let len = bh * u_stride;
+                job.u_buf[..len].copy_from_slice(&u_pl.data()[off..off + len]);
+            }
+            if do_v && let Some(v_pl) = frame.plane(PlaneType::V) {
+                let off = (y0 * v_stride) >> ss_y;
+                let len = bh * v_stride;
+                job.v_buf[..len].copy_from_slice(&v_pl.data()[off..off + len]);
+            }
+        }
+
+        let luts_w = Arc::clone(&luts_arc);
+        let scaling_w = Arc::clone(&scaling_arc);
+        let sp_w = Arc::clone(&scratch_pool);
+        pool.execute_tasks(&mut jobs, move |wid, _idx, job: &mut InPlaceWaveJob| {
+            sp_w.scratch().with_scratch(wid, |ws| {
+                let tmp = ws.ensure_bytes(max_scratch)?;
+                // 1) Kroma düzlemlerini grain'siz `job.y_buf` okunurken sentezle.
+                if let Some(l) = layout.filter(|_| do_u || do_v) {
+                    let fguv_fn = fguv_fns[l.index()];
+                    let (luma_ref, lstride): (&[u8], usize) = if pad_luma {
+                        fill_luma_strip(
+                            &mut job.luma_pad,
+                            luma_pad_stride,
+                            &job.y_buf,
+                            y_stride,
+                            0,
+                            job.band,
+                            w,
+                            bpp,
+                            true,
+                        );
+                        (&job.luma_pad, luma_pad_stride)
+                    } else {
+                        (&job.y_buf, y_stride)
+                    };
+                    if do_u && u_stride > 0 {
+                        let len = job.bh * u_stride;
+                        tmp[..len].copy_from_slice(&job.u_buf[..len]);
+                        let si = if fg_data.chroma_scaling_from_luma {
+                            0
+                        } else {
+                            1
+                        };
+                        crate::dsp::profil_olc!(
+                            FgUv,
+                            (fguv_fn)(
+                                &mut job.u_buf[..len],
+                                &tmp[..len],
+                                u_stride,
+                                &fg_data,
+                                cpw,
+                                &scaling_w[si],
+                                &luts_w[1],
+                                job.bh,
+                                job.row,
+                                luma_ref,
+                                lstride,
+                                0,
+                                is_id,
+                                bd,
+                            )
+                        );
+                    }
+                    if do_v && v_stride > 0 {
+                        let len = job.bh * v_stride;
+                        tmp[..len].copy_from_slice(&job.v_buf[..len]);
+                        let si = if fg_data.chroma_scaling_from_luma {
+                            0
+                        } else {
+                            2
+                        };
+                        crate::dsp::profil_olc!(
+                            FgUv,
+                            (fguv_fn)(
+                                &mut job.v_buf[..len],
+                                &tmp[..len],
+                                v_stride,
+                                &fg_data,
+                                cpw,
+                                &scaling_w[si],
+                                &luts_w[2],
+                                job.bh,
+                                job.row,
+                                luma_ref,
+                                lstride,
+                                1,
+                                is_id,
+                                bd,
+                            )
+                        );
+                    }
+                }
+                // 2) Kroma tamamlandıktan sonra Luma şeridini yerinde sentezle.
+                if do_y && y_stride > 0 {
+                    let len = job.band * y_stride;
+                    tmp[..len].copy_from_slice(&job.y_buf[..len]);
+                    crate::dsp::profil_olc!(
+                        FgY,
+                        (fgy_fn)(
+                            &mut job.y_buf[..len],
+                            &tmp[..len],
+                            y_stride,
+                            &fg_data,
+                            w,
+                            &scaling_w[0],
+                            &luts_w[0],
+                            job.band,
+                            job.row,
+                            bd,
+                        )
+                    );
+                }
+                Ok(())
+            })
+        })?;
+
+        for job in &jobs {
+            let y0 = job.row * FG_BLOCK_SIZE;
+            if do_y && let Some(y_pl) = frame.plane_mut(PlaneType::Y) {
+                copy_rows_to_frame(
+                    y_pl.data_mut(),
+                    y0 * y_stride,
+                    y_stride,
+                    &job.y_buf,
+                    job.band,
+                    w * bpp,
+                );
+            }
+            if do_u && let Some(u_pl) = frame.plane_mut(PlaneType::U) {
+                copy_rows_to_frame(
+                    u_pl.data_mut(),
+                    (y0 * u_stride) >> ss_y,
+                    u_stride,
+                    &job.u_buf,
+                    job.bh,
+                    cpw * bpp,
+                );
+            }
+            if do_v && let Some(v_pl) = frame.plane_mut(PlaneType::V) {
+                copy_rows_to_frame(
+                    v_pl.data_mut(),
+                    (y0 * v_stride) >> ss_y,
+                    v_stride,
+                    &job.v_buf,
+                    job.bh,
+                    cpw * bpp,
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Referans olarak saklanan bir karenin `&mut PicBuf` düzlemlerinden ara
+/// grain'siz [`Frame`] kopyası oluşturmadan tek geçişte grain'li çıktı
+/// [`Frame`]'ini üretir (`n_fc == 1`, `refresh_frame_flags != 0` yolu; `4.A.1`).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn apply_grain_from_pic_mut(
+    pic: &mut crate::decode::intra::PicBuf,
+    chroma: ChromaFormat,
+    bd_in: BitDepth,
+    data: &FilmGrainData,
+    is_id: bool,
+    dsp: &FgDsp,
+    trace: Option<u64>,
+    recycled: [Vec<u8>; 3],
+    butce: &crate::frame::butce::Butce,
+    pool: &crate::thread::WorkerPool,
+) -> crate::error::Result<Frame> {
+    let bd = fg_bd(bd_in);
+    let layout = fg_layout(chroma);
+    let do_y = data.num_y_points != 0;
+    let do_uv = layout.is_some()
+        && (data.num_uv_points[0] != 0
+            || data.num_uv_points[1] != 0
+            || data.chroma_scaling_from_luma);
+    let do_u = do_uv && (data.chroma_scaling_from_luma || data.num_uv_points[0] != 0);
+    let do_v = do_uv && (data.chroma_scaling_from_luma || data.num_uv_points[1] != 0);
+
+    let mut out = Frame::new_for_grain_from_pic_in(
+        pic.width,
+        pic.height,
+        chroma,
+        bd_in,
+        &pic.data,
+        pic.stride,
+        [do_y, do_u, do_v],
+        recycled,
+        butce,
+    )?;
+
+    let rows = pic.height.div_ceil(FG_BLOCK_SIZE);
+    if pool.is_parallel() && rows > 1 && trace.is_none() {
+        use std::sync::Arc;
+        let prep = prep_grain(pic.width, pic.height, bd, layout, data, dsp, None);
+        alloc_pic_grain_temp_budget(
+            pic.width, pic.height, pic.stride, &out, bd, layout, do_y, do_u, do_v, butce,
+        )?;
+        let src_arc = Arc::new([
+            core::mem::take(&mut pic.data[0]),
+            core::mem::take(&mut pic.data[1]),
+            core::mem::take(&mut pic.data[2]),
+        ]);
+        let src_stride = pic.stride;
+        let res = apply_grain_parallel_waves_shared(
+            &src_arc,
+            move |arr, idx| (arr[idx].as_slice(), src_stride[idx]),
+            &mut out,
+            data,
+            is_id,
+            dsp,
+            bd,
+            layout,
+            do_y,
+            do_u,
+            do_v,
+            &prep,
+            rows,
+            pool,
+        );
+        let [p0, p1, p2] = Arc::try_unwrap(src_arc).unwrap_or_else(|a| (*a).clone());
+        pic.data = [p0, p1, p2];
+        res?;
+        out.metadata_mut().film_grain_applied = true;
+        return Ok(out);
+    }
+
+    let src_data = [
+        pic.data[0].as_slice(),
+        pic.data[1].as_slice(),
+        pic.data[2].as_slice(),
+    ];
+    apply_grain_into_out_slices(
+        src_data, pic.stride, &mut out, data, is_id, dsp, bd, layout, trace, butce, pool,
+    )?;
+    out.metadata_mut().film_grain_applied = true;
+    Ok(out)
+}
+
+/// Paylaşılan `Arc<RefFrame>` içindeki `PicBuf` düzlemlerinden tek geçişte
+/// grain'li çıktı [`Frame`]'ini üretir (`show_existing_frame` ve boru hattı yolu; `4.A.1`).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn apply_grain_from_ref_pic(
+    rf: &std::sync::Arc<crate::decode::intra::RefFrame>,
+    data: &FilmGrainData,
+    is_id: bool,
+    dsp: &FgDsp,
+    trace: Option<u64>,
+    recycled: [Vec<u8>; 3],
+    butce: &crate::frame::butce::Butce,
+    pool: &crate::thread::WorkerPool,
+) -> crate::error::Result<Frame> {
+    let pic = &rf.pic;
+    let bd = fg_bd(rf.bd);
+    let layout = fg_layout(rf.chroma);
+    let do_y = data.num_y_points != 0;
+    let do_uv = layout.is_some()
+        && (data.num_uv_points[0] != 0
+            || data.num_uv_points[1] != 0
+            || data.chroma_scaling_from_luma);
+    let do_u = do_uv && (data.chroma_scaling_from_luma || data.num_uv_points[0] != 0);
+    let do_v = do_uv && (data.chroma_scaling_from_luma || data.num_uv_points[1] != 0);
+
+    let mut out = Frame::new_for_grain_from_pic_in(
+        pic.width,
+        pic.height,
+        rf.chroma,
+        rf.bd,
+        &pic.data,
+        pic.stride,
+        [do_y, do_u, do_v],
+        recycled,
+        butce,
+    )?;
+
+    let rows = pic.height.div_ceil(FG_BLOCK_SIZE);
+    if pool.is_parallel() && rows > 1 && trace.is_none() {
+        let prep = prep_grain(pic.width, pic.height, bd, layout, data, dsp, None);
+        alloc_pic_grain_temp_budget(
+            pic.width, pic.height, pic.stride, &out, bd, layout, do_y, do_u, do_v, butce,
+        )?;
+        apply_grain_parallel_waves_shared(
+            rf,
+            |r, idx| (r.pic.data[idx].as_slice(), r.pic.stride[idx]),
+            &mut out,
+            data,
+            is_id,
+            dsp,
+            bd,
+            layout,
+            do_y,
+            do_u,
+            do_v,
+            &prep,
+            rows,
+            pool,
+        )?;
+        out.metadata_mut().film_grain_applied = true;
+        return Ok(out);
+    }
+
+    let src_data = [
+        pic.data[0].as_slice(),
+        pic.data[1].as_slice(),
+        pic.data[2].as_slice(),
+    ];
+    apply_grain_into_out_slices(
+        src_data, pic.stride, &mut out, data, is_id, dsp, bd, layout, trace, butce, pool,
+    )?;
+    out.metadata_mut().film_grain_applied = true;
+    Ok(out)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn alloc_pic_grain_temp_budget(
+    w: usize,
+    h: usize,
+    src_stride: [usize; 3],
+    out: &Frame,
+    bd: FgBitDepth,
+    layout: Option<FgLayout>,
+    do_y: bool,
+    do_u: bool,
+    do_v: bool,
+    butce: &crate::frame::butce::Butce,
+) -> crate::error::Result<()> {
+    let bpp = bd.bytes();
+    let (ss_x, ss_y) = layout.map_or((0, 0), |l| (l.ss_x(), l.ss_y()));
+    let band_max = FG_BLOCK_SIZE.min(h);
+    let bh_max = (band_max + ss_y) >> ss_y;
+    let out_strides = [
+        out.plane(PlaneType::Y).map_or(0, |p| p.stride()),
+        out.plane(PlaneType::U).map_or(0, |p| p.stride()),
+        out.plane(PlaneType::V).map_or(0, |p| p.stride()),
+    ];
+    let mut max_mismatch = 0usize;
+    if do_y && src_stride[0] != out_strides[0] {
+        max_mismatch = max_mismatch.max(band_max * out_strides[0]);
+    }
+    if do_u && src_stride[1] != out_strides[1] {
+        max_mismatch = max_mismatch.max(bh_max * out_strides[1]);
+    }
+    if do_v && src_stride[2] != out_strides[2] {
+        max_mismatch = max_mismatch.max(bh_max * out_strides[2]);
+    }
+    let _src_tok = if max_mismatch > 0 {
+        Some(butce.gecici(max_mismatch, 0u8)?)
+    } else {
+        None
+    };
+    if (do_u || do_v) && (w & ss_x) != 0 {
+        let lstride = w.checked_add(1).and_then(|wp| wp.checked_mul(bpp)).ok_or(
+            crate::error::Error::SizeOverflow {
+                stage: crate::error::SizeStage::RowBytes,
+                lhs: w,
+                rhs: bpp,
+            },
+        )?;
+        let n = lstride
+            .checked_mul(band_max)
+            .ok_or(crate::error::Error::SizeOverflow {
+                stage: crate::error::SizeStage::PlaneArea,
+                lhs: lstride,
+                rhs: band_max,
+            })?;
+        let _luma_tok = butce.gecici(n, 0u8)?;
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_grain_into_out_slices(
+    src_data: [&[u8]; 3],
+    src_stride: [usize; 3],
+    out: &mut Frame,
+    data: &FilmGrainData,
+    is_id: bool,
+    dsp: &FgDsp,
+    bd: FgBitDepth,
+    layout: Option<FgLayout>,
+    trace: Option<u64>,
+    butce: &crate::frame::butce::Butce,
+    pool: &crate::thread::WorkerPool,
+) -> crate::error::Result<()> {
+    let w = out.width();
+    let h = out.height();
+    let bpp = bd.bytes();
+    let (ss_x, ss_y) = layout.map_or((0, 0), |l| (l.ss_x(), l.ss_y()));
+    let do_y = data.num_y_points != 0;
+    let do_uv = layout.is_some()
+        && (data.num_uv_points[0] != 0
+            || data.num_uv_points[1] != 0
+            || data.chroma_scaling_from_luma);
+    let do_u = do_uv && (data.chroma_scaling_from_luma || data.num_uv_points[0] != 0);
+    let do_v = do_uv && (data.chroma_scaling_from_luma || data.num_uv_points[1] != 0);
+
+    let prep = prep_grain(w, h, bd, layout, data, dsp, trace);
+    if !do_y && !do_u && !do_v {
+        return Ok(());
+    }
+
+    let out_strides = [
+        out.plane(PlaneType::Y).map_or(0, |p| p.stride()),
+        out.plane(PlaneType::U).map_or(0, |p| p.stride()),
+        out.plane(PlaneType::V).map_or(0, |p| p.stride()),
+    ];
+    let band_max = FG_BLOCK_SIZE.min(h);
+    let bh_max = (band_max + ss_y) >> ss_y;
+    let mut max_mismatch = 0usize;
+    if do_y && src_stride[0] != out_strides[0] {
+        max_mismatch = max_mismatch.max(band_max * out_strides[0]);
+    }
+    if do_u && src_stride[1] != out_strides[1] {
+        max_mismatch = max_mismatch.max(bh_max * out_strides[1]);
+    }
+    if do_v && src_stride[2] != out_strides[2] {
+        max_mismatch = max_mismatch.max(bh_max * out_strides[2]);
+    }
+    let mut src_strip = if max_mismatch > 0 {
+        Some(butce.gecici(max_mismatch, 0u8)?)
+    } else {
+        None
+    };
+
+    let pad_luma = (do_u || do_v) && (w & ss_x) != 0;
+    let luma_pad_stride = if pad_luma {
+        w.checked_add(1).and_then(|wp| wp.checked_mul(bpp)).ok_or(
+            crate::error::Error::SizeOverflow {
+                stage: crate::error::SizeStage::RowBytes,
+                lhs: w,
+                rhs: bpp,
+            },
+        )?
+    } else {
+        0
+    };
+    let mut luma_strip = if pad_luma {
+        let n = luma_pad_stride
+            .checked_mul(band_max)
+            .ok_or(crate::error::Error::SizeOverflow {
+                stage: crate::error::SizeStage::PlaneArea,
+                lhs: luma_pad_stride,
+                rhs: band_max,
+            })?;
+        Some(butce.gecici(n, 0u8)?)
+    } else {
+        None
+    };
+
+    let cpw = (w + ss_x) >> ss_x;
+    let rows = h.div_ceil(FG_BLOCK_SIZE);
+    if pool.is_parallel() && rows > 1 && trace.is_none() {
+        use crate::frame::butce::kopya_vec;
+        use std::sync::Arc;
+        drop(src_strip);
+        drop(luma_strip);
+        let shared = Arc::new([
+            if do_y || do_u || do_v {
+                kopya_vec(src_data[0])?
+            } else {
+                Vec::new()
+            },
+            if do_u {
+                kopya_vec(src_data[1])?
+            } else {
+                Vec::new()
+            },
+            if do_v {
+                kopya_vec(src_data[2])?
+            } else {
+                Vec::new()
+            },
+        ]);
+        return apply_grain_parallel_waves_shared(
+            &shared,
+            move |arr, idx| (arr[idx].as_slice(), src_stride[idx]),
+            out,
+            data,
+            is_id,
+            dsp,
+            bd,
+            layout,
+            do_y,
+            do_u,
+            do_v,
+            &prep,
+            rows,
+            pool,
+        );
+    }
+
+    for row in 0..rows {
+        let y0 = row * FG_BLOCK_SIZE;
+        let band = (h - y0).min(FG_BLOCK_SIZE);
+        if do_y && let Some(y_out) = out.plane_mut(PlaneType::Y) {
+            let dst_stride = out_strides[0];
+            let dst_off = y0 * dst_stride;
+            let src_off = y0 * src_stride[0];
+            let row_bytes = w * bpp;
+            let src_ref: &[u8] = if src_stride[0] == dst_stride {
+                &src_data[0][src_off..]
+            } else {
+                let st = src_strip.as_deref_mut().expect("src_strip");
+                for r in 0..band {
+                    let d = r * dst_stride;
+                    let s = src_off + r * src_stride[0];
+                    st[d..d + row_bytes].copy_from_slice(&src_data[0][s..s + row_bytes]);
+                }
+                &st[..band * dst_stride]
+            };
+            crate::dsp::profil_olc!(
+                FgY,
+                (dsp.fgy_32x32xn)(
+                    &mut y_out.data_mut()[dst_off..],
+                    src_ref,
+                    dst_stride,
+                    data,
+                    w,
+                    &prep.scaling[0],
+                    &prep.luts[0],
+                    band,
+                    row,
+                    bd,
+                )
+            );
+            if let Some(pic) = trace {
+                let hsh = rows_hash(&y_out.data()[dst_off..], dst_stride, band, row_bytes);
+                eprintln!("Y {pic} {row} {band} {w} {hsh}");
+            }
+        }
+        let Some(l) = layout.filter(|_| do_u || do_v) else {
+            continue;
+        };
+        let bh = (band + ss_y) >> ss_y;
+        let (luma_ref, lstride): (&[u8], usize) = if let Some(lbuf) = luma_strip.as_deref_mut() {
+            fill_luma_strip(
+                lbuf,
+                luma_pad_stride,
+                src_data[0],
+                src_stride[0],
+                y0,
+                band,
+                w,
+                bpp,
+                true,
+            );
+            (lbuf, luma_pad_stride)
+        } else {
+            (&src_data[0][y0 * src_stride[0]..], src_stride[0])
+        };
+        let row_bytes_uv = cpw * bpp;
+        for pl in 0..2 {
+            let active = if pl == 0 { do_u } else { do_v };
+            if !active {
+                continue;
+            }
+            let ptype = if pl == 0 { PlaneType::U } else { PlaneType::V };
+            let Some(c_out) = out.plane_mut(ptype) else {
+                continue;
+            };
+            let dst_stride = out_strides[1 + pl];
+            let s_stride = src_stride[1 + pl];
+            let dst_off = (y0 * dst_stride) >> ss_y;
+            let src_off = (y0 * s_stride) >> ss_y;
+            let src_ref: &[u8] = if s_stride == dst_stride {
+                &src_data[1 + pl][src_off..]
+            } else {
+                let st = src_strip.as_deref_mut().expect("src_strip");
+                for r in 0..bh {
+                    let d = r * dst_stride;
+                    let s = src_off + r * s_stride;
+                    st[d..d + row_bytes_uv].copy_from_slice(&src_data[1 + pl][s..s + row_bytes_uv]);
+                }
+                &st[..bh * dst_stride]
+            };
+            let si = if data.chroma_scaling_from_luma {
+                0
+            } else {
+                1 + pl
+            };
+            crate::dsp::profil_olc!(
+                FgUv,
+                (dsp.fguv_32x32xn[l.index()])(
+                    &mut c_out.data_mut()[dst_off..],
+                    src_ref,
+                    dst_stride,
+                    data,
+                    cpw,
+                    &prep.scaling[si],
+                    &prep.luts[1 + pl],
+                    bh,
+                    row,
+                    luma_ref,
+                    lstride,
+                    pl,
+                    is_id,
+                    bd,
+                )
+            );
+            if let Some(pic) = trace {
+                let hsh = rows_hash(&c_out.data()[dst_off..], dst_stride, bh, row_bytes_uv);
+                eprintln!(
+                    "C {pic} {} {row} {bh} {cpw} {} {hsh}",
+                    pl + 1,
+                    u8::from(is_id)
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_grain_parallel_waves_shared<P, G>(
+    holder: &std::sync::Arc<P>,
+    get_plane: G,
+    out: &mut Frame,
+    data: &FilmGrainData,
+    is_id: bool,
+    dsp: &FgDsp,
+    bd: FgBitDepth,
+    layout: Option<FgLayout>,
+    do_y: bool,
+    do_u: bool,
+    do_v: bool,
+    prep: &GrainPrep,
+    rows: usize,
+    pool: &crate::thread::WorkerPool,
+) -> crate::error::Result<()>
+where
+    P: Send + Sync + 'static,
+    G: Fn(&P, usize) -> (&[u8], usize) + Copy + Send + Sync + 'static,
+{
+    use crate::frame::butce::dolu_vec;
+    use std::sync::Arc;
+
+    struct WaveJob {
         row: usize,
         band: usize,
         bh: usize,
         y_dst: Vec<u8>,
-        uv_dst: [Vec<u8>; 2],
+        u_dst: Vec<u8>,
+        v_dst: Vec<u8>,
+        luma_pad: Vec<u8>,
     }
 
-    let do_y = data.num_y_points != 0;
-    let do_u = do_uv && (data.chroma_scaling_from_luma || data.num_uv_points[0] != 0);
-    let do_v = do_uv && (data.chroma_scaling_from_luma || data.num_uv_points[1] != 0);
+    let w = out.width();
+    let h = out.height();
+    let bpp = bd.bytes();
+    let (ss_x, ss_y) = layout.map_or((0, 0), |l| (l.ss_x(), l.ss_y()));
+    let cpw = (w + ss_x) >> ss_x;
+    let y_dst_stride = out.plane(PlaneType::Y).map_or(0, |p| p.stride());
+    let u_dst_stride = out.plane(PlaneType::U).map_or(0, |p| p.stride());
+    let v_dst_stride = out.plane(PlaneType::V).map_or(0, |p| p.stride());
+    let pad_luma = (do_u || do_v) && (w & ss_x) != 0;
+    let luma_pad_stride = if pad_luma { (w + 1) * bpp } else { 0 };
+    let bh_alloc = (FG_BLOCK_SIZE + ss_y) >> ss_y;
 
-    let u_stride = out.plane(PlaneType::U).map_or(0, |p| p.stride());
-    let v_stride = out.plane(PlaneType::V).map_or(0, |p| p.stride());
-    let luma_is_y = input
-        .plane(PlaneType::Y)
-        .is_some_and(|p| core::ptr::eq(luma, p.data()));
-    let y_arc = Arc::new(
-        out.plane_mut(PlaneType::Y)
-            .map_or_else(Vec::new, |p| p.take_data()),
-    );
-    let u_arc = Arc::new(
-        out.plane_mut(PlaneType::U)
-            .map_or_else(Vec::new, |p| p.take_data()),
-    );
-    let v_arc = Arc::new(
-        out.plane_mut(PlaneType::V)
-            .map_or_else(Vec::new, |p| p.take_data()),
-    );
-    let luma_arc = if luma_is_y {
-        Arc::clone(&y_arc)
-    } else if do_u || do_v {
-        Arc::new(dolu_vec(luma.len(), 0u8).map(|mut b| {
-            b.copy_from_slice(luma);
-            b
-        })?)
-    } else {
-        Arc::new(Vec::new())
-    };
-
-    let mut jobs: Vec<FgRowJob> = Vec::with_capacity(rows);
-    for row in 0..rows {
-        let band = (h - row * FG_BLOCK_SIZE).min(FG_BLOCK_SIZE);
-        let bh = (band + ss_y) >> ss_y;
-        jobs.push(FgRowJob {
-            row,
-            band,
-            bh,
-            y_dst: Vec::new(),
-            uv_dst: [Vec::new(), Vec::new()],
-        });
+    let (_, s0_stride) = get_plane(holder, 0);
+    let (_, s1_stride) = get_plane(holder, 1);
+    let (_, s2_stride) = get_plane(holder, 2);
+    let mut max_mismatch = 0usize;
+    if do_y && s0_stride != y_dst_stride {
+        max_mismatch = max_mismatch.max(FG_BLOCK_SIZE * y_dst_stride);
+    }
+    if do_u && s1_stride != u_dst_stride {
+        max_mismatch = max_mismatch.max(bh_alloc * u_dst_stride);
+    }
+    if do_v && s2_stride != v_dst_stride {
+        max_mismatch = max_mismatch.max(bh_alloc * v_dst_stride);
     }
 
-    let luts_arc = Arc::new(luts.to_vec());
-    let scaling_arc = Arc::new(scaling.to_vec());
+    let wave_size = pool.n_threads().min(rows).max(1);
+    let mut jobs: Vec<WaveJob> = (0..wave_size)
+        .map(|_| {
+            Ok(WaveJob {
+                row: 0,
+                band: 0,
+                bh: 0,
+                y_dst: if do_y {
+                    dolu_vec(FG_BLOCK_SIZE * y_dst_stride, 0u8)?
+                } else {
+                    Vec::new()
+                },
+                u_dst: if do_u {
+                    dolu_vec(bh_alloc * u_dst_stride, 0u8)?
+                } else {
+                    Vec::new()
+                },
+                v_dst: if do_v {
+                    dolu_vec(bh_alloc * v_dst_stride, 0u8)?
+                } else {
+                    Vec::new()
+                },
+                luma_pad: if pad_luma {
+                    dolu_vec(FG_BLOCK_SIZE * luma_pad_stride, 0u8)?
+                } else {
+                    Vec::new()
+                },
+            })
+        })
+        .collect::<crate::error::Result<Vec<_>>>()?;
+
+    let luts_arc = Arc::new(prep.luts);
+    let scaling_arc = Arc::new(prep.scaling);
     let fg_data = *data;
     let fgy_fn = dsp.fgy_32x32xn;
     let fguv_fns = dsp.fguv_32x32xn;
-    let y_w = Arc::clone(&y_arc);
-    let u_w = Arc::clone(&u_arc);
-    let v_w = Arc::clone(&v_arc);
-    let luma_w = Arc::clone(&luma_arc);
+    let scratch_pool = Arc::new(pool.handle());
 
-    let res = pool.execute_tasks(&mut jobs, move |_wid, _idx, job: &mut FgRowJob| {
-        if do_y {
-            let off = job.row * FG_BLOCK_SIZE * y_stride;
-            let len = job.band * y_stride;
-            let mut y_dst = dolu_vec(len, 0u8)?;
-            y_dst.copy_from_slice(&y_w[off..off + len]);
-            job.y_dst = y_dst;
-            crate::dsp::profil_olc!(
-                FgY,
-                (fgy_fn)(
-                    &mut job.y_dst,
-                    &y_w[off..off + len],
-                    y_stride,
-                    &fg_data,
-                    w,
-                    &scaling_arc[0],
-                    &luts_arc[0],
-                    job.band,
-                    job.row,
-                    bd,
-                )
-            );
+    for wave_start in (0..rows).step_by(wave_size) {
+        let count = (rows - wave_start).min(wave_size);
+        if jobs.len() > count {
+            jobs.truncate(count);
         }
-        if let Some(l) = layout.filter(|_| do_uv) {
-            let fguv_fn = fguv_fns[l.index()];
-            let loff = job.row * FG_BLOCK_SIZE * luma_stride;
-            let luma_slice = &luma_w[loff..];
-            for (pl, (do_pl, c_stride, c_src)) in [
-                (do_u, u_stride, u_w.as_slice()),
-                (do_v, v_stride, v_w.as_slice()),
-            ]
-            .into_iter()
-            .enumerate()
-            {
-                if !do_pl || c_stride == 0 {
-                    continue;
-                }
-                let off = (job.row * FG_BLOCK_SIZE * c_stride) >> ss_y;
-                let len = job.bh * c_stride;
-                let mut uv_dst = dolu_vec(len, 0u8)?;
-                uv_dst.copy_from_slice(&c_src[off..off + len]);
-                job.uv_dst[pl] = uv_dst;
-                let si = if fg_data.chroma_scaling_from_luma {
-                    0
+        for (i, job) in jobs.iter_mut().enumerate() {
+            let row = wave_start + i;
+            let band = (h - row * FG_BLOCK_SIZE).min(FG_BLOCK_SIZE);
+            job.row = row;
+            job.band = band;
+            job.bh = (band + ss_y) >> ss_y;
+        }
+
+        let holder_w = Arc::clone(holder);
+        let luts_w = Arc::clone(&luts_arc);
+        let scaling_w = Arc::clone(&scaling_arc);
+        let sp_w = Arc::clone(&scratch_pool);
+        pool.execute_tasks(&mut jobs, move |wid, _idx, job: &mut WaveJob| {
+            let y0 = job.row * FG_BLOCK_SIZE;
+            let (src_y, src_y_stride) = get_plane(&holder_w, 0);
+            sp_w.scratch().with_scratch(wid, |ws| {
+                let tmp = if max_mismatch > 0 {
+                    ws.ensure_bytes(max_mismatch)?
                 } else {
-                    1 + pl
+                    &mut [][..]
                 };
-                crate::dsp::profil_olc!(
-                    FgUv,
-                    (fguv_fn)(
-                        &mut job.uv_dst[pl],
-                        &c_src[off..off + len],
-                        c_stride,
-                        &fg_data,
-                        cpw,
-                        &scaling_arc[si],
-                        &luts_arc[1 + pl],
-                        job.bh,
-                        job.row,
-                        luma_slice,
-                        luma_stride,
-                        pl,
-                        is_id,
-                        bd,
-                    )
+                if do_y && y_dst_stride > 0 {
+                    let row_bytes = w * bpp;
+                    let src_off = y0 * src_y_stride;
+                    let src_ref: &[u8] = if src_y_stride == y_dst_stride {
+                        &src_y[src_off..]
+                    } else {
+                        for r in 0..job.band {
+                            let d = r * y_dst_stride;
+                            let s = src_off + r * src_y_stride;
+                            tmp[d..d + row_bytes].copy_from_slice(&src_y[s..s + row_bytes]);
+                        }
+                        &tmp[..job.band * y_dst_stride]
+                    };
+                    crate::dsp::profil_olc!(
+                        FgY,
+                        (fgy_fn)(
+                            &mut job.y_dst[..job.band * y_dst_stride],
+                            src_ref,
+                            y_dst_stride,
+                            &fg_data,
+                            w,
+                            &scaling_w[0],
+                            &luts_w[0],
+                            job.band,
+                            job.row,
+                            bd,
+                        )
+                    );
+                }
+                if let Some(l) = layout.filter(|_| do_u || do_v) {
+                    let fguv_fn = fguv_fns[l.index()];
+                    let (luma_ref, lstride): (&[u8], usize) = if pad_luma {
+                        fill_luma_strip(
+                            &mut job.luma_pad,
+                            luma_pad_stride,
+                            src_y,
+                            src_y_stride,
+                            y0,
+                            job.band,
+                            w,
+                            bpp,
+                            true,
+                        );
+                        (&job.luma_pad, luma_pad_stride)
+                    } else {
+                        (&src_y[y0 * src_y_stride..], src_y_stride)
+                    };
+                    let row_bytes_uv = cpw * bpp;
+                    for pl in 0..2 {
+                        let (active, dst_stride, dst_buf) = if pl == 0 {
+                            (do_u, u_dst_stride, &mut job.u_dst)
+                        } else {
+                            (do_v, v_dst_stride, &mut job.v_dst)
+                        };
+                        if !active || dst_stride == 0 {
+                            continue;
+                        }
+                        let (src_c, src_c_stride) = get_plane(&holder_w, 1 + pl);
+                        let src_off = (y0 * src_c_stride) >> ss_y;
+                        let src_ref: &[u8] = if src_c_stride == dst_stride {
+                            &src_c[src_off..]
+                        } else {
+                            for r in 0..job.bh {
+                                let d = r * dst_stride;
+                                let s = src_off + r * src_c_stride;
+                                tmp[d..d + row_bytes_uv]
+                                    .copy_from_slice(&src_c[s..s + row_bytes_uv]);
+                            }
+                            &tmp[..job.bh * dst_stride]
+                        };
+                        let si = if fg_data.chroma_scaling_from_luma {
+                            0
+                        } else {
+                            1 + pl
+                        };
+                        crate::dsp::profil_olc!(
+                            FgUv,
+                            (fguv_fn)(
+                                &mut dst_buf[..job.bh * dst_stride],
+                                src_ref,
+                                dst_stride,
+                                &fg_data,
+                                cpw,
+                                &scaling_w[si],
+                                &luts_w[1 + pl],
+                                job.bh,
+                                job.row,
+                                luma_ref,
+                                lstride,
+                                pl,
+                                is_id,
+                                bd,
+                            )
+                        );
+                    }
+                }
+                Ok(())
+            })
+        })?;
+
+        for job in &jobs {
+            let y0 = job.row * FG_BLOCK_SIZE;
+            if do_y && let Some(y_out) = out.plane_mut(PlaneType::Y) {
+                copy_rows_to_frame(
+                    y_out.data_mut(),
+                    y0 * y_dst_stride,
+                    y_dst_stride,
+                    &job.y_dst,
+                    job.band,
+                    w * bpp,
                 );
             }
-        }
-        Ok(())
-    });
-
-    drop(luma_arc);
-    if let Some(p) = out.plane_mut(PlaneType::Y) {
-        p.put_data(Arc::try_unwrap(y_arc).unwrap_or_else(|a| (*a).clone()));
-    }
-    if let Some(p) = out.plane_mut(PlaneType::U) {
-        p.put_data(Arc::try_unwrap(u_arc).unwrap_or_else(|a| (*a).clone()));
-    }
-    if let Some(p) = out.plane_mut(PlaneType::V) {
-        p.put_data(Arc::try_unwrap(v_arc).unwrap_or_else(|a| (*a).clone()));
-    }
-    res?;
-
-    for job in jobs {
-        if do_y && let Some(y_out) = out.plane_mut(PlaneType::Y) {
-            let off = job.row * FG_BLOCK_SIZE * y_stride;
-            let len = job.band * y_stride;
-            y_out.data_mut()[off..off + len].copy_from_slice(&job.y_dst);
-        }
-        if do_u && let Some(u_out) = out.plane_mut(PlaneType::U) {
-            let off = (job.row * FG_BLOCK_SIZE * u_stride) >> ss_y;
-            let len = job.bh * u_stride;
-            u_out.data_mut()[off..off + len].copy_from_slice(&job.uv_dst[0]);
-        }
-        if do_v && let Some(v_out) = out.plane_mut(PlaneType::V) {
-            let off = (job.row * FG_BLOCK_SIZE * v_stride) >> ss_y;
-            let len = job.bh * v_stride;
-            v_out.data_mut()[off..off + len].copy_from_slice(&job.uv_dst[1]);
+            if do_u && let Some(u_out) = out.plane_mut(PlaneType::U) {
+                copy_rows_to_frame(
+                    u_out.data_mut(),
+                    (y0 * u_dst_stride) >> ss_y,
+                    u_dst_stride,
+                    &job.u_dst,
+                    job.bh,
+                    cpw * bpp,
+                );
+            }
+            if do_v && let Some(v_out) = out.plane_mut(PlaneType::V) {
+                copy_rows_to_frame(
+                    v_out.data_mut(),
+                    (y0 * v_dst_stride) >> ss_y,
+                    v_dst_stride,
+                    &job.v_dst,
+                    job.bh,
+                    cpw * bpp,
+                );
+            }
         }
     }
     Ok(())
@@ -720,6 +1668,85 @@ mod tests {
             )
             .expect("grain mt");
             assert_eq!(out, out_mt);
+
+            // Yerinde (`apply_grain_in_place`) tek ve çok iş parçacıklı şerit
+            // sentezi `apply_grain` ile bit-birebir özdeş olmalıdır.
+            let mut f_in_place_st = f.clone();
+            apply_grain_in_place(
+                &mut f_in_place_st,
+                &data(),
+                false,
+                &FgDsp::scalar_for(fg_bd),
+                None,
+                &crate::frame::butce::Butce::sinirsiz(),
+                &crate::thread::WorkerPool::new(1),
+            )
+            .expect("in_place st");
+            assert_eq!(f_in_place_st, out);
+
+            let mut f_in_place_mt = f.clone();
+            apply_grain_in_place(
+                &mut f_in_place_mt,
+                &data(),
+                false,
+                &FgDsp::scalar_for(fg_bd),
+                None,
+                &crate::frame::butce::Butce::sinirsiz(),
+                &crate::thread::WorkerPool::new(4),
+            )
+            .expect("in_place mt");
+            assert_eq!(f_in_place_mt, out);
+
+            // `PicBuf` kaynaklı (`apply_grain_from_pic_mut`) tek geçişli sentez
+            // (`128` hizalı `PicBuf` adımı ≠ `64` hizalı `Frame` adımı dâhil)
+            // bit-birebir özdeş olmalıdır.
+            let bpp = bd.bytes_per_sample();
+            let mut pic = crate::decode::intra::PicBuf::new(
+                37,
+                35,
+                chroma,
+                bd,
+                &crate::frame::butce::Butce::sinirsiz(),
+            )
+            .expect("pic");
+            for (idx, p) in [PlaneType::Y, PlaneType::U, PlaneType::V]
+                .into_iter()
+                .enumerate()
+            {
+                if let Some(pl) = f.plane(p) {
+                    let rb = pl.width() * bpp;
+                    for y in 0..pl.height() {
+                        let s = y * pl.stride();
+                        let d = y * pic.stride[idx];
+                        pic.data[idx][d..d + rb].copy_from_slice(&pl.data()[s..s + rb]);
+                    }
+                }
+            }
+            for nth in [1usize, 4] {
+                let out_pic = apply_grain_from_pic_mut(
+                    &mut pic,
+                    chroma,
+                    bd,
+                    &data(),
+                    false,
+                    &FgDsp::scalar_for(fg_bd),
+                    None,
+                    [Vec::new(), Vec::new(), Vec::new()],
+                    &crate::frame::butce::Butce::sinirsiz(),
+                    &crate::thread::WorkerPool::new(nth),
+                )
+                .expect("from_pic");
+                assert_eq!(out_pic.metadata(), out.metadata());
+                assert_eq!(out_pic.plane_count(), out.plane_count());
+                for p in [PlaneType::Y, PlaneType::U, PlaneType::V] {
+                    if let (Some(a), Some(b)) = (out_pic.plane(p), out.plane(p)) {
+                        assert_eq!(a.layout(), b.layout());
+                        for y in 0..a.height() {
+                            assert_eq!(a.row(y), b.row(y), "from_pic nth={nth} p={p:?} y={y}");
+                        }
+                    }
+                }
+            }
         }
     }
 

@@ -97,15 +97,12 @@ impl Frame {
         Self::new_in(width, height, chroma_format, bit_depth, &butce)
     }
 
-    /// [`Frame::new_bounded`]'ın defterli biçimi: kare toplamı tek parça olarak
-    /// `butce`'ye yazılır (aşımda hiçbir düzlem ayrılmaz).
-    pub(crate) fn new_in(
+    fn compute_layouts_and_total(
         width: usize,
         height: usize,
         chroma_format: ChromaFormat,
         bit_depth: BitDepth,
-        butce: &Butce,
-    ) -> Result<Self> {
+    ) -> Result<(Vec<(PlaneType, PlaneLayout)>, usize)> {
         if width == 0 || height == 0 {
             return Err(Error::InvalidArgument(
                 "kare boyutu sıfır olamaz (genişlik ve yükseklik ≥ 1)",
@@ -115,7 +112,6 @@ impl Frame {
         let align = PlaneLayout::DEFAULT_ALIGN;
         let padding = PlaneLayout::DEFAULT_PADDING;
 
-        // 1) Tüm düzlemlerin yerleşimini hesapla (tahsis yok).
         let mut layouts: Vec<(PlaneType, PlaneLayout)> =
             Vec::with_capacity(chroma_format.num_planes());
         layouts.push((
@@ -133,7 +129,6 @@ impl Frame {
             }
         }
 
-        // 2) Toplamı taşmadan hesapla ve bütçeyi denetle.
         let mut total: usize = 0;
         for (_, layout) in &layouts {
             total = total
@@ -144,14 +139,80 @@ impl Frame {
                     rhs: layout.total(),
                 })?;
         }
+        Ok((layouts, total))
+    }
+
+    /// Verilen boyut ve biçimdeki karenin düzlem yerleşim bayt uzunlukları (`[Y, U, V]`)
+    /// ve toplam tahsis baytı.
+    pub(crate) fn plane_byte_lens_and_total(
+        width: usize,
+        height: usize,
+        chroma_format: ChromaFormat,
+        bit_depth: BitDepth,
+    ) -> Result<([usize; 3], usize)> {
+        let (layouts, total) =
+            Self::compute_layouts_and_total(width, height, chroma_format, bit_depth)?;
+        let mut lens = [0usize; 3];
+        for (i, (_, layout)) in layouts.iter().enumerate() {
+            lens[i] = layout.total();
+        }
+        Ok((lens, total))
+    }
+
+    /// [`Frame::new_bounded`]'ın defterli biçimi: kare toplamı tek parça olarak
+    /// `butce`'ye yazılır (aşımda hiçbir düzlem ayrılmaz).
+    pub(crate) fn new_in(
+        width: usize,
+        height: usize,
+        chroma_format: ChromaFormat,
+        bit_depth: BitDepth,
+        butce: &Butce,
+    ) -> Result<Self> {
+        let (layouts, total) =
+            Self::compute_layouts_and_total(width, height, chroma_format, bit_depth)?;
         butce.ayir(total)?;
 
-        // 3) Ancak şimdi ayır (düşebilir).
         let planes = layouts
             .into_iter()
             .map(|(plane, layout)| FramePlane::from_layout(plane, layout))
-            .collect::<Result<Vec<_>>>()?;
+            .collect::<Result<Vec<_>>>()
+            .inspect_err(|_| butce.birak(total))?;
 
+        Ok(Self {
+            planes,
+            chroma_format,
+            bit_depth,
+            width,
+            height,
+            metadata: FrameMetadata::new(),
+        })
+    }
+
+    /// Referans olarak saklanmayan (`refresh_frame_flags == 0`) bir `PicBuf`
+    /// üçlüsünü sıfır ek tahsisle yerinde (`in-place`) [`Frame`]'e dönüştürür (`4.A.1`).
+    /// Bütçe muhasebesi çağıran tarafından yönetilir.
+    pub(crate) fn from_owned_pic(
+        width: usize,
+        height: usize,
+        chroma_format: ChromaFormat,
+        bit_depth: BitDepth,
+        mut pic_data: [Vec<u8>; 3],
+        pic_stride: [usize; 3],
+        allow_reuse: bool,
+    ) -> Result<Self> {
+        let (layouts, _) =
+            Self::compute_layouts_and_total(width, height, chroma_format, bit_depth)?;
+        let mut planes = Vec::with_capacity(layouts.len());
+        for (i, (plane, layout)) in layouts.into_iter().enumerate() {
+            let buf = core::mem::take(&mut pic_data[i]);
+            planes.push(FramePlane::from_owned_pic_buf(
+                plane,
+                layout,
+                buf,
+                pic_stride[i],
+                allow_reuse,
+            )?);
+        }
         Ok(Self {
             planes,
             chroma_format,
@@ -178,42 +239,8 @@ impl Frame {
         butce: &Butce,
         pool: &crate::thread::WorkerPool,
     ) -> Result<Self> {
-        if width == 0 || height == 0 {
-            return Err(Error::InvalidArgument(
-                "kare boyutu sıfır olamaz (genişlik ve yükseklik ≥ 1)",
-            ));
-        }
-
-        let align = PlaneLayout::DEFAULT_ALIGN;
-        let padding = PlaneLayout::DEFAULT_PADDING;
-
-        let mut layouts: Vec<(PlaneType, PlaneLayout)> =
-            Vec::with_capacity(chroma_format.num_planes());
-        layouts.push((
-            PlaneType::Y,
-            PlaneLayout::compute(width, height, bit_depth, align, padding)?,
-        ));
-        if let Some((chroma_width, chroma_height)) =
-            chroma_format.chroma_dimensions(width, height)?
-        {
-            for plane in [PlaneType::U, PlaneType::V] {
-                layouts.push((
-                    plane,
-                    PlaneLayout::compute(chroma_width, chroma_height, bit_depth, align, padding)?,
-                ));
-            }
-        }
-
-        let mut total: usize = 0;
-        for (_, layout) in &layouts {
-            total = total
-                .checked_add(layout.total())
-                .ok_or(Error::SizeOverflow {
-                    stage: SizeStage::TotalAllocation,
-                    lhs: total,
-                    rhs: layout.total(),
-                })?;
-        }
+        let (layouts, total) =
+            Self::compute_layouts_and_total(width, height, chroma_format, bit_depth)?;
         butce.ayir(total)?;
 
         let allow_reuse = !butce.has_limit();
@@ -296,6 +323,158 @@ impl Frame {
         })
     }
 
+    /// Paylaşılan (`Arc<P>`) salt-okunur yeniden kurulum düzlemlerinden çıktı
+    /// [`Frame`]'ini oluşturur (`show_existing_frame` ve boru hattı referans yolu).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new_from_shared_pic_in<P>(
+        width: usize,
+        height: usize,
+        chroma_format: ChromaFormat,
+        bit_depth: BitDepth,
+        holder: &std::sync::Arc<P>,
+        get_plane: fn(&P, usize) -> (&[u8], usize),
+        mut recycled: [Vec<u8>; 3],
+        butce: &Butce,
+        pool: &crate::thread::WorkerPool,
+    ) -> Result<Self>
+    where
+        P: Send + Sync + 'static,
+    {
+        let (layouts, total) =
+            Self::compute_layouts_and_total(width, height, chroma_format, bit_depth)?;
+        butce.ayir(total)?;
+
+        let allow_reuse = !butce.has_limit();
+        let mut planes = Vec::with_capacity(layouts.len());
+        if pool.is_parallel() && layouts.len() > 1 && width.saturating_mul(height) >= 1920 * 1080 {
+            struct SharedCopyJob {
+                idx: usize,
+                plane: PlaneType,
+                layout: PlaneLayout,
+                recycled: Vec<u8>,
+                out: Option<FramePlane>,
+            }
+            let mut jobs: Vec<SharedCopyJob> = layouts
+                .into_iter()
+                .enumerate()
+                .map(|(i, (plane, layout))| SharedCopyJob {
+                    idx: i,
+                    plane,
+                    layout,
+                    recycled: core::mem::take(&mut recycled[i]),
+                    out: None,
+                })
+                .collect();
+            let holder_w = std::sync::Arc::clone(holder);
+            let res = pool.execute_tasks(&mut jobs, move |_wid, _idx, job: &mut SharedCopyJob| {
+                let buf = core::mem::take(&mut job.recycled);
+                let (src, src_stride) = get_plane(&holder_w, job.idx);
+                let p = FramePlane::from_layout_with_pic(
+                    job.plane,
+                    job.layout,
+                    buf,
+                    src,
+                    src_stride,
+                    allow_reuse,
+                )?;
+                job.out = Some(p);
+                Ok(())
+            });
+            if let Err(err) = res {
+                butce.birak(total);
+                return Err(err);
+            }
+            for job in jobs {
+                if let Some(p) = job.out {
+                    planes.push(p);
+                }
+            }
+        } else {
+            for (i, (plane, layout)) in layouts.into_iter().enumerate() {
+                let buf = core::mem::take(&mut recycled[i]);
+                let (src, src_stride) = get_plane(holder, i);
+                match FramePlane::from_layout_with_pic(
+                    plane,
+                    layout,
+                    buf,
+                    src,
+                    src_stride,
+                    allow_reuse,
+                ) {
+                    Ok(p) => planes.push(p),
+                    Err(err) => {
+                        butce.birak(total);
+                        return Err(err);
+                    }
+                }
+            }
+        }
+
+        Ok(Self {
+            planes,
+            chroma_format,
+            bit_depth,
+            width,
+            height,
+            metadata: FrameMetadata::new(),
+        })
+    }
+
+    /// Doğrudan `PicBuf` kaynaklı Film Grain sentezi için çıktı [`Frame`]'i hazırlar:
+    /// `write_mask[i] == true` olan düzlemlerde kaynak kopyalaması yapmadan yalnız
+    /// satır/kuyruk dolgusunu sıfırlar; `write_mask[i] == false` olan düzlemleri
+    /// `pic_data[i]`'den kopyalar (`4.A.1`).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new_for_grain_from_pic_in(
+        width: usize,
+        height: usize,
+        chroma_format: ChromaFormat,
+        bit_depth: BitDepth,
+        pic_data: &[Vec<u8>; 3],
+        pic_stride: [usize; 3],
+        write_mask: [bool; 3],
+        mut recycled: [Vec<u8>; 3],
+        butce: &Butce,
+    ) -> Result<Self> {
+        let (layouts, total) =
+            Self::compute_layouts_and_total(width, height, chroma_format, bit_depth)?;
+        butce.ayir(total)?;
+
+        let allow_reuse = !butce.has_limit();
+        let mut planes = Vec::with_capacity(layouts.len());
+        for (i, (plane, layout)) in layouts.into_iter().enumerate() {
+            let buf = core::mem::take(&mut recycled[i]);
+            let res = if write_mask[i] {
+                FramePlane::from_layout_for_grain(plane, layout, buf, allow_reuse)
+            } else {
+                FramePlane::from_layout_with_pic(
+                    plane,
+                    layout,
+                    buf,
+                    &pic_data[i],
+                    pic_stride[i],
+                    allow_reuse,
+                )
+            };
+            match res {
+                Ok(p) => planes.push(p),
+                Err(err) => {
+                    butce.birak(total);
+                    return Err(err);
+                }
+            }
+        }
+
+        Ok(Self {
+            planes,
+            chroma_format,
+            bit_depth,
+            width,
+            height,
+            metadata: FrameMetadata::new(),
+        })
+    }
+
     /// Luma genişliği (örnek).
     #[must_use]
     pub const fn width(&self) -> usize {
@@ -330,6 +509,11 @@ impl Frame {
     #[must_use]
     pub fn planes(&self) -> &[FramePlane] {
         &self.planes
+    }
+
+    /// Düzlemler, Y-U-V sırasında (değiştirilebilir, iç şerit işlemleri için).
+    pub(crate) fn planes_mut(&mut self) -> &mut [FramePlane] {
+        &mut self.planes
     }
 
     /// Tek düzlem; biçimde yoksa (monochrome'da U/V) `None`.
@@ -410,11 +594,6 @@ impl Frame {
             height: self.height,
             metadata: self.metadata,
         })
-    }
-
-    /// Düzlem depolarını havuza geri dönüştürmek üzere söküp verir (`F8b-1`).
-    pub(crate) fn into_plane_bufs(self) -> Vec<Vec<u8>> {
-        self.planes.into_iter().map(FramePlane::into_data).collect()
     }
 }
 

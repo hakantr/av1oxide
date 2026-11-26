@@ -58,7 +58,7 @@ use crate::entropy::cdf_layout as layout;
 use crate::entropy::msac::{MsacContext, ulog2};
 use crate::error::{Error, Result, SizeStage};
 use crate::frame::butce::Butce;
-use crate::frame::{BitDepth, ChromaFormat, Frame, PlaneType};
+use crate::frame::{BitDepth, ChromaFormat};
 use crate::tables::decode as t;
 use std::sync::{Arc, OnceLock};
 
@@ -446,9 +446,7 @@ impl PicBuf {
 /// dav1d `Dav1dThreadPicture` + `c->refs[i]` (piksel, `frame_hdr`, `cdf`,
 /// `segmap`, `refmvs`, `refpoc`) alanlarının Rust karşılığıdır.
 pub(crate) struct RefFrame {
-    /// Görünür alan kopyası (`show_existing_frame` çıktısı için).
-    pub frame: Frame,
-    /// 128'e hizalanmış yeniden kurulum tamponu (MC kaynağı).
+    /// 128'e hizalanmış yeniden kurulum tamponu (MC ve `show_existing_frame` kaynağı).
     pub pic: PicBuf,
     /// Kare başlığı (referans doğrulama, `svc`, `gmv`).
     pub hdr: FrameHeader,
@@ -478,13 +476,10 @@ pub(crate) struct RefFrame {
 
 impl RefFrame {
     /// dav1d `dav1d_thread_picture_ref` + `c->refs[i]`: çözülen karenin
-    /// durumu yuvaya **taşınır** (P38: kopya yok; tepe bellek bir kare az).
+    /// durumu yuvaya **taşınır** (P38 / `4.A.1`: ikincil `Frame` kopyası yok).
     #[must_use]
     pub fn from_decoded(decoded: DecodedFrame, hdr: FrameHeader, mc_identity: bool) -> Self {
-        let chroma = decoded.frame.chroma_format();
-        let bd = decoded.frame.bit_depth();
         Self {
-            frame: decoded.frame,
             pic: decoded.pic,
             hdr,
             cdf: decoded.cdf,
@@ -493,17 +488,16 @@ impl RefFrame {
             tmvs_stride: decoded.tmvs_stride,
             refpoc: decoded.refpoc,
             bh: decoded.bh,
-            chroma,
-            bd,
+            chroma: decoded.chroma,
+            bd: decoded.bd,
             mc_identity,
         }
     }
 
     /// Bütçe defterinde sayılan bayt: yapının kendisi (CDF ve başlık dâhil,
-    /// `Rc` ayırması) + piksel, segment ve temporal MV depoları.
+    /// `Arc` ayırması) + piksel, segment ve temporal MV depoları.
     pub(crate) fn bayt(&self) -> usize {
         core::mem::size_of::<Self>()
-            + self.frame.allocation_bytes()
             + self.pic.bayt()
             + self.segmap.len()
             + core::mem::size_of_val(self.tmvs.as_slice())
@@ -514,19 +508,20 @@ impl DecodedFrame {
     /// Yuvaya taşınınca [`RefFrame::bayt`] ile aynı sayıyı verir.
     pub(crate) fn bayt(&self) -> usize {
         core::mem::size_of::<RefFrame>()
-            + self.frame.allocation_bytes()
             + self.pic.bayt()
             + self.segmap.len()
             + core::mem::size_of_val(self.tmvs.as_slice())
     }
 }
 
-/// Bir karenin çözüm çıktısı: görünür kare + referans olarak saklanacak durum.
+/// Bir karenin çözüm çıktısı: yeniden kurulum tamponu + referans durumu.
 pub(crate) struct DecodedFrame {
-    /// Görünür alan (API çıktısı).
-    pub frame: Frame,
-    /// Yeniden kurulum tamponu (referans).
+    /// Yeniden kurulum tamponu (referans veya yerinde çıktı).
     pub pic: PicBuf,
+    /// Piksel düzeni.
+    pub chroma: ChromaFormat,
+    /// Bit derinliği.
+    pub bd: BitDepth,
     /// Kare sonu CDF'si.
     pub cdf: CdfContext,
     /// Segment haritası.
@@ -913,7 +908,7 @@ impl Scratch {
     }
 }
 
-/// Kareler arası geçici çalışma tamponları paketi (`F8b-1`).
+/// Kareler arası geçici çalışma tamponları paketi (`F8b-1` / `4.A.1`).
 #[derive(Default)]
 struct WorkFrameBufs {
     lf: Option<crate::decode::loopfilter::LfFrame>,
@@ -923,41 +918,67 @@ struct WorkFrameBufs {
     scratch: Option<Scratch>,
     refmvs_grid: Vec<crate::decode::refmvs::RefBlock>,
     refmvs_rp_proj: Vec<TemporalBlock>,
-    pre_cdef: Option<[Vec<u8>; 3]>,
+    lr_cdef_backup: Option<[Vec<u8>; 3]>,
 }
 
 struct BufPoolInner {
     work_bufs: Vec<WorkFrameBufs>,
     u8_vecs: Vec<Vec<u8>>,
+    segmap_vecs: Vec<Vec<u8>>,
     tmvs_vecs: Vec<Vec<TemporalBlock>>,
 }
 
-const MAX_POOLED_WORK_BUFS: usize = 12;
-const MAX_POOLED_U8_VECS: usize = 64;
-const MAX_POOLED_TMVS_VECS: usize = 12;
-
-/// Kareler arası sınırlı tampon geri dönüşüm havuzu (`F8b-1`, `%100 #![forbid(unsafe_code)]`).
+/// Kareler arası sınırlı tampon geri dönüşüm havuzu (`F8b-1` / `4.A.1`, `%100 #![forbid(unsafe_code)]`).
 ///
 /// Kare çözümü sonunda düşen çalışma tamponlarını (`LfFrame`, `Blocks`, `CdefState`,
-/// `LrState::mask`, `Scratch`, `RefMvs::grid` ve `rp_proj`, `pre_cdef`) ve referans
-/// penceresinden düşen `RefFrame` düzlem/segmap/tmvs vektörlerini sabit kapasiteyle
-/// saklayarak işletim sistemine tekrar tekrar `mmap`/`munmap` + sayfa sıfırlama
-/// çağrısı yapılmasını önler.
+/// `LrState::mask`, `Scratch`, `RefMvs::grid` ve `rp_proj`, `LrCdefBackup`) ve referans
+/// penceresinden düşen `RefFrame` düzlem/segmap/tmvs vektörlerini iş parçacığı sayısına
+/// orantılı sabit kapasiteyle saklayarak işletim sistemine tekrar tekrar `mmap`/`munmap`
+/// + sayfa sıfırlama çağrısı yapılmasını önler.
 ///
 /// `Config::allocation_limit` (`butce.has_limit() == true`) etkin olduğunda havuz
 /// devre dışı bırakılır; böylece boşta bekleyen hiçbir tampon bütçe sınırını
 /// daraltmaz.
 pub(crate) struct DecodeBufPool {
+    max_work_bufs: usize,
+    max_u8_vecs: usize,
+    max_segmap_vecs: usize,
+    max_tmvs_vecs: usize,
     inner: crate::sync::Mutex<BufPoolInner>,
 }
 
 impl DecodeBufPool {
-    pub(crate) fn new() -> Self {
+    pub(crate) fn new(n_threads: usize) -> Self {
+        let max_work_bufs = if n_threads <= 1 {
+            2
+        } else {
+            n_threads.clamp(2, 8)
+        };
+        let max_u8_vecs = if n_threads <= 1 {
+            9
+        } else {
+            (n_threads * 3).clamp(9, 24)
+        };
+        let max_segmap_vecs = if n_threads <= 1 {
+            4
+        } else {
+            (n_threads * 2).clamp(4, 12)
+        };
+        let max_tmvs_vecs = if n_threads <= 1 {
+            2
+        } else {
+            n_threads.clamp(2, 8)
+        };
         Self {
+            max_work_bufs,
+            max_u8_vecs,
+            max_segmap_vecs,
+            max_tmvs_vecs,
             inner: crate::sync::Mutex::new(BufPoolInner {
-                work_bufs: Vec::with_capacity(MAX_POOLED_WORK_BUFS),
-                u8_vecs: Vec::with_capacity(MAX_POOLED_U8_VECS),
-                tmvs_vecs: Vec::with_capacity(MAX_POOLED_TMVS_VECS),
+                work_bufs: Vec::with_capacity(max_work_bufs),
+                u8_vecs: Vec::with_capacity(max_u8_vecs),
+                segmap_vecs: Vec::with_capacity(max_segmap_vecs),
+                tmvs_vecs: Vec::with_capacity(max_tmvs_vecs),
             }),
         }
     }
@@ -966,6 +987,7 @@ impl DecodeBufPool {
         let mut g = self.inner.lock();
         g.work_bufs.clear();
         g.u8_vecs.clear();
+        g.segmap_vecs.clear();
         g.tmvs_vecs.clear();
     }
 
@@ -982,27 +1004,37 @@ impl DecodeBufPool {
             return;
         }
         let mut g = self.inner.lock();
-        if g.work_bufs.len() < MAX_POOLED_WORK_BUFS {
+        if g.work_bufs.len() < self.max_work_bufs {
             g.work_bufs.push(entry);
         }
     }
 
-    pub(crate) fn take_u8_vec(&self, len: usize, has_limit: bool) -> Vec<u8> {
+    pub(crate) fn take_segmap_vec(&self, len: usize, has_limit: bool) -> Vec<u8> {
         if has_limit || len == 0 {
             return Vec::new();
         }
         let mut g = self.inner.lock();
-        if let Some(pos) = g.u8_vecs.iter().rposition(|v| v.capacity() == len) {
-            return g.u8_vecs.swap_remove(pos);
+        if let Some(pos) = g.segmap_vecs.iter().rposition(|v| v.capacity() == len) {
+            return g.segmap_vecs.swap_remove(pos);
         }
         if let Some(pos) = g
-            .u8_vecs
+            .segmap_vecs
             .iter()
             .rposition(|v| v.capacity() >= len && v.capacity() <= len.saturating_mul(2))
         {
-            return g.u8_vecs.swap_remove(pos);
+            return g.segmap_vecs.swap_remove(pos);
         }
         Vec::new()
+    }
+
+    pub(crate) fn put_segmap_vec(&self, v: Vec<u8>, has_limit: bool) {
+        if has_limit || v.capacity() == 0 {
+            return;
+        }
+        let mut g = self.inner.lock();
+        if g.segmap_vecs.len() < self.max_segmap_vecs {
+            g.segmap_vecs.push(v);
+        }
     }
 
     pub(crate) fn take_u8_triple(&self, lens: [usize; 3], has_limit: bool) -> [Vec<u8>; 3] {
@@ -1034,7 +1066,7 @@ impl DecodeBufPool {
             return;
         }
         let mut g = self.inner.lock();
-        if g.u8_vecs.len() < MAX_POOLED_U8_VECS {
+        if g.u8_vecs.len() < self.max_u8_vecs {
             g.u8_vecs.push(v);
         }
     }
@@ -1054,25 +1086,50 @@ impl DecodeBufPool {
         Vec::new()
     }
 
+    pub(crate) fn recycle_segmap_tmvs(
+        &self,
+        segmap: Vec<u8>,
+        tmvs: Vec<TemporalBlock>,
+        has_limit: bool,
+    ) {
+        if has_limit {
+            return;
+        }
+        let mut g = self.inner.lock();
+        if segmap.capacity() > 0 && g.segmap_vecs.len() < self.max_segmap_vecs {
+            g.segmap_vecs.push(segmap);
+        }
+        if tmvs.capacity() > 0 && g.tmvs_vecs.len() < self.max_tmvs_vecs {
+            g.tmvs_vecs.push(tmvs);
+        }
+    }
+
+    pub(crate) fn recycle_pic(&self, pic: PicBuf, has_limit: bool) {
+        if has_limit {
+            return;
+        }
+        let mut g = self.inner.lock();
+        for v in pic.data {
+            if v.capacity() > 0 && g.u8_vecs.len() < self.max_u8_vecs {
+                g.u8_vecs.push(v);
+            }
+        }
+    }
+
     pub(crate) fn recycle_ref_frame(&self, rf: RefFrame, has_limit: bool) {
         if has_limit {
             return;
         }
         let mut g = self.inner.lock();
         for v in rf.pic.data {
-            if v.capacity() > 0 && g.u8_vecs.len() < MAX_POOLED_U8_VECS {
+            if v.capacity() > 0 && g.u8_vecs.len() < self.max_u8_vecs {
                 g.u8_vecs.push(v);
             }
         }
-        for v in rf.frame.into_plane_bufs() {
-            if v.capacity() > 0 && g.u8_vecs.len() < MAX_POOLED_U8_VECS {
-                g.u8_vecs.push(v);
-            }
+        if rf.segmap.capacity() > 0 && g.segmap_vecs.len() < self.max_segmap_vecs {
+            g.segmap_vecs.push(rf.segmap);
         }
-        if rf.segmap.capacity() > 0 && g.u8_vecs.len() < MAX_POOLED_U8_VECS {
-            g.u8_vecs.push(rf.segmap);
-        }
-        if rf.tmvs.capacity() > 0 && g.tmvs_vecs.len() < MAX_POOLED_TMVS_VECS {
+        if rf.tmvs.capacity() > 0 && g.tmvs_vecs.len() < self.max_tmvs_vecs {
             g.tmvs_vecs.push(rf.tmvs);
         }
     }
@@ -2013,7 +2070,7 @@ impl<'a> Dec<'a> {
             work_bufs.lf = old_lf;
             None
         };
-        let old_segmap = buf_pool.take_u8_vec(segmap_stride * segmap_height.max(1), has_limit);
+        let old_segmap = buf_pool.take_segmap_vec(segmap_stride * segmap_height.max(1), has_limit);
         crate::dsp::profil_bd!(bd);
         let mut dec = Self {
             seq,
@@ -9074,7 +9131,7 @@ pub(crate) fn decode_frame(
             // genişliğiyle (`ref_coded_width`, superres öncesi) sınanır.
             let ref_w = ((r.hdr.width[0] as usize + 7) >> 3) << 1;
             if ref_w == bw && r.bh == bh && r.segmap.len() >= stride * height {
-                let old_prev = buf_pool.take_u8_vec(stride * height, has_limit);
+                let old_prev = buf_pool.take_segmap_vec(stride * height, has_limit);
                 prev_segmap = Some(Arc::new(
                     butce.reuse_kopya(old_prev, &r.segmap[..stride * height])?,
                 ));
@@ -9131,14 +9188,20 @@ pub(crate) fn decode_frame(
         lf.apply(&mut dec.pic, hdr, dec.frame_no, dec.bdsp.lf(), pool);
     }
     // LR şerit sınırı satırları deblocking sonrası, CDEF öncesi piksellerdir
-    // (`dav1d_copy_lpf`, `lf_apply_tmpl.c:104-`); LR açıksa düzlemler saklanır.
-    let pre_cdef = match dec.lr {
-        Some(_) => {
+    // (`dav1d_copy_lpf`, `lf_apply_tmpl.c:104-`); tam kare yerine yalnız LR
+    // açık düzlemlerin 4-satırlık şerit sınırları saklanır (`4.A.1`).
+    let mut pre_cdef = match dec.lr.as_ref() {
+        Some(lr) => {
             let old_pre = work_bufs
-                .pre_cdef
+                .lr_cdef_backup
                 .take()
                 .unwrap_or_else(|| [Vec::new(), Vec::new(), Vec::new()]);
-            Some(dec.pic.try_clone_with_reuse(old_pre, butce)?.data)
+            Some(crate::decode::lr::LrCdefBackup::capture(
+                &dec.pic,
+                lr.restore_planes,
+                old_pre,
+                butce,
+            )?)
         }
         None => None,
     };
@@ -9167,7 +9230,6 @@ pub(crate) fn decode_frame(
     // şerit sınırı satırları da büyütülmüş CDEF öncesi satırlardan gelir
     // (`lf_apply_tmpl.c:64-77`). Referans yuvasına ve çıktıya büyütülmüş kare
     // gider (bkz. `decode::superres`).
-    let mut pre_cdef = pre_cdef;
     if hdr.width[0] != hdr.width[1] {
         let sr = crate::decode::superres::Superres::new(
             hdr.width[0] as usize,
@@ -9190,19 +9252,10 @@ pub(crate) fn decode_frame(
             pool,
         )?;
         let up_pre = pre_cdef
-            .as_mut()
+            .as_ref()
             .map(|pre| {
-                crate::decode::superres::upscale_planes(
-                    pre,
-                    coded_stride,
-                    height,
-                    bw,
-                    &sr,
-                    chroma,
-                    bd,
-                    kernel,
-                    butce,
-                    pool,
+                crate::decode::superres::upscale_lr_backup(
+                    pre, bw, &sr, chroma, bd, up.stride, kernel, butce,
                 )
             })
             .transpose()?;
@@ -9224,13 +9277,11 @@ pub(crate) fn decode_frame(
             buf_pool.put_u8_vec(v, has_limit);
         }
         if let Some(pre) = pre_cdef.take() {
-            butce.birak(pre.iter().map(Vec::len).sum());
-            for v in pre {
-                buf_pool.put_u8_vec(v, has_limit);
-            }
+            butce.birak(pre.bayt());
+            work_bufs.lr_cdef_backup = Some(pre.data);
         }
         dec.pic = up;
-        pre_cdef = up_pre.map(|p| p.data);
+        pre_cdef = up_pre;
         dec.tools.sr_frame = 1;
         dec.tools.sr_denom = u64::from(hdr.super_res.width_scale_denominator);
         dec.tools.sr_lr = u64::from(dec.lr.is_some());
@@ -9257,6 +9308,12 @@ pub(crate) fn decode_frame(
             pool,
         )?;
     }
+    if let Some(pre) = pre_cdef.take() {
+        butce.birak(pre.bayt());
+        if work_bufs.lr_cdef_backup.is_none() {
+            work_bufs.lr_cdef_backup = Some(pre.data);
+        }
+    }
     // --- kare sonu CDF (dav1d `decode.c:3317-3320`) -----------------------
     let cdf_out = if hdr.refresh_context {
         let mut out = cdf_in.clone();
@@ -9280,51 +9337,22 @@ pub(crate) fn decode_frame(
     }
 
     let bpp = dec.bd.bytes_per_sample();
-    let frame_lens = {
-        let align = crate::PlaneLayout::DEFAULT_ALIGN;
-        let pad = crate::PlaneLayout::DEFAULT_PADDING;
-        let y_len = crate::PlaneLayout::compute(dec.pic.width, dec.pic.height, dec.bd, align, pad)
-            .map_or(0, |l| l.total());
-        let uv_len = dec
-            .chroma
-            .chroma_dimensions(dec.pic.width, dec.pic.height)
-            .ok()
-            .flatten()
-            .and_then(|(cw, ch)| crate::PlaneLayout::compute(cw, ch, dec.bd, align, pad).ok())
-            .map_or(0, |l| l.total());
-        [y_len, uv_len, uv_len]
-    };
-    let recycled_frame_bufs = buf_pool.take_u8_triple(frame_lens, has_limit);
-    let frame = Frame::new_from_pic_in(
-        dec.pic.width,
-        dec.pic.height,
-        dec.chroma,
-        dec.bd,
-        &mut dec.pic.data,
-        dec.pic.stride,
-        recycled_frame_bufs,
-        butce,
-        pool,
-    )?;
     if probe::enabled() {
         let mut hash = 0xcbf2_9ce4_8422_2325u64;
         let mut bytes = 0u64;
-        for (pl, plane_type) in [PlaneType::Y, PlaneType::U, PlaneType::V]
-            .into_iter()
-            .enumerate()
-        {
-            if pl >= dec.frame_plane_count() {
-                break;
-            }
-            let Some(plane) = frame.plane(plane_type) else {
-                continue;
+        let n_planes = dec.frame_plane_count();
+        for pl in 0..n_planes {
+            let (pw, ph) = if pl == 0 {
+                (dec.pic.width, dec.pic.height)
+            } else {
+                (dec.pic.cw, dec.pic.ch)
             };
-            let row_bytes = plane.width() * bpp;
-            for y in 0..plane.height() {
-                let Some(row) = frame.plane(plane_type).and_then(|p| p.row(y)) else {
-                    continue;
-                };
-                for &v in &row[..row_bytes] {
+            let row_bytes = pw * bpp;
+            let stride = dec.pic.stride[pl];
+            let plane_data = &dec.pic.data[pl];
+            for y in 0..ph {
+                let row = &plane_data[y * stride..y * stride + row_bytes];
+                for &v in row {
                     hash ^= u64::from(v);
                     hash = hash.wrapping_mul(0x100_0000_01b3);
                 }
@@ -9350,7 +9378,7 @@ pub(crate) fn decode_frame(
     if let Some(arc) = dec.prev_segmap.take()
         && let Ok(v) = Arc::try_unwrap(arc)
     {
-        buf_pool.put_u8_vec(v, has_limit);
+        buf_pool.put_segmap_vec(v, has_limit);
     }
     work_bufs.lf = dec.lf.take();
     work_bufs.blocks = Some(dec.blocks);
@@ -9363,15 +9391,13 @@ pub(crate) fn decode_frame(
     if let Ok(rp) = Arc::try_unwrap(dec.refmvs.rp_proj) {
         work_bufs.refmvs_rp_proj = rp;
     }
-    if let Some(pre) = pre_cdef {
-        work_bufs.pre_cdef = Some(pre);
-    }
     buf_pool.put_work_bufs(work_bufs, has_limit);
     let segmap = dec.segmap;
-    let (refpoc, bh, pic) = (dec.refpoc, dec.bh, dec.pic);
+    let (refpoc, bh, pic, chroma, bd) = (dec.refpoc, dec.bh, dec.pic, dec.chroma, dec.bd);
     Ok(DecodedFrame {
-        frame,
         pic,
+        chroma,
+        bd,
         cdf: cdf_out,
         segmap,
         tmvs,

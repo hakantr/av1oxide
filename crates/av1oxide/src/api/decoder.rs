@@ -174,7 +174,7 @@ enum OutputEntry {
 
 /// Kareler arası boru hattında (`F7b`, `n_fc >= 2`) tamamlanan bir karenin sonucu.
 struct CompletedFrame {
-    ref_frame: Arc<RefFrame>,
+    ref_frame: Option<Arc<RefFrame>>,
     decoded_tools: ToolCounts,
     output: Option<(Frame, ToolCounts, OutputCapiMeta)>,
     _butce_tutucu: Vec<ButceTutucu>,
@@ -360,13 +360,11 @@ impl Clone for Decoder {
                         }
                         let out_butce = Butce::alt_defter(&cloned.pipeline_butce);
                         let mut tools = ToolCounts::default();
-                        if let Ok(mut frame) = build_output_frame(
+                        if let Ok(mut frame) = build_output_frame_from_ref(
                             cloned.config.apply_grain,
                             &cloned.dsp,
                             &cloned.pool,
-                            &entry.frame,
-                            &entry.hdr.film_grain,
-                            entry.mc_identity,
+                            &entry,
                             *output_seq,
                             &mut tools,
                             &out_butce,
@@ -398,9 +396,11 @@ impl Clone for Decoder {
                             cloned.decoded_frames += 1;
                             cloned.last_tools = Some(completed.decoded_tools);
                             cloned.decoded_tools.push(completed.decoded_tools);
-                            for (slot, reference) in cloned.pixel_refs.iter_mut().enumerate() {
-                                if task.refresh_frame_flags & (1 << slot) != 0 {
-                                    *reference = Some(Arc::clone(&completed.ref_frame));
+                            if let Some(ref rf) = completed.ref_frame {
+                                for (slot, reference) in cloned.pixel_refs.iter_mut().enumerate() {
+                                    if task.refresh_frame_flags & (1 << slot) != 0 {
+                                        *reference = Some(Arc::clone(rf));
+                                    }
                                 }
                             }
                             if let Some((frame, tools, capi_meta)) = &completed.output {
@@ -947,25 +947,114 @@ impl Decoder {
             )
         });
         self.tepe_kat(&butce);
+        let mc_identity = seq.mtrx == 0;
+        let has_limit = self.config.allocation_limit.is_some();
+        let want_output = header.show_frame || self.config.output_invisible_frames;
+
+        // `4.A.1`: Referans olarak saklanmayan (`refresh_frame_flags == 0`) karelerde
+        // ikincil `Frame` veya `RefFrame` ayırmadan `decoded.pic` doğrudan yerinde
+        // (`in-place`) çıktı `Frame`'ine dönüştürülür ve şerit bazlı Film Grain uygulanır.
+        if header.refresh_frame_flags == 0 {
+            let decoded = match decoded {
+                Ok(d) => d,
+                Err(err) => {
+                    self.unsupported_frames += 1;
+                    self.last_decode_error = Some(format!("{err}"));
+                    self.last_error_packet_tag = Some(self.parse.current_packet_tag);
+                    return Err(err);
+                }
+            };
+            let decoded_tools = decoded.tools;
+            let (pic, chroma, bd, segmap, tmvs) = (
+                decoded.pic,
+                decoded.chroma,
+                decoded.bd,
+                decoded.segmap,
+                decoded.tmvs,
+            );
+            self.pool
+                .buf_pool()
+                .recycle_segmap_tmvs(segmap, tmvs, has_limit);
+            let cikti = if want_output {
+                let out_butce = self.butce_defteri(grup_bayti);
+                let mut tools = decoded_tools;
+                let frame_res = build_output_frame_in_place(
+                    self.config.apply_grain,
+                    &self.dsp,
+                    &self.pool,
+                    pic,
+                    chroma,
+                    bd,
+                    &header.film_grain,
+                    mc_identity,
+                    self.outputs_pushed,
+                    &mut tools,
+                    &out_butce,
+                );
+                self.tepe_kat(&out_butce);
+                match frame_res {
+                    Ok(frame) => Some((frame, tools)),
+                    Err(err) => {
+                        self.unsupported_frames += 1;
+                        self.last_decode_error = Some(format!("{err}"));
+                        self.last_error_packet_tag = Some(self.parse.current_packet_tag);
+                        return Err(err);
+                    }
+                }
+            } else {
+                self.pool.buf_pool().recycle_pic(pic, has_limit);
+                None
+            };
+            self.decoded_frames += 1;
+            self.last_tools = Some(decoded_tools);
+            self.decoded_tools.push(decoded_tools);
+            let itut_t35 = core::mem::take(&mut self.parse.itut_t35);
+            if let Some((mut frame, tools)) = cikti {
+                if self.parse.current_packet_timestamp.is_some() {
+                    frame.metadata_mut().timestamp = self.parse.current_packet_timestamp;
+                }
+                let capi_meta = OutputCapiMeta {
+                    seq_hdr: self.parse.sequence_header_arc.clone(),
+                    frame_hdr: Some(Arc::new(header)),
+                    content_light: self.parse.content_light,
+                    mastering_display: self.parse.mastering_display,
+                    itut_t35,
+                    event_flags: core::mem::take(&mut self.parse.pending_event_flags),
+                    packet_tag: self.parse.current_packet_tag,
+                };
+                self.outputs.push_back(OutputEntry::Frame(frame));
+                self.outputs_pushed += 1;
+                self.output_errors.push_back(None);
+                self.output_tools.push_back(Some(tools));
+                self.output_capi_meta.push_back(capi_meta);
+            }
+            return Ok(());
+        }
+
         // Çıktı kopyası (grain'li ya da düz) yuvalar değişmeden **önce**
         // ayrılır: bütçe/ayırma hatası geç hata gibi işlenir, yarım kare
         // yuvaya ya da çıktıya girmez.
-        let decoded = decoded.and_then(|decoded| {
-            if !(header.show_frame || self.config.output_invisible_frames) {
+        let decoded = decoded.and_then(|mut decoded| {
+            if !want_output {
                 return Ok((decoded, None));
             }
-            let butce = self.butce_defteri(grup_bayti.saturating_add(decoded.bayt()));
-            let mc_identity = seq.mtrx == 0;
+            let out_butce = self.butce_defteri(grup_bayti.saturating_add(decoded.bayt()));
             let mut tools = decoded.tools;
-            let frame = self.output_frame(
-                &decoded.frame,
+            let frame_res = build_output_frame_from_mut_pic(
+                self.config.apply_grain,
+                &self.dsp,
+                &self.pool,
+                &mut decoded.pic,
+                decoded.chroma,
+                decoded.bd,
                 &header.film_grain,
                 mc_identity,
+                self.outputs_pushed,
                 &mut tools,
-                &butce,
+                &out_butce,
             );
-            self.tepe_kat(&butce);
-            Ok((decoded, Some((frame?, tools))))
+            self.tepe_kat(&out_butce);
+            Ok((decoded, Some((frame_res?, tools))))
         });
         let (decoded, cikti) = match decoded {
             Ok(decoded) => decoded,
@@ -987,10 +1076,7 @@ impl Decoder {
         self.decoded_frames += 1;
         self.last_tools = Some(decoded.tools);
         self.decoded_tools.push(decoded.tools);
-        let mc_identity = seq.mtrx == 0;
-        let has_limit = self.config.allocation_limit.is_some();
-        // Referans yuvası grain'siz kareyi saklar
-        // (`src/lib.c:311-330`).
+        // Referans yuvası grain'siz `PicBuf`'u saklar (`src/lib.c:311-330`).
         let entry = Arc::new(RefFrame::from_decoded(decoded, header.clone(), mc_identity));
         let mut evicted: [Option<Arc<RefFrame>>; 8] = [const { None }; 8];
         for (slot, reference) in self.pixel_refs.iter_mut().enumerate() {
@@ -1250,11 +1336,80 @@ impl Decoder {
                     }
                 }
                 let decoded_tools = decoded.tools;
+                let mc_identity = seq_w.mtrx == 0;
+                let mut tutucular = Vec::with_capacity(3);
+                tutucular.push(grup_tutucu);
+
+                // `4.A.1`: Referans olarak saklanmayan (`refresh_frame_flags == 0`) boru hattı
+                // karelerinde `RefFrame` tutulmaz; `segmap`/`tmvs` anında havuza iade edilir
+                // ve `decoded.pic` yerinde (`in-place`) çıktı `Frame`'ine dönüştürülür.
+                if hdr_w.refresh_frame_flags == 0 {
+                    let (pic, chroma, bd, segmap, tmvs) = (
+                        decoded.pic,
+                        decoded.chroma,
+                        decoded.bd,
+                        decoded.segmap,
+                        decoded.tmvs,
+                    );
+                    pool_w
+                        .buf_pool()
+                        .recycle_segmap_tmvs(segmap, tmvs, has_allocation_limit);
+                    let output = if let Some(capi_meta) = capi_meta_w {
+                        let (_, frame_total) =
+                            Frame::plane_byte_lens_and_total(pic.width, pic.height, chroma, bd)?;
+                        let frame_tutucu = frame_butce.devret(frame_total);
+                        drop(frame_butce);
+                        let mut frame = Frame::from_owned_pic(
+                            pic.width,
+                            pic.height,
+                            chroma,
+                            bd,
+                            pic.data,
+                            pic.stride,
+                            !has_allocation_limit,
+                        )?;
+                        let mut tools = decoded_tools;
+                        if apply_grain_flag
+                            && crate::decode::filmgrain::has_grain(&hdr_w.film_grain.data)
+                        {
+                            fill_fg_tools(&hdr_w.film_grain, &mut tools);
+                            let fg_butce = Butce::alt_defter(&pipeline_butce_w);
+                            let fg_pool = pool_w.single_thread_handle();
+                            crate::dsp::profil_bd!(bd);
+                            crate::decode::filmgrain::apply_grain_in_place(
+                                &mut frame,
+                                &hdr_w.film_grain.data,
+                                mc_identity,
+                                dsp_w.for_bit_depth(bd).fg(),
+                                crate::decode::filmgrain::trace_picture(output_seq),
+                                &fg_butce,
+                                &fg_pool,
+                            )?;
+                        }
+                        if packet_timestamp.is_some() {
+                            frame.metadata_mut().timestamp = packet_timestamp;
+                        }
+                        if let Some(t) = frame_tutucu {
+                            tutucular.push(t);
+                        }
+                        Some((frame, tools, capi_meta))
+                    } else {
+                        drop(frame_butce);
+                        pool_w.buf_pool().recycle_pic(pic, has_allocation_limit);
+                        None
+                    };
+                    return Ok(CompletedFrame {
+                        ref_frame: None,
+                        decoded_tools,
+                        output,
+                        _butce_tutucu: tutucular,
+                    });
+                }
+
                 let decoded_bytes = decoded.bayt();
                 let ref_tutucu = frame_butce.devret(decoded_bytes);
                 drop(frame_butce);
 
-                let mc_identity = seq_w.mtrx == 0;
                 let ref_frame =
                     Arc::new(RefFrame::from_decoded(decoded, hdr_w.clone(), mc_identity));
 
@@ -1266,8 +1421,6 @@ impl Decoder {
                     task_worker.out_slot.publish_ready(Arc::clone(&ref_frame));
                 }
 
-                let mut tutucular = Vec::with_capacity(3);
-                tutucular.push(grup_tutucu);
                 if let Some(t) = ref_tutucu {
                     tutucular.push(t);
                 }
@@ -1278,16 +1431,13 @@ impl Decoder {
                     // `n_fc >= 2` boru hattında `out_slot.publish_ready` sonrası
                     // sonraki kareler diğer işçilerde eşzamanlı çözülmeye başladığından,
                     // bu karenin gecikmeli Film Grain adımı işçi üzerinde doğrudan
-                    // yerinde (`single_thread_handle`, sıfır `FgRowJob` kopyası/çekişmesi)
-                    // yürütülür.
+                    // `single_thread_handle` ile çekişmesiz yürütülür.
                     let fg_pool = pool_w.single_thread_handle();
-                    let mut frame = build_output_frame(
+                    let mut frame = build_output_frame_from_ref(
                         apply_grain_flag,
                         &dsp_w,
                         &fg_pool,
-                        &ref_frame.frame,
-                        &hdr_w.film_grain,
-                        mc_identity,
+                        &ref_frame,
                         output_seq,
                         &mut tools,
                         &out_butce,
@@ -1309,7 +1459,7 @@ impl Decoder {
                 }
 
                 Ok(CompletedFrame {
-                    ref_frame,
+                    ref_frame: Some(ref_frame),
                     decoded_tools,
                     output,
                     _butce_tutucu: tutucular,
@@ -1383,13 +1533,11 @@ impl Decoder {
                 let out_butce = Butce::alt_defter(&self.pipeline_butce);
                 let mut tools = ToolCounts::default();
                 let fg_pool = self.pool.single_thread_handle();
-                let frame_res = build_output_frame(
+                let frame_res = build_output_frame_from_ref(
                     self.config.apply_grain,
                     &self.dsp,
                     &fg_pool,
-                    &entry_rf.frame,
-                    &entry_rf.hdr.film_grain,
-                    entry_rf.mc_identity,
+                    &entry_rf,
                     output_seq,
                     &mut tools,
                     &out_butce,
@@ -1447,19 +1595,22 @@ impl Decoder {
                         self.last_tools = Some(completed.decoded_tools);
                         self.decoded_tools.push(completed.decoded_tools);
                         let mut evicted: [Option<Arc<RefFrame>>; 8] = [const { None }; 8];
-                        for (slot, reference) in self.pixel_refs.iter_mut().enumerate() {
-                            if task.refresh_frame_flags & (1 << slot) != 0
-                                && let Some(old) =
-                                    reference.replace(Arc::clone(&completed.ref_frame))
-                            {
-                                evicted[slot] = Some(old);
+                        if let Some(rf_arc) = completed.ref_frame {
+                            for (slot, reference) in self.pixel_refs.iter_mut().enumerate() {
+                                if task.refresh_frame_flags & (1 << slot) != 0
+                                    && let Some(old) = reference.replace(Arc::clone(&rf_arc))
+                                {
+                                    evicted[slot] = Some(old);
+                                }
                             }
-                        }
-                        if task.refresh_frame_flags == 0 {
+                            if task.refresh_frame_flags == 0 {
+                                task.out_slot.clear_ready();
+                            }
+                            if let Ok(rf) = Arc::try_unwrap(rf_arc) {
+                                self.pool.buf_pool().recycle_ref_frame(rf, has_limit);
+                            }
+                        } else {
                             task.out_slot.clear_ready();
-                        }
-                        if let Ok(rf) = Arc::try_unwrap(completed.ref_frame) {
-                            self.pool.buf_pool().recycle_ref_frame(rf, has_limit);
                         }
                         for old in evicted.into_iter().flatten() {
                             if let Ok(rf) = Arc::try_unwrap(old) {
@@ -1573,10 +1724,12 @@ impl Decoder {
             };
             let mut tools = crate::decode::intra::ToolCounts::default();
             let butce = self.butce_defteri(0);
-            let frame = self.output_frame(
-                &entry.frame,
-                &entry.hdr.film_grain,
-                entry.mc_identity,
+            let frame = build_output_frame_from_ref(
+                self.config.apply_grain,
+                &self.dsp,
+                &self.pool,
+                &entry,
+                self.outputs_pushed,
                 &mut tools,
                 &butce,
             );
@@ -1682,13 +1835,11 @@ impl Decoder {
             let out_butce = Butce::alt_defter(&self.pipeline_butce);
             let mut tools = ToolCounts::default();
             let fg_pool = self.pool.single_thread_handle();
-            let frame_res = build_output_frame(
+            let frame_res = build_output_frame_from_ref(
                 self.config.apply_grain,
                 &self.dsp,
                 &fg_pool,
-                &entry.frame,
-                &entry.hdr.film_grain,
-                entry.mc_identity,
+                &entry,
                 self.outputs_pushed,
                 &mut tools,
                 &out_butce,
@@ -1789,31 +1940,6 @@ impl Decoder {
             packet_timestamp: self.parse.current_packet_timestamp,
         });
         Ok(())
-    }
-
-    /// Çıktı kopyası: `Config::apply_grain` açık ve kare grain taşıyorsa
-    /// (`has_grain`) grain uygulanmış kopya, değilse kare aynen (dav1d
-    /// `output_image`, `src/lib.c:311-330`). Film grain sayaçları `tools`'a
-    /// yazılır.
-    fn output_frame(
-        &self,
-        frame: &Frame,
-        fg: &crate::bitstream::frame_header::FilmGrainHeader,
-        mc_identity: bool,
-        tools: &mut crate::decode::intra::ToolCounts,
-        butce: &Butce,
-    ) -> Result<Frame> {
-        build_output_frame(
-            self.config.apply_grain,
-            &self.dsp,
-            &self.pool,
-            frame,
-            fg,
-            mc_identity,
-            self.outputs_pushed,
-            tools,
-            butce,
-        )
     }
 
     /// Sıradaki çıktı karesini verir (`Ok(None)` = şu an çıktı yok; dav1d
@@ -2267,7 +2393,160 @@ fn validate_frame_refs_slots(
     Ok(())
 }
 
-/// Çıktı karesini (varsa Film Grain uygulayarak) üretir (`dav1d` `output_image`).
+fn fill_fg_tools(fg: &crate::bitstream::frame_header::FilmGrainHeader, tools: &mut ToolCounts) {
+    let d = &fg.data;
+    tools.fg_applied = 1;
+    tools.fg_update0 = u64::from(!fg.update);
+    tools.fg_overlap = u64::from(d.overlap_flag);
+    tools.fg_csfl = u64::from(d.chroma_scaling_from_luma);
+    tools.fg_clip = u64::from(d.clip_to_restricted_range);
+    tools.fg_ar_lag1 = u64::try_from(d.ar_coeff_lag).unwrap_or(0) + 1;
+    tools.fg_y = u64::from(d.num_y_points != 0);
+    tools.fg_uv = u64::from(d.num_uv_points[0] != 0 || d.num_uv_points[1] != 0);
+}
+
+/// Referans olarak saklanmayan (`refresh_frame_flags == 0`) karelerde `PicBuf`'u
+/// yerinde [`Frame`]'e sıkıştırır ve varsa şerit bazlı Film Grain uygular (`4.A.1`).
+#[allow(clippy::too_many_arguments)]
+fn build_output_frame_in_place(
+    apply_grain_cfg: bool,
+    dsp: &DspDispatch,
+    pool: &WorkerPool,
+    pic: crate::decode::intra::PicBuf,
+    chroma: ChromaFormat,
+    bd: BitDepth,
+    fg: &crate::bitstream::frame_header::FilmGrainHeader,
+    mc_identity: bool,
+    output_seq: u64,
+    tools: &mut ToolCounts,
+    butce: &Butce,
+) -> Result<Frame> {
+    use crate::decode::filmgrain;
+    let (_, total) = Frame::plane_byte_lens_and_total(pic.width, pic.height, chroma, bd)?;
+    butce.ayir(total)?;
+    let mut frame = Frame::from_owned_pic(
+        pic.width,
+        pic.height,
+        chroma,
+        bd,
+        pic.data,
+        pic.stride,
+        !butce.has_limit(),
+    )
+    .inspect_err(|_| butce.birak(total))?;
+    let d = &fg.data;
+    if !apply_grain_cfg || !filmgrain::has_grain(d) {
+        return Ok(frame);
+    }
+    fill_fg_tools(fg, tools);
+    crate::dsp::profil_bd!(bd);
+    filmgrain::apply_grain_in_place(
+        &mut frame,
+        d,
+        mc_identity,
+        dsp.for_bit_depth(bd).fg(),
+        filmgrain::trace_picture(output_seq),
+        butce,
+        pool,
+    )
+    .inspect_err(|_| butce.birak(total))?;
+    Ok(frame)
+}
+
+/// Referans olarak saklanacak (`refresh_frame_flags != 0`, `n_fc == 1`) karenin
+/// `&mut PicBuf` düzlemlerinden tek geçişte çıktı [`Frame`]'ini üretir (`4.A.1`).
+#[allow(clippy::too_many_arguments)]
+fn build_output_frame_from_mut_pic(
+    apply_grain_cfg: bool,
+    dsp: &DspDispatch,
+    pool: &WorkerPool,
+    pic: &mut crate::decode::intra::PicBuf,
+    chroma: ChromaFormat,
+    bd: BitDepth,
+    fg: &crate::bitstream::frame_header::FilmGrainHeader,
+    mc_identity: bool,
+    output_seq: u64,
+    tools: &mut ToolCounts,
+    butce: &Butce,
+) -> Result<Frame> {
+    use crate::decode::filmgrain;
+    let (lens, _) = Frame::plane_byte_lens_and_total(pic.width, pic.height, chroma, bd)?;
+    let bufs = pool.buf_pool().take_u8_triple(lens, butce.has_limit());
+    let d = &fg.data;
+    if !apply_grain_cfg || !filmgrain::has_grain(d) {
+        return Frame::new_from_pic_in(
+            pic.width,
+            pic.height,
+            chroma,
+            bd,
+            &mut pic.data,
+            pic.stride,
+            bufs,
+            butce,
+            pool,
+        );
+    }
+    fill_fg_tools(fg, tools);
+    crate::dsp::profil_bd!(bd);
+    filmgrain::apply_grain_from_pic_mut(
+        pic,
+        chroma,
+        bd,
+        d,
+        mc_identity,
+        dsp.for_bit_depth(bd).fg(),
+        filmgrain::trace_picture(output_seq),
+        bufs,
+        butce,
+        pool,
+    )
+}
+
+/// Paylaşılan `Arc<RefFrame>` içindeki `PicBuf` düzlemlerinden tek geçişte çıktı
+/// [`Frame`]'ini üretir (`show_existing_frame` ve boru hattı referans yolu; `4.A.1`).
+fn build_output_frame_from_ref(
+    apply_grain_cfg: bool,
+    dsp: &DspDispatch,
+    pool: &WorkerPool,
+    rf: &Arc<RefFrame>,
+    output_seq: u64,
+    tools: &mut ToolCounts,
+    butce: &Butce,
+) -> Result<Frame> {
+    use crate::decode::filmgrain;
+    let (lens, _) =
+        Frame::plane_byte_lens_and_total(rf.pic.width, rf.pic.height, rf.chroma, rf.bd)?;
+    let bufs = pool.buf_pool().take_u8_triple(lens, butce.has_limit());
+    let fg = &rf.hdr.film_grain;
+    let d = &fg.data;
+    if !apply_grain_cfg || !filmgrain::has_grain(d) {
+        return Frame::new_from_shared_pic_in(
+            rf.pic.width,
+            rf.pic.height,
+            rf.chroma,
+            rf.bd,
+            rf,
+            |r, idx| (r.pic.data[idx].as_slice(), r.pic.stride[idx]),
+            bufs,
+            butce,
+            pool,
+        );
+    }
+    fill_fg_tools(fg, tools);
+    crate::dsp::profil_bd!(rf.bd);
+    filmgrain::apply_grain_from_ref_pic(
+        rf,
+        d,
+        rf.mc_identity,
+        dsp.for_bit_depth(rf.bd).fg(),
+        filmgrain::trace_picture(output_seq),
+        bufs,
+        butce,
+        pool,
+    )
+}
+
+/// Çıktı karesini (varsa Film Grain uygulayarak) üretir (`dav1d_apply_grain` C-ABI yolu).
 #[allow(clippy::too_many_arguments)]
 fn build_output_frame(
     apply_grain_cfg: bool,
@@ -2297,14 +2576,7 @@ fn build_output_frame(
         let bufs = pool.buf_pool().take_u8_triple(lens, butce.has_limit());
         return frame.try_clone_with_bufs(bufs, butce);
     }
-    tools.fg_applied = 1;
-    tools.fg_update0 = u64::from(!fg.update);
-    tools.fg_overlap = u64::from(d.overlap_flag);
-    tools.fg_csfl = u64::from(d.chroma_scaling_from_luma);
-    tools.fg_clip = u64::from(d.clip_to_restricted_range);
-    tools.fg_ar_lag1 = u64::try_from(d.ar_coeff_lag).unwrap_or(0) + 1;
-    tools.fg_y = u64::from(d.num_y_points != 0);
-    tools.fg_uv = u64::from(d.num_uv_points[0] != 0 || d.num_uv_points[1] != 0);
+    fill_fg_tools(fg, tools);
     crate::dsp::profil_bd!(frame.bit_depth());
     filmgrain::apply_grain(
         frame,

@@ -159,6 +159,7 @@ pub(crate) fn upscale_planes(
     }
 
     let stripe_rows = 32usize;
+    let max_wave = pool.n_threads().max(1);
     for p in 0..n_planes {
         let (ss_hor, ss_ver) = plane_ss(p, chroma);
         let dst_w = (sr.sr_w + ss_hor) >> ss_hor;
@@ -187,45 +188,116 @@ pub(crate) fn upscale_planes(
             );
             continue;
         }
-        let mut jobs = Vec::with_capacity(n_stripes);
-        for s in 0..n_stripes {
-            let y0 = s * stripe_rows;
-            let r = stripe_rows.min(total_rows - y0);
-            jobs.push(ResizeJob {
-                y0,
-                rows: r,
-                buf: dolu_vec(r * ds, 0u8)?,
-            });
-        }
+        let wave_size = max_wave.min(n_stripes);
+        let mut jobs: Vec<ResizeJob> = (0..wave_size)
+            .map(|_| {
+                Ok(ResizeJob {
+                    y0: 0,
+                    rows: 0,
+                    buf: dolu_vec(stripe_rows * ds, 0u8)?,
+                })
+            })
+            .collect::<crate::error::Result<Vec<_>>>()?;
         let src_arc = Arc::new(core::mem::take(&mut src[p]));
-        let src_w_arc = Arc::clone(&src_arc);
-        let res = pool.execute_tasks(&mut jobs, move |_wid, _idx, job: &mut ResizeJob| {
-            let src_slice = &src_w_arc[job.y0 * ss..];
-            crate::dsp::profil_olc!(
-                Resize,
-                kernel(
-                    &mut job.buf,
-                    ds,
-                    src_slice,
-                    ss,
-                    dst_w,
-                    job.rows,
-                    src_w,
-                    step,
-                    start,
-                    rbd,
-                )
-            );
-            Ok(())
-        });
-        src[p] = Arc::try_unwrap(src_arc).unwrap_or_else(|a| (*a).clone());
-        res?;
-        for job in jobs {
-            let dst_off = job.y0 * ds;
-            dst.data[p][dst_off..dst_off + job.rows * ds].copy_from_slice(&job.buf);
+        let mut plane_res: crate::error::Result<()> = Ok(());
+        for wave_start in (0..n_stripes).step_by(wave_size) {
+            let count = (n_stripes - wave_start).min(wave_size);
+            if jobs.len() > count {
+                jobs.truncate(count);
+            }
+            for (i, job) in jobs.iter_mut().enumerate() {
+                let s = wave_start + i;
+                let y0 = s * stripe_rows;
+                let r = stripe_rows.min(total_rows - y0);
+                job.y0 = y0;
+                job.rows = r;
+            }
+            let src_w_arc = Arc::clone(&src_arc);
+            let res = pool.execute_tasks(&mut jobs, move |_wid, _idx, job: &mut ResizeJob| {
+                let src_slice = &src_w_arc[job.y0 * ss..];
+                crate::dsp::profil_olc!(
+                    Resize,
+                    kernel(
+                        &mut job.buf[..job.rows * ds],
+                        ds,
+                        src_slice,
+                        ss,
+                        dst_w,
+                        job.rows,
+                        src_w,
+                        step,
+                        start,
+                        rbd,
+                    )
+                );
+                Ok(())
+            });
+            if let Err(e) = res {
+                plane_res = Err(e);
+                break;
+            }
+            for job in &jobs {
+                let dst_off = job.y0 * ds;
+                dst.data[p][dst_off..dst_off + job.rows * ds]
+                    .copy_from_slice(&job.buf[..job.rows * ds]);
+            }
         }
+        src[p] = Arc::try_unwrap(src_arc).unwrap_or_else(|a| (*a).clone());
+        plane_res?;
     }
     Ok(dst)
+}
+
+/// Kodlanan genişlikteki [`crate::decode::lr::LrCdefBackup`] şerit sınırı
+/// satırlarını `sr.sr_w` genişliğine büyütür (`4.A.1`).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn upscale_lr_backup(
+    src: &crate::decode::lr::LrCdefBackup,
+    bw: usize,
+    sr: &Superres,
+    chroma: ChromaFormat,
+    bd: BitDepth,
+    sr_stride: [usize; 3],
+    kernel: ResizeFn,
+    butce: &crate::frame::butce::Butce,
+) -> crate::error::Result<crate::decode::lr::LrCdefBackup> {
+    let rbd = resize_bd(bd);
+    let mut data = [Vec::new(), Vec::new(), Vec::new()];
+    let mut stride = [0usize; 3];
+    for p in 0..3 {
+        let n_b = src.n_boundaries[p];
+        if n_b == 0 {
+            continue;
+        }
+        let (ss_hor, _) = plane_ss(p, chroma);
+        let dst_w = (sr.sr_w + ss_hor) >> ss_hor;
+        let src_w = (4 * bw + ss_hor) >> ss_hor;
+        let rows = 4 * n_b;
+        let ds = sr_stride[p];
+        let mut dst_buf = butce.vec(rows * ds, 0u8)?;
+        crate::dsp::profil_olc!(
+            Resize,
+            kernel(
+                &mut dst_buf,
+                ds,
+                &src.data[p],
+                src.stride[p],
+                dst_w,
+                rows,
+                src_w,
+                sr.step[usize::from(p != 0)],
+                sr.start[usize::from(p != 0)],
+                rbd,
+            )
+        );
+        data[p] = dst_buf;
+        stride[p] = ds;
+    }
+    Ok(crate::decode::lr::LrCdefBackup {
+        data,
+        stride,
+        n_boundaries: src.n_boundaries,
+    })
 }
 
 /// FNV-1a 64 — `resize_trace.c` ile aynı.
@@ -253,7 +325,7 @@ fn fnv_rows(data: &[u8], stride: usize, y0: usize, rows: usize, w_bytes: usize) 
 pub(crate) fn trace(
     frame_no: u32,
     sr_pic: &PicBuf,
-    sr_pre: Option<&PicBuf>,
+    sr_pre: Option<&crate::decode::lr::LrCdefBackup>,
     restore_planes: u8,
     height: usize,
     bw: usize,
@@ -292,9 +364,11 @@ pub(crate) fn trace(
                 let dst_w = (sr.sr_w + ss_hor) >> ss_hor;
                 let src_w = (4 * bw + ss_hor) >> ss_hor;
                 while row + stripe_h <= row_h {
-                    let n_lines = 4 - usize::from(row + stripe_h + 1 == h);
-                    let y = row + stripe_h - 2;
-                    let hash = fnv_rows(&pre.data[p], pre.stride[p], y, n_lines, dst_w * bpp);
+                    let b = row + stripe_h;
+                    let n_lines = 4 - usize::from(b + 1 == h);
+                    let y = b - 2;
+                    let k = (b - (56 >> ss_ver)) >> (6 - ss_ver);
+                    let hash = fnv_rows(&pre.data[p], pre.stride[p], 4 * k, n_lines, dst_w * bpp);
                     eprintln!(
                         "Z {frame_no} L {p} {y} {n_lines} {dst_w} {src_w} {} {} {hash}",
                         sr.step[ss_hor], sr.start[ss_hor]

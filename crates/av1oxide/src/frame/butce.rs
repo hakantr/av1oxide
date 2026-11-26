@@ -280,9 +280,9 @@ impl Butce {
         dolu_vec(n, deger).inspect_err(|_| self.birak(bayt))
     }
 
-    /// `old` vektörünün kapasitesi `n`'ye eşitse (ve `allocation_limit` kapalıysa)
-    /// belleği işletim sistemine geri vermeden `deger` ile sıfırlayıp yeniden kullanır;
-    /// aksi hâlde `old` düşürülüp yeni `Vec<T>` ayrılır.
+    /// `old` vektörünün kapasitesi `[n, 2*n]` aralığındaysa (ve `allocation_limit`
+    /// kapalıysa) belleği işletim sistemine geri vermeden `deger` ile sıfırlayıp
+    /// yeniden kullanır; aksi hâlde `old` düşürülüp yeni `Vec<T>` ayrılır.
     pub(crate) fn reuse_vec<T: Clone>(
         &self,
         mut old: Vec<T>,
@@ -291,7 +291,11 @@ impl Butce {
     ) -> Result<Vec<T>> {
         let bayt = dizi_bayti::<T>(n)?;
         self.ayir(bayt)?;
-        if n > 0 && old.capacity() == n && !self.has_limit() {
+        if n == 0 {
+            drop(old);
+            return Ok(Vec::new());
+        }
+        if !self.has_limit() && old.capacity() >= n && old.capacity() <= n.saturating_mul(2) {
             if old.len() == n {
                 old.fill(deger);
             } else {
@@ -312,14 +316,18 @@ impl Butce {
         kopya_vec(kaynak).inspect_err(|_| self.birak(bayt))
     }
 
-    /// `old` vektörünün kapasitesi `kaynak.len()`'e eşitse belleği işletim
-    /// sistemine geri vermeden `kaynak` dilimini kopyalar; aksi hâlde `old`
-    /// düşürülüp yeni `Vec<T>` ayrılır.
+    /// `old` vektörünün kapasitesi `[kaynak.len(), 2*kaynak.len()]` aralığındaysa
+    /// belleği işletim sistemine geri vermeden `kaynak` dilimini kopyalar; aksi
+    /// hâlde `old` düşürülüp yeni `Vec<T>` ayrılır.
     pub(crate) fn reuse_kopya<T: Clone>(&self, mut old: Vec<T>, kaynak: &[T]) -> Result<Vec<T>> {
         let n = kaynak.len();
         let bayt = dizi_bayti::<T>(n)?;
         self.ayir(bayt)?;
-        if n > 0 && old.capacity() == n && !self.has_limit() {
+        if n == 0 {
+            drop(old);
+            return Ok(Vec::new());
+        }
+        if !self.has_limit() && old.capacity() >= n && old.capacity() <= n.saturating_mul(2) {
             old.clear();
             old.extend_from_slice(kaynak);
             Ok(old)

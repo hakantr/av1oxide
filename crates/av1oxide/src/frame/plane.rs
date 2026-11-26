@@ -284,7 +284,7 @@ impl FramePlane {
         })
     }
 
-    /// Havuzdan geri dönüştürülmüş `buf` kapasitesi `layout.total()` ile eşleşiyorsa
+    /// Havuzdan geri dönüştürülmüş `buf` kapasitesi `[total, 2*total]` aralığındaysa
     /// yeniden tahsis yapmadan `src` (`src_stride`) satırlarını kopyalayıp satır/kuyruk
     /// dolgusunu sıfırlayarak düzlem üretir (`F8b-1`). Bütçe denetimi çağıranındır.
     pub(crate) fn from_layout_with_pic(
@@ -299,7 +299,11 @@ impl FramePlane {
         let row_bytes = layout.row_bytes();
         let dst_stride = layout.stride();
         let height = layout.height();
-        let mut data = if allow_reuse && total > 0 && buf.capacity() == total {
+        let data = if allow_reuse
+            && total > 0
+            && buf.capacity() >= total
+            && buf.capacity() <= total.saturating_mul(2)
+        {
             if buf.len() != total {
                 buf.resize(total, 0);
             }
@@ -327,12 +331,103 @@ impl FramePlane {
             }
             v
         };
-        let _ = &mut data;
         Ok(Self {
             plane,
             layout,
             data,
         })
+    }
+
+    /// Görünür alanı tamamen Film Grain çekirdeklerince (`fgy`/`fguv`) yazılacak
+    /// düzlem için tampon hazırlar: havuzdan dönen `buf` kapasitesi uygunsa yalnız
+    /// satır/kuyruk dolgusunu sıfırlar (tam düzlem kopyası/sıfırlaması yapmaz).
+    pub(crate) fn from_layout_for_grain(
+        plane: PlaneType,
+        layout: PlaneLayout,
+        mut buf: Vec<u8>,
+        allow_reuse: bool,
+    ) -> Result<Self> {
+        let total = layout.total();
+        let row_bytes = layout.row_bytes();
+        let dst_stride = layout.stride();
+        let height = layout.height();
+        let data = if allow_reuse
+            && total > 0
+            && buf.capacity() >= total
+            && buf.capacity() <= total.saturating_mul(2)
+        {
+            if buf.len() != total {
+                buf.resize(total, 0);
+            }
+            if dst_stride > row_bytes {
+                for y in 0..height {
+                    let dst_off = y * dst_stride;
+                    buf[dst_off + row_bytes..dst_off + dst_stride].fill(0);
+                }
+            }
+            let area = layout.area();
+            if total > area {
+                buf[area..total].fill(0);
+            }
+            buf
+        } else {
+            drop(buf);
+            crate::frame::butce::dolu_vec(total, 0u8)?
+        };
+        Ok(Self {
+            plane,
+            layout,
+            data,
+        })
+    }
+
+    /// Referans olarak saklanmayan (`refresh_frame_flags == 0`) bir `PicBuf`
+    /// düzlem vektörünü sıfır ek tahsisle yerinde (`in-place`) [`FramePlane`]
+    /// düzenine sıkıştırır (`4.A.1`).
+    pub(crate) fn from_owned_pic_buf(
+        plane: PlaneType,
+        layout: PlaneLayout,
+        mut buf: Vec<u8>,
+        src_stride: usize,
+        allow_reuse: bool,
+    ) -> Result<Self> {
+        let total = layout.total();
+        let row_bytes = layout.row_bytes();
+        let dst_stride = layout.stride();
+        let height = layout.height();
+        if src_stride >= dst_stride && buf.len() >= total {
+            if src_stride > dst_stride {
+                for y in 0..height {
+                    let dst_off = y * dst_stride;
+                    let src_off = y * src_stride;
+                    if dst_off != src_off {
+                        buf.copy_within(src_off..src_off + row_bytes, dst_off);
+                    }
+                    if dst_stride > row_bytes {
+                        buf[dst_off + row_bytes..dst_off + dst_stride].fill(0);
+                    }
+                }
+            } else if dst_stride > row_bytes {
+                for y in 0..height {
+                    let dst_off = y * dst_stride;
+                    buf[dst_off + row_bytes..dst_off + dst_stride].fill(0);
+                }
+            }
+            let area = layout.area();
+            if total > area {
+                buf[area..total].fill(0);
+            }
+            buf.truncate(total);
+            if !allow_reuse {
+                buf.shrink_to_fit();
+            }
+            return Ok(Self {
+                plane,
+                layout,
+                data: buf,
+            });
+        }
+        Self::from_layout_with_pic(plane, layout, Vec::new(), &buf, src_stride, false)
     }
 
     /// Düzlemin düşebilir kopyası (`clone` eşdeğeri; bütçe denetimi
@@ -346,42 +441,29 @@ impl FramePlane {
         })
     }
 
-    /// Havuzdan geri dönüştürülmüş `buf` kapasitesi eşleşiyorsa yeniden tahsis
-    /// yapmadan düzlemi kopyalar (`F8b-1`). Bütçe denetimi çağıranındır.
+    /// Havuzdan geri dönüştürülmüş `buf` kapasitesi `[n, 2*n]` aralığındaysa yeniden
+    /// tahsis yapmadan düzlemi kopyalar (`F8b-1`). Bütçe denetimi çağıranındır.
     pub(crate) fn try_clone_with_buf(&self, mut buf: Vec<u8>, allow_reuse: bool) -> Result<Self> {
         let n = self.data.len();
-        let data = if allow_reuse && n > 0 && buf.capacity() == n {
-            if buf.len() == n {
-                buf.copy_from_slice(&self.data);
+        let data =
+            if allow_reuse && n > 0 && buf.capacity() >= n && buf.capacity() <= n.saturating_mul(2)
+            {
+                if buf.len() == n {
+                    buf.copy_from_slice(&self.data);
+                } else {
+                    buf.clear();
+                    buf.extend_from_slice(&self.data);
+                }
+                buf
             } else {
-                buf.clear();
-                buf.extend_from_slice(&self.data);
-            }
-            buf
-        } else {
-            drop(buf);
-            crate::frame::butce::kopya_vec(&self.data)?
-        };
+                drop(buf);
+                crate::frame::butce::kopya_vec(&self.data)?
+            };
         Ok(Self {
             plane: self.plane,
             layout: self.layout,
             data,
         })
-    }
-
-    /// Düzlem deposunu geri dönüştürmek üzere söküp verir (`F8b-1`).
-    pub(crate) fn into_data(self) -> Vec<u8> {
-        self.data
-    }
-
-    /// Düzlem deposunu geçici `Arc` paylaşımı için yerinde söküp verir (`F8b`).
-    pub(crate) fn take_data(&mut self) -> Vec<u8> {
-        core::mem::take(&mut self.data)
-    }
-
-    /// Sökülen düzlem deposunu geri yerleştirir (`F8b`).
-    pub(crate) fn put_data(&mut self, data: Vec<u8>) {
-        self.data = data;
     }
 
     /// Bu düzlemin kimliği (Y/U/V).

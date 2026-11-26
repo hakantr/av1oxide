@@ -373,7 +373,7 @@ impl WorkerPool {
         #[cfg(not(target_arch = "wasm32"))]
         let n_threads = n_threads.max(1);
         let scratch = Arc::new(ScratchPool::new(n_threads));
-        let buf_pool = Arc::new(DecodeBufPool::new());
+        let buf_pool = Arc::new(DecodeBufPool::new(n_threads));
         if n_threads == 1 {
             return Self {
                 n_threads: 1,
