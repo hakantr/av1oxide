@@ -197,7 +197,7 @@ mod arm {
             .iter()
             .filter(|s| s.key.family == "mc" && s.is_assigned())
             .count();
-        assert_eq!(mc_neon, 96, "mc: 3 × 32 NEON yuvası atanmalı");
+        assert_eq!(mc_neon, 156, "mc: 3 × 52 NEON yuvası atanmalı");
         let mc_dot = tam
             .slot_states()
             .iter()

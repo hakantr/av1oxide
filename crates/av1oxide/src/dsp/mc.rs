@@ -3,7 +3,7 @@
 //! Bu modül **davranışı ve bellek sözleşmesini** tanımlar, gövde içermez:
 //! sabitler, `put_8tap_regular` filtre tabloları, bit derinliği tipi ve çekirdek
 //! işaretçisi imzası. Gövdeler [`crate::dsp::scalar::mc`] (8-bit + 16bpc) ve
-//! [`crate::dsp::x86::mc`] (8-bit AVX2) içindedir. Kapsam **yalnız**
+//! `crate::dsp::x86::mc` (8-bit AVX2) içindedir. Kapsam **yalnız**
 //! `FILTER_2D_8TAP_REGULAR` varyantıdır (`prep`/mct, diğer filtre türleri,
 //! scaled MC ayrı yuvadadır — S15.5 kapsamı).
 //!

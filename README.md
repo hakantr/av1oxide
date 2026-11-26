@@ -15,7 +15,7 @@
 - **Multithreading & Memory Budgets:** Intra-frame (`Tile`, superblock row, in-loop filter) and inter-frame (`FrameSlot`) parallelism (`Config::n_threads`, `Config::max_frame_delay`), recycled plane pools (`DecodeBufPool`), and pre-allocation pixel and memory limits (`Config::frame_size_limit`, `Config::allocation_limit`).
 - **Optional `#![no_std] + alloc` (`default = ["std"]`):** Compiling with `--no-default-features` builds the complete single-thread AV1 + AVIF decoder against `core + alloc` with zero `std` dependencies (verified on `wasm32-unknown-unknown`, `aarch64`, `armv7`, and `riscv64gc`).
 - **Container Helpers (`container`):** `100% #![forbid(unsafe_code)]` zero-copy IVF (`container::ivf::{IvfParser, IvfReader}`) and AV1 Annex-B (`container::annexb::{AnnexBDemuxer, read_leb128}`) demuxers.
-- **`libdav1d` (`1.5.4` / API `7.0.0`) Drop-In C-ABI (`capi`):** Implements all 19 official `DAV1D_API` functions (`dav1d_open`, `dav1d_send_data`, `dav1d_get_picture`, `dav1d_apply_grain`, `dav1d_parse_sequence_header`, etc.), ships the official `include/dav1d/*.h` headers, and declares `[package.metadata.capi]` / `dav1d.pc` metadata — verified by dynamically linking unmodified C `libavif 1.4.2` against `libdav1d.so.7` (`162 / 162` corpus parity) and an independent multithreaded C IVF client.
+- **`libdav1d` (`1.5.4` / API `7.0.0`) Drop-In C-ABI (`capi`):** Implements all 19 official `DAV1D_API` functions (`dav1d_open`, `dav1d_send_data`, `dav1d_get_picture`, `dav1d_apply_grain`, `dav1d_parse_sequence_header`, etc.), ships the official `include/dav1d/*.h` headers, and declares `[package.metadata.capi]` / `dav1d.pc` metadata — verified by dynamically linking unmodified C `libavif 1.4.2` against `libdav1d.so.7` (Linux `x86_64`) and `libdav1d.7.dylib` (macOS `arm64`) (`162 / 162` corpus parity) and an independent multithreaded C IVF client.
 - **Pure-Rust `.avif` / `.avis` Reader (`avif`):** `100% #![forbid(unsafe_code)]` ISOBMFF/HEIF/MIAF/AVIF parser with native `u8` 8-bit plane storage (`AvifPlane::U8`/`U16`) and strip-parallel YUVA→RGB conversion, single `av01` items, multithreaded `grid` tile stitching, `iden` chains, auxiliary alpha (`auxl`/`auxC`), `clap`/`irot`/`imir` transforms, ISO 21496-1 / Ultra HDR `tmap` Gain-Map (`9 / 9` parity), streaming animated `.avis` decoding (`AvifSequenceDecoder`, `6 / 6` animated streams + `nth_frame` seeking), `ICC`/`Exif`/`XMP` metadata (including bounded `defl`/`zlib`/`gzip` compressed HEIF metadata and `cmin` boxes under `std`), and linear + nonlinear ITU-T H.273 conversions (`ICtCp` `mc = 14` PQ/HLG and `BT.2020 CL` `mc = 10`, alongside `RGB8`/`RGBA8`/`RGB16`/`RGBA16`) — verified `100%` MD5 bit-exact parity against reference C `libavif 1.4.2` across `162 / 162` still files (`156` valid + `6` negative, `9 / 9` Gain-Map) and `6 / 6` animated `.avif` sequences.
 - **Separate `image` Ecosystem Adapter (`av1oxide-image`):** Workspace crate [`crates/av1oxide-image`](crates/av1oxide-image/README.md) (`v0.1.0`, `100% #![forbid(unsafe_code)]`) provides `image::ImageDecoder` (`Rgb8`/`Rgba8`/`Rgb16`/`Rgba16`, `icc_profile`, `exif_metadata`, `xmp_metadata`, `Limits`) and `register_decoding_hook` without adding `image` to `av1oxide`'s dependency graph.
 
@@ -301,7 +301,7 @@ Five standalone examples are included in the crate:
 
 ## Performance & Memory Comparison vs. `dav1d 1.5.4` and `libavif 1.4.2`
 
-All benchmarks were measured under `100%` MD5 bit-exact output parity between `av1oxide` (`rustc 1.100.0 --release`, `opt-level = 3`, `lto = "thin"`, `strip = "symbols"`), the reference C/ASM `dav1d 1.5.4` (`99f3354ed0b9b4bf3c7c9347318dbcc522c94af5`), and reference C `libavif 1.4.2` (`b8551fe61aaf92733234efc5e11cdfac5a5f54b3`, built with `-DAVIF_LIBYUV=OFF -DAVIF_LIBSHARPYUV=OFF` over `dav1d 1.5.4`). File I/O, container demuxing, and MD5 verification execute outside the timed decode window; each workload and decoder runs in an isolated subprocess across `5–7` interleaved runs, reporting median (`p50`) wall time, OS Peak RSS (`MiB`), and `av1oxide` live heap peak (`MiB`). The `x86_64` tables below report **`v0.5.0`** measurements; the Apple M4 Pro (`aarch64`) tables report the **`v0.4.0` baseline** pending `v0.5.0` measurement on Apple M4 Pro hardware.
+All benchmarks were measured under `100%` MD5 bit-exact output parity between `av1oxide` (`v0.5.0`, `rustc 1.100.0 --release`, `opt-level = 3`, `lto = "thin"`, `strip = "symbols"`), the reference C/ASM `dav1d 1.5.4` (`99f3354ed0b9b4bf3c7c9347318dbcc522c94af5`), and reference C `libavif 1.4.2` (`b8551fe61aaf92733234efc5e11cdfac5a5f54b3`, built with `-DAVIF_LIBYUV=OFF -DAVIF_LIBSHARPYUV=OFF` over `dav1d 1.5.4`). File I/O, container demuxing, and MD5 verification execute outside the timed decode window; each workload and decoder runs in an isolated subprocess across `5–7` interleaved runs, reporting median (`p50`) wall time, OS Peak RSS (`MiB`), and `av1oxide` live heap peak (`MiB`). Both `x86_64` (`AMD Ryzen 9 9950X3D`) and `aarch64` (`Apple M4 Pro`) tables below report **`v0.5.0`** measurements.
 
 ### 1. `x86_64` — AMD Ryzen 9 9950X3D (Zen 5, `16C / 32T`, `AVX-512ICL`, `v0.5.0`)
 
@@ -346,48 +346,48 @@ All benchmarks were measured under `100%` MD5 bit-exact output parity between `a
 
 ---
 
-### 2. `aarch64` — Apple M4 Pro (`14C = 10P + 4E`, `NEON + DOTPROD`, `v0.4.0` Baseline)
+### 2. `aarch64` — Apple M4 Pro (`14C = 10P + 4E`, `NEON + DOTPROD`, `v0.5.0`)
 
-> The tables in this section record the `v0.4.0` baseline measured on Apple M4 Pro hardware (`aarch64-apple-darwin`); `v0.5.0` Apple M4 Pro measurements will be synced separately on macOS hardware.
-
-#### Single-Thread (`n_threads = 1`, `max_frame_delay = 1`) Suite Summary (`v0.4.0`)
+#### Single-Thread (`n_threads = 1`, `max_frame_delay = 1`) Suite Summary
 
 | Suite | SIMD Mode | Streams / Frames | `av1oxide` Total (`ms`) | `dav1d` Total (`ms`) | Wall-Time Ratio (`av1oxide / dav1d`) | Geometric Mean | Median (`p50`) | Suite Max `av1oxide` Peak RSS (`MiB`) | Suite Max `dav1d` Peak RSS (`MiB`) | RSS Ratio (`av1oxide / dav1d`) | MD5 Parity |
-|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| **`korpus`** | `NEON + DOTPROD` (same-ISA) | `19` streams / `950` decoded frames | `738.5 ms` | `474.1 ms` | **`1.558×`** | `1.623×` | `1.599×` | `16.52 MiB` (`10.89 MiB` live heap) | `8.91 MiB` | `1.85×` | `19 / 19` (`100%`) |
-| **`temsilci`** | `NEON + DOTPROD` (same-ISA) | `8` streams / `485` decoded frames | `1,994.9 ms` | `1,123.8 ms` | **`1.775×`** | `1.560×` | `1.632×` | `1,234.05 MiB` (`1,212.62 MiB` live heap) | `610.30 MiB` | `2.02×` | `8 / 8` (`100%`) |
-| **`korpus`** | `tespit` (`dav1d` + `I8MM`) | `19` streams / `950` decoded frames | `734.2 ms` | `474.5 ms` | **`1.547×`** | `1.647×` | `1.585×` | `16.50 MiB` (`10.89 MiB` live heap) | `8.89 MiB` | `1.86×` | `19 / 19` (`100%`) |
-| **`temsilci`** | `tespit` (`dav1d` + `I8MM`) | `8` streams / `485` decoded frames | `1,982.5 ms` | `1,122.2 ms` | **`1.767×`** | `1.570×` | `1.622×` | `1,233.30 MiB` (`1,212.62 MiB` live heap) | `610.31 MiB` | `2.02×` | `8 / 8` (`100%`) |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| **`korpus`** | `NEON + DOTPROD` (same-ISA) | `19` streams / `950` decoded frames | `760.3 ms` | `503.7 ms` | **`1.509×`** | `1.540×` | `1.503×` | `12.19 MiB` (`6.41 MiB` live heap) | `8.88 MiB` | `1.37×` | `19 / 19` (`100%`) |
+| **`temsilci`** | `NEON + DOTPROD` (same-ISA) | `8` streams / `485` decoded frames | `1,964.3 ms` | `1,163.4 ms` | **`1.688×`** | `1.504×` | `1.555×` | `666.14 MiB` (`644.75 MiB` live heap) | `610.30 MiB` | `1.09×` | `8 / 8` (`100%`) |
+| **`korpus`** | `tespit` (`dav1d` + `I8MM`) | `19` streams / `950` decoded frames | `759.9 ms` | `500.4 ms` | **`1.519×`** | `1.580×` | `1.522×` | `12.17 MiB` (`6.41 MiB` live heap) | `8.92 MiB` | `1.36×` | `19 / 19` (`100%`) |
+| **`temsilci`** | `tespit` (`dav1d` + `I8MM`) | `8` streams / `485` decoded frames | `1,961.2 ms` | `1,157.9 ms` | **`1.694×`** | `1.512×` | `1.553×` | `666.16 MiB` (`644.75 MiB` live heap) | `610.31 MiB` | `1.09×` | `8 / 8` (`100%`) |
 
-#### Single-Thread (`n_threads = 1`) Representative Streams Breakdown (`NEON + DOTPROD`, `v0.4.0`)
+#### Single-Thread (`n_threads = 1`) Representative Streams Breakdown (`NEON + DOTPROD`)
 
 | Stream | Resolution | Bit / Chroma | Frames | `av1oxide` (`ms/frame`) | `av1oxide` (`FPS`) | `dav1d` (`ms/frame`) | `dav1d` (`FPS`) | Time Ratio (`av1oxide / dav1d`) | Speedup vs. Scalar | `av1oxide` Peak RSS / Live Heap (`MiB`) | `dav1d` Peak RSS (`MiB`) | RSS Ratio (`av1oxide / dav1d`) |
 |---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| `422_oddheight_8b` | `64×63` | `8b` `4:2:2` | `80` | `0.292` | `3,423.5` | `0.274` | `3,645.0` | **`1.065×`** | `1.52×` | `4.20` / `0.36` | `2.91` | `1.45×` |
-| `422_oddheight_10b` | `64×63` | `10b` `4:2:2` | `80` | `0.310` | `3,225.8` | `0.283` | `3,538.6` | **`1.097×`** | `1.74×` | `4.58` / `0.55` | `3.00` | `1.53×` |
-| `vq002_inter_432x240` | `432×240` | `8b` `4:2:0` | `50` | `3.263` | `306.5` | `2.526` | `395.8` | **`1.291×`** | `2.34×` | `8.64` / `3.39` | `5.08` | `1.70×` |
-| `test10755_cdef10_sb64` | `1024×512` | `10b` `4:2:0` | `24` | `2.760` | `362.4` | `1.947` | `513.5` | **`1.417×`** | `2.64×` | `20.70` / `13.28` | `11.56` | `1.79×` |
-| `fg10_film_grain_50` | `352×288` | `10b` `4:2:0` | `100` | `0.980` | `1,020.7` | `0.509` | `1,965.6` | **`1.926×`** | `2.98×` | `12.00` / `6.78` | `6.02` | `1.99×` |
-| `test25_8k_444_fg` | `7680×4320` | `8b` `4:4:4` | `6` | `234.857` | `4.3` | `127.112` | `7.9` | **`1.848×`** | `1.68×` | `1,234.05` / `1,212.62` | `610.30` | `2.02×` |
-| `test1472_lr8_444` | `306×255` | `8b` `4:4:4` | `45` | `0.366` | `2,735.2` | `0.182` | `5,501.9` | **`2.011×`** | `2.32×` | `8.34` / `2.90` | `4.95` | `1.68×` |
-| `ccvb_film_grain` | `640×480` | `8b` `4:2:0` | `100` | `1.938` | `516.0` | `0.845` | `1,183.6` | **`2.294×`** | `2.98×` | `16.44` / `10.89` | `8.91` | `1.85×` |
+| `422_oddheight_8b` | `64×63` | `8b` `4:2:2` | `80` | `0.297` | `3,367.3` | `0.272` | `3,676.3` | **`1.092×`** | `1.54×` | `4.25` / `0.28` | `2.91` | `1.46×` |
+| `422_oddheight_10b` | `64×63` | `10b` `4:2:2` | `80` | `0.335` | `2,981.4` | `0.300` | `3,327.8` | **`1.116×`** | `1.58×` | `4.52` / `0.41` | `3.00` | `1.51×` |
+| `vq002_inter_432x240` | `432×240` | `8b` `4:2:0` | `50` | `3.204` | `312.2` | `2.561` | `390.5` | **`1.251×`** | `2.50×` | `7.44` / `2.21` | `5.08` | `1.46×` |
+| `test10755_cdef10_sb64` | `1024×512` | `10b` `4:2:0` | `24` | `2.839` | `352.2` | `2.038` | `490.8` | **`1.393×`** | `2.55×` | `15.36` / `8.25` | `11.56` | `1.33×` |
+| `fg10_film_grain_50` | `352×288` | `10b` `4:2:0` | `100` | `0.971` | `1,030.4` | `0.527` | `1,897.5` | **`1.842×`** | `3.03×` | `9.30` / `4.22` | `6.02` | `1.55×` |
+| `test25_8k_444_fg` | `7680×4320` | `8b` `4:4:4` | `6` | `229.213` | `4.4` | `131.818` | `7.6` | **`1.739×`** | `1.73×` | `666.14` / `644.75` | `610.30` | `1.09×` |
+| `test1472_lr8_444` | `306×255` | `8b` `4:4:4` | `45` | `0.363` | `2,753.6` | `0.212` | `4,725.9` | **`1.716×`** | `2.42×` | `6.91` / `1.78` | `4.98` | `1.39×` |
+| `ccvb_film_grain` | `640×480` | `8b` `4:2:0` | `100` | `1.968` | `508.2` | `0.876` | `1,142.2` | **`2.247×`** | `2.96×` | `12.16` / `6.41` | `8.88` | `1.37×` |
 
-#### Multi-Thread (`Apple M4 Pro`, `v0.4.0`) AV1 Comparison
+#### Multi-Thread (`Apple M4 Pro`) AV1 Comparison
 
 | Stream | Mode (`max_frame_delay`, `n_threads`) | `av1oxide` (`t=1`) | `av1oxide` (Multi-Thread) | `av1oxide` Self-Speedup | `dav1d` (Multi-Thread) | Time Ratio (`av1oxide / dav1d`) | `av1oxide` Peak RSS / Live Heap (`MiB`) | `dav1d` Peak RSS (`MiB`) | RSS Ratio (`av1oxide / dav1d`) | MD5 Parity |
 |---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| `vq002_inter_gop` (`432×240`, `8b`, `10×10=100` frames) | `mfd=1, t=4` | `311.1 ms` | `277.9 ms` | `1.12×` | `231.1 ms` | **`1.20×`** | `9.50` / `3.39` | `5.97` | `1.59×` | `100%` |
-| `test10103_coklu_tile` (`1024×1024`, `10b`, `16` tiles, `8×15=120` frames) | `mfd=0, t=14` | `1,550.6 ms` | `238.2 ms` | **`6.51×`** | `137.5 ms` | **`1.73×`** | `140.00` / `94.42` | `102.77` | `1.36×` | `100%` |
-| `test10103_coklu_tile` (`1024×1024`, `10b`, `16` tiles, `8×15=120` frames) | `mfd=4, t=14` | `1,550.6 ms` | `239.4 ms` | **`6.48×`** | `136.9 ms` | **`1.75×`** | `139.89` / `94.69` | `103.03` | `1.36×` | `100%` |
-| `test25_8k_444_fg` (`7680×4320`, `8b` `4:4:4`, `120` tiles + FG, `6` frames) | `mfd=0, t=14` | `1,418.8 ms` | `147.7 ms` | **`9.60×`** | `66.2 ms` | **`2.23×`** | `2,055.83` / `1,705.67` | `1,398.83` | `1.47×` | `100%` |
-| `test25_8k_120_tile` (`7680×4320`, `12b`, `120` tiles, `10×2=20` frames) | `mfd=0, t=14` | `1,694.6 ms` | `238.7 ms` | **`7.10×`** | `97.3 ms` | **`2.45×`** | `1,410.64` / `1,131.39` | `1,097.81` | `1.28×` | `100%` |
+| `vq002_inter_gop` (`432×240`, `8b`, `10×10=100` frames) | `mfd=1, t=4` | `317.4 ms` | `289.4 ms` | `1.10×` | `240.4 ms` | **`1.20×`** | `8.44` / `2.25` | `5.97` | `1.41×` | `100%` |
+| `fg10_film_grain_50` (`352×288`, `10b`, `10×15=150` frames) | `mfd=1, t=8` | `144.1 ms` | `130.7 ms` | `1.10×` | `75.0 ms` | **`1.74×`** | `13.44` / `4.71` | `7.97` | `1.69×` | `100%` |
+| `ccvb_film_grain` (`640×480`, `8b`, `100×3=300` frames) | `mfd=1, t=8` | `584.6 ms` | `440.9 ms` | `1.33×` | `205.7 ms` | **`2.14×`** | `16.83` / `7.00` | `11.02` | `1.53×` | `100%` |
+| `test10103_coklu_tile` (`1024×1024`, `10b`, `16` tiles, `8×15=120` frames) | `mfd=0, t=14` | `1,344.8 ms` | `205.6 ms` | **`6.54×`** | `136.9 ms` | **`1.50×`** | `103.72` / `67.50` | `104.89` | **`0.99×`** | `100%` |
+| `test10103_coklu_tile` (`1024×1024`, `10b`, `16` tiles, `8×15=120` frames) | `mfd=4, t=14` | `1,344.8 ms` | `205.5 ms` | **`6.54×`** | `137.8 ms` | **`1.49×`** | `103.16` / `67.19` | `104.73` | **`0.98×`** | `100%` |
+| `test25_8k_444_fg` (`7680×4320`, `8b` `4:4:4`, `120` tiles + FG, `6` frames) | `mfd=0, t=14` | `1,383.0 ms` | `140.2 ms` | **`9.87×`** | `69.3 ms` | **`2.02×`** | `1,413.62` / `1,140.47` | `1,398.67` | **`1.01×`** (`t=8`: `0.90×`) | `100%` |
+| `test25_8k_120_tile` (`7680×4320`, `12b`, `120` tiles, `10×2=20` frames) | `mfd=0, t=14` | `1,347.1 ms` | `213.5 ms` | **`6.31×`** | `98.2 ms` | **`2.17×`** | `1,031.45` / `810.51` | `1,097.81` | **`0.94×`** | `100%` |
 
-#### `.avif` Image Decoding + `RGBA8` Conversion (`Apple M4 Pro`, `v0.4.0`)
+#### `.avif` Image Decoding + `RGBA8` Conversion (`Apple M4 Pro`)
 
 | Workload | Images / Mode | `av1oxide` Time (`ms`) | C `libavif` Time (`ms`) | Time Ratio (`av1oxide / libavif`) | `av1oxide` Peak RSS (`MiB`) | `av1oxide` Live Heap (`MiB`) | C `libavif` Peak RSS (`MiB`) | RSS Ratio (`av1oxide / libavif`) | `RGBA8` MD5 Parity |
 |---|---|---:|---:|---:|---:|---:|---:|---:|---:|
-| **`avif_corpus_156_t4`** | `156` valid `.avif` images, `n_threads = 4` (`1` pass) | `3,348.8 ms` | `2,600.8 ms` | **`1.288×`** | `335.95 MiB` | `106.74 MiB` | `205.16 MiB` | **`1.64×`** | `156 / 156` (`100%`) |
-| **`avif_bbb_4k_t8`** | `bbb_4k.avif` (`3840×2160`), `n_threads = 8` (`5` repeats) | `366.1 ms` | `222.8 ms` | **`1.644×`** | `104.80 MiB` | `67.06 MiB` | `51.31 MiB` | **`2.04×`** | `5 / 5` (`100%`) |
+| **`avif_corpus_156_t4`** | `156` valid `.avif` images, `n_threads = 4` (`1` pass) | `2,353.9 ms` | `2,636.1 ms` | **`0.893×`** | `266.45 MiB` | `82.33 MiB` | `205.11 MiB` | **`1.30×`** | `156 / 156` (`100%`) |
+| **`avif_bbb_4k_t8`** | `bbb_4k.avif` (`3840×2160`), `n_threads = 8` (`5` repeats) | `80.2 ms` | `225.4 ms` | **`0.356×`** | `82.14 MiB` | `43.52 MiB` | `51.28 MiB` | **`1.60×`** | `5 / 5` (`100%`) |
 
 ---
 
@@ -405,10 +405,10 @@ All benchmarks were measured under `100%` MD5 bit-exact output parity between `a
 
 #### Measured Technical Factors Behind the Memory (`Peak RSS`) and `.avif` Behavior
 
-- **Single-Thread Baseline and Binary Code Pages (`1.49×–2.05×` RSS on small streams):** On low- and medium-resolution streams (`16×16` to `640×480`), `av1oxide` `v0.5.0` live heap usage is `0.29–8.25 MiB` (`x86_64`), while process resident set size (`7.5–17.0 MiB` on Linux `x86_64` vs. `3.7–11.4 MiB` for C `dav1d`) reflects the statically linked Rust runtime and multi-ISA SIMD dispatch code pages (`10.2 MiB` ELF on `x86_64`, `2.8 MiB` Mach-O on `aarch64` `v0.4.0`) compared to `dav1d`'s shared library mapping.
-- **8K Strip-Based Film Grain and `LrCdefBackup` (`1.10×` single-thread, `0.85×–0.96×` multi-thread RSS on `x86_64`):** Replacing full-frame `pre_cdef` copies with a `4`-row `LrCdefBackup` boundary buffer and applying Film Grain in place over a `32`-row rolling strip buffer (`Frame::from_owned_pic` when `refresh_frame_flags == 0`) reduced `test25_8k_444_fg` (`7680×4320`, `4:4:4` + FG) single-thread Peak RSS from `1,231.4 MiB` (`2.02×`) in `v0.4.0` to `667.5 MiB` (`1.10×` vs. `dav1d` `609.0 MiB`) and multi-thread `t=8` Peak RSS from `1,990.9 MiB` (`1.41×`) to `1,207.2 MiB` (`0.85×`, `14.7%` lower than `dav1d` `1,414.6 MiB`; `t=4`: `0.96×`; `test25_8k_120_tile` `t=16`: `0.87×`).
-- **16-Thread Multi-Tile Scratch Reuse (`0.55×–0.56×` RSS on `x86_64`):** On `1024×1024` `16`-tile `10-bit` streams at `n_threads = 16` (`test10103_coklu_tile`), `av1oxide` records `158.5–161.5 MiB` Peak RSS (`67.9–68.7 MiB` live heap) vs. `284.6–291.9 MiB` for `dav1d` (`0.55×–0.56×`) on Linux `x86_64`, because `av1oxide` reuses bounded worker scratch slots (`ScratchPool`) and recycled plane buffers (`DecodeBufPool`) on demand rather than pre-allocating full per-frame-thread tile and coefficient arenas upfront.
-- **`.avif` Native `u8` Planes and Strip-Parallel YUVA→RGB (`0.464×–0.957×` Time on `x86_64`):** Storing `8-bit` AVIF channels natively as `u8` (`AvifPlane::U8`) and executing specialized `(9, 3, 3, 1)/16` row-pair YUVA→RGB conversion across `std::thread::scope` strips reduced `x86_64` `avif_corpus_156_t4` time from `3,617.2 ms` (`1.460×`) to `2,362.4 ms` (`0.957×`, `4.3%` faster than C `libavif 1.4.2 + dav1d 1.5.4`) and live heap from `99.15 MiB` to `74.75 MiB`; on `4K` `bbb_4k.avif` (`t=8`, `5` repeats), decode + `RGBA8` time dropped from `407.2 ms` (`1.488×`) to `126.9 ms` (`0.464×`, `2.16×` faster than C `libavif`, with `-DAVIF_LIBYUV=OFF`) and live heap fell from `67.06 MiB` to `43.53 MiB`.
+- **Single-Thread Baseline and Binary Code Pages (`1.33×–2.05×` RSS on small streams):** On low- and medium-resolution streams (`16×16` to `640×480`), `av1oxide` `v0.5.0` live heap usage is `0.28–8.25 MiB` across both architectures, while process resident set size (`7.5–17.0 MiB` on Linux `x86_64`, `4.2–15.4 MiB` on macOS `aarch64`) reflects the statically linked Rust runtime and SIMD dispatch code pages (`10.2 MiB` ELF on `x86_64`, `3.4 MiB` Mach-O on `aarch64`) compared to `dav1d`'s smaller C binary mapping.
+- **8K Strip-Based Film Grain and `LrCdefBackup` (`1.09×–1.10×` single-thread, `0.85×–1.01×` multi-thread RSS):** Replacing full-frame `pre_cdef` copies with a `4`-row `LrCdefBackup` boundary buffer and applying Film Grain in place over a `32`-row rolling strip buffer (`Frame::from_owned_pic` when `refresh_frame_flags == 0`) reduced `test25_8k_444_fg` (`7680×4320`, `4:4:4` + FG) single-thread Peak RSS from `~1,231–1,234 MiB` (`2.02×`) in `v0.4.0` to `667.5 MiB` (`1.10×` on `x86_64`) and `666.1 MiB` (`1.09×` on Apple M4 Pro), and reduced multi-thread Peak RSS to `1,207.2 MiB` (`0.85×` at `t=8` on `x86_64`), `1,284.9 MiB` (`0.90×` at `t=8` on Apple M4 Pro), and `1,413.6 MiB` (`1.01×` at `t=14` on Apple M4 Pro; `test25_8k_120_tile`: `0.87×` at `t=16` on `x86_64` and `0.94×` at `t=14` on Apple M4 Pro).
+- **Multi-Tile Scratch Reuse (`0.55×–0.56×` RSS on `x86_64`, `0.98×–0.99×` on Apple M4 Pro):** On `1024×1024` `16`-tile `10-bit` streams (`test10103_coklu_tile`), `av1oxide` records `158.5–161.5 MiB` Peak RSS (`67.9–68.7 MiB` live heap) vs. `284.6–291.9 MiB` for `dav1d` (`0.55×–0.56×`) at `t=16` on Linux `x86_64`, and `103.2–103.7 MiB` Peak RSS (`67.2–67.5 MiB` live heap) vs. `104.7–104.9 MiB` for `dav1d` (`0.98×–0.99×`) at `t=14` on Apple M4 Pro, by reusing bounded worker scratch slots (`ScratchPool`) and recycled plane buffers (`DecodeBufPool`) on demand.
+- **`.avif` Native `u8` Planes and Strip-Parallel YUVA→RGB (`0.356×–0.957×` Time vs. C `libavif`):** Storing `8-bit` AVIF channels natively as `u8` (`AvifPlane::U8`) and executing specialized `(9, 3, 3, 1)/16` row-pair YUVA→RGB conversion across `std::thread::scope` strips reduced `avif_corpus_156_t4` time to `2,362.4 ms` (`0.957×` vs. C `libavif 1.4.2 + dav1d 1.5.4` on `x86_64`) and `2,353.9 ms` (`0.893×` on Apple M4 Pro); on `4K` `bbb_4k.avif` (`t=8`, `5` repeats), decode + `RGBA8` time dropped to `126.9 ms` (`0.464×` on `x86_64`) and `80.2 ms` (`0.356×` on Apple M4 Pro, `2.81×` shorter wall time than C `libavif` built with `-DAVIF_LIBYUV=OFF`), with live heap reduced from `67.06 MiB` to `43.52–43.53 MiB`.
 
 ---
 

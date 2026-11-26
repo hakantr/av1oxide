@@ -3,7 +3,7 @@
 //!
 //! Tespit iki parçadır:
 //!
-//! 1. [`X86CpuId::read`] ham CPUID yapraklarını (0, 1, 7) güvenli
+//! 1. `X86CpuId::read` ham CPUID yapraklarını (0, 1, 7) güvenli
 //!    `std::arch::x86_64::__cpuid` ile ve işletim sistemi durumunu (XCR0)
 //!    std `is_x86_feature_detected!` üzerinden okur.
 //! 2. [`X86CpuId::flags`] saf bir işlevdir: dav1d'nin koşullarını aynı

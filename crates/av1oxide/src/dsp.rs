@@ -70,7 +70,7 @@
 //!
 //! Burada `forbid` değil **`deny`** vardır: `forbid` alt modüllerce
 //! gevşetilemediği için, tek ve denetlenmiş `unsafe` sınırının
-//! ([`x86`], audit defterinde kayıtlı) altında `allow` ile açılabilmesi
+//! (`x86`, audit defterinde kayıtlı) altında `allow` ile açılabilmesi
 //! gerekir. `dsp` ağacındaki **diğer** dosyalar `#![forbid(unsafe_code)]`
 //! taşır; denetim testi (`audit::her_kaynak_dosyasi_politika_bildirir`)
 //! kayıtsız bir dosyada `unsafe` kullanımını yakalar.

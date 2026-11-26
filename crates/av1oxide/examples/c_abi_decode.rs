@@ -1,4 +1,4 @@
-//! `av1oxide` `libdav1d` (`7.0.0`) uyumlu C-ABI kullanım örneği (`v0.4.0`).
+//! `av1oxide` `libdav1d` (`7.0.0`) uyumlu C-ABI kullanım örneği (`v0.5.0`).
 //!
 //! Çalıştırma:
 //!   cargo run --release -p av1oxide --example c_abi_decode

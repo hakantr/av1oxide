@@ -18,6 +18,7 @@
 
 #![forbid(unsafe_code)]
 
+use alloc::vec::Vec;
 use core::arch::aarch64::{
     int8x16_t, int16x8_t, int32x4_t, uint8x16_t, uint32x4_t, vcombine_u8, vdotq_s32, vdotq_u32,
     vdup_n_u8, vextq_u8, vqrdmulhq_s16, vqrshrun_n_s16, vqtbl1q_u8, vreinterpretq_s8_u8,

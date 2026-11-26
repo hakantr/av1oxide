@@ -289,7 +289,7 @@ impl CpuFlags {
     /// Çalışma zamanı tespiti — süreç başına **bir kez** yapılır ve önbelleğe
     /// alınır (DSP-01/4); sonraki çağrılar aynı değeri döner.
     ///
-    /// x86_64'te [`x86::X86CpuId::read`] ham CPUID ve işletim sistemi
+    /// x86_64'te `x86::X86CpuId::read` ham CPUID ve işletim sistemi
     /// durumunu okur, [`x86::X86CpuId::flags`] dav1d koşullarını ve quirks
     /// tablosunu uygular. `wasm32`'de çalışma zamanı CPUID olmadığı için
     /// (`DSP-07`) `-C target-feature=+simd128` derleme zamanı özelliği etkinse

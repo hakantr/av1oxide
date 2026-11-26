@@ -15,7 +15,7 @@
 - **Çok-Thread ve Bellek Bütçesi:** Kare içi (`Tile`, süperblok satırı, halka içi filtre) ve kareler arası (`FrameSlot`) paralellik (`Config::n_threads`, `Config::max_frame_delay`), düzlem geri dönüşüm havuzu (`DecodeBufPool`) ve tahsis öncesi piksel/bellek tavanı (`Config::frame_size_limit`, `Config::allocation_limit`).
 - **İsteğe Bağlı `#![no_std] + alloc` (`default = ["std"]`):** `--no-default-features` ile tam tek-thread AV1 + AVIF çekirdeği sıfır `std` bağımlılığıyla `core + alloc` üzerinde derlenir (`wasm32-unknown-unknown`, `aarch64`, `armv7` ve `riscv64gc` hedeflerinde doğrulandı).
 - **Kapsayıcı Yardımcıları (`container`):** `%100 #![forbid(unsafe_code)]` sıfır kopyalı IVF (`container::ivf::{IvfParser, IvfReader}`) ve AV1 Annex-B (`container::annexb::{AnnexBDemuxer, read_leb128}`) ayrıştırıcıları.
-- **`libdav1d` (`1.5.4` / API `7.0.0`) Drop-In C-ABI (`capi`):** 19 resmî `DAV1D_API` fonksiyonunun tamamını (`dav1d_open`, `dav1d_send_data`, `dav1d_get_picture`, `dav1d_apply_grain`, `dav1d_parse_sequence_header`, vb.), resmî `include/dav1d/*.h` C başlıklarını ve `[package.metadata.capi]` / `dav1d.pc` sistem paketleme üst verisini içerir — değiştirilmemiş C `libavif 1.4.2` ikilisinin dinamik olarak `libdav1d.so.7` kütüphanesine bağlanması (`162 / 162` korpus paritesi) ve bağımsız çok-thread C IVF istemcisi ile doğrulanmıştır.
+- **`libdav1d` (`1.5.4` / API `7.0.0`) Drop-In C-ABI (`capi`):** 19 resmî `DAV1D_API` fonksiyonunun tamamını (`dav1d_open`, `dav1d_send_data`, `dav1d_get_picture`, `dav1d_apply_grain`, `dav1d_parse_sequence_header`, vb.), resmî `include/dav1d/*.h` C başlıklarını ve `[package.metadata.capi]` / `dav1d.pc` sistem paketleme üst verisini içerir — değiştirilmemiş C `libavif 1.4.2` ikilisinin dinamik olarak `libdav1d.so.7` (Linux `x86_64`) ve `libdav1d.7.dylib` (macOS `arm64`) kütüphanelerine bağlanması (`162 / 162` korpus paritesi) ve bağımsız çok-thread C IVF istemcisi ile doğrulanmıştır.
 - **Saf Rust `.avif` / `.avis` Görüntü Okuyucu (`avif`):** `%100 #![forbid(unsafe_code)]` ISOBMFF/HEIF/MIAF/AVIF ayrıştırıcısı; doğal `u8` 8-bit düzlem temsili (`AvifPlane::U8`/`U16`) ve şerit-paralel YUVA→RGB dönüşümü, tekil `av01`, çok-thread `grid` karo birleştirme, `iden` türetilmiş görüntüler, yardımcı alfa (`auxl`/`auxC`), `clap`/`irot`/`imir` dönüşümleri, ISO 21496-1 / Ultra HDR `tmap` Gain-Map (`9 / 9` parite), akışlı animasyonlu `.avis` çözme (`AvifSequenceDecoder`, `6 / 6` animasyonlu akış + `nth_frame` rastgele erişim), `ICC`/`Exif`/`XMP` metaverisi (`std` altında bütçe korumalı `defl`/`zlib`/`gzip` sıkıştırılmış HEIF metaveri öğeleri ve `cmin` kutuları dahil) ve doğrusal/doğrusal olmayan ITU-T H.273 dönüşümleri (`ICtCp` `mc = 14` PQ/HLG ve `BT.2020 CL` `mc = 10` dahil; `RGB8`/`RGBA8`/`RGB16`/`RGBA16`) — lisans denetimli `AOMediaCodec/av1-avif` ve `AOMediaCodec/libavif` test korpusundaki `162 / 162` durağan (`156` geçerli + `6` negatif, `9 / 9` Gain-Map) ve `6 / 6` animasyonlu `.avif` dosyasında referans C `libavif 1.4.2` ile `%100` MD5 bit-birebir eşitlik.
 - **Ayrı `image` Ekosistem Köprüsü (`av1oxide-image`):** Çalışma alanı içindeki bağımsız [`crates/av1oxide-image`](crates/av1oxide-image/README.md) (`v0.1.0`, `%100 #![forbid(unsafe_code)]`) paketi, ana `av1oxide` bağımlılık ağacına `image` eklemeden `image::ImageDecoder` (`Rgb8`/`Rgba8`/`Rgb16`/`Rgba16`, `icc_profile`, `exif_metadata`, `xmp_metadata`, `Limits`) ve `register_decoding_hook` uyumluluğu sunar.
 
@@ -301,7 +301,7 @@ Depoda doğrudan çalıştırılabilen beş kullanım örneği bulunur:
 
 ## `dav1d 1.5.4` ve `libavif 1.4.2` ile Süre ve Bellek (RAM) Karşılaştırması
 
-Tüm ölçümler `%100` MD5 bit-birebir eşitlik altında `av1oxide` (`rustc 1.100.0 --release`, `opt-level = 3`, `lto = "thin"`, `strip = "symbols"`), referans C/ASM `dav1d 1.5.4` (`99f3354ed0b9b4bf3c7c9347318dbcc522c94af5`) ve referans C `libavif 1.4.2` (`b8551fe61aaf92733234efc5e11cdfac5a5f54b3`, `-DAVIF_LIBYUV=OFF -DAVIF_LIBSHARPYUV=OFF` + `dav1d 1.5.4`) arasında gerçekleştirilmiştir. Dosya okuma, kapsayıcı ayrıştırma ve MD5 doğrulaması zamanlama penceresinin dışındadır; her iş yükü ve çözücü izole alt süreçlerde `5–7` dönüşümlü koşu ile yürütülüp ortanca (`p50`) duvar süresi, işletim sistemi Tepe RSS (`MiB`) ve `av1oxide` canlı yığın tepesi (`MiB`) raporlanmıştır. Aşağıdaki `x86_64` tabloları **`v0.5.0`** ölçümlerini, Apple M4 Pro (`aarch64`) tabloları ise donanım üzerindeki `v0.5.0` eşitlemesi öncesindeki **`v0.4.0` taban çizgisini** yansıtır.
+Tüm ölçümler `%100` MD5 bit-birebir eşitlik altında `av1oxide` (`v0.5.0`, `rustc 1.100.0 --release`, `opt-level = 3`, `lto = "thin"`, `strip = "symbols"`), referans C/ASM `dav1d 1.5.4` (`99f3354ed0b9b4bf3c7c9347318dbcc522c94af5`) ve referans C `libavif 1.4.2` (`b8551fe61aaf92733234efc5e11cdfac5a5f54b3`, `-DAVIF_LIBYUV=OFF -DAVIF_LIBSHARPYUV=OFF` + `dav1d 1.5.4`) arasında gerçekleştirilmiştir. Dosya okuma, kapsayıcı ayrıştırma ve MD5 doğrulaması zamanlama penceresinin dışındadır; her iş yükü ve çözücü izole alt süreçlerde `5–7` dönüşümlü koşu ile yürütülüp ortanca (`p50`) duvar süresi, işletim sistemi Tepe RSS (`MiB`) ve `av1oxide` canlı yığın tepesi (`MiB`) raporlanmıştır. Aşağıdaki `x86_64` (`AMD Ryzen 9 9950X3D`) ve `aarch64` (`Apple M4 Pro`) tablolarının tamamı **`v0.5.0`** ölçümlerini içerir.
 
 ### 1. `x86_64` — AMD Ryzen 9 9950X3D (Zen 5, `16C / 32T`, `AVX-512ICL`, `v0.5.0`)
 
@@ -346,48 +346,48 @@ Tüm ölçümler `%100` MD5 bit-birebir eşitlik altında `av1oxide` (`rustc 1.1
 
 ---
 
-### 2. `aarch64` — Apple M4 Pro (`14C = 10P + 4E`, `NEON + DOTPROD`, `v0.4.0` Taban Çizgisi)
+### 2. `aarch64` — Apple M4 Pro (`14C = 10P + 4E`, `NEON + DOTPROD`, `v0.5.0`)
 
-> Bu bölümdeki tablolar Apple M4 Pro (`aarch64-apple-darwin`) donanımında ölçülen `v0.4.0` taban çizgisini içerir; `v0.5.0` Apple M4 Pro ölçümleri macOS donanım doğrulaması ardından güncellenecektir.
-
-#### Tek-Thread (`n_threads = 1`, `max_frame_delay = 1`) Küme Özeti (`v0.4.0`)
+#### Tek-Thread (`n_threads = 1`, `max_frame_delay = 1`) Küme Özeti
 
 | Küme | SIMD Kipi | Akış / Kare | `av1oxide` Toplam (`ms`) | `dav1d` Toplam (`ms`) | Duvar Süresi Oranı (`av1oxide / dav1d`) | Geometrik Ortalama | Ortanca (`p50`) | Küme Maks. `av1oxide` Tepe RSS (`MiB`) | Küme Maks. `dav1d` Tepe RSS (`MiB`) | RSS Oranı (`av1oxide / dav1d`) | MD5 Eşitliği |
-|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| **`korpus`** | `NEON + DOTPROD` (aynı-ISA) | `19` akış / `950` çözülen kare | `738,5 ms` | `474,1 ms` | **`1,558×`** | `1,623×` | `1,599×` | `16,52 MiB` (`10,89 MiB` canlı yığın) | `8,91 MiB` | `1,85×` | `19 / 19` (`%100`) |
-| **`temsilci`** | `NEON + DOTPROD` (aynı-ISA) | `8` akış / `485` çözülen kare | `1 994,9 ms` | `1 123,8 ms` | **`1,775×`** | `1,560×` | `1,632×` | `1 234,05 MiB` (`1 212,62 MiB` canlı yığın) | `610,30 MiB` | `2,02×` | `8 / 8` (`%100`) |
-| **`korpus`** | `tespit` (`dav1d` + `I8MM`) | `19` akış / `950` çözülen kare | `734,2 ms` | `474,5 ms` | **`1,547×`** | `1,647×` | `1,585×` | `16,50 MiB` (`10,89 MiB` canlı yığın) | `8,89 MiB` | `1,86×` | `19 / 19` (`%100`) |
-| **`temsilci`** | `tespit` (`dav1d` + `I8MM`) | `8` akış / `485` çözülen kare | `1 982,5 ms` | `1 122,2 ms` | **`1,767×`** | `1,570×` | `1,622×` | `1 233,30 MiB` (`1 212,62 MiB` canlı yığın) | `610,31 MiB` | `2,02×` | `8 / 8` (`%100`) |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| **`korpus`** | `NEON + DOTPROD` (aynı-ISA) | `19` akış / `950` çözülen kare | `760,3 ms` | `503,7 ms` | **`1,509×`** | `1,540×` | `1,503×` | `12,19 MiB` (`6,41 MiB` canlı yığın) | `8,88 MiB` | `1,37×` | `19 / 19` (`%100`) |
+| **`temsilci`** | `NEON + DOTPROD` (aynı-ISA) | `8` akış / `485` çözülen kare | `1 964,3 ms` | `1 163,4 ms` | **`1,688×`** | `1,504×` | `1,555×` | `666,14 MiB` (`644,75 MiB` canlı yığın) | `610,30 MiB` | `1,09×` | `8 / 8` (`%100`) |
+| **`korpus`** | `tespit` (`dav1d` + `I8MM`) | `19` akış / `950` çözülen kare | `759,9 ms` | `500,4 ms` | **`1,519×`** | `1,580×` | `1,522×` | `12,17 MiB` (`6,41 MiB` canlı yığın) | `8,92 MiB` | `1,36×` | `19 / 19` (`%100`) |
+| **`temsilci`** | `tespit` (`dav1d` + `I8MM`) | `8` akış / `485` çözülen kare | `1 961,2 ms` | `1 157,9 ms` | **`1,694×`** | `1,512×` | `1,553×` | `666,16 MiB` (`644,75 MiB` canlı yığın) | `610,31 MiB` | `1,09×` | `8 / 8` (`%100`) |
 
-#### Tek-Thread (`n_threads = 1`) Temsilci Akışlar Detayı (`NEON + DOTPROD`, `v0.4.0`)
+#### Tek-Thread (`n_threads = 1`) Temsilci Akışlar Detayı (`NEON + DOTPROD`)
 
 | Akış | Çözünürlük | Bit / Kroma | Kare | `av1oxide` (`ms/kare`) | `av1oxide` (`FPS`) | `dav1d` (`ms/kare`) | `dav1d` (`FPS`) | Süre Oranı (`av1oxide / dav1d`) | Skaler'e Göre Hızlanma | `av1oxide` Tepe RSS / Canlı Yığın (`MiB`) | `dav1d` Tepe RSS (`MiB`) | RSS Oranı (`av1oxide / dav1d`) |
 |---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| `422_oddheight_8b` | `64×63` | `8b` `4:2:2` | `80` | `0,292` | `3 423,5` | `0,274` | `3 645,0` | **`1,065×`** | `1,52×` | `4,20` / `0,36` | `2,91` | `1,45×` |
-| `422_oddheight_10b` | `64×63` | `10b` `4:2:2` | `80` | `0,310` | `3 225,8` | `0,283` | `3 538,6` | **`1,097×`** | `1,74×` | `4,58` / `0,55` | `3,00` | `1,53×` |
-| `vq002_inter_432x240` | `432×240` | `8b` `4:2:0` | `50` | `3,263` | `306,5` | `2,526` | `395,8` | **`1,291×`** | `2,34×` | `8,64` / `3,39` | `5,08` | `1,70×` |
-| `test10755_cdef10_sb64` | `1024×512` | `10b` `4:2:0` | `24` | `2,760` | `362,4` | `1,947` | `513,5` | **`1,417×`** | `2,64×` | `20,70` / `13,28` | `11,56` | `1,79×` |
-| `fg10_film_grain_50` | `352×288` | `10b` `4:2:0` | `100` | `0,980` | `1 020,7` | `0,509` | `1 965,6` | **`1,926×`** | `2,98×` | `12,00` / `6,78` | `6,02` | `1,99×` |
-| `test25_8k_444_fg` | `7680×4320` | `8b` `4:4:4` | `6` | `234,857` | `4,3` | `127,112` | `7,9` | **`1,848×`** | `1,68×` | `1 234,05` / `1 212,62` | `610,30` | `2,02×` |
-| `test1472_lr8_444` | `306×255` | `8b` `4:4:4` | `45` | `0,366` | `2 735,2` | `0,182` | `5 501,9` | **`2,011×`** | `2,32×` | `8,34` / `2,90` | `4,95` | `1,68×` |
-| `ccvb_film_grain` | `640×480` | `8b` `4:2:0` | `100` | `1,938` | `516,0` | `0,845` | `1 183,6` | **`2,294×`** | `2,98×` | `16,44` / `10,89` | `8,91` | `1,85×` |
+| `422_oddheight_8b` | `64×63` | `8b` `4:2:2` | `80` | `0,297` | `3 367,3` | `0,272` | `3 676,3` | **`1,092×`** | `1,54×` | `4,25` / `0,28` | `2,91` | `1,46×` |
+| `422_oddheight_10b` | `64×63` | `10b` `4:2:2` | `80` | `0,335` | `2 981,4` | `0,300` | `3 327,8` | **`1,116×`** | `1,58×` | `4,52` / `0,41` | `3,00` | `1,51×` |
+| `vq002_inter_432x240` | `432×240` | `8b` `4:2:0` | `50` | `3,204` | `312,2` | `2,561` | `390,5` | **`1,251×`** | `2,50×` | `7,44` / `2,21` | `5,08` | `1,46×` |
+| `test10755_cdef10_sb64` | `1024×512` | `10b` `4:2:0` | `24` | `2,839` | `352,2` | `2,038` | `490,8` | **`1,393×`** | `2,55×` | `15,36` / `8,25` | `11,56` | `1,33×` |
+| `fg10_film_grain_50` | `352×288` | `10b` `4:2:0` | `100` | `0,971` | `1 030,4` | `0,527` | `1 897,5` | **`1,842×`** | `3,03×` | `9,30` / `4,22` | `6,02` | `1,55×` |
+| `test25_8k_444_fg` | `7680×4320` | `8b` `4:4:4` | `6` | `229,213` | `4,4` | `131,818` | `7,6` | **`1,739×`** | `1,73×` | `666,14` / `644,75` | `610,30` | `1,09×` |
+| `test1472_lr8_444` | `306×255` | `8b` `4:4:4` | `45` | `0,363` | `2 753,6` | `0,212` | `4 725,9` | **`1,716×`** | `2,42×` | `6,91` / `1,78` | `4,98` | `1,39×` |
+| `ccvb_film_grain` | `640×480` | `8b` `4:2:0` | `100` | `1,968` | `508,2` | `0,876` | `1 142,2` | **`2,247×`** | `2,96×` | `12,16` / `6,41` | `8,88` | `1,37×` |
 
-#### Çok-Thread (`Apple M4 Pro`, `v0.4.0`) AV1 Karşılaştırması
+#### Çok-Thread (`Apple M4 Pro`) AV1 Karşılaştırması
 
 | Akış | Kip (`max_frame_delay`, `n_threads`) | `av1oxide` (`t=1`) | `av1oxide` (Çok-Thread) | `av1oxide` Öz-Hızlanma | `dav1d` (Çok-Thread) | Süre Oranı (`av1oxide / dav1d`) | `av1oxide` Tepe RSS / Canlı Yığın (`MiB`) | `dav1d` Tepe RSS (`MiB`) | RSS Oranı (`av1oxide / dav1d`) | MD5 Eşitliği |
 |---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| `vq002_inter_gop` (`432×240`, `8b`, `10×10=100` kare) | `mfd=1, t=4` | `311,1 ms` | `277,9 ms` | `1,12×` | `231,1 ms` | **`1,20×`** | `9,50` / `3,39` | `5,97` | `1,59×` | `%100` |
-| `test10103_coklu_tile` (`1024×1024`, `10b`, `16` tile, `8×15=120` kare) | `mfd=0, t=14` | `1 550,6 ms` | `238,2 ms` | **`6,51×`** | `137,5 ms` | **`1,73×`** | `140,00` / `94,42` | `102,77` | `1,36×` | `%100` |
-| `test10103_coklu_tile` (`1024×1024`, `10b`, `16` tile, `8×15=120` kare) | `mfd=4, t=14` | `1 550,6 ms` | `239,4 ms` | **`6,48×`** | `136,9 ms` | **`1,75×`** | `139,89` / `94,69` | `103,03` | `1,36×` | `%100` |
-| `test25_8k_444_fg` (`7680×4320`, `8b` `4:4:4`, `120` tile + FG, `6` kare) | `mfd=0, t=14` | `1 418,8 ms` | `147,7 ms` | **`9,60×`** | `66,2 ms` | **`2,23×`** | `2 055,83` / `1 705,67` | `1 398,83` | `1,47×` | `%100` |
-| `test25_8k_120_tile` (`7680×4320`, `12b`, `120` tile, `10×2=20` kare) | `mfd=0, t=14` | `1 694,6 ms` | `238,7 ms` | **`7,10×`** | `97,3 ms` | **`2,45×`** | `1 410,64` / `1 131,39` | `1 097,81` | `1,28×` | `%100` |
+| `vq002_inter_gop` (`432×240`, `8b`, `10×10=100` kare) | `mfd=1, t=4` | `317,4 ms` | `289,4 ms` | `1,10×` | `240,4 ms` | **`1,20×`** | `8,44` / `2,25` | `5,97` | `1,41×` | `%100` |
+| `fg10_film_grain_50` (`352×288`, `10b`, `10×15=150` kare) | `mfd=1, t=8` | `144,1 ms` | `130,7 ms` | `1,10×` | `75,0 ms` | **`1,74×`** | `13,44` / `4,71` | `7,97` | `1,69×` | `%100` |
+| `ccvb_film_grain` (`640×480`, `8b`, `100×3=300` kare) | `mfd=1, t=8` | `584,6 ms` | `440,9 ms` | `1,33×` | `205,7 ms` | **`2,14×`** | `16,83` / `7,00` | `11,02` | `1,53×` | `%100` |
+| `test10103_coklu_tile` (`1024×1024`, `10b`, `16` tile, `8×15=120` kare) | `mfd=0, t=14` | `1 344,8 ms` | `205,6 ms` | **`6,54×`** | `136,9 ms` | **`1,50×`** | `103,72` / `67,50` | `104,89` | **`0,99×`** | `%100` |
+| `test10103_coklu_tile` (`1024×1024`, `10b`, `16` tile, `8×15=120` kare) | `mfd=4, t=14` | `1 344,8 ms` | `205,5 ms` | **`6,54×`** | `137,8 ms` | **`1,49×`** | `103,16` / `67,19` | `104,73` | **`0,98×`** | `%100` |
+| `test25_8k_444_fg` (`7680×4320`, `8b` `4:4:4`, `120` tile + FG, `6` kare) | `mfd=0, t=14` | `1 383,0 ms` | `140,2 ms` | **`9,87×`** | `69,3 ms` | **`2,02×`** | `1 413,62` / `1 140,47` | `1 398,67` | **`1,01×`** (`t=8`: `0,90×`) | `%100` |
+| `test25_8k_120_tile` (`7680×4320`, `12b`, `120` tile, `10×2=20` kare) | `mfd=0, t=14` | `1 347,1 ms` | `213,5 ms` | **`6,31×`** | `98,2 ms` | **`2,17×`** | `1 031,45` / `810,51` | `1 097,81` | **`0,94×`** | `%100` |
 
-#### `.avif` Görüntü Çözme + `RGBA8` Dönüşümü (`Apple M4 Pro`, `v0.4.0`)
+#### `.avif` Görüntü Çözme + `RGBA8` Dönüşümü (`Apple M4 Pro`)
 
 | İş Yükü | Görüntü / Kip | `av1oxide` Süre (`ms`) | C `libavif` Süre (`ms`) | Süre Oranı (`av1oxide / libavif`) | `av1oxide` Tepe RSS (`MiB`) | `av1oxide` Canlı Yığın (`MiB`) | C `libavif` Tepe RSS (`MiB`) | RSS Oranı (`av1oxide / libavif`) | `RGBA8` MD5 Eşitliği |
 |---|---|---:|---:|---:|---:|---:|---:|---:|---:|
-| **`avif_corpus_156_t4`** | `156` geçerli `.avif` görüntüsü, `n_threads = 4` (`1` tur) | `3 348,8 ms` | `2 600,8 ms` | **`1,288×`** | `335,95 MiB` | `106,74 MiB` | `205,16 MiB` | **`1,64×`** | `156 / 156` (`%100`) |
-| **`avif_bbb_4k_t8`** | `bbb_4k.avif` (`3840×2160`), `n_threads = 8` (`5` tekrar) | `366,1 ms` | `222,8 ms` | **`1,644×`** | `104,80 MiB` | `67,06 MiB` | `51,31 MiB` | **`2,04×`** | `5 / 5` (`%100`) |
+| **`avif_corpus_156_t4`** | `156` geçerli `.avif` görüntüsü, `n_threads = 4` (`1` tur) | `2 353,9 ms` | `2 636,1 ms` | **`0,893×`** | `266,45 MiB` | `82,33 MiB` | `205,11 MiB` | **`1,30×`** | `156 / 156` (`%100`) |
+| **`avif_bbb_4k_t8`** | `bbb_4k.avif` (`3840×2160`), `n_threads = 8` (`5` tekrar) | `80,2 ms` | `225,4 ms` | **`0,356×`** | `82,14 MiB` | `43,52 MiB` | `51,28 MiB` | **`1,60×`** | `5 / 5` (`%100`) |
 
 ---
 
@@ -405,10 +405,10 @@ Tüm ölçümler `%100` MD5 bit-birebir eşitlik altında `av1oxide` (`rustc 1.1
 
 #### Bellek (`Peak RSS`) ve `.avif` Davranışının Teknik Nedenleri
 
-- **Tek-Thread Taban İzi ve İkili Kod Sayfaları (Küçük akışlarda `1,49×–2,05×` RSS):** Küçük ve orta çözünürlüklü akışlarda (`16×16` – `640×480`) `av1oxide` `v0.5.0` canlı yığın kullanımı `0,29–8,25 MiB` (`x86_64`) iken işletim sistemi süreç yerleşik küme boyutu (`x86_64` Linux üzerinde `7,5–17,0 MiB`; C `dav1d`: `3,7–11,4 MiB`), paylaşımlı kütüphane bağlaması yerine statik bağlanan Rust çalışma zamanı ile çoklu-ISA SIMD kod sayfalarını (`x86_64` ELF: `10,2 MiB`, `aarch64` Mach-O `v0.4.0`: `2,8 MiB`) içerir.
-- **8K Şerit Bazlı Film Grain ve `LrCdefBackup` (`x86_64` tek-thread `1,10×`, çok-thread `0,85×–0,96×` RSS):** Tam kare `pre_cdef` kopyası yerine `4` satırlık `LrCdefBackup` şerit sınır tamponu ve `32` satırlık kayan şerit tamponu üzerinde yerinde Film Grain sentezi (`refresh_frame_flags == 0` için `Frame::from_owned_pic`) sayesinde `test25_8k_444_fg` (`7680×4320`, `4:4:4` + FG) tek-thread Tepe RSS değeri `v0.4.0` sürümündeki `1 231,4 MiB` (`2,02×`) düzeyinden `667,5 MiB` (`1,10×`, `dav1d` `609,0 MiB`) düzeyine, çok-thread `t=8` Tepe RSS değeri ise `1 990,9 MiB` (`1,41×`) düzeyinden `1 207,2 MiB` (`0,85×`, `dav1d` `1 414,6 MiB` değerinden `%14,7` daha düşük; `t=4`: `0,96×`; `test25_8k_120_tile` `t=16`: `0,87×`) düzeyine inmiştir.
-- **16-Thread Çok-Karolu Akışlarda Paylaşımlı Geçici Havuz (`x86_64` Üzerinde `0,55×–0,56×` RSS):** `1024×1024` `16` karolu `10-bit` akışta `n_threads = 16` kipinde (`test10103_coklu_tile`), `av1oxide` Linux `x86_64` üzerinde `158,5–161,5 MiB` Tepe RSS (`67,9–68,7 MiB` canlı yığın) kullanırken C `dav1d` `284,6–291,9 MiB` (`0,55×–0,56×`) kullanır; bunun nedeni `av1oxide` tarafında her kare bağlamı için tam karo/katsayı arenalarını peşin tahsis etmek yerine sınırlı `ScratchPool` işçi yuvalarının ve `DecodeBufPool` düzlemlerinin talep üzerine paylaşılmasıdır.
-- **`.avif` Doğal `u8` Düzlemler ve Şerit-Paralel YUVA→RGB (`x86_64` Üzerinde `0,464×–0,957×` Süre):** `8-bit` AVIF kanallarının doğal `u8` (`AvifPlane::U8`) olarak saklanması ve özelleştirilmiş `(9, 3, 3, 1)/16` satır-çifti YUVA→RGB dönüşümünün `std::thread::scope` şeritleriyle paralelleştirilmesi sonucunda `x86_64` `avif_corpus_156_t4` süresi `3 617,2 ms` (`1,460×`) değerinden `2 362,4 ms` (`0,957×`, C `libavif 1.4.2 + dav1d 1.5.4` toplamından `%4,3` daha hızlı) değerine, canlı yığın tepesi `99,15 MiB` değerinden `74,75 MiB` değerine inmiştir; `4K` `bbb_4k.avif` (`t=8`, `5` tekrar) iş yükünde süre `407,2 ms` (`1,488×`) değerinden `126,9 ms` (`0,464×`, `-DAVIF_LIBYUV=OFF` derlenmiş C `libavif` sürümünden `2,16×` daha hızlı) değerine, canlı yığın tepesi ise `67,06 MiB` değerinden `43,53 MiB` değerine düşmüştür.
+- **Tek-Thread Taban İzi ve İkili Kod Sayfaları (Küçük akışlarda `1,33×–2,05×` RSS):** Küçük ve orta çözünürlüklü akışlarda (`16×16` – `640×480`) `av1oxide` `v0.5.0` canlı yığın kullanımı her iki mimaride `0,28–8,25 MiB` iken işletim sistemi süreç yerleşik küme boyutu (`x86_64` Linux üzerinde `7,5–17,0 MiB`, macOS `aarch64` üzerinde `4,2–15,4 MiB`), C `dav1d` ikilisine kıyasla statik bağlanan Rust çalışma zamanı ile SIMD dağıtım kod sayfalarını (`x86_64` ELF: `10,2 MiB`, `aarch64` Mach-O: `3,4 MiB`) içerir.
+- **8K Şerit Bazlı Film Grain ve `LrCdefBackup` (Tek-thread `1,09×–1,10×`, çok-thread `0,85×–1,01×` RSS):** Tam kare `pre_cdef` kopyası yerine `4` satırlık `LrCdefBackup` şerit sınır tamponu ve `32` satırlık kayan şerit tamponu üzerinde yerinde Film Grain sentezi (`refresh_frame_flags == 0` için `Frame::from_owned_pic`) sayesinde `test25_8k_444_fg` (`7680×4320`, `4:4:4` + FG) tek-thread Tepe RSS değeri `v0.4.0` sürümündeki `~1 231–1 234 MiB` (`2,02×`) düzeyinden `667,5 MiB` (`x86_64`: `1,10×`) ve `666,1 MiB` (`Apple M4 Pro`: `1,09×`) düzeyine, çok-thread Tepe RSS değeri ise `x86_64` `t=8` üzerinde `1 207,2 MiB` (`0,85×`), `Apple M4 Pro` `t=8` üzerinde `1 284,9 MiB` (`0,90×`) ve `t=14` üzerinde `1 413,6 MiB` (`1,01×`; `test25_8k_120_tile`: `x86_64` `t=16` `0,87×`, `Apple M4 Pro` `t=14` `0,94×`) düzeyine inmiştir.
+- **Çok-Karolu Akışlarda Paylaşımlı Geçici Havuz (`x86_64` Üzerinde `0,55×–0,56×`, `Apple M4 Pro` Üzerinde `0,98×–0,99×` RSS):** `1024×1024` `16` karolu `10-bit` akışta (`test10103_coklu_tile`), `av1oxide` Linux `x86_64` (`t=16`) üzerinde `158,5–161,5 MiB` (`67,9–68,7 MiB` canlı yığın; `dav1d`: `284,6–291,9 MiB`, `0,55×–0,56×`) ve `Apple M4 Pro` (`t=14`) üzerinde `103,2–103,7 MiB` (`67,2–67,5 MiB` canlı yığın; `dav1d`: `104,7–104,9 MiB`, `0,98×–0,99×`) Tepe RSS kullanır; bunun nedeni her kare bağlamı için tam karo/katsayı arenalarını peşin tahsis etmek yerine sınırlı `ScratchPool` işçi yuvalarının ve `DecodeBufPool` düzlemlerinin talep üzerine paylaşılmasıdır.
+- **`.avif` Doğal `u8` Düzlemler ve Şerit-Paralel YUVA→RGB (C `libavif` Karşısında `0,356×–0,957×` Süre):** `8-bit` AVIF kanallarının doğal `u8` (`AvifPlane::U8`) olarak saklanması ve özelleştirilmiş `(9, 3, 3, 1)/16` satır-çifti YUVA→RGB dönüşümünün `std::thread::scope` şeritleriyle paralelleştirilmesi sonucunda `avif_corpus_156_t4` süresi `x86_64` üzerinde `2 362,4 ms` (`0,957×`) ve `Apple M4 Pro` üzerinde `2 353,9 ms` (`0,893×`) düzeyine inmiştir; `4K` `bbb_4k.avif` (`t=8`, `5` tekrar) iş yükünde süre `x86_64` üzerinde `126,9 ms` (`0,464×`), `Apple M4 Pro` üzerinde ise `80,2 ms` (`0,356×`, `-DAVIF_LIBYUV=OFF` derlenmiş C `libavif` sürümünden `2,81×` daha kısa duvar süresi) olarak ölçülmüş ve canlı yığın tepesi `67,06 MiB` değerinden `43,52–43,53 MiB` değerine düşmüştür.
 
 ---
 

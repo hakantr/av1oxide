@@ -2,7 +2,7 @@
 //!
 //! Bu modül **davranışı** tanımlar, gövde içermez: sabitler, parametre tipleri ve
 //! çekirdek işaretçisi imzaları. Gövdeler [`crate::dsp::scalar::cdef`] (tüm bit
-//! derinlikleri) ve [`crate::dsp::x86::cdef`] (8 bpc ve 16 bpc AVX2) içindedir.
+//! derinlikleri) ve `crate::dsp::x86::cdef` (8 bpc ve 16 bpc AVX2) içindedir.
 //!
 //! ## Kaynak eşlemesi (dav1d @ `99f3354`, salt-okunur)
 //!

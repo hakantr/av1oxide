@@ -1711,7 +1711,7 @@ pub fn emu_edge<const BPC: u32>(
 ///
 /// `put_8tap_regular` artık [`put_8tap`]'in `FILTER_2D_8TAP_REGULAR` için ince
 /// bir sarmalayıcısıdır; davranış (bit-exact) değişmemiştir ve AVX2 yuvası
-/// ([`crate::dsp::x86::mc`]) aynı işlevi kullanmaya devam eder. Sözleşme
+/// (`crate::dsp::x86::mc`) aynı işlevi kullanmaya devam eder. Sözleşme
 /// S15.5'teki gibidir: `src` dolgu hücresinden (satır −3, sütun −3) başlar.
 #[allow(clippy::too_many_arguments)]
 pub fn put_8tap_regular(
