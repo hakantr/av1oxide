@@ -155,7 +155,7 @@ impl Obu<'_> {
     /// Yükün paket içindeki bit ofseti (hata konumlarını eşlemek için).
     #[must_use]
     pub const fn payload_offset_bits(&self) -> usize {
-        self.payload_offset * 8
+        self.payload_offset.saturating_mul(8)
     }
 }
 
@@ -199,28 +199,33 @@ pub fn split_next_with<'a>(
     strict: bool,
 ) -> Result<Option<Obu<'a>>> {
     if *offset > packet.len() {
-        return Err(BitstreamError::new(BitstreamErrorKind::UnexpectedEnd, *offset * 8).into());
+        return Err(BitstreamError::new(
+            BitstreamErrorKind::UnexpectedEnd,
+            offset.saturating_mul(8),
+        )
+        .into());
     }
     if *offset == packet.len() {
         return Ok(None);
     }
     let base = *offset;
+    let base_bits = base.saturating_mul(8);
     let mut br = BitReader::new(&packet[base..]);
-    let forbidden = br.read_bit().map_err(|err| rebase(err, base * 8))?;
+    let forbidden = br.read_bit().map_err(|err| rebase(err, base_bits))?;
     if forbidden != 0 && strict {
-        return Err(BitstreamError::new(BitstreamErrorKind::ForbiddenBit, base * 8).into());
+        return Err(BitstreamError::new(BitstreamErrorKind::ForbiddenBit, base_bits).into());
     }
-    let raw_type = br.read_bits(4).map_err(|err| rebase(err, base * 8))? as u8;
+    let raw_type = br.read_bits(4).map_err(|err| rebase(err, base_bits))? as u8;
     let obu_type = ObuType::from_raw(raw_type);
-    let has_extension = br.read_bit().map_err(|err| rebase(err, base * 8))? != 0;
-    let has_size_field = br.read_bit().map_err(|err| rebase(err, base * 8))? != 0;
+    let has_extension = br.read_bit().map_err(|err| rebase(err, base_bits))? != 0;
+    let has_size_field = br.read_bit().map_err(|err| rebase(err, base_bits))? != 0;
     // obu_reserved_1bit: 0 olmalıdır ama dav1d gibi yok sayılır (§5.3.2).
-    br.read_bit().map_err(|err| rebase(err, base * 8))?;
+    br.read_bit().map_err(|err| rebase(err, base_bits))?;
     let extension = if has_extension {
-        let temporal_id = br.read_bits(3).map_err(|err| rebase(err, base * 8))? as u8;
-        let spatial_id = br.read_bits(2).map_err(|err| rebase(err, base * 8))? as u8;
+        let temporal_id = br.read_bits(3).map_err(|err| rebase(err, base_bits))? as u8;
+        let spatial_id = br.read_bits(2).map_err(|err| rebase(err, base_bits))? as u8;
         // Uzantının son 3 biti ayrılmıştır; dav1d gibi yok sayılır.
-        br.read_bits(3).map_err(|err| rebase(err, base * 8))?;
+        br.read_bits(3).map_err(|err| rebase(err, base_bits))?;
         Some(ObuExtension {
             temporal_id,
             spatial_id,
@@ -229,17 +234,20 @@ pub fn split_next_with<'a>(
         None
     };
     let declared_len = if has_size_field {
-        Some(br.read_uleb128().map_err(|err| rebase(err, base * 8))? as usize)
+        Some(br.read_uleb128().map_err(|err| rebase(err, base_bits))? as usize)
     } else {
         None
     };
     if !br.is_byte_aligned() {
         // Başlık (1/2 bayt) + leb128 (tam baytlar) daima bayt hizalıdır; bu
         // noktaya yalnız kod değişikliğiyle gelinebilir. Panik yerine hata.
-        return Err(BitstreamError::new(BitstreamErrorKind::UnexpectedEnd, base * 8).into());
+        return Err(BitstreamError::new(BitstreamErrorKind::UnexpectedEnd, base_bits).into());
     }
     let header_len = br.byte_position();
-    let payload_offset = base + header_len;
+    let payload_offset = base
+        .checked_add(header_len)
+        .filter(|&off| off <= packet.len())
+        .ok_or_else(|| BitstreamError::new(BitstreamErrorKind::UnexpectedEnd, base_bits))?;
     let remaining = packet.len() - payload_offset;
     let payload_len = match declared_len {
         Some(declared) => {
@@ -249,7 +257,7 @@ pub fn split_next_with<'a>(
                         declared,
                         remaining,
                     },
-                    base * 8,
+                    base_bits,
                 )
                 .into());
             }
@@ -434,5 +442,28 @@ mod tests {
         let mut offset = 0usize;
         assert!(split_next(&[], &mut offset).expect("boş").is_none());
         assert_eq!(offset, 0);
+    }
+
+    #[test]
+    fn sinir_ofset_degerlerinde_tasma_ve_panik_olmaz() {
+        let data = [0x12u8, 0x00];
+        for bad_off in [data.len() + 1, usize::MAX / 8 + 1, usize::MAX] {
+            let mut offset = bad_off;
+            let err = super::split_next_with(&data, &mut offset, true)
+                .expect_err("paket dışı ofset hata döndürmeli");
+            assert_eq!(kind(err), BitstreamErrorKind::UnexpectedEnd);
+            assert_eq!(offset, bad_off);
+        }
+        let obu = super::Obu {
+            header: super::ObuHeader {
+                obu_type: ObuType::Padding,
+                extension: None,
+                has_size_field: false,
+            },
+            payload: &[],
+            payload_offset: usize::MAX,
+            total_len: 0,
+        };
+        assert_eq!(obu.payload_offset_bits(), usize::MAX);
     }
 }

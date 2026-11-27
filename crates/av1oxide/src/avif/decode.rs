@@ -912,6 +912,15 @@ impl AvifPrepared {
     /// kapsayıcı ve başlık tahsislerini (`cmin`/`infe` açma, `idat`, `ICC`/`Exif`/`XMP`, `tmap`)
     /// sınırlar; toplam uçtan uca tavan isteniyorsa `limit - raw_bytes.len()` geçirilmelidir.
     pub fn from_vec(raw_bytes: Vec<u8>, config: &AvifDecodeConfig) -> Result<Self> {
+        let base = crate::avif::boxes::container_base_overhead();
+        if let Some(limit) = config.allocation_limit
+            && limit < base
+        {
+            return Err(Error::BudgetExceeded {
+                requested: base,
+                limit,
+            });
+        }
         let butce = Arc::new(Butce::yeni(config.allocation_limit, 0));
         let container = parse_container_owned(raw_bytes, &butce)?;
         let info = parse_info_from_container(&container, &butce, config)?;
@@ -930,11 +939,17 @@ impl AvifPrepared {
         self.container.raw_len()
     }
 
-    /// İçeride tutulan ham girdi + sahipli kapsayıcı (`cmin`/`idat`/`ipco`) + üst veri bayt toplamı.
+    /// İçeride tutulan ham AVIF girdi vektörünün gerçek yığın kapasitesi (bayt).
+    #[must_use]
+    pub fn raw_capacity(&self) -> usize {
+        self.container.raw_capacity()
+    }
+
+    /// İçeride tutulan ham girdi (`capacity`) + sahipli kapsayıcı (`cmin`/`idat`/`ipco`) + üst veri bayt toplamı.
     #[must_use]
     pub fn held_bytes(&self) -> usize {
         self.container
-            .raw_len()
+            .raw_capacity()
             .saturating_add(self.container.owned_bytes())
             .saturating_add(info_metadata_bytes(&self.info))
     }

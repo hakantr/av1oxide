@@ -2814,20 +2814,20 @@ fn avif_sequence_tkhd_orientation_and_elst_timeline() {
     );
     let mut seq = AvifSequenceDecoder::new(&avis_elst).expect("elst AVIS açılmalı");
     assert_eq!(seq.info().frame_count, 2);
-    assert_eq!(seq.info().timescale, 60);
-    assert_eq!(seq.info().duration_in_timescale, 50);
+    assert_eq!(seq.info().timescale, 30);
+    assert_eq!(seq.info().duration_in_timescale, 25);
 
     let f0 = seq.next_frame().unwrap().expect("sunum karesi 0 (INTER1)");
     assert_eq!(f0.index, 0);
-    assert_eq!(f0.pts_in_timescale, 10);
-    assert_eq!(f0.duration_in_timescale, 20);
+    assert_eq!(f0.pts_in_timescale, 5);
+    assert_eq!(f0.duration_in_timescale, 10);
     assert!(!f0.is_keyframe);
     assert_eq!(f0.image, ref_frames[1]);
 
     let f1 = seq.next_frame().unwrap().expect("sunum karesi 1 (INTER2)");
     assert_eq!(f1.index, 1);
-    assert_eq!(f1.pts_in_timescale, 30);
-    assert_eq!(f1.duration_in_timescale, 20);
+    assert_eq!(f1.pts_in_timescale, 15);
+    assert_eq!(f1.duration_in_timescale, 10);
     assert!(!f1.is_keyframe);
     assert_eq!(f1.image, ref_frames[2]);
     assert!(seq.next_frame().unwrap().is_none());
@@ -2836,10 +2836,10 @@ fn avif_sequence_tkhd_orientation_and_elst_timeline() {
     let seek0 = seq
         .nth_frame(0)
         .expect("nth_frame(0) pre-roll ile çözülmeli");
-    assert_eq!(seek0.pts_in_timescale, 10);
+    assert_eq!(seek0.pts_in_timescale, 5);
     assert_eq!(seek0.image, ref_frames[1]);
     let seek1 = seq.nth_frame(1).expect("nth_frame(1) çözülmeli");
-    assert_eq!(seek1.pts_in_timescale, 30);
+    assert_eq!(seek1.pts_in_timescale, 15);
     assert_eq!(seek1.image, ref_frames[2]);
 }
 
@@ -2995,6 +2995,25 @@ fn avif_sequence_elst_128k_perf_and_sub_media_tick_precision() {
     assert_eq!(info_full.frame_count, 5);
     assert_eq!(info_full.timescale, 30);
     assert_eq!(info_full.duration_in_timescale, 5);
+
+    // 2b. Tam medya birimi hizalı kırpmalı `elst` (`movie_ts = 1000`, `media_ts = 30`,
+    //     5 kare, `segment_duration = 100` ms = tam `3 / 30 s`): tüm sunum PTS/süreleri
+    //     `m_mul = 100`'e tam bölündüğü için `timescale == 30`, `dur == 3`, kareler
+    //     `(0, 1), (1, 1), (2, 1)` olarak sadeleştirilmelidir (`6.H.5`).
+    let avis_100ms = build_synthetic_avis(5, 1000, 30, 1, &[(100, 0)]);
+    let mut dec_100 = AvifSequenceDecoder::new(&avis_100ms).expect("100 ms elst geçerli olmalı");
+    assert_eq!(dec_100.info().frame_count, 3);
+    assert_eq!(dec_100.info().timescale, 30);
+    assert_eq!(dec_100.info().duration_in_timescale, 3);
+    for expected_pts in 0..3u64 {
+        let f = dec_100
+            .next_frame()
+            .unwrap()
+            .expect("100 ms kırpma karesi gelmeli");
+        assert_eq!(f.pts_in_timescale, expected_pts);
+        assert_eq!(f.duration_in_timescale, 1);
+    }
+    assert!(dec_100.next_frame().unwrap().is_none());
 
     // 3. 128 000 örnek × 128 000 `elst` girdisi: `O((S + E + K) log S)` aralık ağacı ile
     //    `parse_sequence_info` 250 ms altında (pratikte birkaç ms) tamamlanmalıdır.

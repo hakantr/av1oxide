@@ -5,7 +5,9 @@
 use std::path::{Path, PathBuf};
 
 use av1oxide::container::annexb::{AnnexBDemuxer, read_leb128};
-use av1oxide::container::ivf::{IvfParser, IvfReader};
+use av1oxide::container::ivf::IvfParser;
+#[cfg(feature = "std")]
+use av1oxide::container::ivf::IvfReader;
 use av1oxide::{Config, Decoder, Error, Frame, Packet, PlaneType};
 
 /// RFC 1321 MD5 özeti (haricî bağımlılık gerektirmez).
@@ -293,39 +295,42 @@ fn ivf_parser_ve_reader_gercek_fixture_akislarinda_bit_birebir_md5_verir() {
         let (count_parser, md5_parser) = decode_packets_md5(parsed.iter().map(|p| (p.pts, p.data)));
         assert!(count_parser > 0);
 
-        // 2. IvfReader (akış tabanlı yeniden kullanılan tampon)
-        let mut reader = IvfReader::new(bytes.as_slice()).expect("IvfReader başlığı");
-        assert_eq!(reader.header(), IvfParser::new(&bytes).unwrap().header());
-        let mut decoder = Decoder::new(Config {
-            n_threads: 1,
-            max_frame_delay: 1,
-            ..Config::default()
-        })
-        .expect("çözücü");
-        let mut buf = Vec::with_capacity(65_536);
-        let mut md5_reader = Md5::new();
-        let mut count_reader = 0usize;
-        let mut pkt_idx = 0usize;
-        while let Some(pts) = reader.read_packet_into(&mut buf).expect("paket okunmalı") {
-            assert_eq!(pts, parsed[pkt_idx].pts);
-            assert_eq!(buf.as_slice(), parsed[pkt_idx].data);
-            pkt_idx += 1;
-            decoder
-                .send_packet(&Packet::with_timestamp(&buf, pts))
-                .expect("paket gönderimi");
-            while let Some(frame) = decoder.receive_frame().expect("kare") {
+        // 2. IvfReader (akış tabanlı yeniden kullanılan tampon; `std` özelliği gerektirir)
+        #[cfg(feature = "std")]
+        {
+            let mut reader = IvfReader::new(bytes.as_slice()).expect("IvfReader başlığı");
+            assert_eq!(reader.header(), IvfParser::new(&bytes).unwrap().header());
+            let mut decoder = Decoder::new(Config {
+                n_threads: 1,
+                max_frame_delay: 1,
+                ..Config::default()
+            })
+            .expect("çözücü");
+            let mut buf = Vec::with_capacity(65_536);
+            let mut md5_reader = Md5::new();
+            let mut count_reader = 0usize;
+            let mut pkt_idx = 0usize;
+            while let Some(pts) = reader.read_packet_into(&mut buf).expect("paket okunmalı") {
+                assert_eq!(pts, parsed[pkt_idx].pts);
+                assert_eq!(buf.as_slice(), parsed[pkt_idx].data);
+                pkt_idx += 1;
+                decoder
+                    .send_packet(&Packet::with_timestamp(&buf, pts))
+                    .expect("paket gönderimi");
+                while let Some(frame) = decoder.receive_frame().expect("kare") {
+                    hash_frame(&mut md5_reader, &frame);
+                    count_reader += 1;
+                }
+            }
+            decoder.flush();
+            while let Some(frame) = decoder.receive_frame().expect("boşaltma") {
                 hash_frame(&mut md5_reader, &frame);
                 count_reader += 1;
             }
+            assert_eq!(pkt_idx, parsed.len());
+            assert_eq!(count_reader, count_parser);
+            assert_eq!(md5_reader.finish_hex(), md5_parser);
         }
-        decoder.flush();
-        while let Some(frame) = decoder.receive_frame().expect("boşaltma") {
-            hash_frame(&mut md5_reader, &frame);
-            count_reader += 1;
-        }
-        assert_eq!(pkt_idx, parsed.len());
-        assert_eq!(count_reader, count_parser);
-        assert_eq!(md5_reader.finish_hex(), md5_parser);
 
         // 3. Aynı paketleri Annex B'ye sarıp AnnexBDemuxer ile geri açarak MD5 eşitliği doğrula.
         let mut annexb_stream = Vec::new();
@@ -408,6 +413,7 @@ fn annexb_demuxer_gercek_argon_akislari_referans_md5_ile_birebir_eslesir() {
 #[test]
 fn container_bozuk_ve_sinir_disi_girdilerde_temiz_hata_dondurur() {
     assert!(matches!(IvfParser::new(&[]), Err(Error::InvalidData(_))));
+    #[cfg(feature = "std")]
     assert!(matches!(
         IvfReader::new(&[][..]),
         Err(Error::InvalidData(_))
@@ -425,4 +431,63 @@ fn container_bozuk_ve_sinir_disi_girdilerde_temiz_hata_dondurur() {
         AnnexBDemuxer::demux_all(&[0x7f, 0x01, 0x01, 0x12]),
         Err(Error::InvalidData(_))
     ));
+}
+
+#[cfg(feature = "std")]
+#[test]
+fn ivf_reader_budget_exceeded_preserves_packet_alignment() {
+    let pkt1: Vec<u8> = (0..15_106usize).map(|i| (i & 0xFF) as u8).collect();
+    let pkt2: Vec<u8> = (0..7_581usize)
+        .map(|i| ((i * 7 + 13) & 0xFF) as u8)
+        .collect();
+    let pkt3: Vec<u8> = (0..17_174usize)
+        .map(|i| ((i * 3 + 5) & 0xFF) as u8)
+        .collect();
+
+    let mut ivf = Vec::new();
+    ivf.extend_from_slice(b"DKIF");
+    ivf.extend_from_slice(&0u16.to_le_bytes());
+    ivf.extend_from_slice(&32u16.to_le_bytes());
+    ivf.extend_from_slice(b"AV01");
+    ivf.extend_from_slice(&320u16.to_le_bytes());
+    ivf.extend_from_slice(&240u16.to_le_bytes());
+    ivf.extend_from_slice(&30u32.to_le_bytes());
+    ivf.extend_from_slice(&1u32.to_le_bytes());
+    ivf.extend_from_slice(&3u32.to_le_bytes());
+    ivf.extend_from_slice(&0u32.to_le_bytes());
+    for (pts, payload) in [(0i64, &pkt1), (33i64, &pkt2), (66i64, &pkt3)] {
+        ivf.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        ivf.extend_from_slice(&pts.to_le_bytes());
+        ivf.extend_from_slice(payload);
+    }
+
+    let mut reader = IvfReader::with_max_frame_bytes(ivf.as_slice(), 7_581).expect("başlık");
+    let mut buf = Vec::new();
+
+    // 1. Paket (15 106 B > 7 581 B): BudgetExceeded dönmeli ve yükü akıştan tüketmeli.
+    assert_eq!(
+        reader.read_packet_into(&mut buf),
+        Err(Error::BudgetExceeded {
+            requested: 15_106,
+            limit: 7_581,
+        })
+    );
+    assert!(buf.is_empty());
+
+    // 2. Paket (7 581 B == limit): paket sınırı bozulmadan tam okunmalı.
+    assert_eq!(reader.read_packet_into(&mut buf), Ok(Some(33)));
+    assert_eq!(buf, pkt2);
+
+    // 3. Paket (17 174 B > 7 581 B): BudgetExceeded dönmeli ve yükü tüketmeli.
+    assert_eq!(
+        reader.read_packet_into(&mut buf),
+        Err(Error::BudgetExceeded {
+            requested: 17_174,
+            limit: 7_581,
+        })
+    );
+    assert!(buf.is_empty());
+
+    // 4. Temiz EOF.
+    assert_eq!(reader.read_packet_into(&mut buf), Ok(None));
 }

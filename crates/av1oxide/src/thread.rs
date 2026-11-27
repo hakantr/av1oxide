@@ -384,12 +384,6 @@ impl FrameSlot {
         }
     }
 
-    /// Bloklamadan yuvanın `Failed` durumunda olup olmadığını döndürür.
-    pub(crate) fn is_failed_nonblocking(&self) -> bool {
-        let st = self.state.lock();
-        matches!(*st, SlotState::Failed)
-    }
-
     /// Bloklamadan yuvanın `Ready` veya `Failed` (yani `Pending` dışı) olup olmadığını döndürür.
     pub(crate) fn is_done_nonblocking(&self) -> bool {
         let st = self.state.lock();

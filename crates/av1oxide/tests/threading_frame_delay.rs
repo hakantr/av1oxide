@@ -541,3 +541,176 @@ fn f85_decode_buf_pool_cok_thread_geri_donusum_flush_reset_ve_klon() {
         dec.reset();
     }
 }
+
+/// `6.H.1`: Doğrudan saf Rust `Decoder::send_packet` / `Decoder::receive_frame` API'sinde
+/// arka planda asenkron çözülen bozuk bir kare emekliye ayrıldığında yeni gelen toparlanma
+/// `KEY` karesi ve süper-kare alt kareleri düşürülmemeli; tüm çoklu gecikme ayarlarında
+/// (`t=14, delay=4` ve `delay=6`, 10 tekrar) `delay=1` ile `%100` deterministik kare sayısı
+/// ve piksel özeti üretilmelidir.
+#[test]
+fn rust_decoder_delayed_error_preserves_superframe_and_recovery_keyframe() {
+    let root = repo_root();
+    let ivf_path = root.join(
+        "crates/av1oxide/tests/fixtures/streams/Syntax_AV1_mainb8ss420_432x240_002_vq_aom_ctest_4.2.stripped.ivf",
+    );
+    let pkts = read_packets(&ivf_path);
+    assert!(pkts.len() >= 4, "en az 4 IVF paketi beklenir");
+
+    let pkt_key = &pkts[0];
+    let pkt_inter1 = &pkts[1];
+    let pkt_inter2 = &pkts[2];
+
+    // `pkt_inter1` içindeki `OBU_FRAME` başlığını (`FrameHeader`) koruyup her karoyu 1 bayt
+    // uzunluğa indirge (`tile_size_minus_1 = 0` + `0x00`): senkron ayrıştırıcı ve
+    // `split_tile_groups` hatasız geçer, arka plan işçi çözümü ise kesinlikle asenkron
+    // `MSAC veri sonu aşıldı` hatası üretir.
+    let seq = av1oxide::bitstream::parse_sequence_header_obus(pkt_key)
+        .unwrap()
+        .expect("SequenceHeader bulunmalı");
+    let mut fh0_opt = None;
+    {
+        let mut off0 = 0usize;
+        while off0 < pkt_key.len() {
+            let Some(obu) = av1oxide::bitstream::split_next_with(pkt_key, &mut off0, true).unwrap()
+            else {
+                break;
+            };
+            if obu.header.obu_type == av1oxide::bitstream::ObuType::Frame {
+                let mut br = av1oxide::bitstream::BitReader::new(obu.payload);
+                let refs0: [Option<av1oxide::bitstream::FrameHeader>; 8] = Default::default();
+                let ctx = av1oxide::bitstream::FrameHeaderContext {
+                    sequence_header: &seq,
+                    refs: &refs0,
+                    temporal_id: 0,
+                    spatial_id: 0,
+                    strict_std_compliance: false,
+                };
+                fh0_opt = Some(av1oxide::bitstream::FrameHeader::parse(&mut br, &ctx).unwrap());
+                break;
+            }
+        }
+    }
+    let fh0 = fh0_opt.expect("KEY FrameHeader bulunmalı");
+
+    let mut corrupt_inter1 = Vec::new();
+    let mut off = 0usize;
+    while off < pkt_inter1.len() {
+        let Some(obu) = av1oxide::bitstream::split_next_with(pkt_inter1, &mut off, true).unwrap()
+        else {
+            break;
+        };
+        if obu.header.obu_type == av1oxide::bitstream::ObuType::Frame {
+            let mut br = av1oxide::bitstream::BitReader::new(obu.payload);
+            let refs1: [Option<av1oxide::bitstream::FrameHeader>; 8] =
+                std::array::from_fn(|_| Some(fh0.clone()));
+            let ctx = av1oxide::bitstream::FrameHeaderContext {
+                sequence_header: &seq,
+                refs: &refs1,
+                temporal_id: 0,
+                spatial_id: 0,
+                strict_std_compliance: false,
+            };
+            let fh = av1oxide::bitstream::FrameHeader::parse(&mut br, &ctx).unwrap();
+            br.align_to_byte();
+            let fh_end = br.byte_position();
+            let n_tiles = usize::from(fh.tiling.cols) * usize::from(fh.tiling.rows);
+            let size_bytes = usize::from(fh.tiling.n_bytes);
+            let mut body = obu.payload[..fh_end].to_vec();
+            for t in 0..n_tiles {
+                if t + 1 < n_tiles {
+                    body.resize(body.len() + size_bytes, 0u8);
+                }
+                body.push(0x00);
+            }
+            corrupt_inter1.extend_from_slice(&[0x12, 0x00, 0x32]);
+            let mut rem = body.len();
+            loop {
+                let mut byte = (rem & 0x7F) as u8;
+                rem >>= 7;
+                if rem != 0 {
+                    byte |= 0x80;
+                }
+                corrupt_inter1.push(byte);
+                if rem == 0 {
+                    break;
+                }
+            }
+            corrupt_inter1.extend_from_slice(&body);
+            break;
+        }
+    }
+    assert!(!corrupt_inter1.is_empty());
+
+    // 2 bağımsız kare içeren süper-kare (`KEY` + `INTER1`).
+    let mut superframe = Vec::with_capacity(pkt_key.len() + pkt_inter1.len());
+    superframe.extend_from_slice(pkt_key);
+    superframe.extend_from_slice(pkt_inter1);
+
+    // Senaryo: temiz KEY + bozuk INTER1 + bağımlı INTER2 + toparlanma KEY + süper-kare +
+    // akışın kalan tüm paketleri (görünmez ARF + show_existing süper-kareleri dâhil).
+    let mut scenario: Vec<&[u8]> = vec![
+        pkt_key.as_slice(),
+        corrupt_inter1.as_slice(),
+        pkt_inter2.as_slice(),
+        pkt_key.as_slice(),
+        superframe.as_slice(),
+        pkt_inter2.as_slice(),
+    ];
+    for p in pkts.iter().skip(3) {
+        scenario.push(p.as_slice());
+    }
+
+    let run_fault_tolerant = |n_threads: usize, max_frame_delay: usize| -> (Vec<[u64; 3]>, usize) {
+        let mut dec = Decoder::new(Config {
+            n_threads,
+            max_frame_delay,
+            ..Config::default()
+        })
+        .expect("çözücü");
+        let mut digests = Vec::new();
+        let mut err_count = 0usize;
+        for &pkt in &scenario {
+            if dec.send_packet(&Packet::new(pkt)).is_err() {
+                err_count += 1;
+            }
+            loop {
+                match dec.receive_frame() {
+                    Ok(Some(f)) => digests.push(frame_digest(&f)),
+                    Ok(None) => break,
+                    Err(_) => err_count += 1,
+                }
+            }
+        }
+        dec.flush();
+        loop {
+            match dec.receive_frame() {
+                Ok(Some(f)) => digests.push(frame_digest(&f)),
+                Ok(None) => break,
+                Err(_) => err_count += 1,
+            }
+        }
+        (digests, err_count)
+    };
+
+    let (ref_digests, ref_errs) = run_fault_tolerant(1, 1);
+    assert!(ref_errs >= 1, "bozuk INTER1 en az bir hata üretmeli");
+    assert!(
+        ref_digests.len() >= 5,
+        "toparlanma KEY ve süper-kare çıktıları alınmalı, alınan: {}",
+        ref_digests.len()
+    );
+
+    for delay in [4usize, 6] {
+        for run in 0..10usize {
+            let (got_digests, got_errs) = run_fault_tolerant(14, delay);
+            assert!(
+                got_errs >= 1,
+                "t=14, delay={delay}, run={run}: gecikmeli hata raporlanmalı"
+            );
+            assert_eq!(
+                got_digests, ref_digests,
+                "t=14, delay={delay}, run={run}: çıktı kareleri/pikselleri delay=1 ile özdeş olmalı"
+            );
+        }
+    }
+}

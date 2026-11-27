@@ -37,14 +37,18 @@ use image::{
 ///
 /// ## Memory Budget Scope (`allocation_limit` and `Limits::max_alloc`)
 ///
-/// - [`AvifDecoder::with_config`] bounds stream ingestion with `Read::take(limit + 1)`
-///   before reading into memory, then forwards the remaining budget (`limit - raw_bytes.len()`)
-///   to [`AvifPrepared::from_vec`] so `cmin`/`infe` decompression and `ICC`/`Exif`/`XMP`
+/// - [`AvifDecoder::with_config`] reads the input stream into a `Vec<u8>` whose capacity
+///   is grown with `try_reserve_exact` capped at `limit` (never doubling past `limit`),
+///   then forwards the remaining budget (`limit - raw_bytes.capacity()`) to
+///   [`AvifPrepared::from_vec`] so `cmin`/`infe` decompression and `ICC`/`Exif`/`XMP`
 ///   metadata allocations remain within the same ceiling.
 /// - [`ImageDecoder::set_limits`] validates both the output size (`total_bytes()`) and
 ///   the input/container/metadata memory already held by the adapter against `limits.max_alloc`.
+/// - Metadata copies returned by [`ImageDecoder::icc_profile`],
+///   [`ImageDecoder::exif_metadata`], and [`ImageDecoder::xmp_metadata`] are also checked
+///   against the effective allocation limit.
 /// - During [`ImageDecoder::read_image`], internal decoder allocations are capped by
-///   subtracting `raw_bytes.len()` from the effective ceiling; the caller-owned `&mut [u8]`
+///   subtracting `raw_capacity()` from the effective ceiling; the caller-owned `&mut [u8]`
 ///   output buffer passed to `read_image` is outside the library's internal allocation counter.
 #[derive(Clone, Debug)]
 pub struct AvifDecoder<R: Read> {
@@ -66,27 +70,28 @@ impl<R: Read> AvifDecoder<R> {
 
     /// Creates a new [`AvifDecoder`] with a custom [`AvifDecodeConfig`].
     ///
-    /// When `config.allocation_limit` is set, input reading is bounded with
-    /// `Read::take(limit + 1)` before reading starts; if the input exceeds `limit` bytes,
-    /// `LimitErrorKind::InsufficientMemory` is returned before header parsing. The remaining
-    /// budget (`limit - raw_bytes.len()`) is passed to [`AvifPrepared::from_vec`].
+    /// When `config.allocation_limit` is set, input reading uses a fixed stack buffer and
+    /// `try_reserve_exact` so the input vector's capacity never exceeds `limit`; if the
+    /// stream exceeds `limit` bytes, `LimitErrorKind::InsufficientMemory` is returned before
+    /// header parsing. The remaining budget (`limit - raw_bytes.capacity()`) is passed to
+    /// [`AvifPrepared::from_vec`].
     pub fn with_config(mut reader: R, config: AvifDecodeConfig) -> ImageResult<Self> {
-        let mut raw_bytes = Vec::new();
-        let header_cfg = if let Some(limit) = config.allocation_limit {
-            let max_read = (limit as u64).saturating_add(1);
-            (&mut reader).take(max_read).read_to_end(&mut raw_bytes)?;
-            if raw_bytes.len() > limit {
-                return Err(ImageError::Limits(LimitError::from_kind(
-                    LimitErrorKind::InsufficientMemory,
-                )));
-            }
-            AvifDecodeConfig {
-                allocation_limit: Some(limit - raw_bytes.len()),
-                ..config.clone()
-            }
+        let (raw_bytes, header_cfg) = if let Some(limit) = config.allocation_limit {
+            let raw_bytes = read_bounded_exact_cap(&mut reader, limit)?;
+            let remaining = limit.checked_sub(raw_bytes.capacity()).ok_or_else(|| {
+                ImageError::Limits(LimitError::from_kind(LimitErrorKind::InsufficientMemory))
+            })?;
+            (
+                raw_bytes,
+                AvifDecodeConfig {
+                    allocation_limit: Some(remaining),
+                    ..config.clone()
+                },
+            )
         } else {
+            let mut raw_bytes = Vec::new();
             reader.read_to_end(&mut raw_bytes)?;
-            config.clone()
+            (raw_bytes, config.clone())
         };
         let prepared =
             AvifPrepared::from_vec(raw_bytes, &header_cfg).map_err(map_av1oxide_error)?;
@@ -143,15 +148,27 @@ impl<R: Read> ImageDecoder for AvifDecoder<R> {
     }
 
     fn icc_profile(&mut self) -> ImageResult<Option<Vec<u8>>> {
-        Ok(self.prepared.info().icc_profile.clone())
+        clone_metadata_budgeted(
+            self.prepared.info().icc_profile.as_deref(),
+            self.held_header_bytes(),
+            self.effective_allocation_limit(),
+        )
     }
 
     fn exif_metadata(&mut self) -> ImageResult<Option<Vec<u8>>> {
-        Ok(self.prepared.info().exif.clone())
+        clone_metadata_budgeted(
+            self.prepared.info().exif.as_deref(),
+            self.held_header_bytes(),
+            self.effective_allocation_limit(),
+        )
     }
 
     fn xmp_metadata(&mut self) -> ImageResult<Option<Vec<u8>>> {
-        Ok(self.prepared.info().xmp.clone())
+        clone_metadata_budgeted(
+            self.prepared.info().xmp.as_deref(),
+            self.held_header_bytes(),
+            self.effective_allocation_limit(),
+        )
     }
 
     fn set_limits(&mut self, limits: Limits) -> ImageResult<()> {
@@ -195,7 +212,7 @@ impl<R: Read> ImageDecoder for AvifDecoder<R> {
         let effective_limit = self.effective_allocation_limit();
         let bit_depth = self.prepared.info().bit_depth;
         let has_alpha = self.prepared.info().has_alpha;
-        let raw_len = self.prepared.raw_len();
+        let raw_cap = self.prepared.raw_capacity();
         let mut cfg = self.config;
         if let Some(max_w) = self.limits.max_image_width
             && let Some(max_h) = self.limits.max_image_height
@@ -204,15 +221,15 @@ impl<R: Read> ImageDecoder for AvifDecoder<R> {
             cfg.max_pixels = cfg.max_pixels.min(pixel_limit);
         }
 
-        // `raw_bytes` tamponunu toplam bütçeden düşerek tek ayrıştırmalı çözücüye geçir;
-        // `decode_with(self, ...)` tamamlandığında ham baytlar ve kapsayıcı anında bırakılır.
+        // `raw_bytes` tamponunun gerçek kapasitesini toplam bütçeden düşerek tek ayrıştırmalı
+        // çözücüye geçir; `decode_with(self, ...)` tamamlandığında ham baytlar ve kapsayıcı bırakılır.
         if let Some(limit) = effective_limit {
-            if raw_len > limit {
+            if raw_cap > limit {
                 return Err(ImageError::Limits(LimitError::from_kind(
                     LimitErrorKind::InsufficientMemory,
                 )));
             }
-            cfg.allocation_limit = Some(limit - raw_len);
+            cfg.allocation_limit = Some(limit - raw_cap);
         } else {
             cfg.allocation_limit = None;
         }
@@ -238,6 +255,85 @@ impl<R: Read> ImageDecoder for AvifDecoder<R> {
     fn read_image_boxed(self: Box<Self>, buf: &mut [u8]) -> ImageResult<()> {
         (*self).read_image(buf)
     }
+}
+
+fn insufficient_memory() -> ImageError {
+    ImageError::Limits(LimitError::from_kind(LimitErrorKind::InsufficientMemory))
+}
+
+/// Reads up to `limit` bytes from `reader` without allowing the output `Vec`'s capacity
+/// to exceed `limit`, returning `InsufficientMemory` if the stream contains more than `limit` bytes.
+fn read_bounded_exact_cap<R: Read>(reader: &mut R, limit: usize) -> ImageResult<Vec<u8>> {
+    if limit == 0 {
+        let mut probe = [0u8; 1];
+        loop {
+            match reader.read(&mut probe) {
+                Ok(0) => return Ok(Vec::new()),
+                Ok(_) => return Err(insufficient_memory()),
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(e.into()),
+            }
+        }
+    }
+
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 4096];
+    while buf.len() < limit {
+        let to_read = (limit - buf.len()).min(chunk.len());
+        let n = match reader.read(&mut chunk[..to_read]) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e.into()),
+        };
+        if buf.capacity() - buf.len() < n {
+            let needed = buf.len() + n;
+            let target_cap = buf
+                .capacity()
+                .saturating_mul(2)
+                .max(256)
+                .min(limit)
+                .max(needed);
+            buf.try_reserve_exact(target_cap - buf.len())
+                .map_err(|_| insufficient_memory())?;
+        }
+        buf.extend_from_slice(&chunk[..n]);
+    }
+
+    if buf.len() == limit {
+        let mut probe = [0u8; 1];
+        loop {
+            match reader.read(&mut probe) {
+                Ok(0) => break,
+                Ok(_) => return Err(insufficient_memory()),
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(e.into()),
+            }
+        }
+    }
+
+    buf.shrink_to_fit();
+    Ok(buf)
+}
+
+fn clone_metadata_budgeted(
+    meta: Option<&[u8]>,
+    held_header_bytes: usize,
+    effective_limit: Option<usize>,
+) -> ImageResult<Option<Vec<u8>>> {
+    let Some(bytes) = meta else {
+        return Ok(None);
+    };
+    if let Some(limit) = effective_limit
+        && held_header_bytes.saturating_add(bytes.len()) > limit
+    {
+        return Err(insufficient_memory());
+    }
+    let mut out = Vec::new();
+    out.try_reserve_exact(bytes.len())
+        .map_err(|_| insufficient_memory())?;
+    out.extend_from_slice(bytes);
+    Ok(Some(out))
 }
 
 fn map_av1oxide_error(err: Error) -> ImageError {

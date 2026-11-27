@@ -1083,6 +1083,20 @@ pub(crate) fn build_presented_timeline(
 
     let total_duration = u64::try_from(timeline_pts_u128)
         .map_err(|_| Error::InvalidData("elst toplam süre u64 taşması"))?;
+    let m_mul_u64 = eff_ts / media_ts;
+    if m_mul_u64 > 1
+        && total_duration.is_multiple_of(m_mul_u64)
+        && presented.iter().all(|p| {
+            p.pts_in_timescale.is_multiple_of(m_mul_u64)
+                && p.duration_in_timescale.is_multiple_of(m_mul_u64)
+        })
+    {
+        for p in &mut presented {
+            p.pts_in_timescale /= m_mul_u64;
+            p.duration_in_timescale /= m_mul_u64;
+        }
+        return Ok((presented, total_duration / m_mul_u64, media_ts));
+    }
     Ok((presented, total_duration, eff_ts))
 }
 

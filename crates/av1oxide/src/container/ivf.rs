@@ -252,6 +252,7 @@ impl<R: std::io::Read> IvfReader<R> {
         ]);
         if frame_size > self.max_frame_bytes {
             buf.clear();
+            discard_bytes(&mut self.reader, frame_size);
             return Err(Error::BudgetExceeded {
                 requested: frame_size,
                 limit: self.max_frame_bytes,
@@ -270,6 +271,20 @@ impl<R: std::io::Read> IvfReader<R> {
             return Err(err);
         }
         Ok(Some(pts))
+    }
+}
+
+#[cfg(feature = "std")]
+fn discard_bytes<R: std::io::Read>(reader: &mut R, mut remaining: usize) {
+    let mut scratch = [0u8; 4096];
+    while remaining > 0 {
+        let to_read = remaining.min(scratch.len());
+        match reader.read(&mut scratch[..to_read]) {
+            Ok(0) => break,
+            Ok(n) => remaining -= n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => break,
+        }
     }
 }
 

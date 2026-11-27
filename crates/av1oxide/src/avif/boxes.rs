@@ -536,7 +536,7 @@ fn parse_container_cow<'a>(data: Cow<'a, [u8]>, butce: &Arc<Butce>) -> Result<Av
                         .saturating_mul(core::mem::size_of::<[u8; 4]>());
                     ftyp_guard.ekle(compat_bytes)?;
                     compatible_brands
-                        .try_reserve(compat_chunks.len())
+                        .try_reserve_exact(compat_chunks.len())
                         .map_err(|_| Error::AllocationFailed {
                             requested: compat_bytes,
                         })?;
@@ -625,6 +625,17 @@ pub(crate) fn parse_meta_box<'a>(
     )
 }
 
+/// `AvifContainer` ayrıştırıcısının `Arc<Butce>` (`CachePadded` hizalaması dâhil) ve
+/// `Arc<ButceTutucu>` için harcadığı sabit taban yığın maliyeti.
+#[inline]
+pub(crate) fn container_base_overhead() -> usize {
+    let arc_hdr_butce = core::mem::align_of::<Butce>().max(2 * core::mem::size_of::<usize>());
+    let arc_butce = core::mem::size_of::<Butce>().saturating_add(arc_hdr_butce);
+    let arc_hdr_guard = core::mem::align_of::<ButceTutucu>().max(2 * core::mem::size_of::<usize>());
+    let arc_guard = core::mem::size_of::<ButceTutucu>().saturating_add(arc_hdr_guard);
+    arc_butce.saturating_add(arc_guard)
+}
+
 fn parse_meta_box_cow<'a>(
     file_data: Cow<'a, [u8]>,
     meta_src: MetaSource,
@@ -652,12 +663,14 @@ fn parse_meta_box_cow<'a>(
         None => {
             let mut g = ButceTutucu::bos(butce);
             let brand_bytes = compatible_brands
-                .len()
+                .capacity()
                 .saturating_mul(core::mem::size_of::<[u8; 4]>());
             g.ekle(brand_bytes)?;
             g
         }
     };
+    // `Arc<Butce>` (`CachePadded` hizalaması dâhil) ve `Arc<ButceTutucu>` taban maliyeti.
+    container_guard.ekle(container_base_overhead())?;
     let mut has_hdlr = false;
 
     {
@@ -819,6 +832,21 @@ fn parse_grpl(
     Ok(())
 }
 
+/// `FxIndexMap<K, V>` (`indexmap 2.x`: `Vec<Bucket<K, V>>` + `hashbrown::RawTable<usize>`)
+/// için `cap` girdilik rezervasyonun gerçek yığın bayt tahminini döndürür.
+fn indexmap_table_bytes<K, V>(cap: usize) -> usize {
+    if cap == 0 {
+        return 0;
+    }
+    let bucket_size = core::mem::size_of::<(usize, K, V)>();
+    let entries_bytes = cap.saturating_mul(bucket_size);
+    let raw_buckets = cap.saturating_mul(8).div_ceil(7).max(4).next_power_of_two();
+    let indices_bytes = raw_buckets
+        .saturating_mul(core::mem::size_of::<usize>() + 1)
+        .saturating_add(16);
+    entries_bytes.saturating_add(indices_bytes)
+}
+
 fn parse_iinf(
     payload: &[u8],
     items: &mut FxIndexMap<u32, ItemInfoEntry>,
@@ -846,12 +874,12 @@ fn parse_iinf(
             "iinf içindeki infe sayısı kutu boyutunu aşıyor",
         ));
     }
-    let slot_size = core::mem::size_of::<(u32, ItemInfoEntry)>();
+    let slot_size = core::mem::size_of::<(usize, u32, ItemInfoEntry)>();
     let reserve_n = (entry_count as usize).min(256);
-    let mut pre_reserved = reserve_n.saturating_mul(slot_size);
+    let pre_reserved = indexmap_table_bytes::<u32, ItemInfoEntry>(reserve_n);
     if pre_reserved > 0 {
         guard.ekle(pre_reserved)?;
-        items.try_reserve(reserve_n).map_err(|_| {
+        items.try_reserve_exact(reserve_n).map_err(|_| {
             guard.dusur(pre_reserved);
             Error::AllocationFailed {
                 requested: pre_reserved,
@@ -863,25 +891,19 @@ fn parse_iinf(
         offset = child.next_offset;
         if &child.box_type == b"infe" {
             let entry = parse_infe(child.payload, guard)?;
-            if pre_reserved >= slot_size {
-                pre_reserved -= slot_size;
-            } else {
-                let extra = slot_size - pre_reserved;
-                pre_reserved = 0;
-                guard.ekle(extra)?;
+            if items.len() >= reserve_n && !items.contains_key(&entry.item_id) {
+                guard.ekle(slot_size)?;
             }
             if let Some(prev) = items.insert(entry.item_id, entry) {
-                let prev_bytes = slot_size
-                    .saturating_add(prev.item_name.len())
+                let prev_bytes = prev
+                    .item_name
+                    .len()
                     .saturating_add(prev.content_type.len())
                     .saturating_add(prev.content_encoding.len());
                 guard.dusur(prev_bytes);
             }
             parsed += 1;
         }
-    }
-    if pre_reserved > 0 {
-        guard.dusur(pre_reserved);
     }
     if parsed < entry_count {
         return Err(Error::InvalidData(
@@ -993,6 +1015,24 @@ pub(crate) fn parse_property_boxes(
     is_track: bool,
     guard: &mut ButceTutucu,
 ) -> Result<()> {
+    // Önce tahsissiz geçişle alt kutu sayısını belirle ve `properties` vektörünü tam kapasiteyle
+    // bütçe denetimi altında ayır (ikili büyüme kapasite aşımını önler).
+    let mut box_count = 0usize;
+    let mut scan_off = 0usize;
+    while let Some(prop_box) = read_box_header(payload, scan_off)? {
+        scan_off = prop_box.next_offset;
+        box_count += 1;
+    }
+    if box_count > 0 {
+        let props_bytes = box_count.saturating_mul(core::mem::size_of::<ItemProperty>());
+        guard.ekle(props_bytes)?;
+        properties.try_reserve_exact(box_count).map_err(|_| {
+            guard.dusur(props_bytes);
+            Error::AllocationFailed {
+                requested: props_bytes,
+            }
+        })?;
+    }
     let mut offset = 0usize;
     while let Some(prop_box) = read_box_header(payload, offset)? {
         offset = prop_box.next_offset;
@@ -1259,7 +1299,6 @@ pub(crate) fn parse_property_boxes(
             }
             other => ItemProperty::Unknown(*other),
         };
-        guard.ekle(core::mem::size_of::<ItemProperty>())?;
         properties.push(p);
     }
     Ok(())
@@ -1281,12 +1320,12 @@ fn parse_ipma(
     if (entry_count as usize) > max_entries {
         return Err(Error::InvalidData("ipma entry_count kutu boyutunu aşıyor"));
     }
-    let slot_size = core::mem::size_of::<(u32, Vec<PropertyAssoc>)>();
+    let slot_size = core::mem::size_of::<(usize, u32, Vec<PropertyAssoc>)>();
     let reserve_n = (entry_count as usize).min(256);
-    let mut pre_reserved = reserve_n.saturating_mul(slot_size);
+    let pre_reserved = indexmap_table_bytes::<u32, Vec<PropertyAssoc>>(reserve_n);
     if pre_reserved > 0 {
         guard.ekle(pre_reserved)?;
-        associations.try_reserve(reserve_n).map_err(|_| {
+        associations.try_reserve_exact(reserve_n).map_err(|_| {
             guard.dusur(pre_reserved);
             Error::AllocationFailed {
                 requested: pre_reserved,
@@ -1318,16 +1357,8 @@ fn parse_ipma(
         if needed > body.len().saturating_sub(pos) {
             return Err(Error::InvalidData("kesik ipma özellik listesi"));
         }
-        let is_new_key = !associations.contains_key(&item_id);
-        let key_bytes = if is_new_key {
-            if pre_reserved >= slot_size {
-                pre_reserved -= slot_size;
-                0
-            } else {
-                let extra = slot_size - pre_reserved;
-                pre_reserved = 0;
-                extra
-            }
+        let key_bytes = if associations.len() >= reserve_n && !associations.contains_key(&item_id) {
+            slot_size
         } else {
             0
         };
@@ -1365,10 +1396,12 @@ fn parse_ipma(
             }
         }
 
-        associations.entry(item_id).or_default().extend(list);
-    }
-    if pre_reserved > 0 {
-        guard.dusur(pre_reserved);
+        match associations.entry(item_id) {
+            indexmap::map::Entry::Occupied(mut e) => e.get_mut().extend(list),
+            indexmap::map::Entry::Vacant(e) => {
+                e.insert(list);
+            }
+        }
     }
     Ok(())
 }
@@ -1421,12 +1454,12 @@ fn parse_iloc(
     if (item_count as usize) > max_items {
         return Err(Error::InvalidData("iloc item_count kutu boyutunu aşıyor"));
     }
-    let slot_size = core::mem::size_of::<(u32, IlocItem)>();
+    let slot_size = core::mem::size_of::<(usize, u32, IlocItem)>();
     let reserve_n = (item_count as usize).min(256);
-    let mut pre_reserved = reserve_n.saturating_mul(slot_size);
+    let pre_reserved = indexmap_table_bytes::<u32, IlocItem>(reserve_n);
     if pre_reserved > 0 {
         guard.ekle(pre_reserved)?;
-        locations.try_reserve(reserve_n).map_err(|_| {
+        locations.try_reserve_exact(reserve_n).map_err(|_| {
             guard.dusur(pre_reserved);
             Error::AllocationFailed {
                 requested: pre_reserved,
@@ -1476,13 +1509,10 @@ fn parse_iloc(
                 return Err(Error::InvalidData("kesik iloc extent dizisi"));
             }
         }
-        let slot_extra = if pre_reserved >= slot_size {
-            pre_reserved -= slot_size;
-            0
+        let slot_extra = if locations.len() >= reserve_n && !locations.contains_key(&item_id) {
+            slot_size
         } else {
-            let extra = slot_size - pre_reserved;
-            pre_reserved = 0;
-            extra
+            0
         };
         let item_bytes = slot_extra
             .saturating_add(extent_count.saturating_mul(core::mem::size_of::<IlocExtent>()));
@@ -1526,16 +1556,12 @@ fn parse_iloc(
                 extents,
             },
         ) {
-            let prev_bytes = slot_size.saturating_add(
-                prev.extents
-                    .len()
-                    .saturating_mul(core::mem::size_of::<IlocExtent>()),
-            );
+            let prev_bytes = prev
+                .extents
+                .len()
+                .saturating_mul(core::mem::size_of::<IlocExtent>());
             guard.dusur(prev_bytes);
         }
-    }
-    if pre_reserved > 0 {
-        guard.dusur(pre_reserved);
     }
     Ok(())
 }
@@ -1777,6 +1803,15 @@ impl<'a> AvifContainer<'a> {
     #[inline]
     pub(crate) fn raw_len(&self) -> usize {
         self.file_data.len()
+    }
+
+    /// İçeride tutulan ham dosya bayt taşıyıcısının gerçek yığın kapasitesi.
+    #[inline]
+    pub(crate) fn raw_capacity(&self) -> usize {
+        match &self.file_data {
+            Cow::Owned(v) => v.capacity(),
+            Cow::Borrowed(s) => s.len(),
+        }
     }
 
     /// Kapsayıcı içinde sahipli tutulan (`cmin` `idat`, `ColrIcc`, `Av1C.config_obus`) bayt toplamı.

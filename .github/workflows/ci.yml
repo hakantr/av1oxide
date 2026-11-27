@@ -25,8 +25,8 @@ jobs:
         run: cargo fmt --all -- --check
       - name: Clippy (workspace, all-targets, all-features)
         run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
-      - name: Clippy (av1oxide no_std + alloc)
-        run: cargo clippy --locked -p av1oxide --no-default-features -- -D warnings
+      - name: Clippy (av1oxide no_std + alloc, all-targets)
+        run: cargo clippy --locked -p av1oxide --no-default-features --all-targets -- -D warnings
       - name: Rustdoc (workspace, all-features)
         env:
           RUSTDOCFLAGS: "-D warnings"

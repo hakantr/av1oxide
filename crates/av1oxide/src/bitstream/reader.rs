@@ -74,7 +74,7 @@ impl<'a> BitReader<'a> {
     /// Kalan bit sayısı.
     #[must_use]
     pub const fn remaining_bits(&self) -> usize {
-        self.data.len() * 8 - self.pos
+        self.data.len().saturating_mul(8).saturating_sub(self.pos)
     }
 
     /// Bayt hizalı mı?
@@ -87,7 +87,7 @@ impl<'a> BitReader<'a> {
     pub fn align_to_byte(&mut self) {
         let rem = self.pos % 8;
         if rem != 0 {
-            self.pos += 8 - rem;
+            self.pos = self.pos.saturating_add(8 - rem);
         }
     }
 
@@ -101,7 +101,7 @@ impl<'a> BitReader<'a> {
     ///
     /// [`BitstreamErrorKind::UnexpectedEnd`]: tamponda bit kalmadı.
     pub fn read_bit(&mut self) -> Result<u32> {
-        if self.pos >= self.data.len() * 8 {
+        if self.pos >= self.data.len().saturating_mul(8) {
             return Err(self
                 .error(BitstreamErrorKind::UnexpectedEnd, self.pos)
                 .into());
@@ -275,7 +275,7 @@ impl<'a> BitReader<'a> {
         let shift = 1i64 << n;
         let ref_u = i64::from(reference) + shift;
         let range = 2i64 << n;
-        if ref_u < 0 || ref_u > i64::from(u32::MAX) || range > i64::from(u32::MAX) {
+        if ref_u < 0 || ref_u > range || range > i64::from(u32::MAX) {
             return Err(self.error(BitstreamErrorKind::InvalidSubexp, start).into());
         }
         let value = self.read_subexp_u(ref_u as u32, range as u32, start)?;
@@ -284,6 +284,9 @@ impl<'a> BitReader<'a> {
 
     /// `get_bits_subexp_u`: `read_subexp`'in işaretsiz çekirdeği (getbits.c 158–174).
     fn read_subexp_u(&mut self, reference: u32, n: u32, start: usize) -> Result<u32> {
+        if n == 0 || reference > n {
+            return Err(self.error(BitstreamErrorKind::InvalidSubexp, start).into());
+        }
         let mut v: u64 = 0;
         let mut i: u32 = 0;
         loop {
@@ -316,7 +319,11 @@ impl<'a> BitReader<'a> {
         let recentered = if u64::from(reference) * 2 <= u64::from(n) {
             inv_recenter(reference, v)
         } else {
-            n - inv_recenter(n - reference, v)
+            let sub = n
+                .checked_sub(reference)
+                .ok_or_else(|| self.error(BitstreamErrorKind::InvalidSubexp, start))?;
+            n.checked_sub(inv_recenter(sub, v))
+                .ok_or_else(|| self.error(BitstreamErrorKind::InvalidSubexp, start))?
         };
         Ok(recentered)
     }
@@ -348,7 +355,7 @@ impl<'a> BitReader<'a> {
         if self.data[self.byte_position()..].iter().any(|&b| b != 0) {
             return Err(self.error(BitstreamErrorKind::TrailingBits, start).into());
         }
-        self.pos = self.data.len() * 8;
+        self.pos = self.data.len().saturating_mul(8);
         Ok(())
     }
 }
@@ -360,7 +367,7 @@ fn inv_recenter(r: u32, v: u32) -> u32 {
     if v > r * 2 {
         v as u32
     } else if v & 1 == 0 {
-        (v >> 1) as u32 + r as u32
+        ((v >> 1) + r) as u32
     } else {
         (r - ((v + 1) >> 1)) as u32
     }
@@ -609,5 +616,52 @@ mod tests {
         assert!(br.is_byte_aligned());
         assert_eq!(br.remaining_bits(), 8);
         assert_eq!(br.read_bits(8).expect("8 bit"), 0x0F);
+    }
+
+    #[test]
+    fn genel_bit_okuyucu_uc_degerlerde_paniklemez() {
+        let data = [0xFFu8; 16];
+        // `read_subexp`: reference aralık dışı (ref_u > range veya ref_u < 0) ve n > 30
+        for (reference, n) in [
+            (100, 2),
+            (5, 2),
+            (-5, 2),
+            (i32::MAX, 4),
+            (i32::MIN, 4),
+            (i32::MAX, 30),
+            (i32::MIN, 30),
+            (0, 31),
+            (0, u32::MAX),
+            (i32::MAX, u32::MAX),
+        ] {
+            let mut br = BitReader::new(&data);
+            let err = br
+                .read_subexp(reference, n)
+                .expect_err("aralık dışı subexp hata döndürmeli");
+            assert_eq!(kind(err), BitstreamErrorKind::InvalidSubexp);
+        }
+        // Geçerli sınırlar: n = 0, reference ∈ {-1, 0, 1}
+        for reference in [-1i32, 0, 1] {
+            let mut br = BitReader::new(&data);
+            let val = br.read_subexp(reference, 0).expect("n=0 geçerli");
+            assert!((-1..=1).contains(&val));
+        }
+        // `read_uniform`: 0, 1 reddedilir; u32::MAX paniklemez.
+        assert_eq!(
+            kind(BitReader::new(&data).read_uniform(0).expect_err("0")),
+            BitstreamErrorKind::InvalidUniformMax(0)
+        );
+        assert!(BitReader::new(&data).read_uniform(u32::MAX).is_ok());
+        // `read_bits` / `read_sbits`: 0 ve u32::MAX sınırları.
+        assert_eq!(BitReader::new(&[]).read_bits(0).unwrap(), 0);
+        assert_eq!(BitReader::new(&[]).read_sbits(0).unwrap(), 0);
+        assert_eq!(
+            kind(BitReader::new(&data).read_bits(u32::MAX).expect_err("max")),
+            BitstreamErrorKind::InvalidBitCount(u32::MAX)
+        );
+        assert_eq!(
+            kind(BitReader::new(&data).read_sbits(u32::MAX).expect_err("max")),
+            BitstreamErrorKind::InvalidBitCount(u32::MAX)
+        );
     }
 }

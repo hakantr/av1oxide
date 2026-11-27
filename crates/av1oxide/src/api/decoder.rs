@@ -1518,43 +1518,11 @@ impl Decoder {
                 self.retire_front_in_flight(true)?;
             }
         }
-        // 3. Saf Rust kipte, bu karenin başvurduğu yuvalardan biri arka planda hata
-        //    vermiş bir uçuş karesine aitse erken doğrulamadan önce kuyruğu boşalt.
-        //    C-ABI sıkı gecikme kipinde (`dav1d` `decode.c:3452-3474`) yarışlı erken
-        //    boşaltma yapılmaz; bağımlı kare işçi görevinde deterministik olarak hata verir.
-        if !self.capi_strict_frame_delay
-            && matches!(header.frame_type, FrameType::Inter | FrameType::Switch)
-        {
-            let mut has_failed_dep = false;
-            for &ridx in &header.refidx {
-                let slot = usize::from(ridx as u8);
-                if self
-                    .slot_promises
-                    .get(slot)
-                    .and_then(Option::as_ref)
-                    .is_some_and(|s| s.is_failed_nonblocking())
-                {
-                    has_failed_dep = true;
-                    break;
-                }
-            }
-            if has_failed_dep {
-                while !self.in_flight.is_empty() {
-                    self.retire_front_in_flight(true)?;
-                }
-            }
-        }
-
-        // 4. Erken doğrulama (`validate_frame_refs_slots`): hata durumunda yuvalar değişmez.
-        let check_async_failed = !self.capi_strict_frame_delay;
+        // 3. Erken doğrulama (`validate_frame_refs_slots`): hata durumunda yuvalar değişmez.
+        //    Yarışlı ana-iş-parçacığı `is_failed_nonblocking()` kısa devresi yapılmaz;
+        //    bağımlı kare işçi görevinde deterministik olarak hata verir (`dav1d` `decode.c:3452-3474`).
         let early = frame_format(seq).and_then(|(chroma, bd)| {
-            validate_frame_refs_slots(
-                &header,
-                chroma,
-                bd,
-                &self.slot_promises,
-                check_async_failed,
-            )?;
+            validate_frame_refs_slots(&header, chroma, bd, &self.slot_promises)?;
             Ok((chroma, bd))
         });
         let (chroma, bd) = match early {
@@ -1958,22 +1926,12 @@ impl Decoder {
                     }
                 }
                 let Some(entry_rf) = promise.wait(&self.cancel_flag) else {
-                    if self.capi_strict_frame_delay {
-                        // `dav1d` (`src/obu.c:1594-1602`, `src/decode.c:3369-3377`, `src/lib.c:391-400`):
-                        // `show_existing_frame` kendi çözme görevi üretmez (`retval == 0`); referans
-                        // karesi `FRAME_ERROR` ile başarısız olduysa kare sessizce atılır ve yeni
-                        // gelen paketler/superframe OBU'ları kesilmez.
-                        self.pipeline_butce.taban_guncelle(self.kalici_bayt());
-                        return Ok(true);
-                    }
-                    self.last_error_packet_tag = Some(capi_meta.packet_tag);
-                    return Err(BitstreamError::new(
-                        BitstreamErrorKind::InvalidFrameHeader(
-                            "show_existing_frame: referans resmi yok (obu.c 1544)",
-                        ),
-                        0,
-                    )
-                    .into());
+                    // `dav1d` (`src/obu.c:1594-1602`, `src/decode.c:3369-3377`, `src/lib.c:391-400`):
+                    // `show_existing_frame` kendi çözme görevi üretmez (`retval == 0`); referans
+                    // karesi `FRAME_ERROR` ile başarısız olduysa kare sessizce atılır ve yeni
+                    // gelen paketler/süper-kare OBU'ları kesilmez.
+                    self.pipeline_butce.taban_guncelle(self.kalici_bayt());
+                    return Ok(true);
                 };
                 self.pipeline_butce.taban_guncelle(self.kalici_bayt());
                 let out_butce = Butce::alt_defter(&self.pipeline_butce);
@@ -1993,17 +1951,13 @@ impl Decoder {
                     Ok(frame) => frame,
                     Err(err) => {
                         drop(out_butce);
-                        if self.capi_strict_frame_delay {
-                            let detail = format!("{err}");
-                            self.outputs.push_back(OutputEntry::DelayedError(err));
-                            self.output_errors.push_back(Some(detail));
-                            self.output_tools.push_back(None);
-                            self.output_capi_meta.push_back(capi_meta);
-                            self.pipeline_butce.taban_guncelle(self.kalici_bayt());
-                            return Ok(true);
-                        }
-                        self.last_error_packet_tag = Some(capi_meta.packet_tag);
-                        return Err(err);
+                        let detail = format!("{err}");
+                        self.outputs.push_back(OutputEntry::DelayedError(err));
+                        self.output_errors.push_back(Some(detail));
+                        self.output_tools.push_back(None);
+                        self.output_capi_meta.push_back(capi_meta);
+                        self.pipeline_butce.taban_guncelle(self.kalici_bayt());
+                        return Ok(true);
                     }
                 };
                 if packet_timestamp.is_some() {
@@ -2092,46 +2046,27 @@ impl Decoder {
                         Ok(true)
                     }
                     Err(err) => {
-                        if self.capi_strict_frame_delay {
-                            // `dav1d` (`src/decode.c:3362-3368, 3718-3720`): `n_fc > 1` arka plan
-                            // çözme hatasında `c->refs[i]` başlık/vaat yuvaları silinmez (`out_slot`
-                            // zaten `Failed` = `FRAME_ERROR` durumundadır) ve hata yeni karenin
-                            // gönderimini kesmeden `outputs` kuyruğuna `DelayedError` olarak eklenir.
-                            for (slot, reference) in self.pixel_refs.iter_mut().enumerate() {
-                                if task.refresh_frame_flags & (1 << slot) != 0 {
-                                    *reference = None;
-                                }
-                            }
-                            let detail = format!("{err}");
-                            self.unsupported_frames += 1;
-                            self.outputs.push_back(OutputEntry::DelayedError(err));
-                            self.output_errors.push_back(Some(detail));
-                            self.output_tools.push_back(None);
-                            self.output_capi_meta.push_back(OutputCapiMeta {
-                                packet_tag: task.packet_tag,
-                                prealloc_id: task.prealloc_id,
-                                ..OutputCapiMeta::default()
-                            });
-                            self.pipeline_butce.taban_guncelle(self.kalici_bayt());
-                            return Ok(true);
-                        }
-                        for slot in 0..8 {
+                        // `dav1d` (`src/decode.c:3362-3368, 3718-3720`): `n_fc > 1` arka plan
+                        // çözme hatasında `c->refs[i]` başlık/vaat yuvaları silinmez (`out_slot`
+                        // zaten `Failed` = `FRAME_ERROR` durumundadır) ve hata yeni karenin
+                        // gönderimini kesmeden `outputs` kuyruğuna `DelayedError` olarak eklenir.
+                        for (slot, reference) in self.pixel_refs.iter_mut().enumerate() {
                             if task.refresh_frame_flags & (1 << slot) != 0 {
-                                self.pixel_refs[slot] = None;
-                                if self.slot_promises[slot]
-                                    .as_ref()
-                                    .is_some_and(|s| Arc::ptr_eq(s, &task.out_slot))
-                                {
-                                    self.slot_promises[slot] = None;
-                                    self.parse.header_state.clear_slots(1 << slot);
-                                }
+                                *reference = None;
                             }
                         }
+                        let detail = format!("{err}");
                         self.unsupported_frames += 1;
-                        self.last_decode_error = Some(format!("{err}"));
-                        self.last_error_packet_tag = Some(task.packet_tag);
+                        self.outputs.push_back(OutputEntry::DelayedError(err));
+                        self.output_errors.push_back(Some(detail));
+                        self.output_tools.push_back(None);
+                        self.output_capi_meta.push_back(OutputCapiMeta {
+                            packet_tag: task.packet_tag,
+                            prealloc_id: task.prealloc_id,
+                            ..OutputCapiMeta::default()
+                        });
                         self.pipeline_butce.taban_guncelle(self.kalici_bayt());
-                        Err(err)
+                        Ok(true)
                     }
                 }
             }
@@ -2298,12 +2233,6 @@ impl Decoder {
         let Some(promise) = self.slot_promises.get(slot).and_then(Clone::clone) else {
             return fail("show_existing_frame: referans resmi yok (obu.c 1544)");
         };
-        if !self.capi_strict_frame_delay && promise.is_failed_nonblocking() {
-            while !self.in_flight.is_empty() {
-                self.retire_front_in_flight(true)?;
-            }
-            return fail("show_existing_frame: referans resmi yok (obu.c 1544)");
-        }
         if opts.strict && !self.parse.header_state.showable(slot) {
             return fail(
                 "show_existing_frame: gösterilemeyen kare (strict_std_compliance; obu.c 1545-1548)",
@@ -2311,12 +2240,10 @@ impl Decoder {
         }
         let prealloc_id = promise.capi_pic_id();
 
-        // Bütçe sınırı (`allocation_limit`) açıksa veya (saf Rust kipte) uçuş kuyruğu boşsa
-        // senkron doğrula; C-ABI sıkı gecikme kipinde (`dav1d` `obu.c:1564-1607`) `show_existing`
-        // de `out_delayed[0..n_fc]` kuyruğunda tam `n_fc` yuva gecikmesiyle sıraya girer.
-        if self.config.allocation_limit.is_some()
-            || (!self.capi_strict_frame_delay && self.in_flight.is_empty())
-        {
+        // Bütçe sınırı (`allocation_limit`) açıksa senkron doğrula; aksi halde hem saf Rust
+        // hem C-ABI kipte `show_existing` `in_flight` FIFO sırasına girerek yarışsız ve
+        // deterministik sırada emekliye ayrılır (`dav1d` `obu.c:1564-1607`).
+        if self.config.allocation_limit.is_some() {
             while !promise.is_done_nonblocking() {
                 if let Some(work) = self.pool.try_pop_async_task() {
                     work();
@@ -2932,7 +2859,6 @@ fn validate_frame_refs_slots(
     chroma: ChromaFormat,
     bd: BitDepth,
     slots: &[Option<Arc<FrameSlot>>; 8],
-    check_async_failed: bool,
 ) -> Result<()> {
     let is_inter = matches!(hdr.frame_type, FrameType::Inter | FrameType::Switch);
     if is_inter {
@@ -2941,9 +2867,6 @@ fn validate_frame_refs_slots(
             let Some(r) = slots.get(slot).and_then(Option::as_ref) else {
                 return Err(Error::Unsupported("referans çözülmedi: inter referans"));
             };
-            if check_async_failed && r.is_failed_nonblocking() {
-                return Err(Error::Unsupported("referans çözülmedi: inter referans"));
-            }
             let cur_w = hdr.width[0] as usize;
             let cur_h = hdr.height as usize;
             if cur_w * 2 < r.width
@@ -2960,12 +2883,9 @@ fn validate_frame_refs_slots(
         if hdr.primary_ref_frame != 7 {
             let pr = usize::from(hdr.primary_ref_frame);
             let slot = usize::from(hdr.refidx[pr] as u8);
-            let Some(r) = slots.get(slot).and_then(Option::as_ref) else {
+            let Some(_) = slots.get(slot).and_then(Option::as_ref) else {
                 return Err(Error::Unsupported("referans çözülmedi: primary_ref_frame"));
             };
-            if check_async_failed && r.is_failed_nonblocking() {
-                return Err(Error::Unsupported("referans çözülmedi: primary_ref_frame"));
-            }
         }
     }
     Ok(())

@@ -19,6 +19,18 @@ include = ["src/**", "examples/**", "include/**", "Cargo.toml", "LICENSE"]
 name = "av1oxide"
 path = "src/lib.rs"
 
+[[example]]
+name = "c_abi_decode"
+required-features = ["std"]
+
+[[test]]
+name = "capi_dav1d_compat"
+required-features = ["std"]
+
+[[test]]
+name = "avif_reader"
+required-features = ["std"]
+
 [lints]
 workspace = true
 
