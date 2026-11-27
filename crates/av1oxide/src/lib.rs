@@ -113,7 +113,7 @@
 //! - `crates/av1oxide/src` altındaki `218` kaynak dosyadan `124`'ü doğrudan `#![forbid(unsafe_code)]`
 //!   taşır (kalan `5` üst modül kökü `0` `unsafe` bloğu içerir); yalnız [`audit::UNSAFE_EXEMPTIONS`]
 //!   içindeki `88` `x86_64`/`aarch64` SIMD dosyası ve `1` C-ABI sınır dosyası (`capi/ffi.rs`)
-//!   dar kapsamlı işlemler için muaf tutulur (`0` güvensiz işlev imzası, `398` blok).
+//!   dar kapsamlı işlemler için muaf tutulur (`0` güvensiz işlev imzası, `399` blok).
 //!
 //! ## Bağımlılık Politikası
 //!

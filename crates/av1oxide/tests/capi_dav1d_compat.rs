@@ -961,6 +961,9 @@ int main(void) {
 
     let c_app_src = r#"
 #include <assert.h>
+#include <stdarg.h>
+#include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <dav1d/dav1d.h>
 
@@ -970,6 +973,54 @@ static const uint8_t PKT0[] = {
     0x8C, 0x64, 0xBE, 0x2E, 0xC7, 0xDA, 0xEE, 0x96
 };
 
+typedef struct {
+    int alloc_calls;
+    int release_calls;
+} CustomAllocState;
+
+typedef struct {
+    int log_calls;
+    char last_msg[512];
+} LoggerState;
+
+static void test_c_logger(void *cookie, const char *fmt, va_list ap) {
+    LoggerState *st = (LoggerState *)cookie;
+    assert(st != NULL && fmt != NULL);
+    st->log_calls += 1;
+    int n = vsnprintf(st->last_msg, sizeof(st->last_msg), fmt, ap);
+    assert(n > 0);
+}
+
+static int test_c_alloc_picture(Dav1dPicture *p, void *cookie) {
+    CustomAllocState *st = (CustomAllocState *)cookie;
+    assert(st != NULL && p != NULL);
+    /* FFmpeg libdav1d_picture_allocator gibi alloc sırasında seq_hdr/frame_hdr/m okunur */
+    assert(p->seq_hdr != NULL);
+    assert(p->frame_hdr != NULL);
+    assert(p->seq_hdr->hbd == 0);
+    assert(p->frame_hdr->width[1] == 1);
+    assert(p->p.w == 1 && p->p.h == 1 && p->p.bpc == 8);
+    assert(p->m.timestamp == 777);
+
+    uint8_t *buf = (uint8_t *)calloc(3, 64);
+    assert(buf != NULL);
+    p->data[0] = buf;
+    p->data[1] = buf + 64;
+    p->data[2] = buf + 128;
+    p->stride[0] = 64;
+    p->stride[1] = 64;
+    p->allocator_data = buf;
+    st->alloc_calls += 1;
+    return 0;
+}
+
+static void test_c_release_picture(Dav1dPicture *p, void *cookie) {
+    CustomAllocState *st = (CustomAllocState *)cookie;
+    assert(st != NULL && p != NULL && p->allocator_data != NULL);
+    free(p->allocator_data);
+    st->release_calls += 1;
+}
+
 int main(void) {
     assert(dav1d_version_api() == 0x00070000U);
     assert(strcmp(dav1d_version(), "0.5.1") == 0);
@@ -978,6 +1029,7 @@ int main(void) {
     assert(dav1d_parse_sequence_header(&seq, PKT0, sizeof(PKT0)) == 0);
     assert(seq.max_width == 1 && seq.max_height == 1);
 
+    /* 1. Varsayılan ayırıcı + 64-bayt hizalama kontrolü */
     Dav1dSettings s;
     dav1d_default_settings(&s);
     s.n_threads = 2;
@@ -1013,6 +1065,74 @@ int main(void) {
     dav1d_picture_unref(&pic);
     dav1d_close(&c);
     assert(c == NULL);
+
+    /* 2. FFmpeg tarzı özel ayırıcı (alloc_cb içinde seq_hdr/frame_hdr/m) + dav1d_apply_grain + C va_list logger */
+    CustomAllocState alloc_st = { 0, 0 };
+    LoggerState log_st = { 0, { 0 } };
+    Dav1dSettings sc;
+    dav1d_default_settings(&sc);
+    sc.n_threads = 1;
+    sc.max_frame_delay = 1;
+    sc.apply_grain = 0;
+    sc.allocator.cookie = &alloc_st;
+    sc.allocator.alloc_picture_callback = test_c_alloc_picture;
+    sc.allocator.release_picture_callback = test_c_release_picture;
+    sc.logger.cookie = &log_st;
+    sc.logger.callback = test_c_logger;
+
+    Dav1dContext *cc = NULL;
+    assert(dav1d_open(&cc, &sc) == 0);
+    assert(cc != NULL);
+
+    Dav1dData d2 = { 0 };
+    uint8_t *b2 = dav1d_data_create(&d2, sizeof(PKT0));
+    assert(b2 != NULL);
+    memcpy(b2, PKT0, sizeof(PKT0));
+    d2.m.timestamp = 777;
+    assert(dav1d_send_data(cc, &d2) == 0);
+
+    Dav1dPicture pic2 = { 0 };
+    do {
+        rc = dav1d_get_picture(cc, &pic2);
+    } while (rc == DAV1D_ERR(EAGAIN));
+    assert(rc == 0);
+    assert(alloc_st.alloc_calls == 1);
+    assert(((const uint8_t *)pic2.data[0])[0] == 190U);
+
+    /* Film grain uygulamasında da alloc_cb seq_hdr/frame_hdr görmeli */
+    Dav1dFrameHeader fg_hdr = *pic2.frame_hdr;
+    fg_hdr.film_grain.present = 1;
+    fg_hdr.film_grain.data.seed = 42;
+    fg_hdr.film_grain.data.num_y_points = 2;
+    fg_hdr.film_grain.data.y_points[0][0] = 0;
+    fg_hdr.film_grain.data.y_points[0][1] = 16;
+    fg_hdr.film_grain.data.y_points[1][0] = 255;
+    fg_hdr.film_grain.data.y_points[1][1] = 16;
+    fg_hdr.film_grain.data.scaling_shift = 8;
+    fg_hdr.film_grain.data.ar_coeff_shift = 6;
+    Dav1dPicture grain_in = pic2;
+    grain_in.frame_hdr = &fg_hdr;
+    Dav1dPicture grain_out = { 0 };
+    assert(dav1d_apply_grain(cc, &grain_out, &grain_in) == 0);
+    assert(alloc_st.alloc_calls == 2);
+    assert(grain_out.seq_hdr != NULL && grain_out.frame_hdr != NULL);
+    dav1d_picture_unref(&grain_out);
+    dav1d_picture_unref(&pic2);
+    assert(alloc_st.release_calls == 2);
+
+    /* Bozuk paketle gerçek C va_list vsnprintf logger geri çağrısı */
+    const uint8_t bad_obu[] = { 0x0A, 0x7F, 0xFF };
+    Dav1dData dbad = { 0 };
+    uint8_t *bb = dav1d_data_create(&dbad, sizeof(bad_obu));
+    assert(bb != NULL);
+    memcpy(bb, bad_obu, sizeof(bad_obu));
+    assert(dav1d_send_data(cc, &dbad) < 0);
+    dav1d_data_unref(&dbad);
+    assert(log_st.log_calls >= 1);
+    assert(strlen(log_st.last_msg) > 0);
+
+    dav1d_close(&cc);
+    assert(cc == NULL);
     return 0;
 }
 "#;
@@ -1350,7 +1470,7 @@ fn capi_inloop_filters_decode_frame_type_and_logger_callback() {
     unsafe extern "C" fn test_logger_cb(
         cookie: *mut core::ffi::c_void,
         fmt: *const core::ffi::c_char,
-        _: ...
+        _ap: core::ffi::VaList<'_>,
     ) {
         if !cookie.is_null() && !fmt.is_null() {
             // SAFETY: `cookie` bu test boyunca canlı `AtomicUsize` örneğidir.

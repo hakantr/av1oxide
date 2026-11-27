@@ -159,6 +159,22 @@ fn ref_inc(ptr: *mut Dav1dRef) -> *mut Dav1dRef {
     ptr
 }
 
+type Dav1dLoggerCallback = unsafe extern "C" fn(*mut c_void, *const c_char, core::ffi::VaList<'_>);
+
+unsafe extern "C" fn invoke_dav1d_logger_va(
+    cb: Dav1dLoggerCallback,
+    cookie: *mut c_void,
+    fmt: *const c_char,
+    args: ...
+) {
+    // SAFETY: (1) ISA koşulu yoktur (C `va_list` günlük geri çağrısı).
+    // (2) sınır: `cb` `log_capi_message` içinde null kontrolünden geçmiş geçerli bir `Dav1dLogger.callback` işlev işaretçisidir ve `fmt` ile `args` geçerli C dizeleridir.
+    // (3) hizalama/takma ad: `args` C variadic ABI tarafından üretilen geçerli bir `va_list` değeridir ve çağrı süresince salt-okunur tüketilir.
+    unsafe {
+        cb(cookie, fmt, args);
+    }
+}
+
 fn log_capi_message(logger: &Dav1dLogger, msg: &str) {
     if logger.callback.is_null() {
         return;
@@ -170,12 +186,11 @@ fn log_capi_message(logger: &Dav1dLogger, msg: &str) {
     let cb_ptr = logger.callback;
     let _ = catch_unwind(AssertUnwindSafe(|| {
         // SAFETY: (1) ISA koşulu yoktur (C günlük geri çağrısı çağrımı).
-        // (2) sınır: `cb_ptr` null değildir ve `Dav1dLogger` sözleşmesi gereği `void (*callback)(void *cookie, const char *format, ...)` imzasına sahip geçerli bir C fonksiyon işaretçisidir; `c"%s\n"` ve `cmsg` NUL sonludur.
+        // (2) sınır: `cb_ptr` null değildir ve `Dav1dLogger` sözleşmesi gereği `void (*callback)(void *cookie, const char *format, va_list ap)` imzasına sahip geçerli bir C fonksiyon işaretçisidir; `c"%s\n"` ve `cmsg` NUL sonludur.
         // (3) hizalama/takma ad: format dizesi ile `cmsg` salt-okunur C dizeleridir ve çağrı süresince canlıdır.
         unsafe {
-            let cb: unsafe extern "C" fn(*mut c_void, *const c_char, ...) =
-                core::mem::transmute(cb_ptr);
-            cb(cookie, c"%s\n".as_ptr(), cmsg.as_ptr());
+            let cb: Dav1dLoggerCallback = core::mem::transmute(cb_ptr);
+            invoke_dav1d_logger_va(cb, cookie, c"%s\n".as_ptr(), cmsg.as_ptr());
         }
     }));
 }
@@ -421,11 +436,30 @@ fn attach_picture_metadata(pic: &mut Dav1dPicture, meta: &OutputCapiMeta) {
     }
 }
 
+enum PictureMetaSource<'a> {
+    Owned(&'a OutputCapiMeta),
+    RetainFrom(&'a Dav1dPicture),
+}
+
+fn retain_picture_metadata(dst: &mut Dav1dPicture, src: &Dav1dPicture) {
+    dst.seq_hdr = src.seq_hdr;
+    dst.seq_hdr_ref = ref_inc(src.seq_hdr_ref);
+    dst.frame_hdr = src.frame_hdr;
+    dst.frame_hdr_ref = ref_inc(src.frame_hdr_ref);
+    dst.content_light = src.content_light;
+    dst.content_light_ref = ref_inc(src.content_light_ref);
+    dst.mastering_display = src.mastering_display;
+    dst.mastering_display_ref = ref_inc(src.mastering_display_ref);
+    dst.itut_t35 = src.itut_t35;
+    dst.n_itut_t35 = src.n_itut_t35;
+    dst.itut_t35_ref = ref_inc(src.itut_t35_ref);
+}
+
 fn fill_output_picture(
     ctx: &ContextInner,
     out: &mut Dav1dPicture,
     frame: &Frame,
-    meta: &OutputCapiMeta,
+    meta_src: PictureMetaSource<'_>,
     props: Dav1dDataProps,
 ) -> Result<(), c_int> {
     picture_unref_value(out);
@@ -435,6 +469,14 @@ fn fill_output_picture(
         layout: chroma_to_pixel_layout(frame.chroma_format()),
         bpc: frame.bit_depth().bits() as c_int,
     };
+    // `dav1d` (`src/picture.c`) sözleşmesi gereği özel `alloc_picture_callback` çağrılmadan
+    // önce `p`, `m`, `seq_hdr`, `frame_hdr` ve HDR/T.35 başlıkları eksiksiz doldurulmalıdır
+    // (ör. FFmpeg `libdav1d_picture_allocator` `p->seq_hdr->hbd` okur).
+    out.m = props;
+    match meta_src {
+        PictureMetaSource::Owned(meta) => attach_picture_metadata(out, meta),
+        PictureMetaSource::RetainFrom(src) => retain_picture_metadata(out, src),
+    }
 
     if let (Some(alloc_cb), Some(release_cb)) = (
         ctx.allocator.alloc_picture_callback,
@@ -442,9 +484,7 @@ fn fill_output_picture(
     ) {
         let rc = alloc_cb(out as *mut Dav1dPicture, ctx.allocator.cookie);
         if rc < 0 {
-            let mut p = props;
-            data_props_unref_value(&mut p);
-            *out = Dav1dPicture::default();
+            picture_unref_value(out);
             return Err(rc);
         }
         let snapshot = *out;
@@ -455,8 +495,6 @@ fn fill_output_picture(
         });
         out.r#ref = pic_ref;
         if let Err(e) = copy_frame_to_custom_pic(frame, out) {
-            let mut p = props;
-            data_props_unref_value(&mut p);
             picture_unref_value(out);
             return Err(e);
         }
@@ -466,16 +504,12 @@ fn fill_output_picture(
                 out.r#ref = ref_into_raw(RefPayload::DefaultPicturePlanes(planes));
             }
             Err(e) => {
-                let mut p = props;
-                data_props_unref_value(&mut p);
-                *out = Dav1dPicture::default();
+                picture_unref_value(out);
                 return Err(e);
             }
         }
     }
 
-    out.m = props;
-    attach_picture_metadata(out, meta);
     Ok(())
 }
 
@@ -897,7 +931,7 @@ fn deliver_ready_picture(ctx: &mut ContextInner, out_ref: &mut Dav1dPicture) -> 
             ..Dav1dDataProps::default()
         }
     };
-    match fill_output_picture(ctx, out_ref, &frame, &meta, props) {
+    match fill_output_picture(ctx, out_ref, &frame, PictureMetaSource::Owned(&meta), props) {
         Ok(()) => 0,
         Err(code) => code,
     }
@@ -1094,21 +1128,15 @@ pub unsafe extern "C" fn dav1d_apply_grain(
         };
 
         let props = clone_data_props(&in_guard.0.m);
-        let empty_meta = OutputCapiMeta::default();
-        if let Err(code) = fill_output_picture(ctx, out_ref, &grained_frame, &empty_meta, props) {
+        if let Err(code) = fill_output_picture(
+            ctx,
+            out_ref,
+            &grained_frame,
+            PictureMetaSource::RetainFrom(&in_guard.0),
+            props,
+        ) {
             return code;
         }
-        out_ref.seq_hdr = in_guard.0.seq_hdr;
-        out_ref.seq_hdr_ref = ref_inc(in_guard.0.seq_hdr_ref);
-        out_ref.frame_hdr = in_guard.0.frame_hdr;
-        out_ref.frame_hdr_ref = ref_inc(in_guard.0.frame_hdr_ref);
-        out_ref.content_light = in_guard.0.content_light;
-        out_ref.content_light_ref = ref_inc(in_guard.0.content_light_ref);
-        out_ref.mastering_display = in_guard.0.mastering_display;
-        out_ref.mastering_display_ref = ref_inc(in_guard.0.mastering_display_ref);
-        out_ref.itut_t35 = in_guard.0.itut_t35;
-        out_ref.n_itut_t35 = in_guard.0.n_itut_t35;
-        out_ref.itut_t35_ref = ref_inc(in_guard.0.itut_t35_ref);
         0
     }));
     res.unwrap_or(dav1d_err(EINVAL))
