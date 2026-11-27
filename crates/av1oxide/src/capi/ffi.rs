@@ -11,7 +11,9 @@ use std::collections::VecDeque;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 
-use crate::api::{Decoder, OutputCapiMeta};
+use crate::api::{
+    Decoder, ItutT35Meta, MasteringDisplayMeta, OutputCapiMeta, PreallocCb, PreallocRequest,
+};
 use crate::capi::convert::{
     bpc_to_bit_depth, chroma_to_pixel_layout, decode_frame_type_from_c, error_to_dav1d,
     film_grain_from_c, frame_delay_from_settings, frame_header_to_c, has_grain_c,
@@ -127,6 +129,8 @@ pub(crate) struct ContextInner {
     pub(crate) cached_error_props: Dav1dDataProps,
     pub(crate) next_packet_tag: u64,
     pub(crate) packet_props: VecDeque<(u64, Dav1dDataProps)>,
+    pub(crate) next_prealloc_id: u64,
+    pub(crate) preallocated_pics: VecDeque<(u64, Dav1dPicture)>,
 }
 
 impl Drop for ContextInner {
@@ -135,6 +139,9 @@ impl Drop for ContextInner {
         data_props_unref_value(&mut self.cached_error_props);
         while let Some((_, mut props)) = self.packet_props.pop_front() {
             data_props_unref_value(&mut props);
+        }
+        while let Some((_, mut pic)) = self.preallocated_pics.pop_front() {
+            picture_unref_value(&mut pic);
         }
     }
 }
@@ -368,22 +375,29 @@ fn allocate_default_picture_planes(
     Ok(buffers)
 }
 
-fn attach_picture_metadata(pic: &mut Dav1dPicture, meta: &OutputCapiMeta) {
-    if let Some(seq) = &meta.seq_hdr {
+fn attach_picture_metadata_parts(
+    pic: &mut Dav1dPicture,
+    seq_hdr: Option<&crate::bitstream::SequenceHeader>,
+    frame_hdr: Option<&crate::bitstream::frame_header::FrameHeader>,
+    content_light: Option<(u16, u16)>,
+    mastering_display: Option<MasteringDisplayMeta>,
+    itut_t35: &[ItutT35Meta],
+) {
+    if let Some(seq) = seq_hdr {
         let mut boxed = Box::new(seq_header_to_c(seq));
         let ptr = &mut *boxed as *mut Dav1dSequenceHeader;
         let r = ref_into_raw(RefPayload::SeqHdr(boxed));
         pic.seq_hdr = ptr;
         pic.seq_hdr_ref = r;
     }
-    if let Some(fh) = &meta.frame_hdr {
+    if let Some(fh) = frame_hdr {
         let mut boxed = Box::new(frame_header_to_c(fh));
         let ptr = &mut *boxed as *mut Dav1dFrameHeader;
         let r = ref_into_raw(RefPayload::FrameHdr(boxed));
         pic.frame_hdr = ptr;
         pic.frame_hdr_ref = r;
     }
-    if let Some((max_cll, max_fall)) = meta.content_light {
+    if let Some((max_cll, max_fall)) = content_light {
         let mut boxed = Box::new(Dav1dContentLightLevel {
             max_content_light_level: max_cll,
             max_frame_average_light_level: max_fall,
@@ -393,7 +407,7 @@ fn attach_picture_metadata(pic: &mut Dav1dPicture, meta: &OutputCapiMeta) {
         pic.content_light = ptr;
         pic.content_light_ref = r;
     }
-    if let Some(md) = &meta.mastering_display {
+    if let Some(md) = mastering_display {
         let mut boxed = Box::new(Dav1dMasteringDisplay {
             primaries: md.primaries,
             white_point: md.white_point,
@@ -405,10 +419,10 @@ fn attach_picture_metadata(pic: &mut Dav1dPicture, meta: &OutputCapiMeta) {
         pic.mastering_display = ptr;
         pic.mastering_display_ref = r;
     }
-    if !meta.itut_t35.is_empty() {
-        let mut payloads: Vec<Vec<u8>> = Vec::with_capacity(meta.itut_t35.len());
-        let mut entries: Vec<Dav1dITUTT35> = Vec::with_capacity(meta.itut_t35.len());
-        for item in &meta.itut_t35 {
+    if !itut_t35.is_empty() {
+        let mut payloads: Vec<Vec<u8>> = Vec::with_capacity(itut_t35.len());
+        let mut entries: Vec<Dav1dITUTT35> = Vec::with_capacity(itut_t35.len());
+        for item in itut_t35 {
             let mut p = item.payload.clone();
             let ptr = if p.is_empty() {
                 core::ptr::null_mut()
@@ -434,6 +448,60 @@ fn attach_picture_metadata(pic: &mut Dav1dPicture, meta: &OutputCapiMeta) {
         pic.n_itut_t35 = n;
         pic.itut_t35_ref = r;
     }
+}
+
+fn attach_picture_metadata(pic: &mut Dav1dPicture, meta: &OutputCapiMeta) {
+    attach_picture_metadata_parts(
+        pic,
+        meta.seq_hdr.as_deref(),
+        meta.frame_hdr.as_deref(),
+        meta.content_light,
+        meta.mastering_display,
+        &meta.itut_t35,
+    );
+}
+
+fn preallocate_custom_picture(
+    allocator: &Dav1dPicAllocator,
+    props: Dav1dDataProps,
+    req: &PreallocRequest<'_>,
+) -> Result<Dav1dPicture, c_int> {
+    let (Some(alloc_cb), Some(release_cb)) = (
+        allocator.alloc_picture_callback,
+        allocator.release_picture_callback,
+    ) else {
+        return Err(dav1d_err(EINVAL));
+    };
+    let mut pic = Dav1dPicture {
+        p: Dav1dPictureParameters {
+            w: req.width as c_int,
+            h: req.height as c_int,
+            layout: chroma_to_pixel_layout(req.chroma),
+            bpc: req.bit_depth.bits() as c_int,
+        },
+        m: props,
+        ..Dav1dPicture::default()
+    };
+    attach_picture_metadata_parts(
+        &mut pic,
+        req.seq_hdr,
+        Some(req.frame_hdr),
+        req.content_light,
+        req.mastering_display,
+        req.itut_t35,
+    );
+    let rc = alloc_cb(&mut pic as *mut Dav1dPicture, allocator.cookie);
+    if rc < 0 {
+        picture_unref_value(&mut pic);
+        return Err(rc);
+    }
+    let snapshot = pic;
+    pic.r#ref = ref_into_raw(RefPayload::CustomPicture {
+        pic_snapshot: snapshot,
+        release_cb,
+        cookie: allocator.cookie,
+    });
+    Ok(pic)
 }
 
 enum PictureMetaSource<'a> {
@@ -677,6 +745,8 @@ pub unsafe extern "C" fn dav1d_open(
                 cached_error_props: Dav1dDataProps::default(),
                 next_packet_tag: 1,
                 packet_props: VecDeque::new(),
+                next_prealloc_id: 1,
+                preallocated_pics: VecDeque::new(),
             },
         });
         // SAFETY: (1) ISA koşulu yoktur (`*c_out` ataması).
@@ -769,6 +839,44 @@ fn record_error_props_for_tag(ctx: &mut ContextInner, tag: u64, fallback: Option
     }
 }
 
+fn take_preallocated_pic(ctx: &mut ContextInner, id: u64) -> Option<Dav1dPicture> {
+    if id == 0 {
+        return None;
+    }
+    let pos = ctx
+        .preallocated_pics
+        .iter()
+        .position(|(pid, _)| *pid == id)?;
+    ctx.preallocated_pics.remove(pos).map(|(_, pic)| pic)
+}
+
+fn drop_preallocated_pic(ctx: &mut ContextInner, id: u64) {
+    if let Some(mut pic) = take_preallocated_pic(ctx, id) {
+        picture_unref_value(&mut pic);
+    }
+}
+
+fn cleanup_orphaned_preallocs(ctx: &mut ContextInner) {
+    let mut i = 0;
+    while i < ctx.preallocated_pics.len() {
+        let id = ctx.preallocated_pics[i].0;
+        let referenced = ctx.decoder.has_pending_prealloc_id(id)
+            || ctx
+                .ready_pic
+                .as_ref()
+                .is_some_and(|(_, m)| m.prealloc_id == id)
+            || ctx
+                .cached_pic
+                .as_ref()
+                .is_some_and(|(_, m)| m.prealloc_id == id);
+        if referenced {
+            i += 1;
+        } else if let Some((_, mut pic)) = ctx.preallocated_pics.remove(i) {
+            picture_unref_value(&mut pic);
+        }
+    }
+}
+
 fn pull_ready_nonblocking(ctx: &mut ContextInner) {
     if ctx.ready_pic.is_some() || ctx.cached_error != 0 {
         return;
@@ -783,6 +891,7 @@ fn pull_ready_nonblocking(ctx: &mut ContextInner) {
             if let Some(tag) = ctx.decoder.last_error_packet_tag() {
                 record_error_props_for_tag(ctx, tag, None);
             }
+            cleanup_orphaned_preallocs(ctx);
             ctx.cached_error = error_to_dav1d(&err);
         }
     }
@@ -805,8 +914,10 @@ fn output_picture_ready(ctx: &mut ContextInner, drain: bool) -> bool {
             {
                 let cached_sid = cached_meta.frame_hdr.as_ref().map_or(0, |h| h.spatial_id);
                 let ready_sid = ready_meta.frame_hdr.as_ref().map_or(0, |h| h.spatial_id);
-                let is_new_tu =
-                    ready_sid <= cached_sid || ready_meta.packet_tag != cached_meta.packet_tag;
+                // `dav1d` SVC `all_layers == 0`: zamansal birim sınırı paket sınırıyla
+                // değil `OBU_TEMPORAL_DELIMITER` (`new_temporal_unit`) veya azalan/eşit
+                // `spatial_id` ile belirlenir.
+                let is_new_tu = ready_sid <= cached_sid || ready_meta.new_temporal_unit;
                 if cached_sid >= max_spatial_id || is_new_tu {
                     return true;
                 }
@@ -814,6 +925,7 @@ fn output_picture_ready(ctx: &mut ContextInner, drain: bool) -> bool {
                 let next = ctx.ready_pic.take();
                 if let Some((_, dropped_meta)) = ctx.cached_pic.take() {
                     ctx.event_flags |= dropped_meta.event_flags;
+                    drop_preallocated_pic(ctx, dropped_meta.prealloc_id);
                     ctx.cached_pic = next;
                     cleanup_unused_packet_props(ctx, dropped_meta.packet_tag);
                 } else {
@@ -821,8 +933,11 @@ fn output_picture_ready(ctx: &mut ContextInner, drain: bool) -> bool {
                 }
                 continue;
             }
-            if ctx.cached_pic.is_some() && drain {
-                return true;
+            if let Some((_, cached_meta)) = ctx.cached_pic.as_ref() {
+                let cached_sid = cached_meta.frame_hdr.as_ref().map_or(0, |h| h.spatial_id);
+                if drain || cached_sid >= max_spatial_id {
+                    return true;
+                }
             }
             if ctx.ready_pic.is_some() {
                 ctx.cached_pic = ctx.ready_pic.take();
@@ -852,9 +967,42 @@ fn gen_picture(ctx: &mut ContextInner) -> c_int {
         // (2) sınır: `data_ptr` null değildir ve `dav1d_send_data` girişinde `0 < data_sz <= usize::MAX / 2` doğrulanmıştır; `ctx.pending_in` tamponu bu çağrı boyunca canlı tutar.
         // (3) hizalama/takma ad: `u8` dilimi hizalama gerektirmez ve `step_one_obu_capi` süresince salt-okunurdur.
         let payload = unsafe { core::slice::from_raw_parts(data_ptr, data_sz) };
-        let step_res = ctx
-            .decoder
-            .step_one_obu_capi(payload, &mut offset, Some(ts), tag);
+        let has_custom_alloc = ctx.allocator.alloc_picture_callback.is_some()
+            && ctx.allocator.release_picture_callback.is_some();
+        let mut prealloc_err: Option<c_int> = None;
+        let step_res = {
+            let ContextInner {
+                decoder,
+                allocator,
+                pending_in,
+                preallocated_pics,
+                next_prealloc_id,
+                ..
+            } = ctx;
+            let mut prealloc_cb = |req: &PreallocRequest<'_>| -> crate::Result<u64> {
+                let props = clone_data_props(&pending_in.m);
+                match preallocate_custom_picture(allocator, props, req) {
+                    Ok(pic) => {
+                        let id = *next_prealloc_id;
+                        *next_prealloc_id = next_prealloc_id.wrapping_add(1).max(1);
+                        preallocated_pics.push_back((id, pic));
+                        Ok(id)
+                    }
+                    Err(code) => {
+                        prealloc_err = Some(code);
+                        Err(crate::Error::InvalidState(
+                            "özel resim ayırıcısı hata döndürdü",
+                        ))
+                    }
+                }
+            };
+            let prealloc_opt: Option<&mut PreallocCb<'_>> = if has_custom_alloc {
+                Some(&mut prealloc_cb)
+            } else {
+                None
+            };
+            decoder.step_one_obu_capi(payload, &mut offset, Some(ts), tag, prealloc_opt)
+        };
 
         match step_res {
             Ok(true) => {
@@ -880,12 +1028,13 @@ fn gen_picture(ctx: &mut ContextInner) -> c_int {
             }
             Err(err) => {
                 log_capi_message(&ctx.logger, &format!("dav1d_send_data error: {err}"));
-                let code = error_to_dav1d(&err);
+                let code = prealloc_err.unwrap_or_else(|| error_to_dav1d(&err));
                 let err_tag = ctx.decoder.last_error_packet_tag().unwrap_or(tag);
                 let fallback_props = clone_data_props(&ctx.pending_in.m);
                 data_unref_value(&mut ctx.pending_in);
                 ctx.pending_offset = 0;
                 ctx.pending_tag = 0;
+                cleanup_orphaned_preallocs(ctx);
                 record_error_props_for_tag(ctx, err_tag, Some(&fallback_props));
                 let mut fb_drop = fallback_props;
                 data_props_unref_value(&mut fb_drop);
@@ -914,6 +1063,20 @@ fn deliver_ready_picture(ctx: &mut ContextInner, out_ref: &mut Dav1dPicture) -> 
         return dav1d_err(EAGAIN);
     };
     ctx.event_flags |= meta.event_flags;
+    if let Some(mut prealloc_pic) = take_preallocated_pic(ctx, meta.prealloc_id) {
+        if let Err(code) = copy_frame_to_custom_pic(&frame, &mut prealloc_pic) {
+            let err_props = clone_data_props(&prealloc_pic.m);
+            data_props_unref_value(&mut ctx.cached_error_props);
+            ctx.cached_error_props = err_props;
+            picture_unref_value(&mut prealloc_pic);
+            cleanup_unused_packet_props(ctx, meta.packet_tag);
+            return code;
+        }
+        picture_unref_value(out_ref);
+        *out_ref = prealloc_pic;
+        cleanup_unused_packet_props(ctx, meta.packet_tag);
+        return 0;
+    }
     let still_pending = is_packet_tag_referenced(ctx, meta.packet_tag);
     let props = if let Some(pos) = ctx
         .packet_props
@@ -931,9 +1094,18 @@ fn deliver_ready_picture(ctx: &mut ContextInner, out_ref: &mut Dav1dPicture) -> 
             ..Dav1dDataProps::default()
         }
     };
+    let err_props_backup = clone_data_props(&props);
     match fill_output_picture(ctx, out_ref, &frame, PictureMetaSource::Owned(&meta), props) {
-        Ok(()) => 0,
-        Err(code) => code,
+        Ok(()) => {
+            let mut drop_backup = err_props_backup;
+            data_props_unref_value(&mut drop_backup);
+            0
+        }
+        Err(code) => {
+            data_props_unref_value(&mut ctx.cached_error_props);
+            ctx.cached_error_props = err_props_backup;
+            code
+        }
     }
 }
 
@@ -1024,7 +1196,7 @@ pub unsafe extern "C" fn dav1d_get_picture(c: *mut Dav1dContext, out: *mut Dav1d
         }
 
         let single_fc = ctx.decoder.config().effective_frame_delay() == 1;
-        if output_picture_ready(ctx, single_fc) {
+        if output_picture_ready(ctx, drain && single_fc) {
             if ctx.cached_error != 0 {
                 let err_code = ctx.cached_error;
                 ctx.cached_error = 0;
@@ -1063,6 +1235,7 @@ pub unsafe extern "C" fn dav1d_get_picture(c: *mut Dav1dContext, out: *mut Dav1d
                         if let Some(tag) = ctx.decoder.last_error_packet_tag() {
                             record_error_props_for_tag(ctx, tag, None);
                         }
+                        cleanup_orphaned_preallocs(ctx);
                         return error_to_dav1d(&err);
                     }
                 }
@@ -1169,6 +1342,9 @@ pub unsafe extern "C" fn dav1d_flush(c: *mut Dav1dContext) {
         data_props_unref_value(&mut ctx.cached_error_props);
         while let Some((_, mut props)) = ctx.packet_props.pop_front() {
             data_props_unref_value(&mut props);
+        }
+        while let Some((_, mut pic)) = ctx.preallocated_pics.pop_front() {
+            picture_unref_value(&mut pic);
         }
     }));
 }

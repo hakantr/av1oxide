@@ -26,9 +26,11 @@ mod decoder;
 mod packet;
 
 pub use config::{Config, DecodeFrameType, InloopFilters, MAX_FRAME_DELAY, MAX_THREADS};
-#[allow(unused_imports)]
-pub(crate) use decoder::OutputCapiMeta;
 pub use decoder::{Decoder, DecoderState};
+#[allow(unused_imports)]
+pub(crate) use decoder::{
+    ItutT35Meta, MasteringDisplayMeta, OutputCapiMeta, PreallocCb, PreallocRequest,
+};
 pub use packet::Packet;
 
 // Mimari yapı: `api/` yüzeyi Frame ve Error'ı da sunar; tanımları kendi

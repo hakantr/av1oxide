@@ -1465,17 +1465,40 @@ fn capi_inloop_filters_decode_frame_type_and_logger_callback() {
         DAV1D_DECODEFRAMETYPE_REFERENCE, DAV1D_INLOOPFILTER_ALL, DAV1D_INLOOPFILTER_CDEF,
         DAV1D_INLOOPFILTER_DEBLOCK, DAV1D_INLOOPFILTER_NONE, DAV1D_INLOOPFILTER_RESTORATION,
     };
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
+
+    unsafe extern "C" {
+        fn vsnprintf(
+            s: *mut core::ffi::c_char,
+            n: usize,
+            format: *const core::ffi::c_char,
+            ap: core::ffi::VaList<'_>,
+        ) -> core::ffi::c_int;
+    }
 
     unsafe extern "C" fn test_logger_cb(
         cookie: *mut core::ffi::c_void,
         fmt: *const core::ffi::c_char,
-        _ap: core::ffi::VaList<'_>,
+        ap: core::ffi::VaList<'_>,
     ) {
         if !cookie.is_null() && !fmt.is_null() {
-            // SAFETY: `cookie` bu test boyunca canlı `AtomicUsize` örneğidir.
-            let hits = unsafe { &*(cookie as *const AtomicUsize) };
-            hits.fetch_add(1, Ordering::SeqCst);
+            let mut buf = [0u8; 512];
+            // SAFETY: `buf` 512 bayt yazılabilir yerel tampondur; `fmt` ve `ap` C variadic
+            // `Dav1dLogger.callback` çağrısından geçerli olarak gelir; `cookie` canlı `Mutex<Vec<String>>` adresidir.
+            unsafe {
+                let n = vsnprintf(
+                    buf.as_mut_ptr() as *mut core::ffi::c_char,
+                    buf.len(),
+                    fmt,
+                    ap,
+                );
+                assert!(n > 0, "vsnprintf geçerli günlük mesajı biçimlendirmeli");
+                let text = CStr::from_ptr(buf.as_ptr() as *const core::ffi::c_char)
+                    .to_string_lossy()
+                    .into_owned();
+                let logs = &*(cookie as *const Mutex<Vec<String>>);
+                logs.lock().unwrap().push(text);
+            }
         }
     }
 
@@ -1493,20 +1516,29 @@ fn capi_inloop_filters_decode_frame_type_and_logger_callback() {
         pos += sz;
     }
 
-    let log_hits = AtomicUsize::new(0);
+    let log_messages: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
     // SAFETY: C-ABI çağrıları bu test içinde ayrılan geçerli yapılarla yapılır.
     unsafe {
-        // 1. Geçersiz `inloop_filters` ve `decode_frame_type` reddedilir ve logger çağrılır.
+        // 1. Geçersiz `inloop_filters` ve `decode_frame_type` reddedilir ve logger `vsnprintf` ile gerçek mesaj biçimlendirir.
         let mut bad_s = Dav1dSettings::default();
         dav1d_default_settings(&mut bad_s);
-        bad_s.logger.cookie = (&log_hits as *const AtomicUsize) as *mut core::ffi::c_void;
+        bad_s.logger.cookie =
+            (&log_messages as *const Mutex<Vec<String>>) as *mut core::ffi::c_void;
         bad_s.logger.callback = test_logger_cb as *const core::ffi::c_void;
         bad_s.inloop_filters = DAV1D_INLOOPFILTER_ALL | 0x8;
         let mut ctx: *mut Dav1dContext = core::ptr::null_mut();
         assert_eq!(dav1d_open(&mut ctx, &bad_s), dav1d_err(EINVAL));
         assert!(ctx.is_null());
-        assert!(log_hits.load(Ordering::SeqCst) >= 1);
+        {
+            let msgs = log_messages.lock().unwrap();
+            assert!(!msgs.is_empty(), "logger en az bir mesaj kaydetmeli");
+            assert!(
+                msgs[0].ends_with('\n') && msgs[0].contains("invalid settings"),
+                "biçimlendirilen mesaj beklenenden farklı: {:?}",
+                msgs[0]
+            );
+        }
 
         bad_s.inloop_filters = DAV1D_INLOOPFILTER_ALL;
         bad_s.decode_frame_type = DAV1D_DECODEFRAMETYPE_KEY + 1;
@@ -1563,11 +1595,11 @@ fn capi_inloop_filters_decode_frame_type_and_logger_callback() {
         );
 
         // 3. `decode_frame_type = KEY`: çok kareli IVF'den yalnızca anahtar kareler çıkar.
-        let count_for_ft = |ft: u32| -> usize {
+        let count_for_ft = |ft: u32, n_threads: c_int, mfd: c_int| -> usize {
             let mut s = Dav1dSettings::default();
             dav1d_default_settings(&mut s);
-            s.n_threads = 1;
-            s.max_frame_delay = 1;
+            s.n_threads = n_threads;
+            s.max_frame_delay = mfd;
             s.decode_frame_type = ft;
             let mut c: *mut Dav1dContext = core::ptr::null_mut();
             assert_eq!(dav1d_open(&mut c, &s), 0);
@@ -1591,21 +1623,23 @@ fn capi_inloop_filters_decode_frame_type_and_logger_callback() {
             dav1d_close(&mut c);
             count
         };
-        let all_cnt = count_for_ft(DAV1D_DECODEFRAMETYPE_ALL);
-        let ref_cnt = count_for_ft(DAV1D_DECODEFRAMETYPE_REFERENCE);
-        let intra_cnt = count_for_ft(DAV1D_DECODEFRAMETYPE_INTRA);
-        let key_cnt = count_for_ft(DAV1D_DECODEFRAMETYPE_KEY);
-        assert!(all_cnt >= 5);
-        assert!(ref_cnt <= all_cnt);
-        assert!(intra_cnt >= key_cnt && key_cnt >= 1 && key_cnt < all_cnt);
+        for (nt, mfd) in [(1, 1), (4, 2)] {
+            let all_cnt = count_for_ft(DAV1D_DECODEFRAMETYPE_ALL, nt, mfd);
+            let ref_cnt = count_for_ft(DAV1D_DECODEFRAMETYPE_REFERENCE, nt, mfd);
+            let intra_cnt = count_for_ft(DAV1D_DECODEFRAMETYPE_INTRA, nt, mfd);
+            let key_cnt = count_for_ft(DAV1D_DECODEFRAMETYPE_KEY, nt, mfd);
+            assert!(all_cnt >= 5);
+            assert!(ref_cnt <= all_cnt);
+            assert!(intra_cnt >= key_cnt && key_cnt >= 1 && key_cnt < all_cnt);
+        }
 
-        // 4. `logger` bozuk paket hatasında çağrılır.
-        let before = log_hits.load(Ordering::SeqCst);
+        // 4. `logger` bozuk paket hatasında çağrılır ve gerçek hata metni biçimlenir.
+        let before = log_messages.lock().unwrap().len();
         let mut s = Dav1dSettings::default();
         dav1d_default_settings(&mut s);
         s.n_threads = 1;
         s.max_frame_delay = 1;
-        s.logger.cookie = (&log_hits as *const AtomicUsize) as *mut core::ffi::c_void;
+        s.logger.cookie = (&log_messages as *const Mutex<Vec<String>>) as *mut core::ffi::c_void;
         s.logger.callback = test_logger_cb as *const core::ffi::c_void;
         let mut c: *mut Dav1dContext = core::ptr::null_mut();
         assert_eq!(dav1d_open(&mut c, &s), 0);
@@ -1615,7 +1649,383 @@ fn capi_inloop_filters_decode_frame_type_and_logger_callback() {
         core::ptr::copy_nonoverlapping(bad_obu.as_ptr(), p, bad_obu.len());
         assert!(dav1d_send_data(c, &mut d) < 0);
         dav1d_data_unref(&mut d);
-        assert!(log_hits.load(Ordering::SeqCst) > before);
+        {
+            let msgs = log_messages.lock().unwrap();
+            assert!(msgs.len() > before);
+            let last = msgs.last().unwrap();
+            assert!(
+                last.ends_with('\n') && last.contains("dav1d_send_data error:"),
+                "bozuk paket log mesajı beklenenden farklı: {last:?}"
+            );
+        }
         dav1d_close(&mut c);
     }
+}
+
+#[test]
+fn capi_custom_allocator_enomem_timing_and_error_props() {
+    struct FailAllocState {
+        alloc_calls: AtomicUsize,
+        release_calls: AtomicUsize,
+    }
+
+    extern "C" fn fail_enomem_alloc(_pic: *mut Dav1dPicture, cookie: *mut c_void) -> c_int {
+        // SAFETY: `cookie`, test çerçevesinde canlı tutulan `FailAllocState` adresidir.
+        let st = unsafe { &*(cookie as *const FailAllocState) };
+        st.alloc_calls.fetch_add(1, Ordering::SeqCst);
+        dav1d_err(ENOMEM)
+    }
+
+    extern "C" fn fail_enomem_release(_pic: *mut Dav1dPicture, cookie: *mut c_void) {
+        // SAFETY: `cookie`, test çerçevesinde canlı tutulan `FailAllocState` adresidir.
+        let st = unsafe { &*(cookie as *const FailAllocState) };
+        st.release_calls.fetch_add(1, Ordering::SeqCst);
+    }
+
+    for (n_threads, max_frame_delay) in [(1, 1), (4, 2)] {
+        let alloc_st = FailAllocState {
+            alloc_calls: AtomicUsize::new(0),
+            release_calls: AtomicUsize::new(0),
+        };
+        let user_frees = AtomicUsize::new(0);
+        let user_sentinel = [0xDEu8, 0xAD, 0xBE, 0xEF];
+
+        // SAFETY: Test boyunca tüm yapılar yerel yığında canlıdır ve `dav1d_*_unref`/`dav1d_close` ile temizlenir.
+        unsafe {
+            let mut s = Dav1dSettings::default();
+            dav1d_default_settings(&mut s);
+            s.n_threads = n_threads;
+            s.max_frame_delay = max_frame_delay;
+            s.allocator = Dav1dPicAllocator {
+                cookie: (&alloc_st as *const FailAllocState) as *mut c_void,
+                alloc_picture_callback: Some(fail_enomem_alloc),
+                release_picture_callback: Some(fail_enomem_release),
+            };
+
+            let mut c: *mut Dav1dContext = ptr::null_mut();
+            assert_eq!(dav1d_open(&mut c, &s), 0);
+
+            let mut data = Dav1dData::default();
+            let dst = dav1d_data_create(&mut data, SAMPLE_OBU_PACKETS[0].len());
+            assert!(!dst.is_null());
+            ptr::copy_nonoverlapping(
+                SAMPLE_OBU_PACKETS[0].as_ptr(),
+                dst,
+                SAMPLE_OBU_PACKETS[0].len(),
+            );
+            assert_eq!(
+                dav1d_data_wrap_user_data(
+                    &mut data,
+                    user_sentinel.as_ptr(),
+                    Some(count_free_cb),
+                    (&user_frees as *const AtomicUsize) as *mut c_void,
+                ),
+                0
+            );
+            data.m.timestamp = 442;
+            data.m.offset = 123;
+
+            // Özel ayırıcı kare gönderimi sırasında (`dav1d_send_data` içinde) çalışmalı
+            // ve `-ENOMEM` döndürürken çağıranın `Dav1dData` sahipliğini korumalı.
+            let rc = dav1d_send_data(c, &mut data);
+            assert_eq!(
+                rc,
+                dav1d_err(ENOMEM),
+                "t={n_threads}, mfd={max_frame_delay}: dav1d_send_data -ENOMEM döndürmeli"
+            );
+            assert!(
+                !data.data.is_null(),
+                "t={n_threads}, mfd={max_frame_delay}: hata durumunda in_data tüketilmemeli"
+            );
+            assert_eq!(alloc_st.alloc_calls.load(Ordering::SeqCst), 1);
+            assert_eq!(alloc_st.release_calls.load(Ordering::SeqCst), 0);
+
+            dav1d_data_unref(&mut data);
+            assert_eq!(
+                user_frees.load(Ordering::SeqCst),
+                0,
+                "cached_error_props user_data referansını hâlâ canlı tutmalı"
+            );
+
+            let mut err_props = Dav1dDataProps::default();
+            assert_eq!(dav1d_get_decode_error_data_props(c, &mut err_props), 0);
+            assert_eq!(err_props.timestamp, 442);
+            assert_eq!(err_props.offset, 123);
+            assert_eq!(err_props.user_data.data, user_sentinel.as_ptr());
+
+            dav1d_data_props_unref(&mut err_props);
+            assert_eq!(user_frees.load(Ordering::SeqCst), 1);
+            dav1d_close(&mut c);
+        }
+    }
+}
+
+#[test]
+fn capi_decode_frame_type_and_svc_per_obu_parity() {
+    use av1oxide::capi::types::{
+        DAV1D_DECODEFRAMETYPE_ALL, DAV1D_DECODEFRAMETYPE_INTRA, DAV1D_DECODEFRAMETYPE_KEY,
+        DAV1D_DECODEFRAMETYPE_REFERENCE,
+    };
+
+    fn decode_packets_capi(
+        packets: &[&[u8]],
+        n_threads: c_int,
+        mfd: c_int,
+        decode_frame_type: u32,
+        all_layers: c_int,
+        apply_grain: c_int,
+    ) -> Vec<Vec<Vec<u8>>> {
+        // SAFETY: Her çağrı bağımsız bir `Dav1dContext` açıp kapatır ve tamponları güvenle yönetir.
+        unsafe {
+            let mut s = Dav1dSettings::default();
+            dav1d_default_settings(&mut s);
+            s.n_threads = n_threads;
+            s.max_frame_delay = mfd;
+            s.decode_frame_type = decode_frame_type;
+            s.all_layers = all_layers;
+            s.apply_grain = apply_grain;
+
+            let mut c: *mut Dav1dContext = ptr::null_mut();
+            assert_eq!(dav1d_open(&mut c, &s), 0);
+
+            let mut out = Vec::new();
+            let mut pic = Dav1dPicture::default();
+            for &pkt in packets {
+                let mut data = Dav1dData::default();
+                let dst = dav1d_data_create(&mut data, pkt.len());
+                assert!(!dst.is_null());
+                ptr::copy_nonoverlapping(pkt.as_ptr(), dst, pkt.len());
+                loop {
+                    let rc = dav1d_send_data(c, &mut data);
+                    if rc == 0 {
+                        break;
+                    }
+                    assert_eq!(rc, dav1d_err(EAGAIN));
+                    assert_eq!(dav1d_get_picture(c, &mut pic), 0);
+                    out.push(copy_c_picture_planes(&pic));
+                    dav1d_picture_unref(&mut pic);
+                }
+                while dav1d_get_picture(c, &mut pic) == 0 {
+                    out.push(copy_c_picture_planes(&pic));
+                    dav1d_picture_unref(&mut pic);
+                }
+            }
+            loop {
+                let rc = dav1d_get_picture(c, &mut pic);
+                if rc == dav1d_err(EAGAIN) {
+                    break;
+                }
+                assert_eq!(rc, 0);
+                out.push(copy_c_picture_planes(&pic));
+                dav1d_picture_unref(&mut pic);
+            }
+            dav1d_close(&mut c);
+            out
+        }
+    }
+
+    fn split_to_single_obu_packets<'a>(ivf_packets: &[(i64, &'a [u8])]) -> Vec<&'a [u8]> {
+        let mut out = Vec::new();
+        for &(_, payload) in ivf_packets {
+            let mut offset = 0usize;
+            while offset < payload.len() {
+                let start = offset;
+                let Some(_) = av1oxide::bitstream::split_next_with(payload, &mut offset, true)
+                    .expect("geçerli OBU ayrışmalı")
+                else {
+                    break;
+                };
+                out.push(&payload[start..offset]);
+            }
+        }
+        out
+    }
+
+    let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .to_path_buf();
+
+    // 1. `ccvb_film_grain.ivf` ve 10-bit `av1-1-b10-23-film_grain-50.ivf` (varsa):
+    //    `decode_frame_type = ALL/REFERENCE/INTRA/KEY` referans `dav1d` kare sayısı eşliği.
+    let ft_cases = [
+        (
+            workspace_root.join(".cache/dav1d-test-data/8-bit/features/ccvb_film_grain.ivf"),
+            100usize,
+            94usize,
+            1usize,
+            1usize,
+        ),
+        (
+            workspace_root
+                .join(".cache/dav1d-test-data/10-bit/film_grain/av1-1-b10-23-film_grain-50.ivf"),
+            10usize,
+            10usize,
+            1usize,
+            1usize,
+        ),
+    ];
+    for (path, exp_all, exp_ref, exp_intra, exp_key) in ft_cases {
+        if !path.is_file() {
+            continue;
+        }
+        let raw = std::fs::read(&path).unwrap();
+        let ivf = parse_ivf(&raw);
+        let pkts: Vec<&[u8]> = ivf.iter().map(|&(_, p)| p).collect();
+        for (nt, mfd) in [(1, 1), (4, 2)] {
+            let all_frames = decode_packets_capi(&pkts, nt, mfd, DAV1D_DECODEFRAMETYPE_ALL, 1, 0);
+            let ref_frames =
+                decode_packets_capi(&pkts, nt, mfd, DAV1D_DECODEFRAMETYPE_REFERENCE, 1, 0);
+            let intra_frames =
+                decode_packets_capi(&pkts, nt, mfd, DAV1D_DECODEFRAMETYPE_INTRA, 1, 0);
+            let key_frames = decode_packets_capi(&pkts, nt, mfd, DAV1D_DECODEFRAMETYPE_KEY, 1, 0);
+            assert_eq!(all_frames.len(), exp_all, "{:?} t={nt}", path.file_name());
+            assert_eq!(ref_frames.len(), exp_ref, "{:?} t={nt}", path.file_name());
+            assert_eq!(
+                intra_frames.len(),
+                exp_intra,
+                "{:?} t={nt}",
+                path.file_name()
+            );
+            assert_eq!(key_frames.len(), exp_key, "{:?} t={nt}", path.file_name());
+            assert_eq!(key_frames[0], all_frames[0]);
+            assert_eq!(intra_frames[0], all_frames[0]);
+        }
+    }
+
+    // 2. SVC akışlarında (`L2T1`, `L2T2` varsa) OBU-başına-ayrı-paket + `all_layers = 0` / `1`
+    //    ve `n_threads = 4, max_frame_delay = 2` eşliği.
+    for svc_name in ["av1-1-b8-22-svc-L2T1.ivf", "av1-1-b8-22-svc-L2T2.ivf"] {
+        let svc_path = workspace_root
+            .join(".cache/dav1d-test-data/8-bit/svc")
+            .join(svc_name);
+        if !svc_path.is_file() {
+            continue;
+        }
+        let raw = std::fs::read(&svc_path).unwrap();
+        let ivf = parse_ivf(&raw);
+        let tu_pkts: Vec<&[u8]> = ivf.iter().map(|&(_, p)| p).collect();
+        let obu_pkts = split_to_single_obu_packets(&ivf);
+        assert!(obu_pkts.len() > tu_pkts.len());
+
+        for (all_layers, expected_count) in [(0, 8usize), (1, 16usize)] {
+            let ref_tu =
+                decode_packets_capi(&tu_pkts, 1, 1, DAV1D_DECODEFRAMETYPE_ALL, all_layers, 0);
+            assert_eq!(
+                ref_tu.len(),
+                expected_count,
+                "{svc_name} all_layers={all_layers}"
+            );
+            for (nt, mfd) in [(1, 1), (4, 2)] {
+                let per_obu = decode_packets_capi(
+                    &obu_pkts,
+                    nt,
+                    mfd,
+                    DAV1D_DECODEFRAMETYPE_ALL,
+                    all_layers,
+                    0,
+                );
+                assert_eq!(
+                    per_obu.len(),
+                    expected_count,
+                    "{svc_name} per-OBU t={nt} mfd={mfd} all_layers={all_layers}"
+                );
+                assert_eq!(
+                    per_obu, ref_tu,
+                    "{svc_name} per-OBU t={nt} mfd={mfd} all_layers={all_layers} piksel-özdeş olmalı"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn capi_install_prefix_transactional_preserves_existing_on_conflict() {
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let workspace_root = manifest_dir.parent().unwrap().parent().unwrap();
+    let scratch_dir = workspace_root.join(".cache/capi-prefix-rollback-test");
+    let _ = std::fs::remove_dir_all(&scratch_dir);
+    let prefix_dir = scratch_dir.join("prefix");
+    let target_dir = scratch_dir.join("target");
+
+    let inc_dav1d = prefix_dir.join("include").join("dav1d");
+    let lib_dir = prefix_dir.join("lib");
+    let pc_dir = lib_dir.join("pkgconfig");
+    std::fs::create_dir_all(&inc_dav1d).unwrap();
+    std::fs::create_dir_all(&pc_dir).unwrap();
+
+    // Mevcut sentinel dosyaları ve `lib/pkgconfig/dav1d.pc` dizin çakışmasını hazırla.
+    let sentinel_hdr = inc_dav1d.join("dav1d.h");
+    let sentinel_static = lib_dir.join("libdav1d.a");
+    let sentinel_keep = prefix_dir.join("keep_unrelated.txt");
+    #[cfg(target_os = "macos")]
+    let sentinel_shared = lib_dir.join("libdav1d.7.dylib");
+    #[cfg(not(target_os = "macos"))]
+    let sentinel_shared = lib_dir.join("libdav1d.so.7.0.0");
+
+    std::fs::write(&sentinel_hdr, b"OLD_DAV1D_H_SENTINEL").unwrap();
+    std::fs::write(&sentinel_static, b"OLD_LIBDAV1D_A_SENTINEL").unwrap();
+    std::fs::write(&sentinel_shared, b"OLD_SHARED_SENTINEL").unwrap();
+    std::fs::write(&sentinel_keep, b"KEEP_UNRELATED_SENTINEL").unwrap();
+    // Çakışma: `dav1d.pc` bir dosya yerine dizin!
+    std::fs::create_dir(pc_dir.join("dav1d.pc")).unwrap();
+
+    let output = Command::new("cargo")
+        .current_dir(workspace_root)
+        .arg("run")
+        .arg("--locked")
+        .arg("--release")
+        .arg("-p")
+        .arg("av1oxide")
+        .arg("--example")
+        .arg("install_capi_prefix")
+        .arg("--")
+        .arg(&prefix_dir)
+        .arg("--target-dir")
+        .arg(&target_dir)
+        .output()
+        .expect("install_capi_prefix çalıştırılmalı");
+
+    assert!(
+        !output.status.success(),
+        "dav1d.pc dizin çakışmasında install_capi_prefix hata döndürmeli"
+    );
+    assert_eq!(
+        std::fs::read(&sentinel_hdr).unwrap(),
+        b"OLD_DAV1D_H_SENTINEL",
+        "mevcut dav1d.h bayt-birebir korunmalı"
+    );
+    assert_eq!(
+        std::fs::read(&sentinel_static).unwrap(),
+        b"OLD_LIBDAV1D_A_SENTINEL",
+        "mevcut libdav1d.a bayt-birebir korunmalı"
+    );
+    assert_eq!(
+        std::fs::read(&sentinel_shared).unwrap(),
+        b"OLD_SHARED_SENTINEL",
+        "mevcut paylaşımlı kütüphane bayt-birebir korunmalı"
+    );
+    assert_eq!(
+        std::fs::read(&sentinel_keep).unwrap(),
+        b"KEEP_UNRELATED_SENTINEL",
+        "ilgisiz dosya bayt-birebir korunmalı"
+    );
+    assert!(
+        pc_dir.join("dav1d.pc").is_dir(),
+        "çakışan dizine dokunulmamış olmalı"
+    );
+    // Artakalan sahne/yedek dosyası olmamalı
+    for dir in [&inc_dav1d, &lib_dir, &pc_dir] {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let name = entry.unwrap().file_name().to_string_lossy().into_owned();
+            assert!(
+                !name.starts_with(".av1oxide_"),
+                "artakalan geçici dosya olmamalı: {name}"
+            );
+        }
+    }
+
+    let _ = std::fs::remove_dir_all(&scratch_dir);
 }

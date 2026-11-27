@@ -107,7 +107,30 @@ pub(crate) struct OutputCapiMeta {
     pub itut_t35: Vec<ItutT35Meta>,
     pub event_flags: u32,
     pub packet_tag: u64,
+    /// Bu çıktı karesinden önce en az bir `OBU_TEMPORAL_DELIMITER` görüldü mü?
+    pub new_temporal_unit: bool,
+    /// Özel `Dav1dPicAllocator` ile kare gönderim aşamasında ön-tahsis edilmiş resim kimliği (`0` = yok).
+    pub prealloc_id: u64,
 }
+
+/// Özel `Dav1dPicAllocator` için kare gönderim aşamasında (`dav1d_submit_frame` eşleniği)
+/// ön-tahsis isteği.
+#[cfg_attr(not(feature = "std"), allow(dead_code))]
+pub(crate) struct PreallocRequest<'a> {
+    pub width: usize,
+    pub height: usize,
+    pub chroma: ChromaFormat,
+    pub bit_depth: BitDepth,
+    pub seq_hdr: Option<&'a SequenceHeader>,
+    pub frame_hdr: &'a FrameHeader,
+    pub content_light: Option<(u16, u16)>,
+    pub mastering_display: Option<MasteringDisplayMeta>,
+    pub itut_t35: &'a [ItutT35Meta],
+}
+
+/// C-ABI katmanından enjekte edilen özel resim ön-tahsis geri çağrısı.
+#[cfg_attr(not(feature = "std"), allow(dead_code))]
+pub(crate) type PreallocCb<'a> = dyn FnMut(&PreallocRequest<'_>) -> Result<u64> + 'a;
 
 /// Paketler arasında taşınan ayrıştırma durumu (dav1d `Dav1dContext` başlık
 /// alanları; OBU başına güncellenir).
@@ -157,9 +180,9 @@ struct ParseState {
     /// yeniden dener (`src/obu.c:1527-1548`); yeni frame header ya da yeni
     /// dizi gelene kadar her OBU hata verir.
     dangling_show_existing: Option<usize>,
-    /// `decode_frame_type` filtresi nedeniyle atlanan bir karenin takip eden
-    /// `OBU_TILE_GROUP` birimlerini sessizce geçer (`dav1d` `src/obu.c`).
-    skipping_frame_tiles: bool,
+    /// Bir sonraki çıktı üreten kareye taşınacak zamansal birim sınırı bayrağı
+    /// (`OBU_TEMPORAL_DELIMITER` veya yeni dizi başlığı).
+    pending_new_temporal_unit: bool,
 }
 
 /// Tile group OBU'sunun ham verisi (`tile_start`..=`tile_end`, başlık sonrası).
@@ -192,6 +215,7 @@ struct CompletedFrame {
 struct InFlightDecodeTask {
     refresh_frame_flags: u8,
     packet_tag: u64,
+    prealloc_id: u64,
     out_slot: Arc<FrameSlot>,
     started: AtomicBool,
     result: Mutex<Option<Result<CompletedFrame>>>,
@@ -732,7 +756,7 @@ impl Decoder {
         let res = loop {
             match split_next_with(data, &mut offset, opts.strict) {
                 Ok(Some(obu)) => {
-                    if let Err(err) = self.process_obu(&obu, opts) {
+                    if let Err(err) = self.process_obu(&obu, opts, None) {
                         break Err(err);
                     }
                 }
@@ -756,6 +780,7 @@ impl Decoder {
         offset: &mut usize,
         timestamp: Option<i64>,
         packet_tag: u64,
+        prealloc: Option<&mut PreallocCb<'_>>,
     ) -> Result<bool> {
         if self.state != DecoderState::Ready {
             return Err(Error::InvalidState(
@@ -770,7 +795,7 @@ impl Decoder {
         };
         let res = match split_next_with(data, offset, opts.strict) {
             Ok(Some(obu)) => {
-                self.process_obu(&obu, opts)?;
+                self.process_obu(&obu, opts, prealloc)?;
                 Ok(true)
             }
             Ok(None) => Ok(false),
@@ -781,7 +806,12 @@ impl Decoder {
     }
 
     /// Tek OBU (dav1d `dav1d_parse_obus`, `src/obu.c:1169-1694`).
-    fn process_obu(&mut self, obu: &Obu<'_>, opts: ParseOpts) -> Result<()> {
+    fn process_obu(
+        &mut self,
+        obu: &Obu<'_>,
+        opts: ParseOpts,
+        mut prealloc: Option<&mut PreallocCb<'_>>,
+    ) -> Result<()> {
         match obu.header.obu_type {
             ObuType::SequenceHeader => {
                 let header = SequenceHeader::parse_with(
@@ -824,6 +854,7 @@ impl Decoder {
                         self.parse.header_state.reset();
                         self.parse.pending_groups.clear();
                         self.parse.dangling_show_existing = None;
+                        self.parse.pending_new_temporal_unit = true;
                         self.parse.content_light = None;
                         self.parse.mastering_display = None;
                         self.parse.pending_event_flags |= 1;
@@ -849,7 +880,9 @@ impl Decoder {
                 self.parse.sequence_header = Some(header);
                 self.parse.sequence_header_updates += 1;
             }
-            ObuType::TemporalDelimiter => {}
+            ObuType::TemporalDelimiter => {
+                self.parse.pending_new_temporal_unit = true;
+            }
             _ => {
                 // dav1d `src/obu.c:1201-1208`: seçili operating point dışındaki
                 // katmanın OBU'su sonu denetimi de yapılmadan atlanır.
@@ -866,10 +899,14 @@ impl Decoder {
                 }
                 match obu.header.obu_type {
                     ObuType::FrameHeader | ObuType::RedundantFrameHeader | ObuType::Frame => {
-                        self.process_frame_header_obu(obu, opts)?;
+                        self.process_frame_header_obu(obu, opts, prealloc.as_deref_mut())?;
                     }
                     ObuType::TileGroup => {
-                        self.process_tile_group(obu.payload, obu.payload_offset_bits())?;
+                        self.process_tile_group(
+                            obu.payload,
+                            obu.payload_offset_bits(),
+                            prealloc.as_deref_mut(),
+                        )?;
                     }
                     ObuType::Metadata => self.process_metadata_obu(obu, opts.strict)?,
                     _ => {}
@@ -881,14 +918,19 @@ impl Decoder {
         if self.parse.sequence_header.is_some()
             && let Some(slot) = self.parse.dangling_show_existing
         {
-            self.show_existing(slot, opts)?;
+            self.show_existing(slot, opts, prealloc)?;
         }
         Ok(())
     }
 
     /// `parse_frame_hdr()` (+ frame OBU ise tile group), dav1d
     /// `src/obu.c:1264-1321`.
-    fn process_frame_header_obu(&mut self, obu: &Obu<'_>, opts: ParseOpts) -> Result<()> {
+    fn process_frame_header_obu(
+        &mut self,
+        obu: &Obu<'_>,
+        opts: ParseOpts,
+        prealloc: Option<&mut PreallocCb<'_>>,
+    ) -> Result<()> {
         let is_frame_obu = obu.header.obu_type == ObuType::Frame;
         // dav1d `src/obu.c:1264-1265`: redundant frame header, bekleyen bir
         // başlık (bekleyen `show_existing` dâhil) varsa yok sayılır.
@@ -909,33 +951,6 @@ impl Decoder {
         // Yeni başlık önceki bekleyen kareyi geçersiz kılar (dav1d
         // `c->frame_hdr` aynı tampona yeniden ayrıştırılır, `src/obu.c:1279-1282`).
         self.parse.dangling_show_existing = None;
-        self.parse.skipping_frame_tiles = false;
-        // `dav1d` `decode_frame_type` (`KEY` / `INTRA`) filtresi: atlanan karelerde
-        // önceki referans yuvaları güncel olmayabileceğinden, tam başlık ayrıştırmasından
-        // önce ilk 3 bitten (`show_existing_frame`, `frame_type`) erken eleme yapılır.
-        if !sequence_header.reduced_still_picture_header
-            && matches!(
-                self.decode_frame_type,
-                DecodeFrameType::Key | DecodeFrameType::Intra
-            )
-            && let Some(&first_byte) = obu.payload.first()
-        {
-            let show_existing = (first_byte & 0x80) != 0;
-            if !show_existing {
-                let ftype = FrameType::from_raw((first_byte >> 5) & 0x03);
-                let skip = match self.decode_frame_type {
-                    DecodeFrameType::Key => ftype != FrameType::Key,
-                    DecodeFrameType::Intra => !matches!(ftype, FrameType::Key | FrameType::Intra),
-                    _ => false,
-                };
-                if skip {
-                    self.parse.header_state.clear_current();
-                    self.parse.pending_groups.clear();
-                    self.parse.skipping_frame_tiles = !is_frame_obu;
-                    return Ok(());
-                }
-            }
-        }
         let extension = obu.header.extension;
         let (temporal_id, spatial_id) =
             extension.map_or((0, 0), |ext| (ext.temporal_id, ext.spatial_id));
@@ -983,8 +998,6 @@ impl Decoder {
             if header.show_existing_frame {
                 // Gösterim OBU sonu denetiminde yapılır (`process_obu`).
                 self.parse.dangling_show_existing = Some(usize::from(header.existing_frame_idx));
-            } else if self.should_skip_frame(header.frame_type, header.refresh_frame_flags) {
-                self.parse.skipping_frame_tiles = true;
             } else {
                 self.parse.header_state.set_current(header);
             }
@@ -999,9 +1012,6 @@ impl Decoder {
                 ),
             ));
         }
-        if self.should_skip_frame(header.frame_type, header.refresh_frame_flags) {
-            return Ok(());
-        }
         // OBU_FRAME: başlık bekleyen kare olur, bayt hizalanır, kalan baytlar
         // tile grubudur (dav1d `src/obu.c:1317-1321`, fall-through).
         self.parse.header_state.set_current(header);
@@ -1013,15 +1023,21 @@ impl Decoder {
                 BitstreamErrorKind::InvalidFrameHeader("frame OBU: tile verisi sınırı aşıldı"),
             ));
         };
-        self.process_tile_group(tile_payload, obu.payload_offset_bits() + start_byte * 8)
+        self.process_tile_group(
+            tile_payload,
+            obu.payload_offset_bits() + start_byte * 8,
+            prealloc,
+        )
     }
 
     /// `DAV1D_OBU_TILE_GRP` (`src/obu.c:1322-1352`) + kare tamamlanınca çözüm
     /// (`src/obu.c:1640-1666`).
-    fn process_tile_group(&mut self, payload: &[u8], bit_base: usize) -> Result<()> {
-        if self.parse.skipping_frame_tiles {
-            return Ok(());
-        }
+    fn process_tile_group(
+        &mut self,
+        payload: &[u8],
+        bit_base: usize,
+        prealloc: Option<&mut PreallocCb<'_>>,
+    ) -> Result<()> {
         let Some(current) = self.parse.header_state.current() else {
             return Err(BitstreamError::new(
                 BitstreamErrorKind::InvalidTileGroup(
@@ -1031,6 +1047,7 @@ impl Decoder {
             )
             .into());
         };
+        let skip_frame = self.should_skip_frame(current.frame_type, current.refresh_frame_flags);
         let (start, end, data_offset) = tile_group_header(payload, current)
             .map_err(|err| rebase_payload_error(err, bit_base))?;
         // dav1d `src/obu.c:1341-1349`: sıra bozuksa birikim sıfırlanır, bekleyen
@@ -1050,16 +1067,20 @@ impl Decoder {
             self.parse.tile_bytes_skipped += info.data_bytes as u64;
             self.parse.last_tile_group = Some(info);
         }
-        // P38: tile verisinin kopyası bütçe defterinden (düşebilir); aşımda
-        // grup eklenmez, bekleyen kare tamamlanmaz.
-        let butce = self.butce_defteri(0);
-        let data = butce.kopya(&payload[data_offset..]);
-        self.tepe_kat(&butce);
-        self.parse.pending_groups.push(TileGroupRaw {
-            start,
-            end,
-            data: data?,
-        });
+        // `decode_frame_type` ile atlanacak karelerde karo verisi kopyalanmaz;
+        // yine de başlık ve karo grubu sınırları tam doğrulanır (`dav1d` `obu.c:1640-1688`).
+        if !skip_frame {
+            // P38: tile verisinin kopyası bütçe defterinden (düşebilir); aşımda
+            // grup eklenmez, bekleyen kare tamamlanmaz.
+            let butce = self.butce_defteri(0);
+            let data = butce.kopya(&payload[data_offset..]);
+            self.tepe_kat(&butce);
+            self.parse.pending_groups.push(TileGroupRaw {
+                start,
+                end,
+                data: data?,
+            });
+        }
         self.parse
             .header_state
             .add_tiles(usize::from(end - start) + 1);
@@ -1074,9 +1095,16 @@ impl Decoder {
             return Ok(());
         };
         if self.should_skip_frame(header.frame_type, header.refresh_frame_flags) {
-            self.parse
-                .header_state
-                .restore_slots(&prev_slots, header.refresh_frame_flags);
+            // `dav1d` `src/obu.c:1641-1688`: atlanan karenin referans başlık yuvaları
+            // (`header_state`) güncellenmiş olarak kalır, karşılık gelen piksel/vaat
+            // yuvaları ise temizlenir; böylece sonraki `show_existing_frame` başlıkları
+            // gerçek kare türünü görür ve yanlışlıkla eski KEY karesini tekrarlamaz.
+            for slot in 0..8 {
+                if header.refresh_frame_flags & (1 << slot) != 0 {
+                    self.pixel_refs[slot] = None;
+                    self.slot_promises[slot] = None;
+                }
+            }
             self.parse.pending_groups.clear();
             return Ok(());
         }
@@ -1087,7 +1115,7 @@ impl Decoder {
         self.parse.frames_completed += 1;
         let groups = core::mem::take(&mut self.parse.pending_groups);
         let seq = self.parse.sequence_header.clone();
-        self.decode_completed(header, &groups, seq.as_ref(), &prev_slots)
+        self.decode_completed(header, &groups, seq.as_ref(), &prev_slots, prealloc)
     }
 
     /// Tamamlanan kareyi çözer (`n_fc == 1` senkron hızlı yol veya `n_fc >= 2`
@@ -1104,6 +1132,7 @@ impl Decoder {
         groups: &[TileGroupRaw],
         seq: Option<&SequenceHeader>,
         prev_slots: &RefSlots,
+        prealloc: Option<&mut PreallocCb<'_>>,
     ) -> Result<()> {
         if self.parse_only {
             while !self.in_flight.is_empty() {
@@ -1133,19 +1162,52 @@ impl Decoder {
             return Err(Error::Unsupported("sequence header yok"));
         };
         if self.config.effective_frame_delay() > 1 {
-            return self.decode_completed_pipeline(header, groups, seq, prev_slots);
+            return self.decode_completed_pipeline(header, groups, seq, prev_slots, prealloc);
         }
-        let early = frame_format(seq)
-            .and_then(|(chroma, bd)| validate_frame_refs(&header, chroma, bd, &self.pixel_refs));
-        if let Err(err) = early {
-            self.parse
-                .header_state
-                .restore_slots(prev_slots, header.refresh_frame_flags);
-            self.unsupported_frames += 1;
-            self.last_decode_error = Some(format!("{err}"));
-            self.last_error_packet_tag = Some(self.parse.current_packet_tag);
-            return Err(err);
-        }
+        let early = frame_format(seq).and_then(|(chroma, bd)| {
+            validate_frame_refs(&header, chroma, bd, &self.pixel_refs)?;
+            Ok((chroma, bd))
+        });
+        let (early_chroma, early_bd) = match early {
+            Ok(pair) => pair,
+            Err(err) => {
+                self.parse
+                    .header_state
+                    .restore_slots(prev_slots, header.refresh_frame_flags);
+                self.unsupported_frames += 1;
+                self.last_decode_error = Some(format!("{err}"));
+                self.last_error_packet_tag = Some(self.parse.current_packet_tag);
+                return Err(err);
+            }
+        };
+        let want_output = header.show_frame || self.config.output_invisible_frames;
+        let prealloc_id = if want_output && let Some(cb) = prealloc {
+            let req = PreallocRequest {
+                width: header.width[1] as usize,
+                height: header.height as usize,
+                chroma: early_chroma,
+                bit_depth: early_bd,
+                seq_hdr: Some(seq),
+                frame_hdr: &header,
+                content_light: self.parse.content_light,
+                mastering_display: self.parse.mastering_display,
+                itut_t35: &self.parse.itut_t35,
+            };
+            match cb(&req) {
+                Ok(id) => id,
+                Err(err) => {
+                    self.parse
+                        .header_state
+                        .restore_slots(prev_slots, header.refresh_frame_flags);
+                    self.unsupported_frames += 1;
+                    self.last_decode_error = Some(format!("{err}"));
+                    self.last_error_packet_tag = Some(self.parse.current_packet_tag);
+                    return Err(err);
+                }
+            }
+        } else {
+            0
+        };
         #[cfg(feature = "msac-trace")]
         {
             crate::trace::frame(
@@ -1175,7 +1237,6 @@ impl Decoder {
         self.tepe_kat(&butce);
         let mc_identity = seq.mtrx == 0;
         let has_limit = self.config.allocation_limit.is_some();
-        let want_output = header.show_frame || self.config.output_invisible_frames;
 
         // `4.A.1`: Referans olarak saklanmayan (`refresh_frame_flags == 0`) karelerde
         // ikincil `Frame` veya `RefFrame` ayırmadan `decoded.pic` doğrudan yerinde
@@ -1249,6 +1310,8 @@ impl Decoder {
                     itut_t35,
                     event_flags: core::mem::take(&mut self.parse.pending_event_flags),
                     packet_tag: self.parse.current_packet_tag,
+                    new_temporal_unit: core::mem::take(&mut self.parse.pending_new_temporal_unit),
+                    prealloc_id,
                 };
                 self.outputs.push_back(OutputEntry::Frame(frame));
                 self.outputs_pushed += 1;
@@ -1339,6 +1402,8 @@ impl Decoder {
                 itut_t35,
                 event_flags: core::mem::take(&mut self.parse.pending_event_flags),
                 packet_tag: self.parse.current_packet_tag,
+                new_temporal_unit: core::mem::take(&mut self.parse.pending_new_temporal_unit),
+                prealloc_id,
             };
             self.outputs.push_back(OutputEntry::Frame(frame));
             self.outputs_pushed += 1;
@@ -1358,6 +1423,7 @@ impl Decoder {
         groups: &[TileGroupRaw],
         seq: &SequenceHeader,
         prev_slots: &RefSlots,
+        prealloc: Option<&mut PreallocCb<'_>>,
     ) -> Result<()> {
         let n_fc = self.config.effective_frame_delay();
         // 1. Zaten tamamlanmış ön uçuş görevlerini bloklamadan emekliye ayır.
@@ -1415,6 +1481,35 @@ impl Decoder {
             }
         };
 
+        let want_output = header.show_frame || self.config.output_invisible_frames;
+        let prealloc_id = if want_output && let Some(cb) = prealloc {
+            let req = PreallocRequest {
+                width: header.width[1] as usize,
+                height: header.height as usize,
+                chroma,
+                bit_depth: bd,
+                seq_hdr: Some(seq),
+                frame_hdr: &header,
+                content_light: self.parse.content_light,
+                mastering_display: self.parse.mastering_display,
+                itut_t35: &self.parse.itut_t35,
+            };
+            match cb(&req) {
+                Ok(id) => id,
+                Err(err) => {
+                    self.parse
+                        .header_state
+                        .restore_slots(prev_slots, header.refresh_frame_flags);
+                    self.unsupported_frames += 1;
+                    self.last_decode_error = Some(format!("{err}"));
+                    self.last_error_packet_tag = Some(self.parse.current_packet_tag);
+                    return Err(err);
+                }
+            }
+        } else {
+            0
+        };
+
         // 5. Paylaşılan bütçe tabanını senkronla, tile grup baytlarını ve tile
         //    boyut sınırlarını (`split_tile_groups`) doğrula.
         self.pipeline_butce.taban_guncelle(self.kalici_bayt());
@@ -1451,7 +1546,6 @@ impl Decoder {
             }
         }
 
-        let want_output = header.show_frame || self.config.output_invisible_frames;
         let output_seq = if want_output {
             let s = self.outputs_pushed;
             self.outputs_pushed += 1;
@@ -1471,6 +1565,8 @@ impl Decoder {
                 itut_t35,
                 event_flags: core::mem::take(&mut self.parse.pending_event_flags),
                 packet_tag,
+                new_temporal_unit: core::mem::take(&mut self.parse.pending_new_temporal_unit),
+                prealloc_id,
             })
         } else {
             None
@@ -1479,6 +1575,7 @@ impl Decoder {
         let task = Arc::new(InFlightDecodeTask {
             refresh_frame_flags: header.refresh_frame_flags,
             packet_tag,
+            prealloc_id,
             out_slot: Arc::clone(&out_slot),
             started: AtomicBool::new(false),
             result: Mutex::new(None),
@@ -1840,6 +1937,7 @@ impl Decoder {
                         if let Some(rf_arc) = completed.ref_frame {
                             for (slot, reference) in self.pixel_refs.iter_mut().enumerate() {
                                 if task.refresh_frame_flags & (1 << slot) != 0
+                                    && self.slot_promises[slot].is_some()
                                     && let Some(old) = reference.replace(Arc::clone(&rf_arc))
                                 {
                                     evicted[slot] = Some(old);
@@ -1927,21 +2025,19 @@ impl Decoder {
     ///
     /// Yuva başlığı ya da resmi yoksa (ya da katı uyumda gösterilemiyorsa)
     /// hata döner ve başlık **bekler** (`dangling_show_existing`).
-    fn show_existing(&mut self, slot: usize, opts: ParseOpts) -> Result<()> {
+    fn show_existing(
+        &mut self,
+        slot: usize,
+        opts: ParseOpts,
+        prealloc: Option<&mut PreallocCb<'_>>,
+    ) -> Result<()> {
         if self.config.effective_frame_delay() > 1 && !self.parse_only {
-            return self.show_existing_pipeline(slot, opts);
+            return self.show_existing_pipeline(slot, opts, prealloc);
         }
         let fail = |what: &'static str| -> Result<()> {
             Err(BitstreamError::new(BitstreamErrorKind::InvalidFrameHeader(what), 0).into())
         };
         let Some(ref_hdr) = self.parse.header_state.reference(slot) else {
-            if matches!(
-                self.decode_frame_type,
-                DecodeFrameType::Key | DecodeFrameType::Intra
-            ) {
-                self.parse.dangling_show_existing = None;
-                return Ok(());
-            }
             return fail("show_existing_frame: referans yuva boş (obu.c 1529)");
         };
         if self.should_skip_show_existing(ref_hdr.frame_type) {
@@ -1960,6 +2056,34 @@ impl Decoder {
                 "show_existing_frame: gösterilemeyen kare (strict_std_compliance; obu.c 1545-1548)",
             );
         }
+        let prealloc_id = if !self.parse_only
+            && let Some(cb) = prealloc
+            && let Some(seq) = self.parse.sequence_header.as_ref()
+        {
+            let (chroma, bd) = frame_format(seq)?;
+            let req = PreallocRequest {
+                width: ref_hdr.width[1] as usize,
+                height: ref_hdr.height as usize,
+                chroma,
+                bit_depth: bd,
+                seq_hdr: Some(seq),
+                frame_hdr: ref_hdr,
+                content_light: self.parse.content_light,
+                mastering_display: self.parse.mastering_display,
+                itut_t35: &self.parse.itut_t35,
+            };
+            match cb(&req) {
+                Ok(id) => id,
+                Err(err) => {
+                    self.parse.dangling_show_existing = None;
+                    self.last_decode_error = Some(format!("{err}"));
+                    self.last_error_packet_tag = Some(self.parse.current_packet_tag);
+                    return Err(err);
+                }
+            }
+        } else {
+            0
+        };
         // P38: çıktı kopyası durum değişmeden **önce** ayrılır; bütçe ya da
         // ayırma hatasında başlık bekler (yukarıdaki hatalar gibi), yuvalar
         // değişmez.
@@ -2036,6 +2160,8 @@ impl Decoder {
             itut_t35: core::mem::take(&mut self.parse.itut_t35),
             event_flags: core::mem::take(&mut self.parse.pending_event_flags),
             packet_tag: self.parse.current_packet_tag,
+            new_temporal_unit: core::mem::take(&mut self.parse.pending_new_temporal_unit),
+            prealloc_id,
         };
         self.outputs.push_back(OutputEntry::Frame(frame));
         self.outputs_pushed += 1;
@@ -2046,18 +2172,16 @@ impl Decoder {
     }
 
     /// `n_fc >= 2` boru hattı için `show_existing_frame` işlemi.
-    fn show_existing_pipeline(&mut self, slot: usize, opts: ParseOpts) -> Result<()> {
+    fn show_existing_pipeline(
+        &mut self,
+        slot: usize,
+        opts: ParseOpts,
+        prealloc: Option<&mut PreallocCb<'_>>,
+    ) -> Result<()> {
         let fail = |what: &'static str| -> Result<()> {
             Err(BitstreamError::new(BitstreamErrorKind::InvalidFrameHeader(what), 0).into())
         };
         let Some(ref_hdr) = self.parse.header_state.reference(slot) else {
-            if matches!(
-                self.decode_frame_type,
-                DecodeFrameType::Key | DecodeFrameType::Intra
-            ) {
-                self.parse.dangling_show_existing = None;
-                return Ok(());
-            }
             return fail("show_existing_frame: referans yuva boş (obu.c 1529)");
         };
         if self.should_skip_show_existing(ref_hdr.frame_type) {
@@ -2078,6 +2202,33 @@ impl Decoder {
                 "show_existing_frame: gösterilemeyen kare (strict_std_compliance; obu.c 1545-1548)",
             );
         }
+        let prealloc_id = if let Some(cb) = prealloc
+            && let Some(seq) = self.parse.sequence_header.as_ref()
+        {
+            let (chroma, bd) = frame_format(seq)?;
+            let req = PreallocRequest {
+                width: ref_hdr.width[1] as usize,
+                height: ref_hdr.height as usize,
+                chroma,
+                bit_depth: bd,
+                seq_hdr: Some(seq),
+                frame_hdr: ref_hdr,
+                content_light: self.parse.content_light,
+                mastering_display: self.parse.mastering_display,
+                itut_t35: &self.parse.itut_t35,
+            };
+            match cb(&req) {
+                Ok(id) => id,
+                Err(err) => {
+                    self.parse.dangling_show_existing = None;
+                    self.last_decode_error = Some(format!("{err}"));
+                    self.last_error_packet_tag = Some(self.parse.current_packet_tag);
+                    return Err(err);
+                }
+            }
+        } else {
+            0
+        };
 
         // Bütçe sınırı (`allocation_limit`) açıksa veya uçuş kuyruğu boşsa
         // senkron doğrula; aksi hâlde uçuşta çözülen karenin bitmesini
@@ -2147,6 +2298,8 @@ impl Decoder {
                 itut_t35: core::mem::take(&mut self.parse.itut_t35),
                 event_flags: core::mem::take(&mut self.parse.pending_event_flags),
                 packet_tag: self.parse.current_packet_tag,
+                new_temporal_unit: core::mem::take(&mut self.parse.pending_new_temporal_unit),
+                prealloc_id,
             };
 
             if self.in_flight.is_empty() {
@@ -2201,6 +2354,8 @@ impl Decoder {
             itut_t35: core::mem::take(&mut self.parse.itut_t35),
             event_flags: core::mem::take(&mut self.parse.pending_event_flags),
             packet_tag: self.parse.current_packet_tag,
+            new_temporal_unit: core::mem::take(&mut self.parse.pending_new_temporal_unit),
+            prealloc_id,
         };
         self.in_flight.push_back(InFlightEntry::ShowExisting {
             promise,
@@ -2281,6 +2436,19 @@ impl Decoder {
             || self.in_flight.iter().any(|e| match e {
                 InFlightEntry::Decode(t) => t.packet_tag == tag,
                 InFlightEntry::ShowExisting { capi_meta, .. } => capi_meta.packet_tag == tag,
+            })
+    }
+
+    /// Verilen ön-tahsis kimliğine (`prealloc_id`) sahip bekleyen çıktı veya uçuş görevi var mı?
+    #[cfg_attr(not(feature = "std"), allow(dead_code))]
+    pub(crate) fn has_pending_prealloc_id(&self, id: u64) -> bool {
+        if id == 0 {
+            return false;
+        }
+        self.output_capi_meta.iter().any(|m| m.prealloc_id == id)
+            || self.in_flight.iter().any(|e| match e {
+                InFlightEntry::Decode(t) => t.prealloc_id == id,
+                InFlightEntry::ShowExisting { capi_meta, .. } => capi_meta.prealloc_id == id,
             })
     }
 
