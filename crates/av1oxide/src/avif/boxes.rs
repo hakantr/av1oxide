@@ -464,6 +464,7 @@ fn parse_container_cow<'a>(data: Cow<'a, [u8]>, butce: &Arc<Butce>) -> Result<Av
     let mut offset = 0usize;
     let mut major_brand: Option<[u8; 4]> = None;
     let mut compatible_brands: Vec<[u8; 4]> = Vec::new();
+    let mut ftyp_guard = ButceTutucu::bos(butce);
     let mut has_avif_brand = false;
     let mut meta_source: Option<MetaSource> = None;
     let mut _cmin_guard: Option<ButceTutucu> = None;
@@ -488,7 +489,17 @@ fn parse_container_cow<'a>(data: Cow<'a, [u8]>, butce: &Arc<Butce>) -> Result<Av
                     if is_supported_brand(&major) {
                         has_avif_brand = true;
                     }
-                    for &compat in raw_box.payload[8..].as_chunks::<4>().0 {
+                    let compat_chunks = raw_box.payload[8..].as_chunks::<4>().0;
+                    let compat_bytes = compat_chunks
+                        .len()
+                        .saturating_mul(core::mem::size_of::<[u8; 4]>());
+                    ftyp_guard.ekle(compat_bytes)?;
+                    compatible_brands
+                        .try_reserve(compat_chunks.len())
+                        .map_err(|_| Error::AllocationFailed {
+                            requested: compat_bytes,
+                        })?;
+                    for &compat in compat_chunks {
                         compatible_brands.push(compat);
                         if is_supported_brand(&compat) {
                             has_avif_brand = true;
@@ -534,7 +545,15 @@ fn parse_container_cow<'a>(data: Cow<'a, [u8]>, butce: &Arc<Butce>) -> Result<Av
         ));
     }
     let meta_src = meta_source.ok_or(Error::InvalidData("AVIF dosyasında meta kutusu yok"))?;
-    parse_meta_box_cow(data, meta_src, major_brand, compatible_brands, true, butce)
+    parse_meta_box_cow(
+        data,
+        meta_src,
+        major_brand,
+        compatible_brands,
+        Some(ftyp_guard),
+        true,
+        butce,
+    )
 }
 
 /// Bir `meta` kutusu yükünü (üst düzey veya `trak` içi gömülü) [`AvifContainer`] olarak ayrıştırır.
@@ -559,6 +578,7 @@ pub(crate) fn parse_meta_box<'a>(
         meta_src,
         major_brand,
         compatible_brands,
+        None,
         require_pitm,
         butce,
     )
@@ -569,6 +589,7 @@ fn parse_meta_box_cow<'a>(
     meta_src: MetaSource,
     major_brand: [u8; 4],
     compatible_brands: Vec<[u8; 4]>,
+    initial_guard: Option<ButceTutucu>,
     require_pitm: bool,
     butce: &Arc<Butce>,
 ) -> Result<AvifContainer<'a>> {
@@ -585,7 +606,17 @@ fn parse_meta_box_cow<'a>(
     let mut seen_grpl = false;
     let mut idat = IdatStorage::Empty;
     let mut idat_owned_bytes = 0usize;
-    let mut container_guard = ButceTutucu::bos(butce);
+    let mut container_guard = match initial_guard {
+        Some(g) => g,
+        None => {
+            let mut g = ButceTutucu::bos(butce);
+            let brand_bytes = compatible_brands
+                .len()
+                .saturating_mul(core::mem::size_of::<[u8; 4]>());
+            g.ekle(brand_bytes)?;
+            g
+        }
+    };
     let mut has_hdlr = false;
 
     {
@@ -630,7 +661,7 @@ fn parse_meta_box_cow<'a>(
                     primary_item_id = Some(id);
                 }
                 b"iinf" => {
-                    parse_iinf(child.payload, &mut items)?;
+                    parse_iinf(child.payload, &mut items, &mut container_guard)?;
                 }
                 b"iprp" => {
                     parse_iprp(
@@ -641,17 +672,17 @@ fn parse_meta_box_cow<'a>(
                     )?;
                 }
                 b"iloc" => {
-                    parse_iloc(child.payload, &mut locations)?;
+                    parse_iloc(child.payload, &mut locations, &mut container_guard)?;
                 }
                 b"iref" => {
-                    parse_iref(child.payload, &mut references)?;
+                    parse_iref(child.payload, &mut references, &mut container_guard)?;
                 }
                 b"grpl" => {
                     if seen_grpl {
                         return Err(Error::InvalidData("meta içinde birden fazla grpl kutusu"));
                     }
                     seen_grpl = true;
-                    parse_grpl(child.payload, &mut entity_groups)?;
+                    parse_grpl(child.payload, &mut entity_groups, &mut container_guard)?;
                 }
                 b"idat" => {
                     if idat_owned_bytes > 0 {
@@ -704,7 +735,11 @@ fn parse_meta_box_cow<'a>(
     })
 }
 
-fn parse_grpl(payload: &[u8], groups: &mut Vec<EntityToGroup>) -> Result<()> {
+fn parse_grpl(
+    payload: &[u8],
+    groups: &mut Vec<EntityToGroup>,
+    guard: &mut ButceTutucu,
+) -> Result<()> {
     let mut offset = 0usize;
     while let Some(child) = read_box_header(payload, offset)? {
         offset = child.next_offset;
@@ -720,7 +755,15 @@ fn parse_grpl(payload: &[u8], groups: &mut Vec<EntityToGroup>) -> Result<()> {
         if needed_bytes > rem_bytes {
             return Err(Error::InvalidData("kesik grpl varlık kimlik listesi"));
         }
-        let mut entity_ids = Vec::with_capacity(num_entities);
+        let alloc_bytes = core::mem::size_of::<EntityToGroup>()
+            .saturating_add(num_entities.saturating_mul(core::mem::size_of::<u32>()));
+        guard.ekle(alloc_bytes)?;
+        let mut entity_ids = Vec::new();
+        entity_ids
+            .try_reserve_exact(num_entities)
+            .map_err(|_| Error::AllocationFailed {
+                requested: alloc_bytes,
+            })?;
         for i in 0..num_entities {
             let eid =
                 read_u32_be(body, 8 + i * 4).ok_or(Error::InvalidData("kesik grpl entity_id"))?;
@@ -735,7 +778,11 @@ fn parse_grpl(payload: &[u8], groups: &mut Vec<EntityToGroup>) -> Result<()> {
     Ok(())
 }
 
-fn parse_iinf(payload: &[u8], items: &mut FxIndexMap<u32, ItemInfoEntry>) -> Result<()> {
+fn parse_iinf(
+    payload: &[u8],
+    items: &mut FxIndexMap<u32, ItemInfoEntry>,
+    guard: &mut ButceTutucu,
+) -> Result<()> {
     let (ver, _flags, body) = read_full_box(payload)?;
     let (entry_count, mut offset) = match ver {
         0 => (
@@ -751,13 +798,36 @@ fn parse_iinf(payload: &[u8], items: &mut FxIndexMap<u32, ItemInfoEntry>) -> Res
         _ => return Err(Error::Unsupported("desteklenmeyen iinf sürümü")),
     };
 
-    items.reserve((entry_count as usize).min(256));
+    // Her `infe` (v2/v3) kutusu en az 8 (box) + 4 (fullbox) + 2 (id) + 2 (prot) + 4 (type) = 20 bayttır.
+    let max_possible = body.len().saturating_sub(offset) / 20;
+    if (entry_count as usize) > max_possible {
+        return Err(Error::InvalidData(
+            "iinf içindeki infe sayısı kutu boyutunu aşıyor",
+        ));
+    }
+    let reserve_n = (entry_count as usize).min(256);
+    items
+        .try_reserve(reserve_n)
+        .map_err(|_| Error::AllocationFailed {
+            requested: reserve_n.saturating_mul(core::mem::size_of::<(u32, ItemInfoEntry)>()),
+        })?;
     let mut parsed = 0u32;
     while let Some(child) = read_box_header(body, offset)? {
         offset = child.next_offset;
         if &child.box_type == b"infe" {
             let entry = parse_infe(child.payload)?;
-            items.insert(entry.item_id, entry);
+            let entry_bytes = core::mem::size_of::<(u32, ItemInfoEntry)>()
+                .saturating_add(entry.item_name.len())
+                .saturating_add(entry.content_type.len())
+                .saturating_add(entry.content_encoding.len());
+            guard.ekle(entry_bytes)?;
+            if let Some(prev) = items.insert(entry.item_id, entry) {
+                let prev_bytes = core::mem::size_of::<(u32, ItemInfoEntry)>()
+                    .saturating_add(prev.item_name.len())
+                    .saturating_add(prev.content_type.len())
+                    .saturating_add(prev.content_encoding.len());
+                guard.dusur(prev_bytes);
+            }
             parsed += 1;
         }
     }
@@ -843,7 +913,7 @@ fn parse_iprp(
                 parse_ipco(child.payload, properties, guard)?;
             }
             b"ipma" => {
-                parse_ipma(child.payload, associations)?;
+                parse_ipma(child.payload, associations, guard)?;
             }
             _ => {}
         }
@@ -1100,6 +1170,14 @@ pub(crate) fn parse_property_boxes(
             }
             other => ItemProperty::Unknown(*other),
         };
+        let prop_bytes = core::mem::size_of::<ItemProperty>().saturating_add(match &p {
+            ItemProperty::Pixi { bits_per_channel } => bits_per_channel.len(),
+            ItemProperty::AuxC { aux_type, subtype } => {
+                aux_type.len().saturating_add(subtype.len())
+            }
+            _ => 0,
+        });
+        guard.ekle(prop_bytes)?;
         properties.push(p);
     }
     Ok(())
@@ -1108,15 +1186,27 @@ pub(crate) fn parse_property_boxes(
 fn parse_ipma(
     payload: &[u8],
     associations: &mut FxIndexMap<u32, Vec<PropertyAssoc>>,
+    guard: &mut ButceTutucu,
 ) -> Result<()> {
     let (ver, flags, body) = read_full_box(payload)?;
     if ver > 1 {
         return Err(Error::Unsupported("ipma sürümü > 1 desteklenmiyor"));
     }
     let entry_count = read_u32_be(body, 0).ok_or(Error::InvalidData("kesik ipma entry_count"))?;
-    associations.reserve((entry_count as usize).min(256));
     let mut pos = 4usize;
+    let min_entry_bytes = if ver == 0 { 3usize } else { 5usize };
+    let max_entries = body.len().saturating_sub(pos) / min_entry_bytes;
+    if (entry_count as usize) > max_entries {
+        return Err(Error::InvalidData("ipma entry_count kutu boyutunu aşıyor"));
+    }
+    let reserve_n = (entry_count as usize).min(256);
+    associations
+        .try_reserve(reserve_n)
+        .map_err(|_| Error::AllocationFailed {
+            requested: reserve_n.saturating_mul(core::mem::size_of::<(u32, Vec<PropertyAssoc>)>()),
+        })?;
     let large_index = (flags & 1) != 0;
+    let assoc_stride = if large_index { 2usize } else { 1usize };
 
     for _ in 0..entry_count {
         let item_id = if ver == 0 {
@@ -1134,7 +1224,26 @@ fn parse_ipma(
             as usize;
         pos += 1;
 
-        let mut list: Vec<PropertyAssoc> = Vec::with_capacity(assoc_count);
+        let needed = assoc_count
+            .checked_mul(assoc_stride)
+            .ok_or(Error::InvalidData("ipma özellik sayısı taşması"))?;
+        if needed > body.len().saturating_sub(pos) {
+            return Err(Error::InvalidData("kesik ipma özellik listesi"));
+        }
+        let is_new_key = !associations.contains_key(&item_id);
+        let entry_bytes = (if is_new_key {
+            core::mem::size_of::<(u32, Vec<PropertyAssoc>)>()
+        } else {
+            0
+        })
+        .saturating_add(assoc_count.saturating_mul(core::mem::size_of::<PropertyAssoc>()));
+        guard.ekle(entry_bytes)?;
+
+        let mut list: Vec<PropertyAssoc> = Vec::new();
+        list.try_reserve_exact(assoc_count)
+            .map_err(|_| Error::AllocationFailed {
+                requested: assoc_count.saturating_mul(core::mem::size_of::<PropertyAssoc>()),
+            })?;
         for _ in 0..assoc_count {
             if large_index {
                 let raw =
@@ -1165,7 +1274,11 @@ fn parse_ipma(
     Ok(())
 }
 
-fn parse_iloc(payload: &[u8], locations: &mut FxIndexMap<u32, IlocItem>) -> Result<()> {
+fn parse_iloc(
+    payload: &[u8],
+    locations: &mut FxIndexMap<u32, IlocItem>,
+    guard: &mut ButceTutucu,
+) -> Result<()> {
     let (ver, _flags, body) = read_full_box(payload)?;
     if ver > 2 || body.len() < 2 {
         return Err(Error::Unsupported(
@@ -1200,7 +1313,25 @@ fn parse_iloc(payload: &[u8], locations: &mut FxIndexMap<u32, IlocItem>) -> Resu
         )
     };
 
-    locations.reserve((item_count as usize).min(256));
+    let min_item_bytes = (if ver < 2 { 2usize } else { 4usize })
+        + (if ver == 1 || ver == 2 { 2usize } else { 0usize })
+        + 2
+        + base_offset_size
+        + 2;
+    let max_items = body.len().saturating_sub(pos) / min_item_bytes;
+    if (item_count as usize) > max_items {
+        return Err(Error::InvalidData("iloc item_count kutu boyutunu aşıyor"));
+    }
+    let reserve_n = (item_count as usize).min(256);
+    locations
+        .try_reserve(reserve_n)
+        .map_err(|_| Error::AllocationFailed {
+            requested: reserve_n.saturating_mul(core::mem::size_of::<(u32, IlocItem)>()),
+        })?;
+    let ext_stride = (if ver == 1 || ver == 2 { index_size } else { 0 })
+        .saturating_add(offset_size)
+        .saturating_add(length_size);
+
     for _ in 0..item_count {
         let item_id = if ver < 2 {
             let id = read_u16_be(body, pos).ok_or(Error::InvalidData("kesik iloc item_id"))?;
@@ -1232,7 +1363,24 @@ fn parse_iloc(payload: &[u8], locations: &mut FxIndexMap<u32, IlocItem>) -> Resu
             read_u16_be(body, pos).ok_or(Error::InvalidData("kesik iloc extent_count"))? as usize;
         pos += 2;
 
-        let mut extents: Vec<IlocExtent> = Vec::with_capacity(extent_count);
+        if ext_stride > 0 {
+            let needed = extent_count
+                .checked_mul(ext_stride)
+                .ok_or(Error::InvalidData("iloc extent boyutu taşması"))?;
+            if needed > body.len().saturating_sub(pos) {
+                return Err(Error::InvalidData("kesik iloc extent dizisi"));
+            }
+        }
+        let item_bytes = core::mem::size_of::<(u32, IlocItem)>()
+            .saturating_add(extent_count.saturating_mul(core::mem::size_of::<IlocExtent>()));
+        guard.ekle(item_bytes)?;
+
+        let mut extents: Vec<IlocExtent> = Vec::new();
+        extents
+            .try_reserve_exact(extent_count)
+            .map_err(|_| Error::AllocationFailed {
+                requested: extent_count.saturating_mul(core::mem::size_of::<IlocExtent>()),
+            })?;
         for _ in 0..extent_count {
             let extent_index = if (ver == 1 || ver == 2) && index_size > 0 {
                 let idx = read_uint_n(body, pos, index_size)
@@ -1255,7 +1403,7 @@ fn parse_iloc(payload: &[u8], locations: &mut FxIndexMap<u32, IlocItem>) -> Resu
             });
         }
 
-        locations.insert(
+        if let Some(prev) = locations.insert(
             item_id,
             IlocItem {
                 item_id,
@@ -1264,16 +1412,28 @@ fn parse_iloc(payload: &[u8], locations: &mut FxIndexMap<u32, IlocItem>) -> Resu
                 base_offset,
                 extents,
             },
-        );
+        ) {
+            let prev_bytes = core::mem::size_of::<(u32, IlocItem)>().saturating_add(
+                prev.extents
+                    .len()
+                    .saturating_mul(core::mem::size_of::<IlocExtent>()),
+            );
+            guard.dusur(prev_bytes);
+        }
     }
     Ok(())
 }
 
-fn parse_iref(payload: &[u8], references: &mut Vec<ItemReference>) -> Result<()> {
+fn parse_iref(
+    payload: &[u8],
+    references: &mut Vec<ItemReference>,
+    guard: &mut ButceTutucu,
+) -> Result<()> {
     let (ver, _flags, body) = read_full_box(payload)?;
     if ver > 1 {
         return Err(Error::Unsupported("iref sürümü > 1 desteklenmiyor"));
     }
+    let id_size = if ver == 0 { 2usize } else { 4usize };
     let mut offset = 0usize;
     while let Some(ref_box) = read_box_header(body, offset)? {
         offset = ref_box.next_offset;
@@ -1295,16 +1455,42 @@ fn parse_iref(payload: &[u8], references: &mut Vec<ItemReference>) -> Result<()>
             as usize;
         pos += 2;
 
+        let needed = ref_count
+            .checked_mul(id_size)
+            .ok_or(Error::InvalidData("iref referans boyutu taşması"))?;
+        if needed > rbody.len().saturating_sub(pos) {
+            return Err(Error::InvalidData("kesik iref referans listesi"));
+        }
+
         let is_dimg = &ref_box.box_type == b"dimg";
+        let to_bytes = ref_count.saturating_mul(core::mem::size_of::<u32>());
+        let ref_bytes = core::mem::size_of::<ItemReference>().saturating_add(to_bytes);
+        let seen_bytes = if is_dimg && ref_count > 8 {
+            to_bytes
+        } else {
+            0
+        };
+        guard.ekle(ref_bytes.saturating_add(seen_bytes))?;
+
         let mut seen_dimg = if is_dimg && ref_count > 8 {
-            Some(FxIndexSet::with_capacity_and_hasher(
-                ref_count,
-                rustc_hash::FxBuildHasher,
-            ))
+            let mut set = FxIndexSet::with_hasher(rustc_hash::FxBuildHasher);
+            set.try_reserve(ref_count).map_err(|_| {
+                guard.dusur(ref_bytes.saturating_add(seen_bytes));
+                Error::AllocationFailed {
+                    requested: seen_bytes,
+                }
+            })?;
+            Some(set)
         } else {
             None
         };
-        let mut to_item_ids: Vec<u32> = Vec::with_capacity(ref_count);
+        let mut to_item_ids: Vec<u32> = Vec::new();
+        to_item_ids.try_reserve_exact(ref_count).map_err(|_| {
+            guard.dusur(ref_bytes.saturating_add(seen_bytes));
+            Error::AllocationFailed {
+                requested: to_bytes,
+            }
+        })?;
         for _ in 0..ref_count {
             let to_id = if ver == 0 {
                 let id = read_u16_be(rbody, pos)
@@ -1324,12 +1510,17 @@ fn parse_iref(payload: &[u8], references: &mut Vec<ItemReference>) -> Result<()>
                     to_item_ids.contains(&to_id)
                 };
                 if is_dup {
+                    guard.dusur(seen_bytes);
                     return Err(Error::InvalidData(
                         "dimg referans dizisinde yinelenen hedef öğe kimliği",
                     ));
                 }
             }
             to_item_ids.push(to_id);
+        }
+        drop(seen_dimg);
+        if seen_bytes > 0 {
+            guard.dusur(seen_bytes);
         }
         references.push(ItemReference {
             ref_type: ref_box.box_type,

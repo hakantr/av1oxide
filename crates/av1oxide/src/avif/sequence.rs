@@ -354,6 +354,7 @@ impl<'a> AvifSequenceDecoder<'a> {
                 color_track.height,
                 color_bundle.transforms,
             )?;
+            check_pixel_and_byte_budget(post_w, post_h, 0, &config)?;
 
             // Exif/XMP önceliği: önce `trak/meta` (libavif `colorTrack->meta`), yoksa üst düzey `meta`.
             let (mut exif, mut xmp) = if let Some(ref tmeta) = color_track.meta {
@@ -458,7 +459,7 @@ impl<'a> AvifSequenceDecoder<'a> {
         } else {
             drop(movie);
             // Hareketsiz AVIF dosyası: tek karelik dizi olarak şeffaf destek.
-            let still = parse_info_with_budget(data, &butce)?;
+            let still = parse_info_with_budget(data, &butce, &config)?;
             let meta_bytes = still.icc_profile.as_ref().map_or(0, Vec::len)
                 + still.exif.as_ref().map_or(0, Vec::len)
                 + still.xmp.as_ref().map_or(0, Vec::len);

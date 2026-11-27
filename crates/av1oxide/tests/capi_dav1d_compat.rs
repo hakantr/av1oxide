@@ -686,30 +686,81 @@ int main(void) {
         "DAV1D_ERR(EAGAIN) uyuşmazlığı: beklenen `{eagain_line}`, C çıktısı:\n{stdout}"
     );
 
-    // 2. Resmî drop-in önek kurulum aracı (`examples/install_capi_prefix.rs`) ile temiz `prefix/`
-    //    üzerinde 6 başlık, `dav1d.pc` / `pkg-config`, gerçek `DT_SONAME` / `install_name`,
-    //    zorunlu `nm` tam sembol eşleşmesi ve hem statik hem dinamik C istemci doğrulaması.
+    // 2. Resmî drop-in önek kurulum aracı (`examples/install_capi_prefix.rs`) ile mevcut
+    //    ilgisiz dosyaları silmeden `prefix/` üzerine art arda iki kez kurulum, kök yol reddi,
+    //    6 başlık, `dav1d.pc` / `pkg-config`, gerçek `DT_SONAME` / `install_name`, zorunlu `nm`
+    //    tam sembol eşleşmesi ve hem statik hem dinamik C istemci doğrulaması.
     let prefix_dir = scratch_dir.join("prefix");
     let target_dir = scratch_dir.join("target");
-    let install_status = Command::new("cargo")
-        .current_dir(workspace_root)
-        .arg("run")
-        .arg("--locked")
-        .arg("--release")
-        .arg("-p")
-        .arg("av1oxide")
-        .arg("--example")
-        .arg("install_capi_prefix")
-        .arg("--")
-        .arg(&prefix_dir)
-        .arg("--target-dir")
-        .arg(&target_dir)
-        .status()
-        .expect("resmî install_capi_prefix örneği çalışmalı");
-    assert!(
-        install_status.success(),
-        "install_capi_prefix kurulumu başarısız"
-    );
+    std::fs::create_dir_all(prefix_dir.join("lib")).unwrap();
+    std::fs::create_dir_all(prefix_dir.join("include")).unwrap();
+    let keep_root = prefix_dir.join("keep_root.txt");
+    let keep_lib = prefix_dir.join("lib").join("libunrelated.a");
+    let keep_inc = prefix_dir.join("include").join("unrelated.h");
+    std::fs::write(&keep_root, b"keep-root-sentinel").unwrap();
+    std::fs::write(&keep_lib, b"keep-lib-sentinel").unwrap();
+    std::fs::write(&keep_inc, b"keep-inc-sentinel").unwrap();
+
+    for pass in 0..2 {
+        let install_status = Command::new("cargo")
+            .current_dir(workspace_root)
+            .arg("run")
+            .arg("--locked")
+            .arg("--release")
+            .arg("-p")
+            .arg("av1oxide")
+            .arg("--example")
+            .arg("install_capi_prefix")
+            .arg("--")
+            .arg(&prefix_dir)
+            .arg("--target-dir")
+            .arg(&target_dir)
+            .status()
+            .expect("resmî install_capi_prefix örneği çalışmalı");
+        assert!(
+            install_status.success(),
+            "install_capi_prefix kurulumu {pass}. geçişte başarısız"
+        );
+        assert_eq!(
+            std::fs::read(&keep_root).unwrap(),
+            b"keep-root-sentinel",
+            "ilgisiz kök dosyası korunmalı"
+        );
+        assert_eq!(
+            std::fs::read(&keep_lib).unwrap(),
+            b"keep-lib-sentinel",
+            "ilgisiz lib dosyası korunmalı"
+        );
+        assert_eq!(
+            std::fs::read(&keep_inc).unwrap(),
+            b"keep-inc-sentinel",
+            "ilgisiz include dosyası korunmalı"
+        );
+    }
+
+    // Kök dizin `/` güvenlik nedeniyle reddedilmeli.
+    #[cfg(unix)]
+    {
+        let root_reject = Command::new("cargo")
+            .current_dir(workspace_root)
+            .arg("run")
+            .arg("--locked")
+            .arg("--release")
+            .arg("-p")
+            .arg("av1oxide")
+            .arg("--example")
+            .arg("install_capi_prefix")
+            .arg("--")
+            .arg("/")
+            .arg("--target-dir")
+            .arg(&target_dir)
+            .output()
+            .expect("kök yol reddi çalıştırılmalı");
+        assert!(
+            !root_reject.status.success(),
+            "kök dizin `/` hedef önek olarak reddedilmeli"
+        );
+    }
 
     // 2a. 6 resmî C başlık dosyasının varlığı ve kaynakla birebir eşleşmesi
     let prefix_inc_root = prefix_dir.join("include");
@@ -1021,4 +1072,268 @@ int main(void) {
     }
 
     let _ = std::fs::remove_dir_all(&scratch_dir);
+}
+
+#[test]
+fn capi_apply_grain_in_place_out_equals_in_has_no_uaf_or_leak() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    extern "C" fn count_user_free(_ptr: *const u8, cookie: *mut core::ffi::c_void) {
+        // SAFETY: `cookie` bu test boyunca canlı duran `AtomicUsize` örneğinin adresidir.
+        let counter = unsafe { &*(cookie as *const AtomicUsize) };
+        counter.fetch_add(1, Ordering::SeqCst);
+    }
+
+    // `PKT0` önüne CLL, MDCV ve ITU-T T.35 metadata OBU'ları ekleyerek 7 `Dav1dRef` yuvasının
+    // tamamının (pic, seq_hdr, frame_hdr, cll, mdcv, itut_t35, user_data) strong_count == 1 ile
+    // doldurulmasını sağla.
+    fn make_meta_obu(payload: &[u8]) -> Vec<u8> {
+        // OBU_METADATA = 5, has_size_field = 1 -> header byte = (5 << 3) | 2 = 0x2A
+        let mut out = Vec::with_capacity(2 + payload.len());
+        out.push(0x2A);
+        assert!(payload.len() < 128);
+        out.push(payload.len() as u8);
+        out.extend_from_slice(payload);
+        out
+    }
+
+    let mut cll_payload = vec![1u8, 0x03, 0xE8, 0x01, 0x90, 0x80];
+    let _ = &mut cll_payload;
+    let mut mdcv_payload = vec![2u8];
+    mdcv_payload.extend_from_slice(&[0x12u8; 24]);
+    mdcv_payload.push(0x80);
+    let itut_payload = vec![4u8, 0xB5, 0x00, 0x31, 0x41, 0x80];
+
+    const PKT0_1X1: &[u8] = &[
+        0x12, 0x00, 0x0A, 0x09, 0x00, 0x00, 0x00, 0x00, 0x00, 0x7D, 0xFC, 0xC0, 0x20, 0x32, 0x17,
+        0x10, 0x01, 0x91, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x68, 0xD2, 0x16,
+        0x8C, 0x64, 0xBE, 0x2E, 0xC7, 0xDA, 0xEE, 0x96,
+    ];
+    let mut rich_pkt = Vec::new();
+    rich_pkt.extend_from_slice(&make_meta_obu(&cll_payload));
+    rich_pkt.extend_from_slice(&make_meta_obu(&mdcv_payload));
+    rich_pkt.extend_from_slice(&make_meta_obu(&itut_payload));
+    rich_pkt.extend_from_slice(PKT0_1X1);
+
+    let free_counter = AtomicUsize::new(0);
+    let user_sentinel: [u8; 4] = [1, 2, 3, 4];
+
+    // SAFETY: C-ABI çağrıları bu testte ayrılan geçerli `Dav1dContext`, `Dav1dData` ve `Dav1dPicture` yapılarıyla yapılır.
+    unsafe {
+        let mut settings = Dav1dSettings::default();
+        dav1d_default_settings(&mut settings);
+        settings.n_threads = 1;
+        settings.max_frame_delay = 1;
+        settings.apply_grain = 0;
+
+        let mut ctx: *mut Dav1dContext = core::ptr::null_mut();
+        assert_eq!(dav1d_open(&mut ctx, &settings), 0);
+
+        // 1. `!has_grain_c` kolu: `out == in_pic` (strong_count == 1).
+        let mut data = Dav1dData::default();
+        let buf = dav1d_data_create(&mut data, rich_pkt.len());
+        assert!(!buf.is_null());
+        core::ptr::copy_nonoverlapping(rich_pkt.as_ptr(), buf, rich_pkt.len());
+        assert_eq!(
+            dav1d_data_wrap_user_data(
+                &mut data,
+                user_sentinel.as_ptr(),
+                Some(count_user_free),
+                (&free_counter as *const AtomicUsize) as *mut core::ffi::c_void,
+            ),
+            0
+        );
+        assert_eq!(dav1d_send_data(ctx, &mut data), 0);
+
+        let mut pic = Dav1dPicture::default();
+        assert_eq!(dav1d_get_picture(ctx, &mut pic), 0);
+        assert!(!pic.seq_hdr.is_null());
+        assert!(!pic.frame_hdr.is_null());
+        assert!(!pic.content_light.is_null());
+        assert!(!pic.mastering_display.is_null());
+        assert!(!pic.itut_t35.is_null());
+        assert_eq!(pic.n_itut_t35, 1);
+        assert_eq!(free_counter.load(Ordering::SeqCst), 0);
+
+        let pic_ptr: *mut Dav1dPicture = &mut pic;
+        assert_eq!(dav1d_apply_grain(ctx, pic_ptr, pic_ptr as *const _), 0);
+        assert_eq!(free_counter.load(Ordering::SeqCst), 0);
+        assert_eq!((*pic.content_light).max_content_light_level, 1000);
+        assert_eq!((*pic.itut_t35).country_code, 0xB5);
+        assert_eq!(*(pic.data[0] as *const u8), 190);
+
+        // 2. `has_grain_c` kolu: `out == in_pic` (strong_count == 1).
+        let fh = &mut *pic.frame_hdr;
+        fh.film_grain.present = 1;
+        fh.film_grain.data.seed = 7391;
+        fh.film_grain.data.num_y_points = 2;
+        fh.film_grain.data.y_points[0] = [0, 16];
+        fh.film_grain.data.y_points[1] = [255, 16];
+        fh.film_grain.data.scaling_shift = 8;
+        fh.film_grain.data.grain_scale_shift = 0;
+
+        assert_eq!(dav1d_apply_grain(ctx, pic_ptr, pic_ptr as *const _), 0);
+        assert_eq!(free_counter.load(Ordering::SeqCst), 0);
+        assert!(!pic.seq_hdr.is_null());
+        assert!(!pic.frame_hdr.is_null());
+        assert!(!pic.content_light.is_null());
+        assert!(!pic.mastering_display.is_null());
+        assert!(!pic.itut_t35.is_null());
+        assert_eq!((*pic.content_light).max_content_light_level, 1000);
+        assert_eq!((*pic.itut_t35).country_code, 0xB5);
+        assert_eq!(pic.m.user_data.data, user_sentinel.as_ptr());
+
+        dav1d_picture_unref(&mut pic);
+        assert_eq!(
+            free_counter.load(Ordering::SeqCst),
+            1,
+            "tüm referanslar bırakıldığında user_data tam olarak bir kez serbest bırakılmalı"
+        );
+        dav1d_close(&mut ctx);
+    }
+}
+
+#[test]
+fn capi_send_data_returns_eagain_when_pending_slot_full_and_matches_rust_decoder() {
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let ivf_path = manifest_dir.join(
+        "tests/fixtures/streams/Syntax_AV1_mainb8ss420_432x240_001_vq_aom_ctest_4.2.stripped.ivf",
+    );
+    let raw = std::fs::read(&ivf_path).expect("IVF fikstürü okunmalı");
+    assert!(raw.len() > 32 && &raw[..4] == b"DKIF");
+    let mut packets: Vec<Vec<u8>> = Vec::new();
+    let mut pos = 32usize;
+    while pos + 12 <= raw.len() {
+        let sz = u32::from_le_bytes(raw[pos..pos + 4].try_into().unwrap()) as usize;
+        pos += 12;
+        assert!(pos + sz <= raw.len());
+        packets.push(raw[pos..pos + sz].to_vec());
+        pos += sz;
+    }
+    assert!(packets.len() >= 4, "en az 4 IVF paketi gerekli");
+
+    // Referans: Rust `Decoder` ile tüm karelerin Y/U/V özetleri.
+    let mut ref_dec = av1oxide::Decoder::new(av1oxide::Config {
+        n_threads: 1,
+        max_frame_delay: 1,
+        ..av1oxide::Config::default()
+    })
+    .unwrap();
+    let mut ref_luma_bytes: Vec<Vec<u8>> = Vec::new();
+    for pkt in &packets {
+        ref_dec.send_packet(&av1oxide::Packet::new(pkt)).unwrap();
+        while let Some(frame) = ref_dec.receive_frame().unwrap() {
+            let y = frame.plane(av1oxide::frame::PlaneType::Y).unwrap();
+            let mut rows = Vec::with_capacity(y.width() * y.height());
+            for r in 0..y.height() {
+                rows.extend_from_slice(&y.row(r).unwrap()[..y.width()]);
+            }
+            ref_luma_bytes.push(rows);
+        }
+    }
+    ref_dec.flush();
+    while let Some(frame) = ref_dec.receive_frame().unwrap() {
+        let y = frame.plane(av1oxide::frame::PlaneType::Y).unwrap();
+        let mut rows = Vec::with_capacity(y.width() * y.height());
+        for r in 0..y.height() {
+            rows.extend_from_slice(&y.row(r).unwrap()[..y.width()]);
+        }
+        ref_luma_bytes.push(rows);
+    }
+    assert!(!ref_luma_bytes.is_empty());
+
+    // SAFETY: C-ABI çağrıları bu testte ayrılan geçerli `Dav1dContext`, `Dav1dData` ve `Dav1dPicture` yapılarıyla yapılır.
+    unsafe {
+        let mut settings = Dav1dSettings::default();
+        dav1d_default_settings(&mut settings);
+        settings.n_threads = 1;
+        settings.max_frame_delay = 1;
+
+        let mut ctx: *mut Dav1dContext = core::ptr::null_mut();
+        assert_eq!(dav1d_open(&mut ctx, &settings), 0);
+
+        let make_data = |bytes: &[u8]| -> Dav1dData {
+            let mut d = Dav1dData::default();
+            let p = dav1d_data_create(&mut d, bytes.len());
+            assert!(!p.is_null());
+            core::ptr::copy_nonoverlapping(bytes.as_ptr(), p, bytes.len());
+            d
+        };
+
+        // 1. paket: çözülür ve çıktı hazır olur -> 0 (tüketildi).
+        let mut d0 = make_data(&packets[0]);
+        assert_eq!(dav1d_send_data(ctx, &mut d0), 0);
+        assert!(d0.data.is_null() && d0.sz == 0);
+
+        // 2. paket (`dav1d_get_picture` çağrılmadan): bekleyen giriş yuvasına alınır -> 0 (tüketildi).
+        let mut d1 = make_data(&packets[1]);
+        assert_eq!(dav1d_send_data(ctx, &mut d1), 0);
+        assert!(d1.data.is_null() && d1.sz == 0);
+
+        // 3. paket (çıktı hâlâ alınmadığı ve bekleyen yuva dolu olduğu için): `-EAGAIN` ve
+        // `d2` çağıranda bozulmadan kalır!
+        let mut d2 = make_data(&packets[2]);
+        let orig_ptr = d2.data;
+        let orig_sz = d2.sz;
+        let orig_ref = d2.r#ref;
+        assert_eq!(dav1d_send_data(ctx, &mut d2), dav1d_err(EAGAIN));
+        assert_eq!(d2.data, orig_ptr);
+        assert_eq!(d2.sz, orig_sz);
+        assert_eq!(d2.r#ref, orig_ref);
+
+        // Şimdi standart `dav1d` send/get döngüsüyle `d2` ve kalan paketleri tamamla.
+        let mut capi_luma_bytes: Vec<Vec<u8>> = Vec::new();
+        let drain_one = |ctx: *mut Dav1dContext, out_list: &mut Vec<Vec<u8>>| -> i32 {
+            let mut pic = Dav1dPicture::default();
+            let rc = dav1d_get_picture(ctx, &mut pic);
+            if rc == 0 {
+                let w = pic.p.w as usize;
+                let h = pic.p.h as usize;
+                let stride = pic.stride[0] as usize;
+                let base = pic.data[0] as *const u8;
+                let mut rows = Vec::with_capacity(w * h);
+                for r in 0..h {
+                    let slice = core::slice::from_raw_parts(base.add(r * stride), w);
+                    rows.extend_from_slice(slice);
+                }
+                out_list.push(rows);
+                dav1d_picture_unref(&mut pic);
+            }
+            rc
+        };
+
+        let mut remaining: Vec<Dav1dData> = Vec::new();
+        remaining.push(d2);
+        for pkt in &packets[3..] {
+            remaining.push(make_data(pkt));
+        }
+
+        for mut d in remaining {
+            loop {
+                let s_rc = dav1d_send_data(ctx, &mut d);
+                if s_rc == 0 {
+                    break;
+                }
+                assert_eq!(s_rc, dav1d_err(EAGAIN));
+                let g_rc = drain_one(ctx, &mut capi_luma_bytes);
+                assert_eq!(
+                    g_rc, 0,
+                    "EAGAIN sonrası dav1d_get_picture kare teslim etmeli"
+                );
+            }
+        }
+        loop {
+            let g_rc = drain_one(ctx, &mut capi_luma_bytes);
+            if g_rc == dav1d_err(EAGAIN) {
+                break;
+            }
+            assert_eq!(g_rc, 0);
+        }
+
+        assert_eq!(
+            capi_luma_bytes, ref_luma_bytes,
+            "C-ABI send/get -EAGAIN döngüsü Rust Decoder ile piksel-özdeş olmalı"
+        );
+        dav1d_close(&mut ctx);
+    }
 }

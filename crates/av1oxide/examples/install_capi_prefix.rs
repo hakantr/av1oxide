@@ -44,22 +44,49 @@ fn absolutize(path: PathBuf) -> std::io::Result<PathBuf> {
     }
 }
 
-#[cfg(unix)]
-fn create_symlink(target_rel: &str, link_path: &Path) -> std::io::Result<()> {
-    if link_path.exists() || link_path.symlink_metadata().is_ok() {
-        fs::remove_file(link_path)?;
+fn remove_existing_file_or_symlink(path: &Path) -> Result<(), String> {
+    match fs::symlink_metadata(path) {
+        Ok(meta) => {
+            if meta.file_type().is_dir() {
+                return Err(format!(
+                    "hedef yolda beklenmeyen dizin çakışması var (silinmedi): {}",
+                    path.display()
+                ));
+            }
+            fs::remove_file(path)
+                .map_err(|e| format!("mevcut dosya/bağ güncellenemedi ({}): {e}", path.display()))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(format!("hedef yol incelenemedi ({}): {e}", path.display())),
     }
+}
+
+fn install_file(src: &Path, dst: &Path) -> Result<(), String> {
+    remove_existing_file_or_symlink(dst)?;
+    fs::copy(src, dst)
+        .map(|_| ())
+        .map_err(|e| format!("{} -> {} kopyalanamadı: {e}", src.display(), dst.display()))
+}
+
+fn write_installed_file(dst: &Path, content: &str) -> Result<(), String> {
+    remove_existing_file_or_symlink(dst)?;
+    fs::write(dst, content).map_err(|e| format!("{} yazılamadı: {e}", dst.display()))
+}
+
+#[cfg(unix)]
+fn create_symlink(target_rel: &str, link_path: &Path) -> Result<(), String> {
+    remove_existing_file_or_symlink(link_path)?;
     std::os::unix::fs::symlink(target_rel, link_path)
+        .map_err(|e| format!("{} bağı oluşturulamadı: {e}", link_path.display()))
 }
 
 #[cfg(not(unix))]
-fn create_symlink(target_rel: &str, link_path: &Path) -> std::io::Result<()> {
+fn create_symlink(target_rel: &str, link_path: &Path) -> Result<(), String> {
     let src = link_path
         .parent()
         .unwrap_or_else(|| Path::new("."))
         .join(target_rel);
-    fs::copy(src, link_path)?;
-    Ok(())
+    install_file(&src, link_path)
 }
 
 fn run() -> Result<(), String> {
@@ -96,6 +123,12 @@ fn run() -> Result<(), String> {
             .ok_or_else(|| "hedef <prefix> dizini zorunludur (yardım için --help)".to_string())?,
     )
     .map_err(|e| format!("önek yolu çözümlenemedi: {e}"))?;
+    if prefix.parent().is_none() || prefix == Path::new("/") {
+        return Err(format!(
+            "güvenlik nedeniyle kök dizin (<prefix> = {}) hedef önek olarak kullanılamaz",
+            prefix.display()
+        ));
+    }
 
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let workspace_root = manifest_dir
@@ -107,7 +140,7 @@ fn run() -> Result<(), String> {
 
     let target_dir = match target_dir_arg {
         Some(td) => absolutize(td).map_err(|e| format!("target-dir yolu çözümlenemedi: {e}"))?,
-        None => prefix.parent().unwrap_or(&prefix).join("capi_target"),
+        None => workspace_root.join("target").join("capi_prefix"),
     };
 
     #[cfg(target_os = "macos")]
@@ -165,10 +198,6 @@ fn run() -> Result<(), String> {
         return Err(format!("cargo rustc başarısız oldu: {status}"));
     }
 
-    if prefix.exists() {
-        fs::remove_dir_all(&prefix)
-            .map_err(|e| format!("mevcut önek temizlenemedi ({}): {e}", prefix.display()))?;
-    }
     let inc_dst = prefix.join("include").join("dav1d");
     let lib_dst = prefix.join("lib");
     let pc_dst = lib_dst.join("pkgconfig");
@@ -180,8 +209,7 @@ fn run() -> Result<(), String> {
         if !src.is_file() {
             return Err(format!("eksik C başlık dosyası: {}", src.display()));
         }
-        fs::copy(&src, inc_dst.join(hdr))
-            .map_err(|e| format!("başlık kopyalanamadı ({hdr}): {e}"))?;
+        install_file(&src, &inc_dst.join(hdr))?;
     }
 
     let rel_dir = target_dir.join("release");
@@ -202,31 +230,24 @@ fn run() -> Result<(), String> {
 
     #[cfg(target_os = "macos")]
     {
-        fs::copy(&cdylib_src, lib_dst.join(&soname))
-            .map_err(|e| format!("dylib kopyalanamadı: {e}"))?;
-        create_symlink(&soname, &lib_dst.join("libdav1d.dylib"))
-            .map_err(|e| format!("libdav1d.dylib bağı oluşturulamadı: {e}"))?;
+        install_file(&cdylib_src, &lib_dst.join(&soname))?;
+        create_symlink(&soname, &lib_dst.join("libdav1d.dylib"))?;
     }
 
     #[cfg(all(unix, not(target_os = "macos")))]
     {
         let full_so = format!("libdav1d.so.{DAV1D_API_VERSION}");
-        fs::copy(&cdylib_src, lib_dst.join(&full_so))
-            .map_err(|e| format!("{full_so} kopyalanamadı: {e}"))?;
-        create_symlink(&full_so, &lib_dst.join(&soname))
-            .map_err(|e| format!("{soname} bağı oluşturulamadı: {e}"))?;
-        create_symlink(&soname, &lib_dst.join("libdav1d.so"))
-            .map_err(|e| format!("libdav1d.so bağı oluşturulamadı: {e}"))?;
+        install_file(&cdylib_src, &lib_dst.join(&full_so))?;
+        create_symlink(&full_so, &lib_dst.join(&soname))?;
+        create_symlink(&soname, &lib_dst.join("libdav1d.so"))?;
     }
 
     #[cfg(not(unix))]
     {
-        fs::copy(&cdylib_src, lib_dst.join(&soname))
-            .map_err(|e| format!("{soname} kopyalanamadı: {e}"))?;
+        install_file(&cdylib_src, &lib_dst.join(&soname))?;
     }
 
-    fs::copy(&static_src, lib_dst.join("libdav1d.a"))
-        .map_err(|e| format!("libdav1d.a kopyalanamadı: {e}"))?;
+    install_file(&static_src, &lib_dst.join("libdav1d.a"))?;
 
     let prefix_str = prefix
         .to_str()
@@ -244,8 +265,7 @@ Libs: -L${{libdir}} -ldav1d\n\
 Libs.private: {libs_private}\n\
 Cflags: -I${{includedir}}\n"
     );
-    fs::write(pc_dst.join("dav1d.pc"), pc_content)
-        .map_err(|e| format!("dav1d.pc yazılamadı: {e}"))?;
+    write_installed_file(&pc_dst.join("dav1d.pc"), &pc_content)?;
 
     println!(
         "av1oxide v{} drop-in libdav1d ({} / API {}) öneki kuruldu: {}",

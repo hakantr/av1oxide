@@ -303,6 +303,18 @@ fn limits_reject_oversized_dimensions_and_allocation() {
         err2,
         ImageError::Limits(ref e) if e.kind() == LimitErrorKind::InsufficientMemory
     ));
+
+    // Early max_pixels enforcement in AvifDecoder::with_config (before any output buffer allocation)
+    let oversized_hdr_avif = build_synthetic_avif(AV1_1X1_8BIT, None, 1204, 800, 8, None, None);
+    let err_pixels = AvifDecoder::with_config(
+        Cursor::new(&oversized_hdr_avif),
+        AvifDecodeConfig {
+            max_pixels: 1,
+            ..AvifDecodeConfig::default()
+        },
+    )
+    .expect_err("max_pixels=1 with_config aşamasında reddedilmeli");
+    assert!(matches!(err_pixels, ImageError::Limits(_)));
 }
 
 #[test]

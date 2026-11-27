@@ -11,7 +11,7 @@ use std::collections::VecDeque;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 
-use crate::api::{Decoder, OutputCapiMeta, Packet};
+use crate::api::{Decoder, OutputCapiMeta};
 use crate::capi::convert::{
     bpc_to_bit_depth, chroma_to_pixel_layout, error_to_dav1d, film_grain_from_c,
     frame_delay_from_settings, frame_header_to_c, has_grain_c, parse_sequence_header_bytes,
@@ -109,12 +109,17 @@ impl Drop for RefInner {
     }
 }
 
-/// `Dav1dContext` iç durumu.
+/// `Dav1dContext` iç durumu (`dav1d` `src/lib.c` `c->in` / `c->out` / `c->cache` uyumlu).
 pub(crate) struct ContextInner {
     pub(crate) decoder: Decoder,
     pub(crate) allocator: Dav1dPicAllocator,
     pub(crate) all_layers: bool,
+    pub(crate) ready_pic: Option<(Frame, OutputCapiMeta)>,
     pub(crate) cached_pic: Option<(Frame, OutputCapiMeta)>,
+    pub(crate) pending_in: Dav1dData,
+    pub(crate) pending_offset: usize,
+    pub(crate) pending_tag: u64,
+    pub(crate) cached_error: c_int,
     pub(crate) drain: bool,
     pub(crate) event_flags: Dav1dEventFlags,
     pub(crate) cached_error_props: Dav1dDataProps,
@@ -124,6 +129,7 @@ pub(crate) struct ContextInner {
 
 impl Drop for ContextInner {
     fn drop(&mut self) {
+        data_unref_value(&mut self.pending_in);
         data_props_unref_value(&mut self.cached_error_props);
         while let Some((_, mut props)) = self.packet_props.pop_front() {
             data_props_unref_value(&mut props);
@@ -168,6 +174,43 @@ fn clone_data_props(src: &Dav1dDataProps) -> Dav1dDataProps {
     let mut copy = *src;
     copy.user_data.r#ref = ref_inc(src.user_data.r#ref);
     copy
+}
+
+fn clone_data_ref(src: &Dav1dData) -> Dav1dData {
+    let mut copy = *src;
+    copy.r#ref = ref_inc(src.r#ref);
+    copy.m.user_data.r#ref = ref_inc(src.m.user_data.r#ref);
+    copy
+}
+
+/// `dav1d_apply_grain` içinde `out == in_pic` veya paylaşımlı `Dav1dRef` örtüşmesine karşı
+/// giriş resminin 7 referansını işlem boyunca canlı tutan RAII koruyucusu.
+struct OwnedPictureRefs(Dav1dPicture);
+
+impl OwnedPictureRefs {
+    fn retain(src: &Dav1dPicture) -> Self {
+        let mut retained = *src;
+        retained.r#ref = ref_inc(src.r#ref);
+        retained.seq_hdr_ref = ref_inc(src.seq_hdr_ref);
+        retained.frame_hdr_ref = ref_inc(src.frame_hdr_ref);
+        retained.content_light_ref = ref_inc(src.content_light_ref);
+        retained.mastering_display_ref = ref_inc(src.mastering_display_ref);
+        retained.itut_t35_ref = ref_inc(src.itut_t35_ref);
+        retained.m.user_data.r#ref = ref_inc(src.m.user_data.r#ref);
+        Self(retained)
+    }
+
+    fn into_picture(mut self) -> Dav1dPicture {
+        let pic = self.0;
+        self.0 = Dav1dPicture::default();
+        pic
+    }
+}
+
+impl Drop for OwnedPictureRefs {
+    fn drop(&mut self) {
+        picture_unref_value(&mut self.0);
+    }
 }
 
 fn data_props_unref_value(props: &mut Dav1dDataProps) {
@@ -555,7 +598,12 @@ pub unsafe extern "C" fn dav1d_open(
                 decoder,
                 allocator: settings.allocator,
                 all_layers: settings.all_layers != 0,
+                ready_pic: None,
                 cached_pic: None,
+                pending_in: Dav1dData::default(),
+                pending_offset: 0,
+                pending_tag: 0,
+                cached_error: 0,
                 drain: false,
                 event_flags: 0,
                 cached_error_props: Dav1dDataProps::default(),
@@ -610,7 +658,217 @@ pub unsafe extern "C" fn dav1d_parse_sequence_header(
     res.unwrap_or(dav1d_err(EINVAL))
 }
 
-/// Çözücüye bir `Dav1dData` OBU paketi gönderir (`0` başarıda `in_data` referansını tüketir).
+fn is_packet_tag_referenced(ctx: &ContextInner, tag: u64) -> bool {
+    if tag == 0 {
+        return false;
+    }
+    ctx.pending_tag == tag
+        || ctx.decoder.has_pending_packet_tag(tag)
+        || ctx
+            .ready_pic
+            .as_ref()
+            .is_some_and(|(_, m)| m.packet_tag == tag)
+        || ctx
+            .cached_pic
+            .as_ref()
+            .is_some_and(|(_, m)| m.packet_tag == tag)
+}
+
+fn cleanup_unused_packet_props(ctx: &mut ContextInner, tag: u64) {
+    if tag != 0
+        && !is_packet_tag_referenced(ctx, tag)
+        && let Some(pos) = ctx.packet_props.iter().position(|(t, _)| *t == tag)
+        && let Some((_, mut unused_props)) = ctx.packet_props.remove(pos)
+    {
+        data_props_unref_value(&mut unused_props);
+    }
+}
+
+fn record_error_props_for_tag(ctx: &mut ContextInner, tag: u64, fallback: Option<&Dav1dDataProps>) {
+    if tag != 0
+        && let Some(pos) = ctx.packet_props.iter().position(|(t, _)| *t == tag)
+    {
+        let props = if is_packet_tag_referenced(ctx, tag) {
+            clone_data_props(&ctx.packet_props[pos].1)
+        } else {
+            ctx.packet_props.remove(pos).unwrap().1
+        };
+        data_props_unref_value(&mut ctx.cached_error_props);
+        ctx.cached_error_props = props;
+    } else if let Some(fb) = fallback {
+        data_props_unref_value(&mut ctx.cached_error_props);
+        ctx.cached_error_props = clone_data_props(fb);
+    }
+}
+
+fn pull_ready_nonblocking(ctx: &mut ContextInner) {
+    if ctx.ready_pic.is_some() || ctx.cached_error != 0 {
+        return;
+    }
+    match ctx.decoder.receive_frame_capi(false) {
+        Ok(Some(item)) => {
+            ctx.ready_pic = Some(item);
+        }
+        Ok(None) => {}
+        Err(err) => {
+            if let Some(tag) = ctx.decoder.last_error_packet_tag() {
+                record_error_props_for_tag(ctx, tag, None);
+            }
+            ctx.cached_error = error_to_dav1d(&err);
+        }
+    }
+}
+
+/// `dav1d` `output_picture_ready(c, drain)` (`src/lib.c:332-351`) karşılığı.
+fn output_picture_ready(ctx: &mut ContextInner, drain: bool) -> bool {
+    loop {
+        if ctx.cached_error != 0 {
+            return true;
+        }
+        pull_ready_nonblocking(ctx);
+        if ctx.cached_error != 0 {
+            return true;
+        }
+        let max_spatial_id = ctx.decoder.max_spatial_id();
+        if !ctx.all_layers && max_spatial_id > 0 {
+            if let (Some((_, ready_meta)), Some((_, cached_meta))) =
+                (ctx.ready_pic.as_ref(), ctx.cached_pic.as_ref())
+            {
+                let cached_sid = cached_meta.frame_hdr.as_ref().map_or(0, |h| h.spatial_id);
+                let ready_sid = ready_meta.frame_hdr.as_ref().map_or(0, |h| h.spatial_id);
+                let is_new_tu =
+                    ready_sid <= cached_sid || ready_meta.packet_tag != cached_meta.packet_tag;
+                if cached_sid >= max_spatial_id || is_new_tu {
+                    return true;
+                }
+                // Aynı zamansal birimde daha yüksek uzamsal katman: eski katmanı at.
+                let next = ctx.ready_pic.take();
+                if let Some((_, dropped_meta)) = ctx.cached_pic.take() {
+                    ctx.event_flags |= dropped_meta.event_flags;
+                    ctx.cached_pic = next;
+                    cleanup_unused_packet_props(ctx, dropped_meta.packet_tag);
+                } else {
+                    ctx.cached_pic = next;
+                }
+                continue;
+            }
+            if ctx.cached_pic.is_some() && drain {
+                return true;
+            }
+            if ctx.ready_pic.is_some() {
+                ctx.cached_pic = ctx.ready_pic.take();
+                continue;
+            }
+            return false;
+        }
+        return ctx.cached_pic.is_some() || ctx.ready_pic.is_some();
+    }
+}
+
+/// `dav1d` `gen_picture(c)` (`src/lib.c:412-436`) karşılığı: bekleyen girdi (`pending_in`)
+/// üzerinden çıktı hazır olana kadar OBU bazında ilerler.
+fn gen_picture(ctx: &mut ContextInner) -> c_int {
+    if output_picture_ready(ctx, false) {
+        return 0;
+    }
+
+    while !ctx.pending_in.data.is_null() && ctx.pending_offset < ctx.pending_in.sz {
+        let data_ptr = ctx.pending_in.data;
+        let data_sz = ctx.pending_in.sz;
+        let ts = ctx.pending_in.m.timestamp;
+        let tag = ctx.pending_tag;
+        let mut offset = ctx.pending_offset;
+
+        // SAFETY: (1) ISA koşulu yoktur (bekleyen girdi paketi bayt dilimi).
+        // (2) sınır: `data_ptr` null değildir ve `dav1d_send_data` girişinde `0 < data_sz <= usize::MAX / 2` doğrulanmıştır; `ctx.pending_in` tamponu bu çağrı boyunca canlı tutar.
+        // (3) hizalama/takma ad: `u8` dilimi hizalama gerektirmez ve `step_one_obu_capi` süresince salt-okunurdur.
+        let payload = unsafe { core::slice::from_raw_parts(data_ptr, data_sz) };
+        let step_res = ctx
+            .decoder
+            .step_one_obu_capi(payload, &mut offset, Some(ts), tag);
+
+        match step_res {
+            Ok(true) => {
+                ctx.pending_offset = offset;
+                if ctx.pending_offset >= ctx.pending_in.sz {
+                    data_unref_value(&mut ctx.pending_in);
+                    ctx.pending_offset = 0;
+                    ctx.pending_tag = 0;
+                    cleanup_unused_packet_props(ctx, tag);
+                }
+                if output_picture_ready(ctx, false) {
+                    break;
+                }
+            }
+            Ok(false) => {
+                data_unref_value(&mut ctx.pending_in);
+                ctx.pending_offset = 0;
+                ctx.pending_tag = 0;
+                cleanup_unused_packet_props(ctx, tag);
+                if output_picture_ready(ctx, false) {
+                    break;
+                }
+            }
+            Err(err) => {
+                let code = error_to_dav1d(&err);
+                let err_tag = ctx.decoder.last_error_packet_tag().unwrap_or(tag);
+                let fallback_props = clone_data_props(&ctx.pending_in.m);
+                data_unref_value(&mut ctx.pending_in);
+                ctx.pending_offset = 0;
+                ctx.pending_tag = 0;
+                record_error_props_for_tag(ctx, err_tag, Some(&fallback_props));
+                let mut fb_drop = fallback_props;
+                data_props_unref_value(&mut fb_drop);
+                cleanup_unused_packet_props(ctx, tag);
+                if output_picture_ready(ctx, false) {
+                    if ctx.cached_error == 0 {
+                        ctx.cached_error = code;
+                    }
+                    break;
+                }
+                return code;
+            }
+        }
+    }
+
+    0
+}
+
+fn deliver_ready_picture(ctx: &mut ContextInner, out_ref: &mut Dav1dPicture) -> c_int {
+    let max_spatial_id = ctx.decoder.max_spatial_id();
+    let item = ctx.cached_pic.take().or_else(|| ctx.ready_pic.take());
+    if !ctx.all_layers && max_spatial_id > 0 && ctx.cached_pic.is_none() {
+        ctx.cached_pic = ctx.ready_pic.take();
+    }
+    let Some((frame, meta)) = item else {
+        return dav1d_err(EAGAIN);
+    };
+    ctx.event_flags |= meta.event_flags;
+    let still_pending = is_packet_tag_referenced(ctx, meta.packet_tag);
+    let props = if let Some(pos) = ctx
+        .packet_props
+        .iter()
+        .position(|(tag, _)| *tag == meta.packet_tag)
+    {
+        if still_pending {
+            clone_data_props(&ctx.packet_props[pos].1)
+        } else {
+            ctx.packet_props.remove(pos).unwrap().1
+        }
+    } else {
+        Dav1dDataProps {
+            timestamp: frame.metadata().timestamp.unwrap_or(i64::MIN),
+            ..Dav1dDataProps::default()
+        }
+    };
+    match fill_output_picture(ctx, out_ref, &frame, &meta, props) {
+        Ok(()) => 0,
+        Err(code) => code,
+    }
+}
+
+/// Çözücüye bir `Dav1dData` OBU paketi gönderir (`0` başarıda `in_data` referansını tüketir;
+/// bekleyen giriş yuvası doluysa `in_data`ya dokunmadan `-EAGAIN` döndürür).
 ///
 /// # Safety
 ///
@@ -632,15 +890,16 @@ pub unsafe extern "C" fn dav1d_send_data(c: *mut Dav1dContext, in_data: *mut Dav
             ctx.drain = false;
         } else if data_ref.sz != 0 {
             return dav1d_err(EINVAL);
-        } else {
+        }
+
+        if !ctx.pending_in.data.is_null() {
+            return dav1d_err(EAGAIN);
+        }
+        if data_ref.data.is_null() {
             data_unref_value(data_ref);
             return 0;
         }
 
-        // SAFETY: (1) ISA koşulu yoktur (girdi paketi bayt dilimi).
-        // (2) sınır: `data_ref.data` null değildir ve `0 < data_ref.sz <= usize::MAX / 2` doğrulanmıştır.
-        // (3) hizalama/takma ad: `u8` dilimi hizalama gerektirmez ve `send_packet_capi` süresince salt-okunurdur.
-        let payload = unsafe { core::slice::from_raw_parts(data_ref.data, data_ref.sz) };
         let packet_tag = ctx.next_packet_tag;
         ctx.next_packet_tag = ctx.next_packet_tag.wrapping_add(1).max(1);
 
@@ -652,103 +911,17 @@ pub unsafe extern "C" fn dav1d_send_data(c: *mut Dav1dContext, in_data: *mut Dav
         }
         ctx.packet_props.push_back((packet_tag, retained_props));
 
-        let packet = Packet::with_timestamp(payload, data_ref.m.timestamp);
-        match ctx.decoder.send_packet_capi(&packet, packet_tag) {
-            Ok(()) => {
-                if !ctx.decoder.has_pending_packet_tag(packet_tag)
-                    && let Some(pos) = ctx.packet_props.iter().position(|(t, _)| *t == packet_tag)
-                    && let Some((_, mut unused_props)) = ctx.packet_props.remove(pos)
-                {
-                    data_props_unref_value(&mut unused_props);
-                }
-                data_unref_value(data_ref);
-                0
-            }
-            Err(err) => {
-                data_props_unref_value(&mut ctx.cached_error_props);
-                if !ctx.decoder.has_pending_packet_tag(packet_tag)
-                    && let Some(pos) = ctx.packet_props.iter().position(|(t, _)| *t == packet_tag)
-                    && let Some((_, props)) = ctx.packet_props.remove(pos)
-                {
-                    ctx.cached_error_props = props;
-                } else {
-                    ctx.cached_error_props = clone_data_props(&data_ref.m);
-                }
-                error_to_dav1d(&err)
-            }
+        ctx.pending_in = clone_data_ref(data_ref);
+        ctx.pending_offset = 0;
+        ctx.pending_tag = packet_tag;
+
+        let rc = gen_picture(ctx);
+        if rc == 0 {
+            data_unref_value(data_ref);
         }
+        rc
     }));
     res.unwrap_or(dav1d_err(EINVAL))
-}
-
-/// `dav1d` `all_layers == 0` (`src/lib.c:332-351`) uzamsal katman önbelleğini uygulayarak
-/// sıradaki C-ABI çıktı karesini döndürür.
-fn receive_next_capi_frame(
-    ctx: &mut ContextInner,
-    drain: bool,
-) -> crate::error::Result<Option<(Frame, OutputCapiMeta)>> {
-    let max_spatial_id = ctx.decoder.max_spatial_id();
-    if ctx.all_layers || max_spatial_id == 0 {
-        if let Some(cached) = ctx.cached_pic.take() {
-            return Ok(Some(cached));
-        }
-        return ctx.decoder.receive_frame_capi(drain);
-    }
-
-    loop {
-        if let Some((_, ref cached_meta)) = ctx.cached_pic {
-            let cached_sid = cached_meta.frame_hdr.as_ref().map_or(0, |h| h.spatial_id);
-            if cached_sid >= max_spatial_id {
-                return Ok(ctx.cached_pic.take());
-            }
-            match ctx.decoder.receive_frame_capi(drain)? {
-                Some((next_frame, next_meta)) => {
-                    let next_sid = next_meta.frame_hdr.as_ref().map_or(0, |h| h.spatial_id);
-                    let is_new_tu =
-                        next_sid <= cached_sid || next_meta.packet_tag != cached_meta.packet_tag;
-                    if is_new_tu {
-                        let out = ctx.cached_pic.replace((next_frame, next_meta));
-                        return Ok(out);
-                    }
-                    // Aynı zamansal birimde daha yüksek uzamsal katman: eski katmanı at.
-                    if let Some((_, dropped_meta)) = ctx.cached_pic.replace((next_frame, next_meta))
-                    {
-                        ctx.event_flags |= dropped_meta.event_flags;
-                        let tag = dropped_meta.packet_tag;
-                        let still_held = ctx.decoder.has_pending_packet_tag(tag)
-                            || ctx
-                                .cached_pic
-                                .as_ref()
-                                .is_some_and(|(_, m)| m.packet_tag == tag);
-                        if !still_held
-                            && let Some(pos) = ctx.packet_props.iter().position(|(t, _)| *t == tag)
-                            && let Some((_, mut props)) = ctx.packet_props.remove(pos)
-                        {
-                            data_props_unref_value(&mut props);
-                        }
-                    }
-                }
-                None => {
-                    // dav1d `src/lib.c:476`: `output_picture_ready(c, c->n_fc == 1)`
-                    if drain || ctx.decoder.config().effective_frame_delay() == 1 {
-                        return Ok(ctx.cached_pic.take());
-                    }
-                    return Ok(None);
-                }
-            }
-        } else {
-            match ctx.decoder.receive_frame_capi(drain)? {
-                Some((frame, meta)) => {
-                    let sid = meta.frame_hdr.as_ref().map_or(0, |h| h.spatial_id);
-                    if sid >= max_spatial_id {
-                        return Ok(Some((frame, meta)));
-                    }
-                    ctx.cached_pic = Some((frame, meta));
-                }
-                None => return Ok(None),
-            }
-        }
-    }
 }
 
 /// Çözülmüş sıradaki resmi `*out` içine yazar (`0` = kare hazır, `-EAGAIN` = yeni veri gerekli).
@@ -769,52 +942,63 @@ pub unsafe extern "C" fn dav1d_get_picture(c: *mut Dav1dContext, out: *mut Dav1d
         let drain = ctx.drain;
         ctx.drain = true;
 
-        match receive_next_capi_frame(ctx, drain) {
-            Ok(Some((frame, meta))) => {
-                ctx.event_flags |= meta.event_flags;
-                let still_pending = ctx.decoder.has_pending_packet_tag(meta.packet_tag)
-                    || ctx
-                        .cached_pic
-                        .as_ref()
-                        .is_some_and(|(_, m)| m.packet_tag == meta.packet_tag);
-                let props = if let Some(pos) = ctx
-                    .packet_props
-                    .iter()
-                    .position(|(tag, _)| *tag == meta.packet_tag)
-                {
-                    if still_pending {
-                        clone_data_props(&ctx.packet_props[pos].1)
-                    } else {
-                        ctx.packet_props.remove(pos).unwrap().1
-                    }
-                } else {
-                    Dav1dDataProps {
-                        timestamp: frame.metadata().timestamp.unwrap_or(i64::MIN),
-                        ..Dav1dDataProps::default()
-                    }
-                };
-                match fill_output_picture(ctx, out_ref, &frame, &meta, props) {
-                    Ok(()) => 0,
-                    Err(code) => code,
-                }
+        let res = gen_picture(ctx);
+        if res < 0 {
+            return res;
+        }
+
+        if ctx.cached_error != 0 {
+            let err_code = ctx.cached_error;
+            ctx.cached_error = 0;
+            return err_code;
+        }
+
+        let single_fc = ctx.decoder.config().effective_frame_delay() == 1;
+        if output_picture_ready(ctx, single_fc) {
+            if ctx.cached_error != 0 {
+                let err_code = ctx.cached_error;
+                ctx.cached_error = 0;
+                return err_code;
             }
-            Ok(None) => dav1d_err(EAGAIN),
-            Err(err) => {
-                if let Some(tag) = ctx.decoder.last_error_packet_tag()
-                    && let Some(pos) = ctx.packet_props.iter().position(|(t, _)| *t == tag)
-                {
-                    let still_pending = ctx.decoder.has_pending_packet_tag(tag);
-                    let props = if still_pending {
-                        clone_data_props(&ctx.packet_props[pos].1)
-                    } else {
-                        ctx.packet_props.remove(pos).unwrap().1
-                    };
-                    data_props_unref_value(&mut ctx.cached_error_props);
-                    ctx.cached_error_props = props;
+            return deliver_ready_picture(ctx, out_ref);
+        }
+
+        if !single_fc && drain {
+            loop {
+                match ctx.decoder.receive_frame_capi(true) {
+                    Ok(Some(item)) => {
+                        ctx.ready_pic = Some(item);
+                        if output_picture_ready(ctx, false) {
+                            if ctx.cached_error != 0 {
+                                let err_code = ctx.cached_error;
+                                ctx.cached_error = 0;
+                                return err_code;
+                            }
+                            return deliver_ready_picture(ctx, out_ref);
+                        }
+                    }
+                    Ok(None) => {
+                        if output_picture_ready(ctx, true) {
+                            if ctx.cached_error != 0 {
+                                let err_code = ctx.cached_error;
+                                ctx.cached_error = 0;
+                                return err_code;
+                            }
+                            return deliver_ready_picture(ctx, out_ref);
+                        }
+                        return dav1d_err(EAGAIN);
+                    }
+                    Err(err) => {
+                        if let Some(tag) = ctx.decoder.last_error_packet_tag() {
+                            record_error_props_for_tag(ctx, tag, None);
+                        }
+                        return error_to_dav1d(&err);
+                    }
                 }
-                error_to_dav1d(&err)
             }
         }
+
+        dav1d_err(EAGAIN)
     }));
     res.unwrap_or(dav1d_err(EINVAL))
 }
@@ -841,29 +1025,25 @@ pub unsafe extern "C" fn dav1d_apply_grain(
         if in_snapshot.frame_hdr.is_null() || in_snapshot.data[0].is_null() {
             return dav1d_err(EINVAL);
         }
+        // `out == in_pic` veya paylaşımlı `Dav1dRef` durumunda `picture_unref_value(out_ref)`
+        // çağrısının son referansı düşürüp UAF üretmesini önlemek için tüm 7 referansı önceden tut.
+        let in_guard = OwnedPictureRefs::retain(&in_snapshot);
         // SAFETY: (1) ISA koşulu yoktur (`frame_hdr` ve `seq_hdr` okuma).
-        // (2) sınır: `in_snapshot.frame_hdr` null değildir.
+        // (2) sınır: `in_snapshot.frame_hdr` null değildir ve `in_guard` tarafından canlı tutulur.
         // (3) hizalama/takma ad: başlık yapıları `#[repr(C)]` düzenindedir ve salt-okunur erişilir.
         let (fh_c, mc_identity) = unsafe {
-            let fh = &*in_snapshot.frame_hdr;
-            let mc_id = !in_snapshot.seq_hdr.is_null() && (*in_snapshot.seq_hdr).mtrx == 0;
+            let fh = &*in_guard.0.frame_hdr;
+            let mc_id = !in_guard.0.seq_hdr.is_null() && (*in_guard.0.seq_hdr).mtrx == 0;
             (*fh, mc_id)
         };
 
         if !has_grain_c(&fh_c.film_grain.data) {
             picture_unref_value(out_ref);
-            *out_ref = in_snapshot;
-            out_ref.r#ref = ref_inc(in_snapshot.r#ref);
-            out_ref.seq_hdr_ref = ref_inc(in_snapshot.seq_hdr_ref);
-            out_ref.frame_hdr_ref = ref_inc(in_snapshot.frame_hdr_ref);
-            out_ref.content_light_ref = ref_inc(in_snapshot.content_light_ref);
-            out_ref.mastering_display_ref = ref_inc(in_snapshot.mastering_display_ref);
-            out_ref.itut_t35_ref = ref_inc(in_snapshot.itut_t35_ref);
-            out_ref.m.user_data.r#ref = ref_inc(in_snapshot.m.user_data.r#ref);
+            *out_ref = in_guard.into_picture();
             return 0;
         }
 
-        let src_frame = match frame_from_c_picture(&in_snapshot) {
+        let src_frame = match frame_from_c_picture(&in_guard.0) {
             Ok(f) => f,
             Err(code) => return code,
         };
@@ -876,22 +1056,22 @@ pub unsafe extern "C" fn dav1d_apply_grain(
             Err(err) => return error_to_dav1d(&err),
         };
 
-        let props = clone_data_props(&in_snapshot.m);
+        let props = clone_data_props(&in_guard.0.m);
         let empty_meta = OutputCapiMeta::default();
         if let Err(code) = fill_output_picture(ctx, out_ref, &grained_frame, &empty_meta, props) {
             return code;
         }
-        out_ref.seq_hdr = in_snapshot.seq_hdr;
-        out_ref.seq_hdr_ref = ref_inc(in_snapshot.seq_hdr_ref);
-        out_ref.frame_hdr = in_snapshot.frame_hdr;
-        out_ref.frame_hdr_ref = ref_inc(in_snapshot.frame_hdr_ref);
-        out_ref.content_light = in_snapshot.content_light;
-        out_ref.content_light_ref = ref_inc(in_snapshot.content_light_ref);
-        out_ref.mastering_display = in_snapshot.mastering_display;
-        out_ref.mastering_display_ref = ref_inc(in_snapshot.mastering_display_ref);
-        out_ref.itut_t35 = in_snapshot.itut_t35;
-        out_ref.n_itut_t35 = in_snapshot.n_itut_t35;
-        out_ref.itut_t35_ref = ref_inc(in_snapshot.itut_t35_ref);
+        out_ref.seq_hdr = in_guard.0.seq_hdr;
+        out_ref.seq_hdr_ref = ref_inc(in_guard.0.seq_hdr_ref);
+        out_ref.frame_hdr = in_guard.0.frame_hdr;
+        out_ref.frame_hdr_ref = ref_inc(in_guard.0.frame_hdr_ref);
+        out_ref.content_light = in_guard.0.content_light;
+        out_ref.content_light_ref = ref_inc(in_guard.0.content_light_ref);
+        out_ref.mastering_display = in_guard.0.mastering_display;
+        out_ref.mastering_display_ref = ref_inc(in_guard.0.mastering_display_ref);
+        out_ref.itut_t35 = in_guard.0.itut_t35;
+        out_ref.n_itut_t35 = in_guard.0.n_itut_t35;
+        out_ref.itut_t35_ref = ref_inc(in_guard.0.itut_t35_ref);
         0
     }));
     res.unwrap_or(dav1d_err(EINVAL))
@@ -913,7 +1093,12 @@ pub unsafe extern "C" fn dav1d_flush(c: *mut Dav1dContext) {
         // (3) hizalama/takma ad: `c` münhasıran bu çağrıda değiştirilir.
         let ctx = unsafe { &mut (*c).inner };
         ctx.decoder.reset();
+        ctx.ready_pic = None;
         ctx.cached_pic = None;
+        data_unref_value(&mut ctx.pending_in);
+        ctx.pending_offset = 0;
+        ctx.pending_tag = 0;
+        ctx.cached_error = 0;
         ctx.drain = false;
         ctx.event_flags = 0;
         data_props_unref_value(&mut ctx.cached_error_props);

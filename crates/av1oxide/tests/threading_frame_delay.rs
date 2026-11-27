@@ -240,12 +240,14 @@ fn kareler_arasi_paralellik_each_ve_sendall_tum_matris_bit_ayni() {
         vec![
             root.join("crates/av1oxide/tests/fixtures/streams/Syntax_AV1_mainb8ss420_432x240_001_vq_aom_ctest_4.2.stripped.ivf"),
             root.join("crates/av1oxide/tests/fixtures/streams/Syntax_AV1_mainb8ss420_432x240_002_vq_aom_ctest_4.2.stripped.ivf"),
+            root.join("crates/av1oxide/tests/fixtures/streams/00001105.ivf"),
             root.join(".cache/dav1d-test-data/10-bit/film_grain/av1-1-b10-23-film_grain-50.ivf"),
         ]
     } else {
         vec![
             root.join("crates/av1oxide/tests/fixtures/streams/Syntax_AV1_mainb8ss420_432x240_001_vq_aom_ctest_4.2.stripped.ivf"),
             root.join("crates/av1oxide/tests/fixtures/streams/Syntax_AV1_mainb8ss420_432x240_002_vq_aom_ctest_4.2.stripped.ivf"),
+            root.join("crates/av1oxide/tests/fixtures/streams/00001105.ivf"),
             root.join(".cache/dav1d-test-data/8-bit/features/ccvb_film_grain.ivf"),
             root.join(".cache/dav1d-test-data/10-bit/film_grain/av1-1-b10-23-film_grain-50.ivf"),
         ]

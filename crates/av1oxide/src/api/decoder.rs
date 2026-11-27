@@ -651,6 +651,42 @@ impl Decoder {
         res
     }
 
+    /// C-ABI (`gen_picture`) için verilen paket diliminden tam olarak bir OBU ayırıp işler.
+    ///
+    /// - `Ok(true)`: bir OBU işlendi ve `*offset` ilerletildi.
+    /// - `Ok(false)`: dilimde işlenecek başka OBU kalmadı.
+    /// - `Err(err)`: OBU ayrıştırma veya kare çözme hatası.
+    #[cfg_attr(not(feature = "std"), allow(dead_code))]
+    pub(crate) fn step_one_obu_capi(
+        &mut self,
+        data: &[u8],
+        offset: &mut usize,
+        timestamp: Option<i64>,
+        packet_tag: u64,
+    ) -> Result<bool> {
+        if self.state != DecoderState::Ready {
+            return Err(Error::InvalidState(
+                "flush sonrası send_packet: önce reset() çağrılmalı",
+            ));
+        }
+        self.parse.current_packet_tag = packet_tag;
+        self.parse.current_packet_timestamp = timestamp;
+        let opts = ParseOpts {
+            frame_size_limit: self.config.frame_size_limit,
+            strict: self.config.strict_std_compliance,
+        };
+        let res = match split_next_with(data, offset, opts.strict) {
+            Ok(Some(obu)) => {
+                self.process_obu(&obu, opts)?;
+                Ok(true)
+            }
+            Ok(None) => Ok(false),
+            Err(err) => Err(err),
+        };
+        self.sync_shared_kalici();
+        res
+    }
+
     /// Tek OBU (dav1d `dav1d_parse_obus`, `src/obu.c:1169-1694`).
     fn process_obu(&mut self, obu: &Obu<'_>, opts: ParseOpts) -> Result<()> {
         match obu.header.obu_type {

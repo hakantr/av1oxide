@@ -899,7 +899,41 @@ fn make_infe_v2_with_encoding(
     make_full_box(b"infe", 2, 0, &body)
 }
 
+fn first_ivf_packet_00001105() -> (Vec<u8>, u32, u32) {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/streams/00001105.ivf");
+    let raw = std::fs::read(&path).expect("00001105.ivf okunmalı");
+    assert!(raw.len() > 44 && &raw[..4] == b"DKIF");
+    let w = u16::from_le_bytes([raw[12], raw[13]]) as u32;
+    let h = u16::from_le_bytes([raw[14], raw[15]]) as u32;
+    let sz = u32::from_le_bytes([raw[32], raw[33], raw[34], raw[35]]) as usize;
+    (raw[44..44 + sz].to_vec(), w, h)
+}
+
 fn build_compressed_meta_avif(
+    xmp_bytes: &[u8],
+    xmp_encoding: Option<&str>,
+    exif_bytes: &[u8],
+    exif_cmpc: Option<&[u8; 4]>,
+    use_cmin: bool,
+) -> Vec<u8> {
+    build_compressed_meta_avif_with_frame(
+        SAMPLE_1X1_AV1_OBU,
+        1,
+        1,
+        xmp_bytes,
+        xmp_encoding,
+        exif_bytes,
+        exif_cmpc,
+        use_cmin,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_compressed_meta_avif_with_frame(
+    frame_obu: &[u8],
+    width: u32,
+    height: u32,
     xmp_bytes: &[u8],
     xmp_encoding: Option<&str>,
     exif_bytes: &[u8],
@@ -920,7 +954,7 @@ fn build_compressed_meta_avif(
     iinf_body.extend_from_slice(&infe3);
     let iinf = make_full_box(b"iinf", 0, 0, &iinf_body);
 
-    let ispe = make_ispe(1, 1);
+    let ispe = make_ispe(width, height);
     let av1c = make_box(b"av1C", &[0x81, 0x00, 0x0C, 0x00]);
     let mut ipco_body = Vec::new();
     ipco_body.extend_from_slice(&ispe);
@@ -964,7 +998,7 @@ fn build_compressed_meta_avif(
     let iref = make_full_box(b"iref", 0, 0, &iref_body);
 
     let mut idat_payload = Vec::new();
-    idat_payload.extend_from_slice(SAMPLE_1X1_AV1_OBU);
+    idat_payload.extend_from_slice(frame_obu);
     let exif_off = idat_payload.len() as u32;
     idat_payload.extend_from_slice(exif_bytes);
     let xmp_off = idat_payload.len() as u32;
@@ -976,7 +1010,7 @@ fn build_compressed_meta_avif(
     iloc_body.push(0x00);
     iloc_body.extend_from_slice(&3u16.to_be_bytes());
     for (id, off, len) in [
-        (1u16, 0u32, SAMPLE_1X1_AV1_OBU.len() as u32),
+        (1u16, 0u32, frame_obu.len() as u32),
         (2u16, exif_off, exif_bytes.len() as u32),
         (3u16, xmp_off, xmp_bytes.len() as u32),
     ] {
@@ -1056,7 +1090,6 @@ fn avif_compressed_heif_metadata_cmin_and_security_limits() {
     //    limit - 1 / XMP + 1 reddi.
     let exact_xmp_len = 600_000usize;
     let live_planes_and_exif = 3usize + (orig_exif_block.len() - 4);
-    let exact_total_limit = exact_xmp_len + live_planes_and_exif;
     let payload_exact: Vec<u8> = (0..exact_xmp_len)
         .map(|i| ((i.wrapping_mul(73) ^ (i >> 5)) & 0xFF) as u8)
         .collect();
@@ -1065,6 +1098,14 @@ fn avif_compressed_heif_metadata_cmin_and_security_limits() {
     let comp_exact = enc_exact.finish().unwrap();
     let avif_exact =
         build_compressed_meta_avif(&comp_exact, Some("deflate"), orig_exif_block, None, false);
+    let container_overhead =
+        AvifPrepared::from_vec(avif_exact.clone(), &AvifDecodeConfig::default())
+            .unwrap()
+            .held_bytes()
+            - avif_exact.len()
+            - exact_xmp_len
+            - (orig_exif_block.len() - 4);
+    let exact_total_limit = exact_xmp_len + live_planes_and_exif + container_overhead;
     let img_exact = decode_with(
         &avif_exact,
         &AvifDecodeConfig {
@@ -1821,68 +1862,83 @@ fn avif_shared_budget_cmin_grid_alpha_gainmap_color_and_sequence() {
     assert_eq!(rgba.pixels.len(), (tile_w * tile_h * 4) as usize);
 
     // 3. `AvifImage` canlıyken `to_rgb8()` / `to_rgba8()` renk dönüşümü ortak `Arc<Butce>` paylaşır:
-    //    512 KiB XMP + 1x1 YUV420 (3 bayt) + Exif (exif_block.len() - 4) toplamında tek bayt hassasiyeti.
-    let color_xmp: Vec<u8> = (0usize..512 * 1024)
+    //    352×288 4:2:0 + 2 MiB XMP + Exif toplamında tek bayt hassasiyeti.
+    let (obu_352, w352, h352) = first_ivf_packet_00001105();
+    let color_xmp: Vec<u8> = (0usize..2 * 1024 * 1024)
         .map(|i| b'a' + ((i.wrapping_mul(17) ^ (i >> 4)) % 26) as u8)
         .collect();
-    let avif_color_budget = build_compressed_meta_avif(&color_xmp, None, exif_block, None, false);
-    let live_img_bytes = 3usize + (exif_block.len() - 4) + color_xmp.len();
+    let avif_color_budget = build_compressed_meta_avif_with_frame(
+        &obu_352, w352, h352, &color_xmp, None, exif_block, None, false,
+    );
+    // 00001105.ivf 352×288 8-bit Monochrome (yalnızca Y düzlemi: 352*288 = 101 376 bayt).
+    let yuv_bytes = (w352 as usize) * (h352 as usize);
+    let rgb_bytes = (w352 as usize) * (h352 as usize) * 3;
+    let rgba_bytes = (w352 as usize) * (h352 as usize) * 4;
+    let live_img_bytes = yuv_bytes + (exif_block.len() - 4) + color_xmp.len();
+    let container_overhead =
+        AvifPrepared::from_vec(avif_color_budget.clone(), &AvifDecodeConfig::default())
+            .unwrap()
+            .held_bytes()
+            - avif_color_budget.len()
+            - color_xmp.len()
+            - (exif_block.len() - 4);
+    let decode_exact_limit = live_img_bytes + container_overhead;
 
     let img_exact_only = decode_with(
         &avif_color_budget,
         &AvifDecodeConfig {
-            allocation_limit: Some(live_img_bytes),
+            allocation_limit: Some(decode_exact_limit),
             ..AvifDecodeConfig::default()
         },
     )
-    .expect("tam canlı görüntü bütçesinde decode_with geçmeli");
+    .expect("tam canlı görüntü + kapsayıcı tablosu bütçesinde decode_with geçmeli");
     assert_eq!(
         img_exact_only.to_rgb8().unwrap_err(),
         Error::BudgetExceeded {
-            requested: live_img_bytes + 3,
-            limit: live_img_bytes,
+            requested: live_img_bytes + rgb_bytes,
+            limit: decode_exact_limit,
         }
     );
 
     let img_rgb_exact = decode_with(
         &avif_color_budget,
         &AvifDecodeConfig {
-            allocation_limit: Some(live_img_bytes + 3),
+            allocation_limit: Some(live_img_bytes + rgb_bytes),
             ..AvifDecodeConfig::default()
         },
     )
-    .expect("canlı görüntü + RGB8 (3 bayt) bütçesinde decode_with geçmeli");
+    .expect("canlı görüntü + RGB8 bütçesinde decode_with geçmeli");
     assert_eq!(
         img_rgb_exact
             .to_rgb8()
             .expect("to_rgb8 tam sınırda geçmeli")
             .pixels
             .len(),
-        3
+        rgb_bytes
     );
     assert_eq!(
         img_rgb_exact.to_rgba8().unwrap_err(),
         Error::BudgetExceeded {
-            requested: live_img_bytes + 4,
-            limit: live_img_bytes + 3,
+            requested: live_img_bytes + rgba_bytes,
+            limit: live_img_bytes + rgb_bytes,
         }
     );
 
     let img_rgba_exact = decode_with(
         &avif_color_budget,
         &AvifDecodeConfig {
-            allocation_limit: Some(live_img_bytes + 4),
+            allocation_limit: Some(live_img_bytes + rgba_bytes),
             ..AvifDecodeConfig::default()
         },
     )
-    .expect("canlı görüntü + RGBA8 (4 bayt) bütçesinde decode_with geçmeli");
+    .expect("canlı görüntü + RGBA8 bütçesinde decode_with geçmeli");
     assert_eq!(
         img_rgba_exact
             .to_rgba8()
             .expect("to_rgba8 tam sınırda geçmeli")
             .pixels
             .len(),
-        4
+        rgba_bytes
     );
 
     // 4. `tmap` kazanç haritası ortak bütçesi (`decode_gain_map = false` vs `true`):
@@ -2030,16 +2086,28 @@ fn avif_direct_slice_writers_and_prepared_single_parse() {
         Err(Error::InvalidArgument(_))
     ));
 
-    // 2. Harici `dst` dilimi bütçe tüketmez: tam canlı görüntü sınırında `to_rgb8()` reddederken
-    //    `write_rgb8_into` sıfır ek bütçe ile başarıyla tamamlanmalı.
-    let xmp_pad = vec![b'X'; 512 * 1024];
+    // 2. Harici `dst` dilimi bütçe tüketmez: tam canlı görüntü + kapsayıcı sınırında `to_rgb8()`
+    //    reddederken `write_rgb8_into` sıfır ek bütçe ile başarıyla tamamlanmalı.
+    let (obu_352, w352, h352) = first_ivf_packet_00001105();
+    let xmp_pad = vec![b'X'; 2 * 1024 * 1024];
     let exif_block = b"\x00\x00\x00\x00II*\x00EXIF_DIRECT_WRITER";
-    let avif_tight = build_compressed_meta_avif(&xmp_pad, None, exif_block, None, false);
-    let live_only = 3usize + (exif_block.len() - 4) + xmp_pad.len();
+    let avif_tight = build_compressed_meta_avif_with_frame(
+        &obu_352, w352, h352, &xmp_pad, None, exif_block, None, false,
+    );
+    let yuv_bytes = (w352 as usize) * (h352 as usize);
+    let container_overhead =
+        AvifPrepared::from_vec(avif_tight.clone(), &AvifDecodeConfig::default())
+            .unwrap()
+            .held_bytes()
+            - avif_tight.len()
+            - xmp_pad.len()
+            - (exif_block.len() - 4);
+    let live_plus_container =
+        yuv_bytes + (exif_block.len() - 4) + xmp_pad.len() + container_overhead;
     let img_tight = decode_with(
         &avif_tight,
         &AvifDecodeConfig {
-            allocation_limit: Some(live_only),
+            allocation_limit: Some(live_plus_container),
             ..AvifDecodeConfig::default()
         },
     )
@@ -2048,7 +2116,7 @@ fn avif_direct_slice_writers_and_prepared_single_parse() {
         img_tight.to_rgb8(),
         Err(Error::BudgetExceeded { .. })
     ));
-    let mut direct_rgb = [0u8; 3];
+    let mut direct_rgb = vec![0u8; (w352 as usize) * (h352 as usize) * 3];
     img_tight
         .write_rgb8_into(&mut direct_rgb)
         .expect("dış dilime doğrudan yazım ek bütçe tüketmeden geçmeli");
@@ -2065,4 +2133,96 @@ fn avif_direct_slice_writers_and_prepared_single_parse() {
         .decode_with(&AvifDecodeConfig::default())
         .expect("AvifPrepared::decode_with");
     assert_eq!(prep_img, ref_img);
+}
+
+#[test]
+fn avif_container_tables_fake_counts_and_prepared_metadata_respect_budget() {
+    // 1. Sahte dev iloc extent_count (offset_size=4, length_size=4 ama 0 bayt kalmış)
+    //    veya sahte dev iref ref_count ön-tahsis yapmadan InvalidData ile reddedilmeli.
+    let ftyp = make_ftyp(b"avif", &[*b"mif1"]);
+    let hdlr = make_hdlr_pict();
+    let pitm = make_full_box(b"pitm", 0, 0, &1u16.to_be_bytes());
+    let mut bad_iloc_body = vec![0x44u8, 0x00];
+    bad_iloc_body.extend_from_slice(&1u16.to_be_bytes()); // item_count = 1
+    bad_iloc_body.extend_from_slice(&1u16.to_be_bytes()); // item_id = 1
+    bad_iloc_body.extend_from_slice(&0u16.to_be_bytes()); // data_reference_index = 0
+    bad_iloc_body.extend_from_slice(&u16::MAX.to_be_bytes()); // extent_count = 65535 (sahte)
+    let bad_iloc = make_full_box(b"iloc", 0, 0, &bad_iloc_body);
+    let mut meta_children = Vec::new();
+    meta_children.extend_from_slice(&hdlr);
+    meta_children.extend_from_slice(&pitm);
+    meta_children.extend_from_slice(&bad_iloc);
+    let mut bad_iloc_file = ftyp.clone();
+    bad_iloc_file.extend_from_slice(&make_full_box(b"meta", 0, 0, &meta_children));
+    let err = parse_info_with(
+        &bad_iloc_file,
+        &AvifDecodeConfig {
+            allocation_limit: Some(4096),
+            ..AvifDecodeConfig::default()
+        },
+    )
+    .expect_err("sahte dev iloc extent_count reddedilmeli");
+    assert!(matches!(err, Error::InvalidData(_)));
+
+    // 2. Sahte dev iref ref_count (0 bayt kalmış) ön-tahsis yapmadan reddedilmeli.
+    let mut bad_dimg = Vec::new();
+    bad_dimg.extend_from_slice(&1u16.to_be_bytes()); // from_item_id
+    bad_dimg.extend_from_slice(&u16::MAX.to_be_bytes()); // ref_count = 65535 (sahte)
+    let bad_iref = make_full_box(b"iref", 0, 0, &make_box(b"dimg", &bad_dimg));
+    let mut meta_iref = Vec::new();
+    meta_iref.extend_from_slice(&hdlr);
+    meta_iref.extend_from_slice(&pitm);
+    meta_iref.extend_from_slice(&bad_iref);
+    let mut bad_iref_file = ftyp;
+    bad_iref_file.extend_from_slice(&make_full_box(b"meta", 0, 0, &meta_iref));
+    let err_iref = parse_info_with(
+        &bad_iref_file,
+        &AvifDecodeConfig {
+            allocation_limit: Some(4096),
+            ..AvifDecodeConfig::default()
+        },
+    )
+    .expect_err("sahte dev iref ref_count reddedilmeli");
+    assert!(matches!(err_iref, Error::InvalidData(_)));
+
+    // 3. `AvifPrepared::decode_with` çözme başlamadan önce canlı ICC/Exif/XMP metaveri baytlarını
+    //    bütçeye kaydetmeli (limit < canlı metaveri ise doğrudan BudgetExceeded).
+    let big_xmp = vec![b'X'; 64 * 1024];
+    let exif_block = b"\x00\x00\x00\x00II*\x00EXIF_META_BUDGET";
+    let avif_meta = build_compressed_meta_avif(&big_xmp, None, exif_block, None, false);
+    let prepared = AvifPrepared::from_vec(avif_meta, &AvifDecodeConfig::default())
+        .expect("sınırsız AvifPrepared");
+    let err_prep = prepared
+        .clone()
+        .decode_with(&AvifDecodeConfig {
+            allocation_limit: Some(32 * 1024),
+            ..AvifDecodeConfig::default()
+        })
+        .expect_err("64 KiB canlı XMP taşıyan AvifPrepared 32 KiB bütçede reddedilmeli");
+    assert!(matches!(err_prep, Error::BudgetExceeded { .. }));
+
+    // 4. `parse_info_with` erken `max_pixels` sınırı.
+    let err_px = parse_info_with(
+        &build_compressed_meta_avif(b"<x/>", None, exif_block, None, false),
+        &AvifDecodeConfig {
+            max_pixels: 0, // 0 = sınırsız, bu geçmeli
+            ..AvifDecodeConfig::default()
+        },
+    );
+    assert!(err_px.is_ok());
+    const AV1_1X1_TEST: &[u8] = &[
+        0x12, 0x00, 0x0A, 0x09, 0x00, 0x00, 0x00, 0x00, 0x00, 0x7D, 0xFC, 0xC0, 0x20, 0x32, 0x17,
+        0x10, 0x01, 0x91, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x68, 0xD2, 0x16,
+        0x8C, 0x64, 0xBE, 0x2E, 0xC7, 0xDA, 0xEE, 0x96,
+    ];
+    let grid_avif = build_grid_and_alpha_avif(AV1_1X1_TEST, 1, 1, 2, 2);
+    let err_grid_px = parse_info_with(
+        &grid_avif,
+        &AvifDecodeConfig {
+            max_pixels: 3, // 2x2 = 4 > 3
+            ..AvifDecodeConfig::default()
+        },
+    )
+    .expect_err("2x2 AVIF max_pixels=3 ile parse_info_with aşamasında reddedilmeli");
+    assert!(matches!(err_grid_px, Error::BudgetExceeded { .. }));
 }

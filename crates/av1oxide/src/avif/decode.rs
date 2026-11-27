@@ -223,6 +223,7 @@ fn inspect_item_dimensions(
     item_id: u32,
     depth: usize,
     butce: &Arc<Butce>,
+    config: &AvifDecodeConfig,
 ) -> Result<InspectedItem> {
     if depth > 8 {
         return Err(Error::InvalidData(
@@ -338,7 +339,7 @@ fn inspect_item_dimensions(
                     "grid dimg referans sayısı rows*cols ile uyuşmuyor",
                 ));
             }
-            let tile_info = inspect_item_dimensions(container, tiles[0], depth + 1, butce)?;
+            let tile_info = inspect_item_dimensions(container, tiles[0], depth + 1, butce, config)?;
             if seq_color.is_none() {
                 seq_color = tile_info.seq_color;
             }
@@ -357,7 +358,8 @@ fn inspect_item_dimensions(
                     "iden öğesi tek bir dimg referansı içermelidir",
                 ));
             }
-            let target_info = inspect_item_dimensions(container, targets[0], depth + 1, butce)?;
+            let target_info =
+                inspect_item_dimensions(container, targets[0], depth + 1, butce, config)?;
             if seq_color.is_none() {
                 seq_color = target_info.seq_color;
             }
@@ -373,6 +375,7 @@ fn inspect_item_dimensions(
 
     let raw_width = w;
     let raw_height = h;
+    check_pixel_and_byte_budget(raw_width, raw_height, 0, config)?;
 
     // MIAF dönüşüm sırası: önce clap, sonra irot, sonra imir.
     if let Some(clap) = clap_opt {
@@ -385,6 +388,7 @@ fn inspect_item_dimensions(
     {
         core::mem::swap(&mut w, &mut h);
     }
+    check_pixel_and_byte_budget(w, h, 0, config)?;
 
     Ok(InspectedItem {
         width: w,
@@ -776,20 +780,25 @@ pub fn parse_info(data: &[u8]) -> Result<AvifInfo> {
 /// bellek bütçesi üzerinden denetlenir.
 pub fn parse_info_with(data: &[u8], config: &AvifDecodeConfig) -> Result<AvifInfo> {
     let butce = Arc::new(Butce::yeni(config.allocation_limit, 0));
-    parse_info_with_budget(data, &butce)
+    parse_info_with_budget(data, &butce, config)
 }
 
-pub(crate) fn parse_info_with_budget(data: &[u8], butce: &Arc<Butce>) -> Result<AvifInfo> {
+pub(crate) fn parse_info_with_budget(
+    data: &[u8],
+    butce: &Arc<Butce>,
+    config: &AvifDecodeConfig,
+) -> Result<AvifInfo> {
     let container = parse_container(data, butce)?;
-    parse_info_from_container(&container, butce)
+    parse_info_from_container(&container, butce, config)
 }
 
 fn parse_info_from_container(
     container: &AvifContainer<'_>,
     butce: &Arc<Butce>,
+    config: &AvifDecodeConfig,
 ) -> Result<AvifInfo> {
     let primary_id = container.primary_item_id;
-    let inspected = inspect_item_dimensions(container, primary_id, 0, butce)?;
+    let inspected = inspect_item_dimensions(container, primary_id, 0, butce, config)?;
 
     let props = container.item_properties(primary_id)?;
     let mut color = inspected.seq_color.unwrap_or_default();
@@ -887,7 +896,7 @@ impl AvifPrepared {
     pub fn from_vec(raw_bytes: Vec<u8>, config: &AvifDecodeConfig) -> Result<Self> {
         let butce = Arc::new(Butce::yeni(config.allocation_limit, 0));
         let container = parse_container_owned(raw_bytes, &butce)?;
-        let info = parse_info_from_container(&container, &butce)?;
+        let info = parse_info_from_container(&container, &butce, config)?;
         Ok(Self { container, info })
     }
 
@@ -915,10 +924,17 @@ impl AvifPrepared {
     /// Önceden ayrıştırılmış kapsayıcıyı yeniden ayrıştırmadan pikselleri çözer ve ham girdiyi bırakır.
     pub fn decode_with(self, config: &AvifDecodeConfig) -> Result<AvifImage> {
         let butce = Arc::new(Butce::yeni(config.allocation_limit, 0));
-        // Halihazırda kapsayıcıda canlı tutulan sahipli baytları (`cmin`/`idat`/`ipco`) yeni
-        // bütçe tavanına kaydet; bu nesne fonksiyon sonunda bırakılınca iade edilir.
+        // Halihazırda kapsayıcıda canlı tutulan sahipli baytları (`cmin`/`idat`/`ipco`/tablolar)
+        // ve çözme boyunca canlı kalacak üst veri baytlarını (`ICC`/`Exif`/`XMP`/`alt_icc`)
+        // piksel çözümü başlamadan önce ortak bütçe tavanına kaydet.
         let _container_carry = Butce::tut(&butce, self.container.owned_bytes())?;
-        decode_from_container(&self.container, config, butce, Some(self.info))
+        let info_carry = Butce::tut(&butce, info_metadata_bytes(&self.info))?;
+        decode_from_container(
+            &self.container,
+            config,
+            butce,
+            Some((self.info, info_carry)),
+        )
     }
 }
 
@@ -2039,7 +2055,7 @@ fn decode_from_container(
     container: &AvifContainer<'_>,
     config: &AvifDecodeConfig,
     butce: Arc<Butce>,
-    mut cached_info: Option<AvifInfo>,
+    mut cached_info: Option<(AvifInfo, ButceTutucu)>,
 ) -> Result<AvifImage> {
     let primary_id = container.primary_item_id;
 
@@ -2061,7 +2077,7 @@ fn decode_from_container(
     let mut mdcv = None;
     let mut pasp = None;
 
-    if let Some(ref mut ci) = cached_info {
+    if let Some((ref mut ci, _)) = cached_info {
         for (p, _) in props {
             match p {
                 ItemProperty::ColrNclx(c) => color = *c,
@@ -2071,10 +2087,7 @@ fn decode_from_container(
                 _ => {}
             }
         }
-        if let Some(icc) = ci.icc_profile.take() {
-            img_guard.ekle(icc.len())?;
-            icc_profile = Some(icc);
-        }
+        icc_profile = ci.icc_profile.take();
     } else {
         for (p, _) in props {
             match p {
@@ -2153,16 +2166,8 @@ fn decode_from_container(
         None
     };
 
-    let (exif, xmp) = if let Some(ref mut ci) = cached_info {
-        let ex = ci.exif.take();
-        if let Some(ref v) = ex {
-            img_guard.ekle(v.len())?;
-        }
-        let xm = ci.xmp.take();
-        if let Some(ref v) = xm {
-            img_guard.ekle(v.len())?;
-        }
-        (ex, xm)
+    let (exif, xmp) = if let Some((ref mut ci, _)) = cached_info {
+        (ci.exif.take(), ci.xmp.take())
     } else {
         let (ex, xm, meta_guard) = extract_metadata_items(container, primary_id, &butce)?;
         img_guard.birlestir(meta_guard);
@@ -2173,18 +2178,18 @@ fn decode_from_container(
     // ISO 21496-1 `tmap` üst veri ayrıştırması ve normatif doğrulaması her zaman yürütülür;
     // kazanç haritası pikselleri yalnızca `config.decode_gain_map == true` olduğunda çözülür.
     let (gain_map_metadata, gain_map) = if !config.decode_gain_map
-        && let Some(ref mut ci) = cached_info
+        && let Some((ref mut ci, _)) = cached_info
     {
-        let gm_meta = ci.gain_map_metadata.take();
-        if let Some(ref m) = gm_meta
-            && let Some(ref alt_icc) = m.alt_icc_profile
-        {
-            img_guard.ekle(alt_icc.len())?;
-        }
-        (gm_meta, None)
+        (ci.gain_map_metadata.take(), None)
     } else {
+        if let Some((ref mut ci, ref mut info_carry)) = cached_info
+            && let Some(dropped_gm) = ci.gain_map_metadata.take()
+            && let Some(ref alt_icc) = dropped_gm.alt_icc_profile
+        {
+            info_carry.dusur(alt_icc.len());
+        }
         let (base_raw_w, base_raw_h) =
-            match inspect_item_dimensions(container, primary_id, 0, &butce) {
+            match inspect_item_dimensions(container, primary_id, 0, &butce, config) {
                 Ok(ins) => (ins.raw_width, ins.raw_height),
                 Err(err @ (Error::BudgetExceeded { .. } | Error::AllocationFailed { .. })) => {
                     return Err(err);
@@ -2259,6 +2264,10 @@ fn decode_from_container(
             (None, None)
         }
     };
+
+    if let Some((_, info_carry)) = cached_info {
+        img_guard.birlestir(info_carry);
+    }
 
     Ok(AvifImage {
         width: color_buf.width,
