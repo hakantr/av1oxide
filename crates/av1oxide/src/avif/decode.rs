@@ -12,9 +12,7 @@ use crate::avif::boxes::{
     ALPHA_AUX_URN_CICP, ALPHA_AUX_URN_HEVC, Av1CProperty, AvifContainer, ItemProperty,
     parse_container, parse_container_owned,
 };
-use crate::avif::gainmap::{
-    GainMap, GainMapMetadata, ToneMapParseOutcome, parse_tone_mapped_image_box,
-};
+use crate::avif::gainmap::{GainMap, GainMapMetadata, parse_tone_mapped_image_box};
 use crate::avif::image::{
     AvifDecodeConfig, AvifImage, AvifInfo, CleanAperture, ColorInfo, PlaneStorage, RgbImage,
     RgbaImage,
@@ -243,7 +241,7 @@ fn inspect_item_dimensions(
     let mut clap_opt: Option<&CleanAperture> = None;
     let mut irot_opt: Option<u8> = None;
 
-    for (p, _) in &props {
+    for (p, _) in props {
         match p {
             ItemProperty::Ispe { width, height } => {
                 if *width == 0 || *height == 0 {
@@ -329,18 +327,22 @@ fn inspect_item_dimensions(
             (iw, ih, bd, cf)
         }
         b"grid" => {
-            let (grid_bytes, _grid_guard) = container.resolve_item_data(item_id, butce)?;
+            let (grid_bytes, grid_guard) = container.resolve_item_data(item_id, butce)?;
             let grid = parse_grid_descriptor(&grid_bytes)?;
-            let tiles = container.references_from(item_id, b"dimg");
+            drop((grid_bytes, grid_guard));
+            let mut tiles = container.references_from(item_id, b"dimg");
+            let tile_count = tiles.clone().count();
             let expected = (grid.rows as usize)
                 .checked_mul(grid.cols as usize)
                 .ok_or(Error::InvalidData("grid karo sayısı taşması"))?;
-            if tiles.len() != expected || tiles.is_empty() {
+            if tile_count != expected || tile_count == 0 {
                 return Err(Error::InvalidData(
                     "grid dimg referans sayısı rows*cols ile uyuşmuyor",
                 ));
             }
-            let tile_info = inspect_item_dimensions(container, tiles[0], depth + 1, butce, config)?;
+            let first_tile = tiles.next().unwrap();
+            let tile_info =
+                inspect_item_dimensions(container, first_tile, depth + 1, butce, config)?;
             if seq_color.is_none() {
                 seq_color = tile_info.seq_color;
             }
@@ -353,14 +355,14 @@ fn inspect_item_dimensions(
             )
         }
         b"iden" => {
-            let targets = container.references_from(item_id, b"dimg");
-            if targets.len() != 1 {
+            let mut targets = container.references_from(item_id, b"dimg");
+            let (Some(target_0), None) = (targets.next(), targets.next()) else {
                 return Err(Error::InvalidData(
                     "iden öğesi tek bir dimg referansı içermelidir",
                 ));
-            }
+            };
             let target_info =
-                inspect_item_dimensions(container, targets[0], depth + 1, butce, config)?;
+                inspect_item_dimensions(container, target_0, depth + 1, butce, config)?;
             if seq_color.is_none() {
                 seq_color = target_info.seq_color;
             }
@@ -436,23 +438,24 @@ fn find_alpha_source(
     };
     if &info.item_type == b"grid" {
         let tile_ids = container.references_from(primary_id, b"dimg");
-        if tile_ids.is_empty() {
+        let tile_count = tile_ids.clone().count();
+        if tile_count == 0 {
             return Ok(None);
         }
-        let bytes = tile_ids
-            .len()
-            .checked_mul(core::mem::size_of::<u32>())
-            .ok_or(Error::SizeOverflow {
-                stage: SizeStage::TotalAllocation,
-                lhs: tile_ids.len(),
-                rhs: core::mem::size_of::<u32>(),
-            })?;
+        let bytes =
+            tile_count
+                .checked_mul(core::mem::size_of::<u32>())
+                .ok_or(Error::SizeOverflow {
+                    stage: SizeStage::TotalAllocation,
+                    lhs: tile_count,
+                    rhs: core::mem::size_of::<u32>(),
+                })?;
         let guard = Butce::tut(butce, bytes)?;
         let mut alpha_tiles: Vec<u32> = Vec::new();
         alpha_tiles
-            .try_reserve_exact(tile_ids.len())
+            .try_reserve_exact(tile_count)
             .map_err(|_| Error::AllocationFailed { requested: bytes })?;
-        for &tid in &tile_ids {
+        for tid in tile_ids {
             if let Some(aid) = find_direct_alpha_item(container, tid)? {
                 alpha_tiles.push(aid);
             } else {
@@ -487,12 +490,15 @@ fn is_premultiplied_alpha(
             first
         }
     };
-    let from_primary = container.references_from(primary_id, b"prem");
-    if from_primary.contains(&alpha_id) {
+    if container
+        .references_from(primary_id, b"prem")
+        .any(|id| id == alpha_id)
+    {
         return true;
     }
-    let to_primary = container.references_to(primary_id, b"prem");
-    to_primary.contains(&alpha_id)
+    container
+        .references_to(primary_id, b"prem")
+        .any(|id| id == alpha_id)
 }
 
 pub(crate) type MetadataBundle = (Option<Vec<u8>>, Option<Vec<u8>>, ButceTutucu);
@@ -613,24 +619,33 @@ fn find_and_validate_tmap(
         }
         if !container.item_has_data(item.item_id)
             || container.has_unsupported_essential_property(item.item_id)?
-            || !container.references_from(item.item_id, b"thmb").is_empty()
+            || container
+                .references_from(item.item_id, b"thmb")
+                .next()
+                .is_some()
         {
             continue;
         }
-        let dimg_ids = container.references_from(item.item_id, b"dimg");
-        if dimg_ids.len() != 2
-            || dimg_ids[0] == dimg_ids[1]
-            || container.item_info(dimg_ids[0]).is_none()
-            || container.item_info(dimg_ids[1]).is_none()
+        let mut dimg_ids = container.references_from(item.item_id, b"dimg");
+        let (Some(dimg_0), Some(dimg_1), None) =
+            (dimg_ids.next(), dimg_ids.next(), dimg_ids.next())
+        else {
+            return Err(Error::InvalidData(
+                "tmap dimg referansları tam olarak 2 farklı geçerli öğe içermelidir",
+            ));
+        };
+        if dimg_0 == dimg_1
+            || container.item_info(dimg_0).is_none()
+            || container.item_info(dimg_1).is_none()
         {
             return Err(Error::InvalidData(
                 "tmap dimg referansları tam olarak 2 farklı geçerli öğe içermelidir",
             ));
         }
-        if dimg_ids[0] != primary_id {
+        if dimg_0 != primary_id {
             continue;
         }
-        found = Some((item.item_id, dimg_ids[1]));
+        found = Some((item.item_id, dimg_1));
         break;
     }
 
@@ -644,9 +659,8 @@ fn find_and_validate_tmap(
     }
 
     let (tmap_data, _tmap_data_guard) = container.resolve_item_data(tmap_id, butce)?;
-    let mut metadata = match parse_tone_mapped_image_box(&tmap_data)? {
-        ToneMapParseOutcome::Parsed(m) => *m,
-        ToneMapParseOutcome::UnsupportedVersion => return Ok(None),
+    let Some(mut metadata) = parse_tone_mapped_image_box(&tmap_data)? else {
+        return Ok(None);
     };
     drop((tmap_data, _tmap_data_guard));
 
@@ -666,7 +680,7 @@ fn find_and_validate_tmap(
     let mut seen_alt_nclx = false;
     let mut seen_alt_icc = false;
     let mut tmap_guard = ButceTutucu::bos(butce);
-    for (p, _) in &tmap_props {
+    for (p, _) in tmap_props {
         match p {
             ItemProperty::Ispe { width, height } => {
                 tmap_ispe = Some((*width, *height));
@@ -727,7 +741,7 @@ fn find_and_validate_tmap(
     // Kazanç haritası öğesinde birden fazla `colr nclx` olmamalı (`libavif` `avifReadColorNclxProperty`).
     let gm_props = container.item_properties(gain_map_item_id)?;
     let mut seen_gm_nclx = false;
-    for (p, _) in &gm_props {
+    for (p, _) in gm_props {
         if matches!(p, ItemProperty::ColrNclx(_)) {
             if seen_gm_nclx {
                 return Err(Error::InvalidData(
@@ -796,7 +810,7 @@ pub fn parse_info(data: &[u8]) -> Result<AvifInfo> {
 /// `cmin`/`infe` sıkıştırma açma, `idat`, `ICC`, `Exif`, `XMP` ve `tmap` üst verisi ortak
 /// bellek bütçesi üzerinden denetlenir.
 pub fn parse_info_with(data: &[u8], config: &AvifDecodeConfig) -> Result<AvifInfo> {
-    let butce = Arc::new(Butce::yeni(config.allocation_limit, 0));
+    let butce = Butce::yeni_arc(config.allocation_limit, 0)?;
     parse_info_with_budget(data, &butce, config)
 }
 
@@ -845,7 +859,9 @@ fn parse_info_from_container(
 
     let alpha_src_opt = find_alpha_source(container, primary_id, butce)?;
     let alpha_src = alpha_src_opt.as_ref().map(|(s, _)| s);
+    let has_alpha = alpha_src.is_some();
     let premultiplied_alpha = is_premultiplied_alpha(container, primary_id, alpha_src);
+    drop(alpha_src_opt);
     let (exif, xmp, meta_guard) = extract_metadata_items(container, primary_id, butce)?;
     _info_guard.birlestir(meta_guard);
     let gain_map_metadata = find_and_validate_tmap(
@@ -865,7 +881,7 @@ fn parse_info_from_container(
         height: inspected.height,
         bit_depth: inspected.bit_depth,
         chroma_format: inspected.chroma_format,
-        has_alpha: alpha_src.is_some(),
+        has_alpha,
         premultiplied_alpha,
         color,
         icc_profile,
@@ -912,16 +928,7 @@ impl AvifPrepared {
     /// kapsayıcı ve başlık tahsislerini (`cmin`/`infe` açma, `idat`, `ICC`/`Exif`/`XMP`, `tmap`)
     /// sınırlar; toplam uçtan uca tavan isteniyorsa `limit - raw_bytes.len()` geçirilmelidir.
     pub fn from_vec(raw_bytes: Vec<u8>, config: &AvifDecodeConfig) -> Result<Self> {
-        let base = crate::avif::boxes::container_base_overhead();
-        if let Some(limit) = config.allocation_limit
-            && limit < base
-        {
-            return Err(Error::BudgetExceeded {
-                requested: base,
-                limit,
-            });
-        }
-        let butce = Arc::new(Butce::yeni(config.allocation_limit, 0));
+        let butce = Butce::yeni_arc(config.allocation_limit, 0)?;
         let container = parse_container_owned(raw_bytes, &butce)?;
         let info = parse_info_from_container(&container, &butce, config)?;
         Ok(Self { container, info })
@@ -956,18 +963,21 @@ impl AvifPrepared {
 
     /// Önceden ayrıştırılmış kapsayıcıyı yeniden ayrıştırmadan pikselleri çözer ve ham girdiyi bırakır.
     pub fn decode_with(self, config: &AvifDecodeConfig) -> Result<AvifImage> {
-        let butce = Arc::new(Butce::yeni(config.allocation_limit, 0));
+        let butce = Butce::yeni_arc(config.allocation_limit, 0)?;
         // Halihazırda kapsayıcıda canlı tutulan sahipli baytları (`cmin`/`idat`/`ipco`/tablolar)
         // ve çözme boyunca canlı kalacak üst veri baytlarını (`ICC`/`Exif`/`XMP`/`alt_icc`)
         // piksel çözümü başlamadan önce ortak bütçe tavanına kaydet.
         let _container_carry = Butce::tut(&butce, self.container.owned_bytes())?;
         let info_carry = Butce::tut(&butce, info_metadata_bytes(&self.info))?;
-        decode_from_container(
+        let img = decode_from_container(
             &self.container,
             config,
-            butce,
+            Arc::clone(&butce),
             Some((self.info, info_carry)),
-        )
+        )?;
+        drop((_container_carry, self.container));
+        butce.taban_guncelle(0);
+        Ok(img)
     }
 }
 
@@ -1110,7 +1120,7 @@ fn decode_av01_item(
     let mut a1lx_opt: Option<[usize; 3]> = None;
     let mut has_ispe = false;
 
-    for (p, _) in &props {
+    for (p, _) in props {
         match p {
             ItemProperty::Av1C(av1c) => av1c_opt = Some(av1c),
             ItemProperty::A1op(op) => operating_point = *op,
@@ -1205,6 +1215,11 @@ fn decode_av01_item(
         operating_point,
         ..Config::default()
     };
+    const AV1_DECODER_INSTANCE_OVERHEAD_BYTES: usize = 4096;
+    let _decoder_guard = Butce::tut(
+        butce,
+        AV1_DECODER_INSTANCE_OVERHEAD_BYTES.saturating_add(decode_payload.len()),
+    )?;
     let mut decoder = Decoder::new_with_shared_budget(dec_config, Arc::clone(butce))?;
 
     if let Some(av1c) = av1c_opt
@@ -1241,6 +1256,7 @@ fn decode_av01_item(
     });
     // Çözücü ve girdi yükü artık gerekli değil; düzlem kopyalamasından önce bütçeyi iade et.
     drop(decoder);
+    drop(_decoder_guard);
     drop((payload, payload_guard));
     let _frame_guard = Butce::tut(butce, frame.allocation_bytes())?;
 
@@ -2188,8 +2204,11 @@ fn decode_grid_item(
     let (grid_bytes, grid_guard) = container.resolve_item_data(item_id, butce)?;
     let grid = parse_grid_descriptor(&grid_bytes)?;
     drop((grid_bytes, grid_guard));
-    let tile_ids = container.references_from(item_id, b"dimg");
-    decode_grid_tiles_into_canvas(container, grid, &tile_ids, config, is_alpha, depth, butce)
+    let (tile_ids, tile_ids_guard) = container.references_from_slice(item_id, b"dimg", butce)?;
+    let res =
+        decode_grid_tiles_into_canvas(container, grid, &tile_ids, config, is_alpha, depth, butce);
+    drop((tile_ids, tile_ids_guard));
+    res
 }
 
 fn decode_item_planar(
@@ -2221,15 +2240,15 @@ fn decode_item_planar(
         )?,
         b"grid" => decode_grid_item(container, item_id, config, is_alpha, depth, butce)?,
         b"iden" => {
-            let targets = container.references_from(item_id, b"dimg");
-            if targets.len() != 1 {
+            let mut targets = container.references_from(item_id, b"dimg");
+            let (Some(target_0), None) = (targets.next(), targets.next()) else {
                 return Err(Error::InvalidData(
                     "iden öğesi tek bir dimg referansı içermelidir",
                 ));
-            }
+            };
             decode_item_planar(
                 container,
-                targets[0],
+                target_0,
                 config,
                 threads_for_item,
                 is_alpha,
@@ -2241,7 +2260,7 @@ fn decode_item_planar(
     };
 
     let props = container.item_properties(item_id)?;
-    for (p, _) in &props {
+    for (p, _) in props {
         if let ItemProperty::Ispe { width, height } = p
             && (*width < buf.width || *height < buf.height)
         {
@@ -2262,7 +2281,7 @@ pub fn decode(data: &[u8]) -> Result<AvifImage> {
 
 /// Belirtilen [`AvifDecodeConfig`] yapılandırması ile bir `.avif` bayt dilimini çözer.
 pub fn decode_with(data: &[u8], config: &AvifDecodeConfig) -> Result<AvifImage> {
-    let butce = Arc::new(Butce::yeni(config.allocation_limit, 0));
+    let butce = Butce::yeni_arc(config.allocation_limit, 0)?;
     decode_with_budget(data, config, butce)
 }
 
@@ -2272,7 +2291,10 @@ pub(crate) fn decode_with_budget(
     butce: Arc<Butce>,
 ) -> Result<AvifImage> {
     let container = parse_container(data, &butce)?;
-    decode_from_container(&container, config, butce, None)
+    let img = decode_from_container(&container, config, Arc::clone(&butce), None)?;
+    drop(container);
+    butce.taban_guncelle(0);
+    Ok(img)
 }
 
 fn decode_from_container(
@@ -2343,7 +2365,7 @@ fn decode_from_container(
                     decode_item_planar(container, *aid, config, config.n_threads, true, 0, &butce)?;
                 // libavif uyumu: alfa öğesinin kendi irot/imir/clap dönüşümleri dikkate alınmaz,
                 // birincil öğenin dönüşümleri birincil görüntü ile birlikte alfa düzlemine de uygulanır.
-                let alpha_has_transforms = container.item_properties(*aid)?.iter().any(|(p, _)| {
+                let alpha_has_transforms = container.item_properties(*aid)?.any(|(p, _)| {
                     matches!(
                         p,
                         ItemProperty::Clap(_) | ItemProperty::Irot(_) | ItemProperty::Imir(_)
@@ -2390,6 +2412,7 @@ fn decode_from_container(
     } else {
         None
     };
+    drop(alpha_src_opt);
 
     let (exif, xmp) = if let Some((ref mut ci, _)) = cached_info {
         (ci.exif.take(), ci.xmp.take())

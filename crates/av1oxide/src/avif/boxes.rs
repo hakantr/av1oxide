@@ -11,13 +11,13 @@ use alloc::vec::Vec;
 use std::io::Read;
 
 #[cfg(feature = "std")]
-use flate2::read::{DeflateDecoder, GzDecoder, ZlibDecoder};
+use flate2::bufread::{DeflateDecoder, GzDecoder, ZlibDecoder};
 
 use crate::avif::image::{
     CleanAperture, ColorInfo, ContentLightLevel, MasteringDisplay, PixelAspectRatio,
 };
 use crate::error::{Error, Result};
-use crate::frame::butce::{Butce, ButceTutucu, kopya_vec};
+use crate::frame::butce::{Butce, ButceTutucu, arc_alloc_bytes, kopya_vec};
 
 /// AVIF / HEIF dosya imzasında kabul edilen `ftyp` marka kodları.
 const SUPPORTED_BRANDS: &[[u8; 4]] = &[
@@ -191,10 +191,16 @@ const ZIP_BOMB_THRESHOLD_BYTES: usize = 64 * 1024;
 #[cfg(feature = "std")]
 const MAX_EXPANSION_RATIO: usize = 1024;
 
+/// `flate2::bufread` açıcılarının (`ZlibDecoder` / `DeflateDecoder` / `GzDecoder`) iç `InflateState`
+/// (`~43,3 KiB`) ve başlık durumu için ayırdığı yığın belleği üst sınırı (`48 KiB`).
+#[cfg(feature = "std")]
+pub(crate) const FLATE2_DECOMPRESS_STATE_BYTES: usize = 48 * 1024;
+
 #[cfg(feature = "std")]
 fn decompress_bounded<R: Read>(
     mut reader: R,
     compressed_len: usize,
+    state_guard: ButceTutucu,
     butce: &Arc<Butce>,
 ) -> Result<(Vec<u8>, ButceTutucu)> {
     let ratio_limit = compressed_len
@@ -207,8 +213,10 @@ fn decompress_bounded<R: Read>(
 
     loop {
         let budget_rem = butce.kalan();
+        let free_in_out = out.capacity() - out.len();
+        let max_new = budget_rem.map_or(usize::MAX, |r| free_in_out.saturating_add(r));
         let cap_rem = hard_cap.saturating_sub(out.len());
-        let step_limit = budget_rem.map_or(cap_rem, |r| cap_rem.min(r));
+        let step_limit = cap_rem.min(max_new);
         if step_limit == 0 {
             let mut probe = [0u8; 1];
             let extra = reader.read(&mut probe).map_err(|_| {
@@ -233,11 +241,38 @@ fn decompress_bounded<R: Read>(
         if n == 0 {
             break;
         }
-        guard.ekle(n)?;
-        let new_len = out.len().saturating_add(n);
-        out.try_reserve(n)
-            .map_err(|_| Error::AllocationFailed { requested: new_len })?;
+        if out.capacity() - out.len() < n {
+            let needed = out.len().saturating_add(n);
+            let max_allowed_cap = out
+                .capacity()
+                .saturating_add(budget_rem.unwrap_or(hard_cap))
+                .min(hard_cap);
+            let target_cap = out
+                .capacity()
+                .saturating_mul(2)
+                .max(256)
+                .min(max_allowed_cap)
+                .max(needed);
+            let add_cap = target_cap - out.capacity();
+            guard.ekle(add_cap)?;
+            out.try_reserve_exact(target_cap - out.len()).map_err(|_| {
+                guard.dusur(add_cap);
+                Error::AllocationFailed {
+                    requested: target_cap,
+                }
+            })?;
+        }
         out.extend_from_slice(&chunk[..n]);
+    }
+    drop(reader);
+    drop(state_guard);
+    if out.capacity() > out.len() {
+        let old_cap = out.capacity();
+        out.shrink_to_fit();
+        let saved = old_cap.saturating_sub(out.capacity());
+        if saved > 0 {
+            guard.dusur(saved);
+        }
     }
     Ok((out, guard))
 }
@@ -248,7 +283,13 @@ fn decompress_zlib(
     orig_compressed_len: usize,
     butce: &Arc<Butce>,
 ) -> Result<(Vec<u8>, ButceTutucu)> {
-    decompress_bounded(ZlibDecoder::new(data), orig_compressed_len, butce)
+    let state_guard = Butce::tut(butce, FLATE2_DECOMPRESS_STATE_BYTES)?;
+    decompress_bounded(
+        ZlibDecoder::new(data),
+        orig_compressed_len,
+        state_guard,
+        butce,
+    )
 }
 
 #[cfg(feature = "std")]
@@ -257,7 +298,13 @@ fn decompress_deflate(
     orig_compressed_len: usize,
     butce: &Arc<Butce>,
 ) -> Result<(Vec<u8>, ButceTutucu)> {
-    decompress_bounded(DeflateDecoder::new(data), orig_compressed_len, butce)
+    let state_guard = Butce::tut(butce, FLATE2_DECOMPRESS_STATE_BYTES)?;
+    decompress_bounded(
+        DeflateDecoder::new(data),
+        orig_compressed_len,
+        state_guard,
+        butce,
+    )
 }
 
 #[cfg(feature = "std")]
@@ -266,7 +313,13 @@ fn decompress_gzip(
     orig_compressed_len: usize,
     butce: &Arc<Butce>,
 ) -> Result<(Vec<u8>, ButceTutucu)> {
-    decompress_bounded(GzDecoder::new(data), orig_compressed_len, butce)
+    let state_guard = Butce::tut(butce, FLATE2_DECOMPRESS_STATE_BYTES)?;
+    decompress_bounded(
+        GzDecoder::new(data),
+        orig_compressed_len,
+        state_guard,
+        butce,
+    )
 }
 
 pub(crate) fn decompress_by_fourcc(
@@ -625,17 +678,6 @@ pub(crate) fn parse_meta_box<'a>(
     )
 }
 
-/// `AvifContainer` ayrıştırıcısının `Arc<Butce>` (`CachePadded` hizalaması dâhil) ve
-/// `Arc<ButceTutucu>` için harcadığı sabit taban yığın maliyeti.
-#[inline]
-pub(crate) fn container_base_overhead() -> usize {
-    let arc_hdr_butce = core::mem::align_of::<Butce>().max(2 * core::mem::size_of::<usize>());
-    let arc_butce = core::mem::size_of::<Butce>().saturating_add(arc_hdr_butce);
-    let arc_hdr_guard = core::mem::align_of::<ButceTutucu>().max(2 * core::mem::size_of::<usize>());
-    let arc_guard = core::mem::size_of::<ButceTutucu>().saturating_add(arc_hdr_guard);
-    arc_butce.saturating_add(arc_guard)
-}
-
 fn parse_meta_box_cow<'a>(
     file_data: Cow<'a, [u8]>,
     meta_src: MetaSource,
@@ -669,8 +711,6 @@ fn parse_meta_box_cow<'a>(
             g
         }
     };
-    // `Arc<Butce>` (`CachePadded` hizalaması dâhil) ve `Arc<ButceTutucu>` taban maliyeti.
-    container_guard.ekle(container_base_overhead())?;
     let mut has_hdlr = false;
 
     {
@@ -770,7 +810,8 @@ fn parse_meta_box_cow<'a>(
     } else {
         primary_item_id.unwrap_or(0)
     };
-    let owned_bytes = container_guard.bayt();
+    let guard = container_guard.into_arc()?;
+    let owned_bytes = guard.bayt().saturating_add(arc_alloc_bytes::<Butce>());
 
     Ok(AvifContainer {
         file_data,
@@ -785,7 +826,7 @@ fn parse_meta_box_cow<'a>(
         entity_groups,
         idat,
         owned_bytes,
-        _guard: Arc::new(container_guard),
+        _guard: guard,
     })
 }
 
@@ -794,6 +835,23 @@ fn parse_grpl(
     groups: &mut Vec<EntityToGroup>,
     guard: &mut ButceTutucu,
 ) -> Result<()> {
+    let mut box_count = 0usize;
+    let mut scan_off = 0usize;
+    while let Some(child) = read_box_header(payload, scan_off)? {
+        scan_off = child.next_offset;
+        box_count += 1;
+    }
+    if box_count > 0 {
+        let vec_bytes = box_count.saturating_mul(core::mem::size_of::<EntityToGroup>());
+        guard.ekle(vec_bytes)?;
+        groups.try_reserve_exact(box_count).map_err(|_| {
+            guard.dusur(vec_bytes);
+            Error::AllocationFailed {
+                requested: vec_bytes,
+            }
+        })?;
+    }
+
     let mut offset = 0usize;
     while let Some(child) = read_box_header(payload, offset)? {
         offset = child.next_offset;
@@ -809,8 +867,7 @@ fn parse_grpl(
         if needed_bytes > rem_bytes {
             return Err(Error::InvalidData("kesik grpl varlık kimlik listesi"));
         }
-        let alloc_bytes = core::mem::size_of::<EntityToGroup>()
-            .saturating_add(num_entities.saturating_mul(core::mem::size_of::<u32>()));
+        let alloc_bytes = num_entities.saturating_mul(core::mem::size_of::<u32>());
         guard.ekle(alloc_bytes)?;
         let mut entity_ids = Vec::new();
         entity_ids
@@ -847,6 +904,30 @@ fn indexmap_table_bytes<K, V>(cap: usize) -> usize {
     entries_bytes.saturating_add(indices_bytes)
 }
 
+fn reserve_indexmap_exact<K, V>(
+    map: &mut FxIndexMap<K, V>,
+    count: usize,
+    guard: &mut ButceTutucu,
+) -> Result<()> {
+    let needed = count.saturating_sub(map.len());
+    if map.capacity() - map.len() < needed {
+        let old_bytes = indexmap_table_bytes::<K, V>(map.capacity());
+        let new_cap = map.len().saturating_add(needed);
+        let new_bytes = indexmap_table_bytes::<K, V>(new_cap);
+        guard.ekle(new_bytes)?;
+        map.try_reserve_exact(needed).map_err(|_| {
+            guard.dusur(new_bytes);
+            Error::AllocationFailed {
+                requested: new_bytes,
+            }
+        })?;
+        if old_bytes > 0 {
+            guard.dusur(old_bytes);
+        }
+    }
+    Ok(())
+}
+
 fn parse_iinf(
     payload: &[u8],
     items: &mut FxIndexMap<u32, ItemInfoEntry>,
@@ -874,26 +955,12 @@ fn parse_iinf(
             "iinf içindeki infe sayısı kutu boyutunu aşıyor",
         ));
     }
-    let slot_size = core::mem::size_of::<(usize, u32, ItemInfoEntry)>();
-    let reserve_n = (entry_count as usize).min(256);
-    let pre_reserved = indexmap_table_bytes::<u32, ItemInfoEntry>(reserve_n);
-    if pre_reserved > 0 {
-        guard.ekle(pre_reserved)?;
-        items.try_reserve_exact(reserve_n).map_err(|_| {
-            guard.dusur(pre_reserved);
-            Error::AllocationFailed {
-                requested: pre_reserved,
-            }
-        })?;
-    }
+    reserve_indexmap_exact(items, entry_count as usize, guard)?;
     let mut parsed = 0u32;
     while let Some(child) = read_box_header(body, offset)? {
         offset = child.next_offset;
         if &child.box_type == b"infe" {
             let entry = parse_infe(child.payload, guard)?;
-            if items.len() >= reserve_n && !items.contains_key(&entry.item_id) {
-                guard.ekle(slot_size)?;
-            }
             if let Some(prev) = items.insert(entry.item_id, entry) {
                 let prev_bytes = prev
                     .item_name
@@ -1320,18 +1387,7 @@ fn parse_ipma(
     if (entry_count as usize) > max_entries {
         return Err(Error::InvalidData("ipma entry_count kutu boyutunu aşıyor"));
     }
-    let slot_size = core::mem::size_of::<(usize, u32, Vec<PropertyAssoc>)>();
-    let reserve_n = (entry_count as usize).min(256);
-    let pre_reserved = indexmap_table_bytes::<u32, Vec<PropertyAssoc>>(reserve_n);
-    if pre_reserved > 0 {
-        guard.ekle(pre_reserved)?;
-        associations.try_reserve_exact(reserve_n).map_err(|_| {
-            guard.dusur(pre_reserved);
-            Error::AllocationFailed {
-                requested: pre_reserved,
-            }
-        })?;
-    }
+    reserve_indexmap_exact(associations, entry_count as usize, guard)?;
     let large_index = (flags & 1) != 0;
     let assoc_stride = if large_index { 2usize } else { 1usize };
 
@@ -1357,20 +1413,37 @@ fn parse_ipma(
         if needed > body.len().saturating_sub(pos) {
             return Err(Error::InvalidData("kesik ipma özellik listesi"));
         }
-        let key_bytes = if associations.len() >= reserve_n && !associations.contains_key(&item_id) {
-            slot_size
-        } else {
-            0
-        };
-        let entry_bytes = key_bytes
-            .saturating_add(assoc_count.saturating_mul(core::mem::size_of::<PropertyAssoc>()));
-        guard.ekle(entry_bytes)?;
+        let assoc_bytes = assoc_count.saturating_mul(core::mem::size_of::<PropertyAssoc>());
 
-        let mut list: Vec<PropertyAssoc> = Vec::new();
-        list.try_reserve_exact(assoc_count)
-            .map_err(|_| Error::AllocationFailed {
-                requested: assoc_count.saturating_mul(core::mem::size_of::<PropertyAssoc>()),
-            })?;
+        let target_list: &mut Vec<PropertyAssoc> = match associations.entry(item_id) {
+            indexmap::map::Entry::Occupied(e) => {
+                let list = e.into_mut();
+                if list.capacity() - list.len() < assoc_count {
+                    let add_cap = assoc_count - (list.capacity() - list.len());
+                    let add_bytes = add_cap.saturating_mul(core::mem::size_of::<PropertyAssoc>());
+                    guard.ekle(add_bytes)?;
+                    list.try_reserve_exact(assoc_count).map_err(|_| {
+                        guard.dusur(add_bytes);
+                        Error::AllocationFailed {
+                            requested: add_bytes,
+                        }
+                    })?;
+                }
+                list
+            }
+            indexmap::map::Entry::Vacant(e) => {
+                guard.ekle(assoc_bytes)?;
+                let mut list: Vec<PropertyAssoc> = Vec::new();
+                list.try_reserve_exact(assoc_count).map_err(|_| {
+                    guard.dusur(assoc_bytes);
+                    Error::AllocationFailed {
+                        requested: assoc_bytes,
+                    }
+                })?;
+                e.insert(list)
+            }
+        };
+
         for _ in 0..assoc_count {
             if large_index {
                 let raw =
@@ -1378,7 +1451,7 @@ fn parse_ipma(
                 pos += 2;
                 let essential = (raw & 0x8000) != 0;
                 let property_index = raw & 0x7FFF;
-                list.push(PropertyAssoc {
+                target_list.push(PropertyAssoc {
                     property_index,
                     essential,
                 });
@@ -1389,17 +1462,10 @@ fn parse_ipma(
                 pos += 1;
                 let essential = (raw & 0x80) != 0;
                 let property_index = u16::from(raw & 0x7F);
-                list.push(PropertyAssoc {
+                target_list.push(PropertyAssoc {
                     property_index,
                     essential,
                 });
-            }
-        }
-
-        match associations.entry(item_id) {
-            indexmap::map::Entry::Occupied(mut e) => e.get_mut().extend(list),
-            indexmap::map::Entry::Vacant(e) => {
-                e.insert(list);
             }
         }
     }
@@ -1454,18 +1520,7 @@ fn parse_iloc(
     if (item_count as usize) > max_items {
         return Err(Error::InvalidData("iloc item_count kutu boyutunu aşıyor"));
     }
-    let slot_size = core::mem::size_of::<(usize, u32, IlocItem)>();
-    let reserve_n = (item_count as usize).min(256);
-    let pre_reserved = indexmap_table_bytes::<u32, IlocItem>(reserve_n);
-    if pre_reserved > 0 {
-        guard.ekle(pre_reserved)?;
-        locations.try_reserve_exact(reserve_n).map_err(|_| {
-            guard.dusur(pre_reserved);
-            Error::AllocationFailed {
-                requested: pre_reserved,
-            }
-        })?;
-    }
+    reserve_indexmap_exact(locations, item_count as usize, guard)?;
     let ext_stride = (if ver == 1 || ver == 2 { index_size } else { 0 })
         .saturating_add(offset_size)
         .saturating_add(length_size);
@@ -1509,21 +1564,16 @@ fn parse_iloc(
                 return Err(Error::InvalidData("kesik iloc extent dizisi"));
             }
         }
-        let slot_extra = if locations.len() >= reserve_n && !locations.contains_key(&item_id) {
-            slot_size
-        } else {
-            0
-        };
-        let item_bytes = slot_extra
-            .saturating_add(extent_count.saturating_mul(core::mem::size_of::<IlocExtent>()));
+        let item_bytes = extent_count.saturating_mul(core::mem::size_of::<IlocExtent>());
         guard.ekle(item_bytes)?;
 
         let mut extents: Vec<IlocExtent> = Vec::new();
-        extents
-            .try_reserve_exact(extent_count)
-            .map_err(|_| Error::AllocationFailed {
-                requested: extent_count.saturating_mul(core::mem::size_of::<IlocExtent>()),
-            })?;
+        extents.try_reserve_exact(extent_count).map_err(|_| {
+            guard.dusur(item_bytes);
+            Error::AllocationFailed {
+                requested: item_bytes,
+            }
+        })?;
         for _ in 0..extent_count {
             let extent_index = if (ver == 1 || ver == 2) && index_size > 0 {
                 let idx = read_uint_n(body, pos, index_size)
@@ -1575,6 +1625,23 @@ fn parse_iref(
     if ver > 1 {
         return Err(Error::Unsupported("iref sürümü > 1 desteklenmiyor"));
     }
+    let mut box_count = 0usize;
+    let mut scan_off = 0usize;
+    while let Some(ref_box) = read_box_header(body, scan_off)? {
+        scan_off = ref_box.next_offset;
+        box_count += 1;
+    }
+    if box_count > 0 {
+        let vec_bytes = box_count.saturating_mul(core::mem::size_of::<ItemReference>());
+        guard.ekle(vec_bytes)?;
+        references.try_reserve_exact(box_count).map_err(|_| {
+            guard.dusur(vec_bytes);
+            Error::AllocationFailed {
+                requested: vec_bytes,
+            }
+        })?;
+    }
+
     let id_size = if ver == 0 { 2usize } else { 4usize };
     let mut offset = 0usize;
     while let Some(ref_box) = read_box_header(body, offset)? {
@@ -1606,18 +1673,18 @@ fn parse_iref(
 
         let is_dimg = &ref_box.box_type == b"dimg";
         let to_bytes = ref_count.saturating_mul(core::mem::size_of::<u32>());
-        let ref_bytes = core::mem::size_of::<ItemReference>().saturating_add(to_bytes);
-        let seen_bytes = if is_dimg && ref_count > 8 {
-            to_bytes
+        let seen_bytes = if is_dimg && ref_count > 64 {
+            indexmap_table_bytes::<u32, ()>(ref_count)
         } else {
             0
         };
-        guard.ekle(ref_bytes.saturating_add(seen_bytes))?;
+        let step_bytes = to_bytes.saturating_add(seen_bytes);
+        guard.ekle(step_bytes)?;
 
-        let mut seen_dimg = if is_dimg && ref_count > 8 {
+        let mut seen_dimg = if is_dimg && ref_count > 64 {
             let mut set = FxIndexSet::with_hasher(rustc_hash::FxBuildHasher);
-            set.try_reserve(ref_count).map_err(|_| {
-                guard.dusur(ref_bytes.saturating_add(seen_bytes));
+            set.try_reserve_exact(ref_count).map_err(|_| {
+                guard.dusur(step_bytes);
                 Error::AllocationFailed {
                     requested: seen_bytes,
                 }
@@ -1628,7 +1695,7 @@ fn parse_iref(
         };
         let mut to_item_ids: Vec<u32> = Vec::new();
         to_item_ids.try_reserve_exact(ref_count).map_err(|_| {
-            guard.dusur(ref_bytes.saturating_add(seen_bytes));
+            guard.dusur(step_bytes);
             Error::AllocationFailed {
                 requested: to_bytes,
             }
@@ -1671,6 +1738,79 @@ fn parse_iref(
         });
     }
     Ok(())
+}
+
+/// Bir öğenin `ipma` özellik ilişkileri üzerinde sıfır-tahsisli yineleyici.
+#[derive(Clone)]
+pub(crate) struct ItemPropertiesIter<'a> {
+    properties: &'a [ItemProperty],
+    assocs: core::slice::Iter<'a, PropertyAssoc>,
+}
+
+impl<'a> Iterator for ItemPropertiesIter<'a> {
+    type Item = (&'a ItemProperty, bool);
+
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
+        for assoc in self.assocs.by_ref() {
+            if assoc.property_index == 0 {
+                continue;
+            }
+            let idx = (assoc.property_index as usize) - 1;
+            if let Some(prop) = self.properties.get(idx) {
+                return Some((prop, assoc.essential));
+            }
+        }
+        None
+    }
+}
+
+/// Belirtilen `from_item_id` ve `ref_type` için hedef öğe kimlikleri üzerinde sıfır-tahsisli yineleyici.
+#[derive(Clone)]
+pub(crate) struct ReferencesFromIter<'a> {
+    refs: core::slice::Iter<'a, ItemReference>,
+    current: core::slice::Iter<'a, u32>,
+    from_item_id: u32,
+    ref_type: [u8; 4],
+}
+
+impl Iterator for ReferencesFromIter<'_> {
+    type Item = u32;
+
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            if let Some(&id) = self.current.next() {
+                return Some(id);
+            }
+            let r = self.refs.next()?;
+            if r.from_item_id == self.from_item_id && r.ref_type == self.ref_type {
+                self.current = r.to_item_ids.iter();
+            }
+        }
+    }
+}
+
+/// Belirtilen `to_item_id` ve `ref_type` için kaynak öğe kimlikleri üzerinde sıfır-tahsisli yineleyici.
+#[derive(Clone)]
+pub(crate) struct ReferencesToIter<'a> {
+    refs: core::slice::Iter<'a, ItemReference>,
+    to_item_id: u32,
+    ref_type: [u8; 4],
+}
+
+impl Iterator for ReferencesToIter<'_> {
+    type Item = u32;
+
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
+        for r in self.refs.by_ref() {
+            if r.ref_type == self.ref_type && r.to_item_ids.contains(&self.to_item_id) {
+                return Some(r.from_item_id);
+            }
+        }
+        None
+    }
 }
 
 impl<'a> AvifContainer<'a> {
@@ -1735,12 +1875,14 @@ impl<'a> AvifContainer<'a> {
         self.items.get(&item_id)
     }
 
-    /// Belirtilen `item_id` ile ilişkilendirilmiş özellikleri (`ipma` sırasıyla) döndürür.
-    pub(crate) fn item_properties(&self, item_id: u32) -> Result<Vec<(&ItemProperty, bool)>> {
+    /// Belirtilen `item_id` ile ilişkilendirilmiş özellikleri (`ipma` sırasıyla) doğrular ve sıfır-tahsisli yineleyici döndürür.
+    pub(crate) fn item_properties(&self, item_id: u32) -> Result<ItemPropertiesIter<'_>> {
         let Some(assocs) = self.associations.get(&item_id) else {
-            return Ok(Vec::new());
+            return Ok(ItemPropertiesIter {
+                properties: &self.properties,
+                assocs: [].iter(),
+            });
         };
-        let mut out = Vec::with_capacity(assocs.len());
         for assoc in assocs {
             if assoc.property_index == 0 {
                 continue;
@@ -1772,31 +1914,82 @@ impl<'a> AvifContainer<'a> {
                     "dönüşüm özellikleri (clap, irot, imir) ipma içinde zorunlu (essential) olmalıdır",
                 ));
             }
-            out.push((prop, assoc.essential));
         }
-        Ok(out)
+        Ok(ItemPropertiesIter {
+            properties: &self.properties,
+            assocs: assocs.iter(),
+        })
     }
 
-    /// Belirtilen `from_item_id` ve `ref_type` için hedef öğe kimliklerini döndürür.
-    pub(crate) fn references_from(&self, from_item_id: u32, ref_type: &[u8; 4]) -> Vec<u32> {
+    /// Belirtilen `from_item_id` ve `ref_type` için hedef öğe kimlikleri üzerinde sıfır-tahsisli yineleyici döndürür.
+    #[inline]
+    pub(crate) fn references_from(
+        &self,
+        from_item_id: u32,
+        ref_type: &[u8; 4],
+    ) -> ReferencesFromIter<'_> {
+        ReferencesFromIter {
+            refs: self.references.iter(),
+            current: [].iter(),
+            from_item_id,
+            ref_type: *ref_type,
+        }
+    }
+
+    /// Belirtilen `from_item_id` ve `ref_type` için hedef öğe kimliklerini dilim olarak döndürür;
+    /// tek `iref` kaydı varsa sıfır kopyayla ödünç alır, birden fazla kayda bölünmüşse bütçe altında birleştirir.
+    pub(crate) fn references_from_slice(
+        &self,
+        from_item_id: u32,
+        ref_type: &[u8; 4],
+        butce: &Arc<Butce>,
+    ) -> Result<(Cow<'_, [u32]>, ButceTutucu)> {
+        let mut single: Option<&[u32]> = None;
+        let mut total_len = 0usize;
+        let mut match_boxes = 0usize;
+        for r in &self.references {
+            if r.from_item_id == from_item_id && &r.ref_type == ref_type {
+                match_boxes += 1;
+                total_len = total_len.saturating_add(r.to_item_ids.len());
+                if match_boxes == 1 {
+                    single = Some(r.to_item_ids.as_slice());
+                }
+            }
+        }
+        if match_boxes == 0 {
+            return Ok((Cow::Borrowed(&[]), ButceTutucu::bos(butce)));
+        }
+        if match_boxes == 1
+            && let Some(slice) = single
+        {
+            return Ok((Cow::Borrowed(slice), ButceTutucu::bos(butce)));
+        }
+        let bytes = total_len.saturating_mul(core::mem::size_of::<u32>());
+        let guard = Butce::tut(butce, bytes)?;
         let mut targets = Vec::new();
+        targets
+            .try_reserve_exact(total_len)
+            .map_err(|_| Error::AllocationFailed { requested: bytes })?;
         for r in &self.references {
             if r.from_item_id == from_item_id && &r.ref_type == ref_type {
                 targets.extend_from_slice(&r.to_item_ids);
             }
         }
-        targets
+        Ok((Cow::Owned(targets), guard))
     }
 
-    /// Belirtilen `to_item_id` ve `ref_type` için kaynak öğe kimliklerini döndürür.
-    pub(crate) fn references_to(&self, to_item_id: u32, ref_type: &[u8; 4]) -> Vec<u32> {
-        let mut sources = Vec::new();
-        for r in &self.references {
-            if &r.ref_type == ref_type && r.to_item_ids.contains(&to_item_id) {
-                sources.push(r.from_item_id);
-            }
+    /// Belirtilen `to_item_id` ve `ref_type` için kaynak öğe kimlikleri üzerinde sıfır-tahsisli yineleyici döndürür.
+    #[inline]
+    pub(crate) fn references_to(
+        &self,
+        to_item_id: u32,
+        ref_type: &[u8; 4],
+    ) -> ReferencesToIter<'_> {
+        ReferencesToIter {
+            refs: self.references.iter(),
+            to_item_id,
+            ref_type: *ref_type,
         }
-        sources
     }
 
     /// İçeride tutulan ham dosya bayt diliminin uzunluğu.
@@ -1947,7 +2140,7 @@ impl<'a> AvifContainer<'a> {
                     } else {
                         0
                     };
-                    let target_id = *dimg_targets.get(idx).ok_or(Error::InvalidData(
+                    let target_id = dimg_targets.clone().nth(idx).ok_or(Error::InvalidData(
                         "iloc construction_method=2 hedef öğesi yok",
                     ))?;
                     let (target_data, _target_guard) =

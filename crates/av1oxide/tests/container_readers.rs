@@ -490,4 +490,106 @@ fn ivf_reader_budget_exceeded_preserves_packet_alignment() {
 
     // 4. Temiz EOF.
     assert_eq!(reader.read_packet_into(&mut buf), Ok(None));
+
+    // 5. `6.I.2` (`P3-1`): Atlama sırasında (`4 096` B sonra) ve başlık ortasında geçici `WouldBlock`
+    //    hatası geldiğinde kalan `pending_skip` / `hdr_filled` korunmalı ve sonraki çağrı ikinci
+    //    paketi (`pts = 33`, `7 581 B`) hiza kaybı olmadan döndürmelidir.
+    struct FlakyIvfStream<'a> {
+        data: &'a [u8],
+        pos: usize,
+        fail_offsets: Vec<usize>,
+        chunk_cap: usize,
+    }
+
+    impl std::io::Read for FlakyIvfStream<'_> {
+        fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+            if self.pos >= self.data.len() {
+                return Ok(0);
+            }
+            if let Some(idx) = self.fail_offsets.iter().position(|&off| off == self.pos) {
+                self.fail_offsets.remove(idx);
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::WouldBlock,
+                    "yapay geçici G/Ç kesintisi",
+                ));
+            }
+            let next_fail = self
+                .fail_offsets
+                .iter()
+                .copied()
+                .filter(|&off| off > self.pos)
+                .min()
+                .unwrap_or(self.data.len());
+            let n = out
+                .len()
+                .min(self.data.len() - self.pos)
+                .min(self.chunk_cap)
+                .min(next_fail - self.pos);
+            out[..n].copy_from_slice(&self.data[self.pos..self.pos + n]);
+            self.pos += n;
+            Ok(n)
+        }
+    }
+
+    // 5a. İlk paket (15 106 B) atlanırken tam 4 096 bayt sonra (ofset 32 + 12 + 4096 = 4140)
+    //     tekil `WouldBlock`: ilk çağrı `BudgetExceeded` döner, ikinci çağrı kalan 11 010 baytı
+    //     tüketip 2. paketi (`pts = 33`, `7 581 B`) eksiksiz okur.
+    let stream_single = FlakyIvfStream {
+        data: &ivf,
+        pos: 0,
+        fail_offsets: vec![32 + 12 + 4096],
+        chunk_cap: 4096,
+    };
+    let mut flaky_single =
+        IvfReader::with_max_frame_bytes(stream_single, 7_581).expect("IVF başlığı");
+    assert_eq!(
+        flaky_single.read_packet_into(&mut buf),
+        Err(Error::BudgetExceeded {
+            requested: 15_106,
+            limit: 7_581,
+        })
+    );
+    assert_eq!(flaky_single.read_packet_into(&mut buf), Ok(Some(33)));
+    assert_eq!(buf, pkt2);
+    assert_eq!(
+        flaky_single.read_packet_into(&mut buf),
+        Err(Error::BudgetExceeded {
+            requested: 17_174,
+            limit: 7_581,
+        })
+    );
+    assert_eq!(flaky_single.read_packet_into(&mut buf), Ok(None));
+
+    // 5b. Ardışık çoklu `WouldBlock` (hem ilk atlama sırasında 4096. baytta, hem kalan `pending_skip`
+    //     boşaltılırken +2048. baytta, hem de 2. paketin 12-bayt başlığının 5. baytında):
+    let pkt2_hdr_off = 32 + 12 + 15_106;
+    let stream_multi = FlakyIvfStream {
+        data: &ivf,
+        pos: 0,
+        fail_offsets: vec![32 + 12 + 4096, 32 + 12 + 4096 + 2048, pkt2_hdr_off + 5],
+        chunk_cap: 4096,
+    };
+    let mut flaky_multi =
+        IvfReader::with_max_frame_bytes(stream_multi, 7_581).expect("IVF başlığı");
+    // Çağrı 1: 4096 B atladıktan sonra WouldBlock -> BudgetExceeded (kalan skip = 11 010 B).
+    assert_eq!(
+        flaky_multi.read_packet_into(&mut buf),
+        Err(Error::BudgetExceeded {
+            requested: 15_106,
+            limit: 7_581,
+        })
+    );
+    // Çağrı 2: 2048 B daha atladıktan sonra WouldBlock -> InvalidData (kalan skip = 8 962 B).
+    assert!(matches!(
+        flaky_multi.read_packet_into(&mut buf),
+        Err(Error::InvalidData(_))
+    ));
+    // Çağrı 3: Kalan 8 962 B atlanır, 2. paket başlığının ilk 5 baytı okunur ve WouldBlock -> InvalidData.
+    assert!(matches!(
+        flaky_multi.read_packet_into(&mut buf),
+        Err(Error::InvalidData(_))
+    ));
+    // Çağrı 4: Başlığın kalan 7 baytı ve 7 581 B yük tamamlanır -> Ok(Some(33)).
+    assert_eq!(flaky_multi.read_packet_into(&mut buf), Ok(Some(33)));
+    assert_eq!(buf, pkt2);
 }

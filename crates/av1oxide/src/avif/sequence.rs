@@ -290,6 +290,7 @@ struct TrackSequenceState {
     transforms: TrackTransforms,
     color_decoder: Option<Decoder>,
     alpha_decoder: Option<Decoder>,
+    decoder_guard: ButceTutucu,
     decoder_raw_next: usize,
     next_pres_index: usize,
 }
@@ -364,7 +365,7 @@ impl<'a> AvifSequenceDecoder<'a> {
 
     /// Belirtilen [`AvifDecodeConfig`] ile bir `.avis` / `.avif` dizi çözücüsü oluşturur.
     pub fn with_config(data: &'a [u8], config: AvifDecodeConfig) -> Result<Self> {
-        let butce = Arc::new(Butce::yeni(config.allocation_limit, 0));
+        let butce = Butce::yeni_arc(config.allocation_limit, 0)?;
         let mut state_guard = ButceTutucu::bos(&butce);
         let movie = parse_movie(data, &butce)?;
 
@@ -460,19 +461,22 @@ impl<'a> AvifSequenceDecoder<'a> {
                 .saturating_mul(core::mem::size_of::<TrackSample>());
             state_guard.ekle(color_sample_bytes)?;
             let raw_color_samples = color_track.samples.clone();
+            let has_alpha = alpha_track.is_some();
+            let repetition_count = color_track.repetition_count;
+            drop(movie);
 
             let info = AvifSequenceInfo {
                 width: post_w,
                 height: post_h,
                 bit_depth: color_bundle.bit_depth,
                 chroma_format: color_bundle.chroma_format,
-                has_alpha: alpha_track.is_some(),
+                has_alpha,
                 premultiplied_alpha,
                 frame_count: presented.len(),
                 timescale,
                 duration_in_timescale,
                 duration_sec,
-                repetition_count: color_track.repetition_count,
+                repetition_count,
                 color: color_bundle.color.unwrap_or_default(),
                 icc_profile,
                 exif,
@@ -491,10 +495,12 @@ impl<'a> AvifSequenceDecoder<'a> {
                 transforms: color_bundle.transforms,
                 color_decoder: None,
                 alpha_decoder: None,
+                decoder_guard: ButceTutucu::bos(&butce),
                 decoder_raw_next: 0,
                 next_pres_index: 0,
             };
 
+            state_guard.ekle(core::mem::size_of::<TrackSequenceState>())?;
             Ok(Self {
                 data,
                 config,
@@ -596,6 +602,7 @@ impl<'a> AvifSequenceDecoder<'a> {
             SequenceBackend::Track(st) => {
                 st.color_decoder = None;
                 st.alpha_decoder = None;
+                st.decoder_guard = ButceTutucu::bos(&self.butce);
                 st.decoder_raw_next = 0;
                 st.next_pres_index = 0;
             }
@@ -677,6 +684,7 @@ impl<'a> AvifSequenceDecoder<'a> {
             if target_raw < st.decoder_raw_next || nearest_raw_kf > st.decoder_raw_next {
                 st.color_decoder = None;
                 st.alpha_decoder = None;
+                st.decoder_guard = ButceTutucu::bos(&self.butce);
                 st.decoder_raw_next = nearest_raw_kf;
             }
         }
@@ -745,6 +753,7 @@ impl<'a> AvifSequenceDecoder<'a> {
 
         let color_dec = get_or_init_decoder(
             &mut st.color_decoder,
+            &mut st.decoder_guard,
             &self.config,
             &st.color_config_obus,
             &self.butce,
@@ -764,6 +773,7 @@ impl<'a> AvifSequenceDecoder<'a> {
         let alpha_decoded = if let Some(asamp) = alpha_sample {
             let alpha_dec = get_or_init_decoder(
                 &mut st.alpha_decoder,
+                &mut st.decoder_guard,
                 &self.config,
                 &st.alpha_config_obus,
                 &self.butce,
@@ -866,11 +876,15 @@ impl<'a> AvifSequenceDecoder<'a> {
 
 fn get_or_init_decoder<'d>(
     slot: &'d mut Option<Decoder>,
+    decoder_guard: &mut ButceTutucu,
     config: &AvifDecodeConfig,
     config_obus: &[u8],
     butce: &Arc<Butce>,
 ) -> Result<&'d mut Decoder> {
     if slot.is_none() {
+        const AV1_DECODER_INSTANCE_OVERHEAD_BYTES: usize = 4096;
+        decoder_guard
+            .ekle(AV1_DECODER_INSTANCE_OVERHEAD_BYTES.saturating_add(config_obus.len()))?;
         let dec_cfg = Config {
             n_threads: config.n_threads,
             max_frame_delay: 1,
@@ -897,6 +911,7 @@ fn decode_single_sample_frame(
     sample_bytes: &[u8],
     butce: &Arc<Butce>,
 ) -> Result<(Frame, ButceTutucu)> {
+    let _sample_guard = Butce::tut(butce, sample_bytes.len())?;
     decoder.send_packet(&Packet::new(sample_bytes))?;
     let first = decoder
         .receive_frame()?

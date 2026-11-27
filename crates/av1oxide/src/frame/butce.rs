@@ -90,6 +90,28 @@ impl ButceTutucu {
     pub(crate) const fn bayt(&self) -> usize {
         self.bayt
     }
+
+    /// `ArcInner<ButceTutucu>` yığın maliyetini tahsisten **önce** bekçiye ekleyip
+    /// `Arc<ButceTutucu>` içine sarar; bekçi düşürüldüğünde `Arc` maliyeti de iade edilir.
+    #[cfg_attr(not(feature = "std"), allow(dead_code))]
+    pub(crate) fn into_arc(mut self) -> Result<Arc<Self>> {
+        self.ekle(arc_alloc_bytes::<Self>())?;
+        Ok(Arc::new(self))
+    }
+}
+
+/// `Arc::new(val)` çağrısının yığında ayırdığı `ArcInner<T>` bayt boyutu.
+#[inline]
+pub(crate) const fn arc_alloc_bytes<T>() -> usize {
+    let align = if core::mem::align_of::<T>() > core::mem::align_of::<usize>() {
+        core::mem::align_of::<T>()
+    } else {
+        core::mem::align_of::<usize>()
+    };
+    let two_usize = 2 * core::mem::size_of::<usize>();
+    let data_offset = if align > two_usize { align } else { two_usize };
+    let raw = data_offset.saturating_add(core::mem::size_of::<T>());
+    raw.saturating_add(align - 1) & !(align - 1)
 }
 
 impl Drop for ButceTutucu {
@@ -123,6 +145,29 @@ impl Butce {
             taban: AtomicUsize::new(taban),
             ust: None,
         }
+    }
+
+    /// Kök `Arc<Butce>` öz-maliyetini (`ArcInner<Butce>`) ve `ek_taban` baytını
+    /// yığın tahsisinden **önce** `sinir` ile karşılaştırarak yeni `Arc<Butce>` oluşturur.
+    #[allow(dead_code)]
+    pub(crate) fn yeni_arc(sinir: Option<usize>, ek_taban: usize) -> Result<Arc<Self>> {
+        let arc_bytes = arc_alloc_bytes::<Self>();
+        let toplam = arc_bytes.checked_add(ek_taban).ok_or(Error::SizeOverflow {
+            stage: SizeStage::TotalAllocation,
+            lhs: arc_bytes,
+            rhs: ek_taban,
+        })?;
+        if let Some(lim) = sinir
+            && toplam > lim
+        {
+            return Err(Error::BudgetExceeded {
+                requested: toplam,
+                limit: lim,
+            });
+        }
+        let b = Self::yeni(sinir, toplam);
+        b.tepe.store(toplam, Ordering::Relaxed);
+        Ok(Arc::new(b))
     }
 
     /// Paylaşılan `ust` boru hattı defterine bağlı kare-içi alt defter oluşturur (`F7b`).

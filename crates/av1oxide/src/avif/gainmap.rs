@@ -105,16 +105,6 @@ pub struct GainMap {
     pub image: Box<AvifImage>,
 }
 
-/// ISO 21496-1 `ToneMapImage` ikili yük ayrıştırma sonucu.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum ToneMapParseOutcome {
-    /// Desteklenen `version == 0` ve `minimum_version == 0` kazanç haritası üst verisi.
-    Parsed(Box<GainMapMetadata>),
-    /// Desteklenmeyen `version != 0` veya `minimum_version > 0`; `libavif` uyumu gereği
-    /// kazanç haritası yoksayılır ve birincil görüntü çözülmeye devam edilir.
-    UnsupportedVersion,
-}
-
 fn read_u16_be(buf: &[u8], pos: &mut usize) -> Result<u16> {
     let end = pos
         .checked_add(2)
@@ -176,8 +166,11 @@ pub(crate) fn validate_gain_map_metadata(meta: &GainMapMetadata) -> Result<()> {
     Ok(())
 }
 
-/// ISO 21496-1 `ToneMapImage` (`tmap` öğesi) ikili yükünü ayrıştırır ve doğrular.
-pub(crate) fn parse_tone_mapped_image_box(raw: &[u8]) -> Result<ToneMapParseOutcome> {
+/// ISO 21496-1 `ToneMapImage` (`tmap` öğesi) ikili yükünü yığın tahsisi yapmadan ayrıştırır ve doğrular.
+///
+/// Desteklenmeyen `version != 0` veya `minimum_version > 0` durumunda `libavif` uyumu gereği
+/// `Ok(None)` döndürülür ve birincil görüntü çözülmeye devam edilir.
+pub(crate) fn parse_tone_mapped_image_box(raw: &[u8]) -> Result<Option<GainMapMetadata>> {
     const SUPPORTED_METADATA_VERSION: u16 = 0;
 
     if raw.is_empty() {
@@ -185,13 +178,13 @@ pub(crate) fn parse_tone_mapped_image_box(raw: &[u8]) -> Result<ToneMapParseOutc
     }
     let version = raw[0];
     if version != 0 {
-        return Ok(ToneMapParseOutcome::UnsupportedVersion);
+        return Ok(None);
     }
 
     let mut pos = 1usize;
     let minimum_version = read_u16_be(raw, &mut pos)?;
     if minimum_version > SUPPORTED_METADATA_VERSION {
-        return Ok(ToneMapParseOutcome::UnsupportedVersion);
+        return Ok(None);
     }
     let writer_version = read_u16_be(raw, &mut pos)?;
     if writer_version < minimum_version {
@@ -285,16 +278,14 @@ pub(crate) fn parse_tone_mapped_image_box(raw: &[u8]) -> Result<ToneMapParseOutc
         alt_mdcv: None,
     };
     validate_gain_map_metadata(&metadata)?;
-    Ok(ToneMapParseOutcome::Parsed(Box::new(metadata)))
+    Ok(Some(metadata))
 }
 
 #[cfg(test)]
 mod tests {
     use alloc::vec::Vec;
 
-    use super::{
-        GainMapFractionI32, GainMapFractionU32, ToneMapParseOutcome, parse_tone_mapped_image_box,
-    };
+    use super::{GainMapFractionI32, GainMapFractionU32, parse_tone_mapped_image_box};
     use crate::error::Error;
 
     fn make_tmap_payload(
@@ -337,10 +328,9 @@ mod tests {
     #[test]
     fn tmap_valid_single_and_multichannel_and_forward_compat() {
         let single = make_tmap_payload(0, 0, 0, false, true, 1, &[]);
-        let ToneMapParseOutcome::Parsed(meta) = parse_tone_mapped_image_box(&single).unwrap()
-        else {
-            panic!("Parsed bekleniyordu");
-        };
+        let meta = parse_tone_mapped_image_box(&single)
+            .unwrap()
+            .expect("Some(GainMapMetadata) bekleniyordu");
         assert!(meta.use_base_color_space);
         assert_eq!(
             meta.gain_map_min,
@@ -360,27 +350,20 @@ mod tests {
 
         // writer_version > 0 fazladan kuyruk baytları ileri uyumluluk gereği kabul edilmeli.
         let forward = make_tmap_payload(0, 0, 1, true, false, 2, &[0xDE, 0xAD, 0xBE, 0xEF]);
-        let ToneMapParseOutcome::Parsed(meta_mc) = parse_tone_mapped_image_box(&forward).unwrap()
-        else {
-            panic!("Parsed bekleniyordu");
-        };
+        let meta_mc = parse_tone_mapped_image_box(&forward)
+            .unwrap()
+            .expect("Some(GainMapMetadata) bekleniyordu");
         assert!(!meta_mc.use_base_color_space);
         assert_eq!(meta_mc.gain_map_max[2].numerator, 4);
     }
 
     #[test]
     fn tmap_version_and_validation_rules() {
-        // version != 0 veya minimum_version > 0 -> UnsupportedVersion (yoksayılır).
+        // version != 0 veya minimum_version > 0 -> None (yoksayılır).
         let bad_ver = make_tmap_payload(1, 0, 0, false, true, 1, &[]);
-        assert_eq!(
-            parse_tone_mapped_image_box(&bad_ver).unwrap(),
-            ToneMapParseOutcome::UnsupportedVersion
-        );
+        assert_eq!(parse_tone_mapped_image_box(&bad_ver).unwrap(), None);
         let bad_min = make_tmap_payload(0, 1, 1, false, true, 1, &[]);
-        assert_eq!(
-            parse_tone_mapped_image_box(&bad_min).unwrap(),
-            ToneMapParseOutcome::UnsupportedVersion
-        );
+        assert_eq!(parse_tone_mapped_image_box(&bad_min).unwrap(), None);
 
         // writer_version == 0 + fazladan kuyruk baytı -> InvalidData.
         let extra_v0 = make_tmap_payload(0, 0, 0, false, true, 1, &[0x00]);

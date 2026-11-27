@@ -168,6 +168,9 @@ pub struct IvfReader<R: std::io::Read> {
     reader: R,
     header: IvfHeader,
     max_frame_bytes: usize,
+    pending_skip: usize,
+    hdr_buf: [u8; IVF_FRAME_HEADER_LEN],
+    hdr_filled: usize,
 }
 
 #[cfg(feature = "std")]
@@ -203,6 +206,9 @@ impl<R: std::io::Read> IvfReader<R> {
             reader,
             header,
             max_frame_bytes,
+            pending_skip: 0,
+            hdr_buf: [0u8; IVF_FRAME_HEADER_LEN],
+            hdr_filled: 0,
         })
     }
 
@@ -217,19 +223,23 @@ impl<R: std::io::Read> IvfReader<R> {
     /// `buf` kapasitesi zaten yeterli olduğunda ek yığın tahsisi yapılmaz. Akış
     /// temiz biçimde bittiğinde `Ok(None)` döndürülür.
     pub fn read_packet_into(&mut self, buf: &mut alloc::vec::Vec<u8>) -> Result<Option<i64>> {
-        let mut frame_hdr = [0u8; IVF_FRAME_HEADER_LEN];
-        let mut filled = 0usize;
-        while filled < IVF_FRAME_HEADER_LEN {
-            match self.reader.read(&mut frame_hdr[filled..]) {
+        if self.pending_skip > 0 && !drain_pending_skip(&mut self.reader, &mut self.pending_skip) {
+            buf.clear();
+            return Err(Error::InvalidData("IVF atlanan kare yükü okunamadı"));
+        }
+
+        while self.hdr_filled < IVF_FRAME_HEADER_LEN {
+            match self.reader.read(&mut self.hdr_buf[self.hdr_filled..]) {
                 Ok(0) => {
-                    if filled == 0 {
+                    if self.hdr_filled == 0 {
                         buf.clear();
                         return Ok(None);
                     }
+                    self.hdr_filled = 0;
                     buf.clear();
                     return Err(Error::InvalidData("kesik IVF kare başlığı (< 12 bayt)"));
                 }
-                Ok(n) => filled += n,
+                Ok(n) => self.hdr_filled += n,
                 Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
                 Err(_) => {
                     buf.clear();
@@ -238,6 +248,8 @@ impl<R: std::io::Read> IvfReader<R> {
             }
         }
 
+        let frame_hdr = self.hdr_buf;
+        self.hdr_filled = 0;
         let frame_size =
             u32::from_le_bytes([frame_hdr[0], frame_hdr[1], frame_hdr[2], frame_hdr[3]]) as usize;
         let pts = i64::from_le_bytes([
@@ -252,7 +264,8 @@ impl<R: std::io::Read> IvfReader<R> {
         ]);
         if frame_size > self.max_frame_bytes {
             buf.clear();
-            discard_bytes(&mut self.reader, frame_size);
+            self.pending_skip = frame_size;
+            let _ = drain_pending_skip(&mut self.reader, &mut self.pending_skip);
             return Err(Error::BudgetExceeded {
                 requested: frame_size,
                 limit: self.max_frame_bytes,
@@ -266,26 +279,45 @@ impl<R: std::io::Read> IvfReader<R> {
                 })?;
         }
         buf.resize(frame_size, 0);
-        if let Err(err) = read_exact_mapped(&mut self.reader, buf, "kesik IVF kare yükü") {
-            buf.clear();
-            return Err(err);
+        let mut read_so_far = 0usize;
+        while read_so_far < frame_size {
+            match self.reader.read(&mut buf[read_so_far..]) {
+                Ok(0) => {
+                    buf.clear();
+                    return Err(Error::InvalidData("kesik IVF kare yükü"));
+                }
+                Ok(n) => read_so_far += n,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => {
+                    self.pending_skip = frame_size - read_so_far;
+                    buf.clear();
+                    return Err(Error::InvalidData("IVF kare yükü okunamadı"));
+                }
+            }
         }
         Ok(Some(pts))
     }
 }
 
+/// Kalan `pending_skip` baytlarını `[0u8; 4096]` yığın tamponuyla tüketir.
+/// Tamamlandığında (veya EOF'ta) `true`, `Interrupted` dışı geçici G/Ç hatasında
+/// kalan `pending_skip` değerini koruyarak `false` döndürür.
 #[cfg(feature = "std")]
-fn discard_bytes<R: std::io::Read>(reader: &mut R, mut remaining: usize) {
+fn drain_pending_skip<R: std::io::Read>(reader: &mut R, pending_skip: &mut usize) -> bool {
     let mut scratch = [0u8; 4096];
-    while remaining > 0 {
-        let to_read = remaining.min(scratch.len());
+    while *pending_skip > 0 {
+        let to_read = (*pending_skip).min(scratch.len());
         match reader.read(&mut scratch[..to_read]) {
-            Ok(0) => break,
-            Ok(n) => remaining -= n,
+            Ok(0) => {
+                *pending_skip = 0;
+                return true;
+            }
+            Ok(n) => *pending_skip -= n,
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(_) => break,
+            Err(_) => return false,
         }
     }
+    true
 }
 
 #[cfg(feature = "std")]

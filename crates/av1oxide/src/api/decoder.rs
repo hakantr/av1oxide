@@ -1297,6 +1297,7 @@ impl Decoder {
             )
         });
         self.tepe_kat(&butce);
+        drop(butce);
         let mc_identity = seq.mtrx == 0;
         let has_limit = self.config.allocation_limit.is_some();
 

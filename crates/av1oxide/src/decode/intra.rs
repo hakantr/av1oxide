@@ -1229,10 +1229,10 @@ impl DecodeBufPool {
             max_segmap_vecs,
             max_tmvs_vecs,
             inner: crate::sync::Mutex::new(BufPoolInner {
-                work_bufs: Vec::with_capacity(max_work_bufs),
-                u8_vecs: Vec::with_capacity(max_u8_vecs),
-                segmap_vecs: Vec::with_capacity(max_segmap_vecs),
-                tmvs_vecs: Vec::with_capacity(max_tmvs_vecs),
+                work_bufs: Vec::new(),
+                u8_vecs: Vec::new(),
+                segmap_vecs: Vec::new(),
+                tmvs_vecs: Vec::new(),
             }),
         }
     }

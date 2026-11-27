@@ -1105,7 +1105,9 @@ fn avif_compressed_heif_metadata_cmin_and_security_limits() {
             - avif_exact.len()
             - exact_xmp_len
             - (orig_exif_block.len() - 4);
-    let exact_total_limit = exact_xmp_len + live_planes_and_exif + container_overhead;
+    const FLATE2_DECOMPRESS_STATE_BYTES: usize = 48 * 1024;
+    let exact_total_limit =
+        exact_xmp_len + live_planes_and_exif + container_overhead + FLATE2_DECOMPRESS_STATE_BYTES;
     let img_exact = decode_with(
         &avif_exact,
         &AvifDecodeConfig {
@@ -3031,4 +3033,145 @@ fn avif_sequence_elst_128k_perf_and_sub_media_tick_precision() {
         elapsed.as_millis() < 250,
         "128k × 128k elst ayrıştırması < 250 ms olmalı, ölçülen: {elapsed:?}"
     );
+
+    // 4. `6.I.3` (`P3-2`): Geniş ortak-asal zaman tabanlarında (`movie_ts = 2_147_483_629`,
+    //    `media_ts = 2_147_483_587`, 5 kare × 2 s) `elst` v1 ile `3 s` ve `5 s` kırpmaları:
+    //    `eff_ts = lcm(movie_ts, media_ts)` uzayında `5 s` toplam süre `u64::MAX` sınırını aşsa da
+    //    `m_mul` sadeleştirmesi `u128` uzayında `u64::try_from` öncesinde yapıldığından
+    //    `media_ts` ölçeğinde (`10_737_417_935` tik, `3` kare) taşmasız açılmalıdır.
+    let build_wide_elst_v1_avis =
+        |movie_ts: u32, media_ts: u32, sample_delta: u32, seg_dur_movie: u64| -> Vec<u8> {
+            let ftyp = make_ftyp(b"avis", &[*b"msf1", *b"avif", *b"miaf"]);
+            let sample_count = 5u32;
+            let total_media_dur = u64::from(sample_count) * u64::from(sample_delta);
+
+            let mut mvhd_body = vec![0u8; 108];
+            mvhd_body[16..20].copy_from_slice(&movie_ts.to_be_bytes());
+            mvhd_body[20..28].copy_from_slice(&seg_dur_movie.to_be_bytes());
+            let mvhd = make_full_box(b"mvhd", 1, 0, &mvhd_body);
+
+            let make_trak = |chunk_offset: u32| -> Vec<u8> {
+                let mut tkhd_body = vec![0u8; 92];
+                tkhd_body[16..20].copy_from_slice(&1u32.to_be_bytes());
+                tkhd_body[24..32].copy_from_slice(&seg_dur_movie.to_be_bytes());
+                for (i, &val) in identity.iter().enumerate() {
+                    tkhd_body[48 + i * 4..52 + i * 4].copy_from_slice(&val.to_be_bytes());
+                }
+                tkhd_body[84..88].copy_from_slice(&(1u32 << 16).to_be_bytes());
+                tkhd_body[88..92].copy_from_slice(&(1u32 << 16).to_be_bytes());
+                let tkhd = make_full_box(b"tkhd", 1, 3, &tkhd_body);
+
+                let mut elst_body = Vec::with_capacity(24);
+                elst_body.extend_from_slice(&1u32.to_be_bytes());
+                elst_body.extend_from_slice(&seg_dur_movie.to_be_bytes());
+                elst_body.extend_from_slice(&0i64.to_be_bytes());
+                elst_body.extend_from_slice(&1i16.to_be_bytes());
+                elst_body.extend_from_slice(&0i16.to_be_bytes());
+                let edts = make_box(b"edts", &make_full_box(b"elst", 1, 0, &elst_body));
+
+                let mut mdhd_body = vec![0u8; 32];
+                mdhd_body[16..20].copy_from_slice(&media_ts.to_be_bytes());
+                mdhd_body[20..28].copy_from_slice(&total_media_dur.to_be_bytes());
+                let mdhd = make_full_box(b"mdhd", 1, 0, &mdhd_body);
+
+                let mut hdlr_body = Vec::new();
+                hdlr_body.extend_from_slice(&0u32.to_be_bytes());
+                hdlr_body.extend_from_slice(b"pict");
+                hdlr_body.extend_from_slice(&[0u8; 13]);
+                let hdlr = make_full_box(b"hdlr", 0, 0, &hdlr_body);
+
+                let mut av01_payload = vec![0u8; 78];
+                av01_payload[24..26].copy_from_slice(&1u16.to_be_bytes());
+                av01_payload[26..28].copy_from_slice(&1u16.to_be_bytes());
+                av01_payload.extend_from_slice(&make_box(b"av1C", &[0x81, 0x00, 0x0C, 0x00]));
+                let mut stsd_body = 1u32.to_be_bytes().to_vec();
+                stsd_body.extend_from_slice(&make_box(b"av01", &av01_payload));
+                let stsd = make_full_box(b"stsd", 0, 0, &stsd_body);
+
+                let mut stts_body = Vec::new();
+                stts_body.extend_from_slice(&1u32.to_be_bytes());
+                stts_body.extend_from_slice(&sample_count.to_be_bytes());
+                stts_body.extend_from_slice(&sample_delta.to_be_bytes());
+                let stts = make_full_box(b"stts", 0, 0, &stts_body);
+
+                let mut stsc_body = Vec::new();
+                stsc_body.extend_from_slice(&1u32.to_be_bytes());
+                stsc_body.extend_from_slice(&1u32.to_be_bytes());
+                stsc_body.extend_from_slice(&1u32.to_be_bytes());
+                stsc_body.extend_from_slice(&1u32.to_be_bytes());
+                let stsc = make_full_box(b"stsc", 0, 0, &stsc_body);
+
+                let mut stsz_body = Vec::new();
+                stsz_body.extend_from_slice(&(SAMPLE_1X1_AV1_OBU.len() as u32).to_be_bytes());
+                stsz_body.extend_from_slice(&sample_count.to_be_bytes());
+                let stsz = make_full_box(b"stsz", 0, 0, &stsz_body);
+
+                let mut stco_body = Vec::with_capacity(4 + (sample_count as usize) * 4);
+                stco_body.extend_from_slice(&sample_count.to_be_bytes());
+                for _ in 0..sample_count {
+                    stco_body.extend_from_slice(&chunk_offset.to_be_bytes());
+                }
+                let stco = make_full_box(b"stco", 0, 0, &stco_body);
+
+                let mut stbl_body = Vec::new();
+                for b in [&stsd, &stts, &stsc, &stsz, &stco] {
+                    stbl_body.extend_from_slice(b);
+                }
+                let stbl = make_box(b"stbl", &stbl_body);
+                let minf = make_box(b"minf", &stbl);
+                let mut mdia_body = Vec::new();
+                for b in [&mdhd, &hdlr, &minf] {
+                    mdia_body.extend_from_slice(b);
+                }
+                let mdia = make_box(b"mdia", &mdia_body);
+
+                let mut trak_body = tkhd;
+                trak_body.extend_from_slice(&edts);
+                trak_body.extend_from_slice(&mdia);
+                make_box(b"trak", &trak_body)
+            };
+
+            let dummy_moov = make_box(b"moov", &[mvhd.as_slice(), &make_trak(0)].concat());
+            let data_off = (ftyp.len() + dummy_moov.len() + 8) as u32;
+            let moov = make_box(b"moov", &[mvhd.as_slice(), &make_trak(data_off)].concat());
+            let mdat = make_box(b"mdat", SAMPLE_1X1_AV1_OBU);
+
+            let mut file = ftyp;
+            file.extend_from_slice(&moov);
+            file.extend_from_slice(&mdat);
+            file
+        };
+
+    let movie_ts = 2_147_483_629u32;
+    let media_ts = 2_147_483_587u32;
+    let two_sec_media = media_ts * 2; // 4_294_967_174 <= u32::MAX
+
+    // 3 saniyelik elst: 2 kare (2 s + 1 s kırpılmış), toplam 3 * media_ts = 6_442_450_761 tik.
+    let avis_3s =
+        build_wide_elst_v1_avis(movie_ts, media_ts, two_sec_media, u64::from(movie_ts) * 3);
+    let info_3s =
+        av1oxide::avif::parse_sequence_info(&avis_3s).expect("3s geniş zaman tabanlı AVIS");
+    assert_eq!(info_3s.frame_count, 2);
+    assert_eq!(info_3s.timescale, u64::from(media_ts));
+    assert_eq!(info_3s.duration_in_timescale, u64::from(media_ts) * 3);
+
+    // 5 saniyelik elst: 3 kare (2 s + 2 s + 1 s kırpılmış), toplam 5 * media_ts = 10_737_417_935 tik.
+    // (`10_737_417_935 * 2_147_483_629 > u64::MAX`, ancak `m_mul` sadeleştirmesi sonrası `u64`'e sığar!)
+    let avis_5s =
+        build_wide_elst_v1_avis(movie_ts, media_ts, two_sec_media, u64::from(movie_ts) * 5);
+    let mut dec_5s =
+        AvifSequenceDecoder::new(&avis_5s).expect("5s geniş zaman tabanlı AVIS taşmasız açılmalı");
+    assert_eq!(dec_5s.info().frame_count, 3);
+    assert_eq!(dec_5s.info().timescale, u64::from(media_ts));
+    assert_eq!(dec_5s.info().duration_in_timescale, 10_737_417_935);
+    let f0 = dec_5s.next_frame().unwrap().unwrap();
+    assert_eq!(f0.pts_in_timescale, 0);
+    assert_eq!(f0.duration_in_timescale, u64::from(two_sec_media));
+    let f1 = dec_5s.next_frame().unwrap().unwrap();
+    assert_eq!(f1.pts_in_timescale, u64::from(two_sec_media));
+    assert_eq!(f1.duration_in_timescale, u64::from(two_sec_media));
+    let f2 = dec_5s.next_frame().unwrap().unwrap();
+    assert_eq!(f2.pts_in_timescale, u64::from(two_sec_media) * 2);
+    assert_eq!(f2.duration_in_timescale, u64::from(media_ts));
+    assert!(dec_5s.next_frame().unwrap().is_none());
 }

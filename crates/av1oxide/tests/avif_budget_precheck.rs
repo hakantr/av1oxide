@@ -636,4 +636,40 @@ fn avif_budget_accounts_gainmap_second_icc_and_grid_planning() {
         max_tight_grid <= 4096,
         "sıkı bütçeli grid reddi aşırı tekil tahsis yapmamalı: {max_tight_grid}"
     );
+
+    // 3. `6.I.1` (`P2-2`): `iref` + `grpl` + `tmap` + çoklu `ipma` içeren `avif_gm` üzerinde
+    //    `parse_info_with` ve `AvifPrepared::from_vec` için ikili aramayla bulunan minimum kabul
+    //    eşiği `hi` etrafında (`hi-32..=hi+64`) hiçbir bütçe değerinde `peak_live > limit` veya
+    //    `max_single > limit` oluşmamalıdır.
+    let mut lo_info = 512usize;
+    let mut hi_info = 256 * 1024usize;
+    while lo_info < hi_info {
+        let mid = lo_info + (hi_info - lo_info) / 2;
+        let c = AvifDecodeConfig {
+            allocation_limit: Some(mid),
+            ..AvifDecodeConfig::default()
+        };
+        let (res, max_s, peak_l) = measure_allocs(|| parse_info_with(&avif_gm, &c));
+        assert!(
+            peak_l <= mid && max_s <= mid,
+            "parse_info_with mid={mid}: peak_live={peak_l}, max_single={max_s}"
+        );
+        if res.is_ok() {
+            hi_info = mid;
+        } else {
+            lo_info = mid + 1;
+        }
+    }
+    for budget in hi_info.saturating_sub(32)..=hi_info + 64 {
+        let c = AvifDecodeConfig {
+            allocation_limit: Some(budget),
+            ..AvifDecodeConfig::default()
+        };
+        let (res, max_s, peak_l) = measure_allocs(|| parse_info_with(&avif_gm, &c));
+        assert!(
+            peak_l <= budget && max_s <= budget,
+            "parse_info_with budget={budget} (hi={hi_info}, ok={}): peak_live={peak_l}, max_single={max_s}",
+            res.is_ok()
+        );
+    }
 }

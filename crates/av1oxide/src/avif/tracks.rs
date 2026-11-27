@@ -191,13 +191,14 @@ impl ParsedTrack<'_> {
 }
 
 /// Ayrıştırılmış üst düzey ISOBMFF kapsayıcısı (`ftyp` + isteğe bağlı `moov` + isteğe bağlı `meta`).
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub(crate) struct ParsedMovie<'a> {
     pub(crate) major_brand: [u8; 4],
     #[allow(dead_code)]
     pub(crate) compatible_brands: Vec<[u8; 4]>,
     pub(crate) tracks: Vec<ParsedTrack<'a>>,
     pub(crate) top_meta: Option<AvifContainer<'a>>,
+    pub(crate) _guard: ButceTutucu,
 }
 
 impl<'a> ParsedMovie<'a> {
@@ -286,7 +287,7 @@ pub(crate) fn parse_movie<'a>(data: &'a [u8], butce: &Arc<Butce>) -> Result<Pars
                     .saturating_mul(core::mem::size_of::<[u8; 4]>());
                 ftyp_guard.ekle(compat_bytes)?;
                 compatible_brands
-                    .try_reserve(compat_chunks.len())
+                    .try_reserve_exact(compat_chunks.len())
                     .map_err(|_| Error::AllocationFailed {
                         requested: compat_bytes,
                     })?;
@@ -369,11 +370,13 @@ pub(crate) fn parse_movie<'a>(data: &'a [u8], butce: &Arc<Butce>) -> Result<Pars
         )?;
     }
 
+    ftyp_guard.birlestir(tracks_guard);
     Ok(ParsedMovie {
         major_brand,
         compatible_brands,
         tracks,
         top_meta,
+        _guard: ftyp_guard,
     })
 }
 
@@ -386,6 +389,25 @@ fn parse_moov<'a>(
     tracks: &mut Vec<ParsedTrack<'a>>,
     tracks_guard: &mut ButceTutucu,
 ) -> Result<()> {
+    let mut trak_count = 0usize;
+    let mut scan_off = 0usize;
+    while let Some(child) = read_box_header(moov_payload, scan_off)? {
+        scan_off = child.next_offset;
+        if &child.box_type == b"trak" {
+            trak_count += 1;
+        }
+    }
+    if trak_count > 0 {
+        let tracks_bytes = trak_count.saturating_mul(core::mem::size_of::<ParsedTrack<'_>>());
+        tracks_guard.ekle(tracks_bytes)?;
+        tracks.try_reserve_exact(trak_count).map_err(|_| {
+            tracks_guard.dusur(tracks_bytes);
+            Error::AllocationFailed {
+                requested: tracks_bytes,
+            }
+        })?;
+    }
+
     let mut offset = 0usize;
     let mut seen_mvhd = false;
     let mut movie_timescale = 0u64;
@@ -413,10 +435,6 @@ fn parse_moov<'a>(
                 {
                     return Err(Error::InvalidData("görüntü parçası boyutu sıfır olamaz"));
                 }
-                tracks_guard.ekle(core::mem::size_of::<ParsedTrack<'_>>())?;
-                tracks.try_reserve(1).map_err(|_| Error::AllocationFailed {
-                    requested: core::mem::size_of::<ParsedTrack<'_>>(),
-                })?;
                 tracks.push(track);
             }
             _ => {}
@@ -567,15 +585,18 @@ fn parse_trak<'a>(
     };
 
     let (is_av01, properties, samples, mut track_guard) =
-        if let Some((stbl, mut prop_guard, _table_guard)) = raw_stbl {
+        if let Some((mut stbl, mut prop_guard, table_guard)) = raw_stbl {
             let is_av01 = stbl.is_av01;
             let (samples, sample_guard) = if is_av01 {
                 build_track_samples(&stbl, file_data.len(), butce)?
             } else {
                 (Vec::new(), ButceTutucu::bos(butce))
             };
+            let properties = core::mem::take(&mut stbl.properties);
+            drop(stbl);
+            drop(table_guard);
             prop_guard.birlestir(sample_guard);
-            (is_av01, stbl.properties, samples, prop_guard)
+            (is_av01, properties, samples, prop_guard)
         } else {
             (false, Vec::new(), Vec::new(), ButceTutucu::bos(butce))
         };
@@ -597,7 +618,7 @@ fn parse_trak<'a>(
         references,
         samples,
         meta: track_meta,
-        _guard: Arc::new(track_guard),
+        _guard: track_guard.into_arc()?,
     })
 }
 
@@ -768,6 +789,15 @@ const fn gcd_u64(mut a: u64, mut b: u64) -> u64 {
     a
 }
 
+const fn gcd_u128(mut a: u128, mut b: u128) -> u128 {
+    while b != 0 {
+        let r = a % b;
+        a = b;
+        b = r;
+    }
+    a
+}
+
 /// Parçanın `elst` düzenleme listesini uygulayarak sunum zaman çizelgesini (`PresentedSample`),
 /// toplam sunum süresini ve etkin zaman ölçeğini (`lcm(media_timescale, movie_timescale)`)
 /// `O((S + E + K) log S)` karmaşıklıkta üretir.
@@ -810,11 +840,9 @@ pub(crate) fn build_presented_timeline(
     let g = gcd_u64(media_ts, movie_ts).max(1);
     let m_mul = u128::from(movie_ts / g);
     let v_mul = u128::from(media_ts / g);
-    let eff_ts_u128 = u128::from(media_ts)
+    let mut eff_ts_u128 = u128::from(media_ts)
         .checked_mul(m_mul)
         .ok_or(Error::InvalidData("elst ortak zaman ölçeği taşması"))?;
-    let eff_ts = u64::try_from(eff_ts_u128)
-        .map_err(|_| Error::InvalidData("elst ortak zaman ölçeği u64 taşması"))?;
 
     // Tek girdili, `media_time == 0` düzenleme listesi:
     // - Tekrarlayan (`flags & 1 != 0`) AVIS döngüsünde medya kırpma yapmıyorsa (`seg_eff >= total_media_end`),
@@ -867,6 +895,13 @@ pub(crate) fn build_presented_timeline(
         start: u128,
         end: u128,
         raw_index: usize,
+    }
+
+    #[derive(Clone, Copy)]
+    struct RawPresented {
+        raw_index: usize,
+        pts: u128,
+        dur: u128,
     }
 
     // Geçici sıralı aralık dizisi + düz maksimum-bitiş aralık ağacı (`O(S)` bellek, `Butce` altında).
@@ -935,36 +970,44 @@ pub(crate) fn build_presented_timeline(
             requested: stack_bytes,
         })?;
 
-    let mut presented: Vec<PresentedSample> = Vec::new();
+    let mut raw_presented: Vec<RawPresented> = Vec::new();
+    let mut raw_pres_guard = ButceTutucu::bos(butce);
     let mut timeline_pts_u128: u128 = 0;
 
-    let push_sample = |presented: &mut Vec<PresentedSample>,
-                       guard: &mut ButceTutucu,
+    let push_sample = |raw_presented: &mut Vec<RawPresented>,
+                       raw_pres_guard: &mut ButceTutucu,
                        raw_index: usize,
                        pres_pts_u128: u128,
                        clipped_dur_u128: u128,
                        seg_max_end: &mut u128|
      -> Result<()> {
-        if presented.len() >= MAX_TRACK_SAMPLES {
+        if raw_presented.len() >= MAX_TRACK_SAMPLES {
             return Err(Error::BudgetExceeded {
-                requested: presented.len() + 1,
+                requested: raw_presented.len() + 1,
                 limit: MAX_TRACK_SAMPLES,
             });
         }
-        let pres_pts = u64::try_from(pres_pts_u128)
-            .map_err(|_| Error::InvalidData("elst sunum zaman damgası u64 taşması"))?;
-        let clipped_dur = u64::try_from(clipped_dur_u128)
-            .map_err(|_| Error::InvalidData("elst kırpılmış süre u64 taşması"))?;
-        guard.ekle(core::mem::size_of::<PresentedSample>())?;
-        presented
-            .try_reserve(1)
-            .map_err(|_| Error::AllocationFailed {
-                requested: core::mem::size_of::<PresentedSample>(),
+        if raw_presented.len() == raw_presented.capacity() {
+            let old_cap = raw_presented.capacity();
+            let new_cap = if old_cap == 0 {
+                n.clamp(1, 64)
+            } else {
+                old_cap.saturating_mul(2).min(MAX_TRACK_SAMPLES)
+            };
+            let add_cap = new_cap - old_cap;
+            let add_bytes = add_cap.saturating_mul(core::mem::size_of::<RawPresented>());
+            raw_pres_guard.ekle(add_bytes)?;
+            raw_presented.try_reserve_exact(add_cap).map_err(|_| {
+                raw_pres_guard.dusur(add_bytes);
+                Error::AllocationFailed {
+                    requested: add_bytes,
+                }
             })?;
-        presented.push(PresentedSample {
+        }
+        raw_presented.push(RawPresented {
             raw_index,
-            pts_in_timescale: pres_pts,
-            duration_in_timescale: clipped_dur,
+            pts: pres_pts_u128,
+            dur: clipped_dur_u128,
         });
         *seg_max_end = (*seg_max_end).max(pres_pts_u128.saturating_add(clipped_dur_u128));
         Ok(())
@@ -989,7 +1032,7 @@ pub(crate) fn build_presented_timeline(
             .ok_or(Error::InvalidData("elst media_time taşması"))?;
         let edit_end = seg_dur_eff.map(|d| edit_start.saturating_add(d));
         let mut seg_max_end = timeline_pts_u128;
-        let seg_start_idx = presented.len();
+        let seg_start_idx = raw_presented.len();
 
         // 1. Pozitif kesişimli örnekleri (`s_start < edit_end && s_end > edit_start`)
         //    düz maksimum-bitiş aralık ağacında `O(log S + k)` sürede bul.
@@ -1014,8 +1057,8 @@ pub(crate) fn build_presented_timeline(
                         let clipped_dur = clip_end - clip_start;
                         let pres_pts = timeline_pts_u128.saturating_add(clip_start - edit_start);
                         push_sample(
-                            &mut presented,
-                            guard,
+                            &mut raw_presented,
+                            &mut raw_pres_guard,
                             iv.raw_index,
                             pres_pts,
                             clipped_dur,
@@ -1049,8 +1092,8 @@ pub(crate) fn build_presented_timeline(
                 let iv = intervals[idx];
                 if iv.end == iv.start {
                     push_sample(
-                        &mut presented,
-                        guard,
+                        &mut raw_presented,
+                        &mut raw_pres_guard,
                         iv.raw_index,
                         timeline_pts_u128,
                         0,
@@ -1061,10 +1104,10 @@ pub(crate) fn build_presented_timeline(
             }
         }
 
-        if presented.len() > seg_start_idx + 1 {
-            presented[seg_start_idx..].sort_unstable_by(|a, b| {
-                a.pts_in_timescale
-                    .cmp(&b.pts_in_timescale)
+        if raw_presented.len() > seg_start_idx + 1 {
+            raw_presented[seg_start_idx..].sort_unstable_by(|a, b| {
+                a.pts
+                    .cmp(&b.pts)
                     .then_with(|| a.raw_index.cmp(&b.raw_index))
             });
         }
@@ -1075,28 +1118,81 @@ pub(crate) fn build_presented_timeline(
         };
     }
 
-    if presented.is_empty() {
+    drop((intervals, tree_max_end, stack, _temp_guard));
+
+    if raw_presented.is_empty() {
         return Err(Error::InvalidData(
             "elst zaman çizelgesi hiç görünür kare üretmedi",
         ));
     }
 
+    // `u128` uzayında zaman ölçeği sadeleştirmesi:
+    // 1. Tüm sunum zaman damgaları, süreler ve toplam süre `m_mul`'a tam bölünüyorsa
+    //    doğrudan `media_ts` ölçeğine indirge (`u64::try_from` dönüşümünden ÖNCE).
+    // 2. Tam bölünmüyorsa ama herhangi bir değer `u64::MAX` sınırını aşıyorsa ortak bölen (`gcd`)
+    //    ile sadeleştir (`u64` içine zaten sığan alt-birim zaman çizelgelerinin ölçeğine dokunulmaz).
+    if m_mul > 1
+        && timeline_pts_u128.is_multiple_of(m_mul)
+        && raw_presented
+            .iter()
+            .all(|p| p.pts.is_multiple_of(m_mul) && p.dur.is_multiple_of(m_mul))
+    {
+        for p in &mut raw_presented {
+            p.pts /= m_mul;
+            p.dur /= m_mul;
+        }
+        timeline_pts_u128 /= m_mul;
+        eff_ts_u128 = u128::from(media_ts);
+    } else if eff_ts_u128 > u128::from(u64::MAX)
+        || timeline_pts_u128 > u128::from(u64::MAX)
+        || raw_presented
+            .iter()
+            .any(|p| p.pts > u128::from(u64::MAX) || p.dur > u128::from(u64::MAX))
+    {
+        let mut g_red = gcd_u128(m_mul, timeline_pts_u128);
+        for p in &raw_presented {
+            g_red = gcd_u128(g_red, gcd_u128(p.pts, p.dur));
+            if g_red <= 1 {
+                break;
+            }
+        }
+        if g_red > 1 {
+            for p in &mut raw_presented {
+                p.pts /= g_red;
+                p.dur /= g_red;
+            }
+            timeline_pts_u128 /= g_red;
+            eff_ts_u128 /= g_red;
+        }
+    }
+
+    let eff_ts = u64::try_from(eff_ts_u128)
+        .map_err(|_| Error::InvalidData("elst ortak zaman ölçeği u64 taşması"))?;
     let total_duration = u64::try_from(timeline_pts_u128)
         .map_err(|_| Error::InvalidData("elst toplam süre u64 taşması"))?;
-    let m_mul_u64 = eff_ts / media_ts;
-    if m_mul_u64 > 1
-        && total_duration.is_multiple_of(m_mul_u64)
-        && presented.iter().all(|p| {
-            p.pts_in_timescale.is_multiple_of(m_mul_u64)
-                && p.duration_in_timescale.is_multiple_of(m_mul_u64)
-        })
-    {
-        for p in &mut presented {
-            p.pts_in_timescale /= m_mul_u64;
-            p.duration_in_timescale /= m_mul_u64;
-        }
-        return Ok((presented, total_duration / m_mul_u64, media_ts));
+
+    let pres_len = raw_presented.len();
+    let pres_bytes = pres_len.saturating_mul(core::mem::size_of::<PresentedSample>());
+    guard.ekle(pres_bytes)?;
+    let mut presented = Vec::new();
+    presented
+        .try_reserve_exact(pres_len)
+        .map_err(|_| Error::AllocationFailed {
+            requested: pres_bytes,
+        })?;
+    for p in &raw_presented {
+        let pres_pts = u64::try_from(p.pts)
+            .map_err(|_| Error::InvalidData("elst sunum zaman damgası u64 taşması"))?;
+        let clipped_dur = u64::try_from(p.dur)
+            .map_err(|_| Error::InvalidData("elst kırpılmış süre u64 taşması"))?;
+        presented.push(PresentedSample {
+            raw_index: p.raw_index,
+            pts_in_timescale: pres_pts,
+            duration_in_timescale: clipped_dur,
+        });
     }
+    drop((raw_presented, raw_pres_guard));
+
     Ok((presented, total_duration, eff_ts))
 }
 
@@ -1105,34 +1201,42 @@ fn parse_tref(
     refs: &mut Vec<TrackReference>,
     guard: &mut ButceTutucu,
 ) -> Result<()> {
-    let mut offset = 0usize;
-    while let Some(child) = read_box_header(payload, offset)? {
-        offset = child.next_offset;
+    let mut total_valid = 0usize;
+    let mut scan_off = 0usize;
+    while let Some(child) = read_box_header(payload, scan_off)? {
+        scan_off = child.next_offset;
         if matches!(&child.box_type, b"auxl" | b"prem") {
             if child.payload.len() < 4 {
                 return Err(Error::InvalidData("tref referans kutusu 4 bayttan kısa"));
             }
-            let chunks = child.payload.as_chunks::<4>().0;
-            let bytes = chunks
-                .len()
-                .saturating_mul(core::mem::size_of::<TrackReference>());
-            guard.ekle(bytes)?;
-            refs.try_reserve(chunks.len())
-                .map_err(|_| Error::AllocationFailed { requested: bytes })?;
-            let mut pushed = 0usize;
-            for chunk in chunks {
+            for chunk in child.payload.as_chunks::<4>().0 {
+                if u32::from_be_bytes(*chunk) != 0 {
+                    total_valid += 1;
+                }
+            }
+        }
+    }
+    if total_valid > 0 {
+        let bytes = total_valid.saturating_mul(core::mem::size_of::<TrackReference>());
+        guard.ekle(bytes)?;
+        refs.try_reserve_exact(total_valid).map_err(|_| {
+            guard.dusur(bytes);
+            Error::AllocationFailed { requested: bytes }
+        })?;
+    }
+
+    let mut offset = 0usize;
+    while let Some(child) = read_box_header(payload, offset)? {
+        offset = child.next_offset;
+        if matches!(&child.box_type, b"auxl" | b"prem") {
+            for chunk in child.payload.as_chunks::<4>().0 {
                 let to_id = u32::from_be_bytes(*chunk);
                 if to_id != 0 {
                     refs.push(TrackReference {
                         ref_type: child.box_type,
                         to_track_id: to_id,
                     });
-                    pushed += 1;
                 }
-            }
-            let unused = chunks.len().saturating_sub(pushed);
-            if unused > 0 {
-                guard.dusur(unused.saturating_mul(core::mem::size_of::<TrackReference>()));
             }
         }
     }
@@ -1296,7 +1400,7 @@ fn parse_chunk_offsets(
     }
     reserve_table_budget(count, core::mem::size_of::<u64>(), guard)?;
     stbl.chunks
-        .try_reserve(count)
+        .try_reserve_exact(count)
         .map_err(|_| Error::AllocationFailed {
             requested: count.saturating_mul(core::mem::size_of::<u64>()),
         })?;
@@ -1325,7 +1429,7 @@ fn parse_stsc(payload: &[u8], stbl: &mut RawSampleTable, guard: &mut ButceTutucu
     }
     reserve_table_budget(count, core::mem::size_of::<SampleToChunk>(), guard)?;
     stbl.sample_to_chunks
-        .try_reserve(count)
+        .try_reserve_exact(count)
         .map_err(|_| Error::AllocationFailed {
             requested: count.saturating_mul(core::mem::size_of::<SampleToChunk>()),
         })?;
@@ -1373,7 +1477,7 @@ fn parse_stsz(payload: &[u8], stbl: &mut RawSampleTable, guard: &mut ButceTutucu
         }
         reserve_table_budget(sample_count, core::mem::size_of::<u32>(), guard)?;
         stbl.sample_sizes
-            .try_reserve(sample_count)
+            .try_reserve_exact(sample_count)
             .map_err(|_| Error::AllocationFailed {
                 requested: sample_count.saturating_mul(core::mem::size_of::<u32>()),
             })?;
@@ -1399,7 +1503,7 @@ fn parse_stts(payload: &[u8], stbl: &mut RawSampleTable, guard: &mut ButceTutucu
     }
     reserve_table_budget(count, core::mem::size_of::<TimeToSample>(), guard)?;
     stbl.time_to_samples
-        .try_reserve(count)
+        .try_reserve_exact(count)
         .map_err(|_| Error::AllocationFailed {
             requested: count.saturating_mul(core::mem::size_of::<TimeToSample>()),
         })?;
@@ -1429,7 +1533,7 @@ fn parse_ctts(payload: &[u8], stbl: &mut RawSampleTable, guard: &mut ButceTutucu
     }
     reserve_table_budget(count, core::mem::size_of::<CompositionOffset>(), guard)?;
     stbl.composition_offsets
-        .try_reserve(count)
+        .try_reserve_exact(count)
         .map_err(|_| Error::AllocationFailed {
             requested: count.saturating_mul(core::mem::size_of::<CompositionOffset>()),
         })?;
@@ -1464,7 +1568,7 @@ fn parse_stss(payload: &[u8], stbl: &mut RawSampleTable, guard: &mut ButceTutucu
     reserve_table_budget(count, core::mem::size_of::<u32>(), guard)?;
     stbl.has_stss = true;
     stbl.sync_samples
-        .try_reserve(count)
+        .try_reserve_exact(count)
         .map_err(|_| Error::AllocationFailed {
             requested: count.saturating_mul(core::mem::size_of::<u32>()),
         })?;

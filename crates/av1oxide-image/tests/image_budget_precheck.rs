@@ -323,3 +323,528 @@ fn with_config_input_buffer_never_exceeds_allocation_limit_and_metadata_clones_r
         ImageError::Limits(ref e) if e.kind() == LimitErrorKind::InsufficientMemory
     ));
 }
+
+fn build_rich_avif_with_iref_grpl_tmap_and_props() -> Vec<u8> {
+    let mut ftyp_payload = Vec::new();
+    ftyp_payload.extend_from_slice(b"avif");
+    ftyp_payload.extend_from_slice(&0u32.to_be_bytes());
+    ftyp_payload.extend_from_slice(b"avifmif1miaftmap");
+    let ftyp = make_box(b"ftyp", &ftyp_payload);
+
+    let mut hdlr_body = vec![0u8; 4];
+    hdlr_body.extend_from_slice(b"pict");
+    hdlr_body.extend_from_slice(&[0u8; 13]);
+    let hdlr = make_full_box(b"hdlr", 0, 0, &hdlr_body);
+    let pitm = make_full_box(b"pitm", 0, 0, &1u16.to_be_bytes());
+
+    let make_infe = |id: u16, ty: &[u8; 4]| -> Vec<u8> {
+        let mut b = Vec::new();
+        b.extend_from_slice(&id.to_be_bytes());
+        b.extend_from_slice(&0u16.to_be_bytes());
+        b.extend_from_slice(ty);
+        b.push(0);
+        make_full_box(b"infe", 2, 0, &b)
+    };
+    let mut iinf_b = 3u16.to_be_bytes().to_vec();
+    iinf_b.extend_from_slice(&make_infe(1, b"av01"));
+    iinf_b.extend_from_slice(&make_infe(2, b"av01"));
+    iinf_b.extend_from_slice(&make_infe(3, b"tmap"));
+    let iinf = make_full_box(b"iinf", 0, 0, &iinf_b);
+
+    let mut dimg_b = Vec::new();
+    dimg_b.extend_from_slice(&3u16.to_be_bytes());
+    dimg_b.extend_from_slice(&2u16.to_be_bytes());
+    dimg_b.extend_from_slice(&1u16.to_be_bytes());
+    dimg_b.extend_from_slice(&2u16.to_be_bytes());
+    let iref = make_full_box(b"iref", 0, 0, &make_box(b"dimg", &dimg_b));
+
+    let mut altr_b = Vec::new();
+    altr_b.extend_from_slice(&1u32.to_be_bytes());
+    altr_b.extend_from_slice(&2u32.to_be_bytes());
+    altr_b.extend_from_slice(&3u32.to_be_bytes());
+    altr_b.extend_from_slice(&1u32.to_be_bytes());
+    let grpl = make_box(b"grpl", &make_full_box(b"altr", 0, 0, &altr_b));
+
+    let mut ispe_b = Vec::new();
+    ispe_b.extend_from_slice(&1u32.to_be_bytes());
+    ispe_b.extend_from_slice(&1u32.to_be_bytes());
+    let mut colr_nclx = Vec::new();
+    colr_nclx.extend_from_slice(b"nclx");
+    colr_nclx.extend_from_slice(&1u16.to_be_bytes());
+    colr_nclx.extend_from_slice(&13u16.to_be_bytes());
+    colr_nclx.extend_from_slice(&6u16.to_be_bytes());
+    colr_nclx.push(0x80);
+    let mut pasp_b = Vec::new();
+    pasp_b.extend_from_slice(&1u32.to_be_bytes());
+    pasp_b.extend_from_slice(&1u32.to_be_bytes());
+    let mut ipco_b = Vec::new();
+    ipco_b.extend_from_slice(&make_full_box(b"ispe", 0, 0, &ispe_b));
+    ipco_b.extend_from_slice(&make_full_box(b"pixi", 0, 0, &[3, 8, 8, 8]));
+    ipco_b.extend_from_slice(&make_box(b"av1C", &[0x81, 0x00, 0x0c, 0x00]));
+    ipco_b.extend_from_slice(&make_box(b"colr", &colr_nclx));
+    ipco_b.extend_from_slice(&make_box(b"pasp", &pasp_b));
+    let ipco = make_box(b"ipco", &ipco_b);
+
+    let mut ipma_b = 3u32.to_be_bytes().to_vec();
+    ipma_b.extend_from_slice(&1u16.to_be_bytes());
+    ipma_b.push(5);
+    ipma_b.extend_from_slice(&[1, 2, 0x80 | 3, 4, 5]);
+    ipma_b.extend_from_slice(&2u16.to_be_bytes());
+    ipma_b.push(4);
+    ipma_b.extend_from_slice(&[1, 2, 0x80 | 3, 4]);
+    ipma_b.extend_from_slice(&3u16.to_be_bytes());
+    ipma_b.push(3);
+    ipma_b.extend_from_slice(&[1, 2, 4]);
+    let ipma = make_full_box(b"ipma", 0, 0, &ipma_b);
+    let iprp = make_box(b"iprp", &[ipco.as_slice(), ipma.as_slice()].concat());
+
+    let mut tmap_payload = vec![0u8, 0, 0, 0, 0, 0];
+    tmap_payload.extend_from_slice(&0u32.to_be_bytes());
+    tmap_payload.extend_from_slice(&1u32.to_be_bytes());
+    tmap_payload.extend_from_slice(&1u32.to_be_bytes());
+    tmap_payload.extend_from_slice(&1u32.to_be_bytes());
+    tmap_payload.extend_from_slice(&0i32.to_be_bytes());
+    tmap_payload.extend_from_slice(&1u32.to_be_bytes());
+    tmap_payload.extend_from_slice(&1i32.to_be_bytes());
+    tmap_payload.extend_from_slice(&1u32.to_be_bytes());
+    tmap_payload.extend_from_slice(&1u32.to_be_bytes());
+    tmap_payload.extend_from_slice(&1u32.to_be_bytes());
+    tmap_payload.extend_from_slice(&0i32.to_be_bytes());
+    tmap_payload.extend_from_slice(&1u32.to_be_bytes());
+    tmap_payload.extend_from_slice(&0i32.to_be_bytes());
+    tmap_payload.extend_from_slice(&1u32.to_be_bytes());
+
+    let mut idat_payload = Vec::new();
+    let off1 = 0u32;
+    idat_payload.extend_from_slice(AV1_1X1_8BIT);
+    let off2 = idat_payload.len() as u32;
+    idat_payload.extend_from_slice(AV1_1X1_8BIT);
+    let off3 = idat_payload.len() as u32;
+    idat_payload.extend_from_slice(&tmap_payload);
+    let idat = make_box(b"idat", &idat_payload);
+
+    let mut iloc_b = vec![0x44u8, 0x00];
+    iloc_b.extend_from_slice(&3u16.to_be_bytes());
+    for (id, off, len) in [
+        (1u16, off1, AV1_1X1_8BIT.len() as u32),
+        (2u16, off2, AV1_1X1_8BIT.len() as u32),
+        (3u16, off3, tmap_payload.len() as u32),
+    ] {
+        iloc_b.extend_from_slice(&id.to_be_bytes());
+        iloc_b.extend_from_slice(&1u16.to_be_bytes());
+        iloc_b.extend_from_slice(&0u16.to_be_bytes());
+        iloc_b.extend_from_slice(&1u16.to_be_bytes());
+        iloc_b.extend_from_slice(&off.to_be_bytes());
+        iloc_b.extend_from_slice(&len.to_be_bytes());
+    }
+    let iloc = make_full_box(b"iloc", 1, 0, &iloc_b);
+
+    let meta = make_full_box(
+        b"meta",
+        0,
+        0,
+        &[
+            hdlr.as_slice(),
+            pitm.as_slice(),
+            iinf.as_slice(),
+            iref.as_slice(),
+            grpl.as_slice(),
+            iprp.as_slice(),
+            iloc.as_slice(),
+            idat.as_slice(),
+        ]
+        .concat(),
+    );
+    [ftyp.as_slice(), meta.as_slice()].concat()
+}
+
+fn check_threshold_sweep(label: &str, data: &[u8]) {
+    let mut lo = data.len();
+    let mut hi = data.len().saturating_add(16 * 1024 * 1024);
+    let probe = |budget: usize| -> (bool, usize, usize) {
+        let cfg = AvifDecodeConfig {
+            n_threads: 1,
+            allocation_limit: Some(budget),
+            ..AvifDecodeConfig::default()
+        };
+        let (res, peak, largest) =
+            measure_allocs(|| AvifDecoder::with_config(Cursor::new(data), cfg));
+        let ok = res.is_ok();
+        drop(res);
+        (ok, peak, largest)
+    };
+    let (ok_hi, peak_hi, largest_hi) = probe(hi);
+    assert!(
+        peak_hi <= hi && largest_hi <= hi,
+        "{label}: hi={hi} peak={peak_hi} largest={largest_hi}"
+    );
+    if !ok_hi {
+        return;
+    }
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        let (ok, peak, largest) = probe(mid);
+        assert!(
+            peak <= mid && largest <= mid,
+            "{label}: ikili arama mid={mid} ok={ok} peak={peak} largest={largest}"
+        );
+        if ok {
+            hi = mid;
+        } else {
+            lo = mid + 1;
+        }
+    }
+    for budget in [data.len(), data.len() + 1]
+        .into_iter()
+        .chain(hi.saturating_sub(32)..=hi + 64)
+    {
+        let (ok, peak, largest) = probe(budget);
+        assert!(
+            peak <= budget && largest <= budget,
+            "{label}: budget={budget} (hi={hi}, ok={ok}) peak={peak} largest={largest}"
+        );
+    }
+    for budget in [hi.saturating_sub(1), hi] {
+        let cfg = AvifDecodeConfig {
+            n_threads: 1,
+            allocation_limit: Some(budget),
+            ..AvifDecodeConfig::default()
+        };
+        let (res, peak, largest) = measure_allocs(|| {
+            AvifDecoder::with_config(
+                ChunkedReader {
+                    data,
+                    chunk_size: 256,
+                },
+                cfg,
+            )
+        });
+        assert!(
+            peak <= budget && largest <= budget,
+            "{label}: chunk=256 budget={budget} (hi={hi}, ok={}) peak={peak} largest={largest}",
+            res.is_ok()
+        );
+        drop(res);
+    }
+}
+
+/// `6.I.1` (`P2-2`): Sentetik (`iref`/`grpl`/`tmap`/`ipma`, `cmin` `zlib`/`deflate`/`gzip`,
+/// `AvifSequenceDecoder` `.avis`, `read_image`) ve varsa izinli `libavif/tests/data`
+/// korpusundaki (`colors-animated-8bpc.avif` dâhil) tüm AVIF dosyalarında ikili-arama eşiği `hi`
+/// etrafında (`[len, len+1, hi-32..=hi+64]`) `peak_live <= limit` ve `max_single <= limit` korunur.
+#[test]
+fn with_config_strict_threshold_sweep_never_exceeds_allocation_limit() {
+    let synth_simple = build_padded_avif(1_235, None);
+    check_threshold_sweep("synthetic_1235", &synth_simple);
+
+    let synth_rich = build_rich_avif_with_iref_grpl_tmap_and_props();
+    check_threshold_sweep("synthetic_rich_iref_grpl_tmap", &synth_rich);
+
+    // 1. Sentetik `cmin` (`zlib`, `deflate`, `gzip`) AVIF üzerinde hem `limit = 4096`
+    //    (`InflateState` ~43 KiB ayrılmadan önce reddedilmeli!) hem de ikili-arama `hi` eşiği taraması.
+    let ftyp_end = u32::from_be_bytes(synth_simple[0..4].try_into().unwrap()) as usize;
+    let ftyp_slice = &synth_simple[..ftyp_end];
+    let meta_len =
+        u32::from_be_bytes(synth_simple[ftyp_end..ftyp_end + 4].try_into().unwrap()) as usize;
+    let meta_payload = &synth_simple[ftyp_end + 8..ftyp_end + meta_len];
+
+    let encode_deflate_stored = |raw: &[u8]| -> Vec<u8> {
+        let len = raw.len() as u16;
+        let nlen = !len;
+        let mut out = Vec::with_capacity(5 + raw.len());
+        out.push(0x01); // BFINAL=1, BTYPE=00 (stored)
+        out.extend_from_slice(&len.to_le_bytes());
+        out.extend_from_slice(&nlen.to_le_bytes());
+        out.extend_from_slice(raw);
+        out
+    };
+    let adler32 = |raw: &[u8]| -> u32 {
+        let mut a = 1u32;
+        let mut b = 0u32;
+        for &byte in raw {
+            a = (a + u32::from(byte)) % 65_521;
+            b = (b + a) % 65_521;
+        }
+        (b << 16) | a
+    };
+    let crc32 = |raw: &[u8]| -> u32 {
+        let mut crc = 0xFFFF_FFFFu32;
+        for &byte in raw {
+            crc ^= u32::from(byte);
+            for _ in 0..8 {
+                let mask = (crc & 1).wrapping_neg();
+                crc = (crc >> 1) ^ (0xEDB8_8320 & mask);
+            }
+        }
+        !crc
+    };
+
+    for (fourcc, label) in [
+        (b"zlib", "cmin_zlib"),
+        (b"defl", "cmin_defl"),
+        (b"gzip", "cmin_gzip"),
+    ] {
+        let deflate_block = encode_deflate_stored(meta_payload);
+        let compressed = match fourcc {
+            b"zlib" => {
+                let mut v = vec![0x78, 0x01];
+                v.extend_from_slice(&deflate_block);
+                v.extend_from_slice(&adler32(meta_payload).to_be_bytes());
+                v
+            }
+            b"defl" => deflate_block,
+            _ => {
+                let mut v = vec![0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff];
+                v.extend_from_slice(&deflate_block);
+                v.extend_from_slice(&crc32(meta_payload).to_le_bytes());
+                v.extend_from_slice(&(meta_payload.len() as u32).to_le_bytes());
+                v
+            }
+        };
+        let mut cmin_body = Vec::with_capacity(4 + compressed.len());
+        cmin_body.extend_from_slice(fourcc);
+        cmin_body.extend_from_slice(&compressed);
+        let cmin_box = make_full_box(b"cmin", 0, 0, &cmin_body);
+        let cmin_avif = [ftyp_slice, cmin_box.as_slice()].concat();
+
+        let (res_4k, peak_4k, max_4k) = measure_allocs(|| {
+            AvifDecoder::with_config(
+                Cursor::new(&cmin_avif),
+                AvifDecodeConfig {
+                    n_threads: 1,
+                    allocation_limit: Some(4_096),
+                    ..AvifDecodeConfig::default()
+                },
+            )
+        });
+        assert!(
+            res_4k.is_err() && peak_4k <= 4_096 && max_4k <= 4_096,
+            "{label} limit=4096: ok={} peak={peak_4k} max={max_4k}",
+            res_4k.is_ok()
+        );
+        check_threshold_sweep(label, &cmin_avif);
+    }
+
+    // 2. `AvifDecoder::with_config` + `read_image` uçtan uca ikili-arama eşiği (`hi-16..=hi+32`).
+    let mut lo_ri = synth_simple.len();
+    let mut hi_ri = 512 * 1024usize;
+    let probe_read_image = |budget: usize| -> (bool, usize, usize) {
+        let mut out_rgb = [0u8; 3];
+        let (res, peak, largest) = measure_allocs(|| -> Result<(), ImageError> {
+            let dec = AvifDecoder::with_config(
+                Cursor::new(&synth_simple),
+                AvifDecodeConfig {
+                    n_threads: 1,
+                    allocation_limit: Some(budget),
+                    ..AvifDecodeConfig::default()
+                },
+            )?;
+            dec.read_image(&mut out_rgb)
+        });
+        (res.is_ok(), peak, largest)
+    };
+    while lo_ri < hi_ri {
+        let mid = lo_ri + (hi_ri - lo_ri) / 2;
+        let (ok, peak, largest) = probe_read_image(mid);
+        assert!(
+            peak <= mid && largest <= mid,
+            "read_image mid={mid} ok={ok} peak={peak} largest={largest}"
+        );
+        if ok {
+            hi_ri = mid;
+        } else {
+            lo_ri = mid + 1;
+        }
+    }
+    for budget in hi_ri.saturating_sub(16)..=hi_ri + 32 {
+        let (ok, peak, largest) = probe_read_image(budget);
+        assert!(
+            peak <= budget && largest <= budget,
+            "read_image budget={budget} (hi={hi_ri}, ok={ok}) peak={peak} largest={largest}"
+        );
+    }
+
+    // 3. `AvifSequenceDecoder::with_config` üzerinde `top_meta` içermeyen saf `.avis` ikili-arama eşiği.
+    let build_pure_avis = || -> Vec<u8> {
+        let mut ftyp_p = Vec::new();
+        ftyp_p.extend_from_slice(b"avis");
+        ftyp_p.extend_from_slice(&0u32.to_be_bytes());
+        ftyp_p.extend_from_slice(b"msf1avifmiaf");
+        let ftyp = make_box(b"ftyp", &ftyp_p);
+        let mut mvhd_b = vec![0u8; 96];
+        mvhd_b[8..12].copy_from_slice(&30u32.to_be_bytes());
+        mvhd_b[12..16].copy_from_slice(&1u32.to_be_bytes());
+        let mvhd = make_full_box(b"mvhd", 0, 0, &mvhd_b);
+        let make_trak = |off: u32| -> Vec<u8> {
+            let mut tkhd_b = vec![0u8; 80];
+            tkhd_b[8..12].copy_from_slice(&1u32.to_be_bytes());
+            tkhd_b[16..20].copy_from_slice(&1u32.to_be_bytes());
+            tkhd_b[36..40].copy_from_slice(&0x0001_0000i32.to_be_bytes());
+            tkhd_b[52..56].copy_from_slice(&0x0001_0000i32.to_be_bytes());
+            tkhd_b[68..72].copy_from_slice(&0x4000_0000i32.to_be_bytes());
+            tkhd_b[72..76].copy_from_slice(&(1u32 << 16).to_be_bytes());
+            tkhd_b[76..80].copy_from_slice(&(1u32 << 16).to_be_bytes());
+            let tkhd = make_full_box(b"tkhd", 0, 3, &tkhd_b);
+            let mut mdhd_b = vec![0u8; 20];
+            mdhd_b[8..12].copy_from_slice(&30u32.to_be_bytes());
+            mdhd_b[12..16].copy_from_slice(&1u32.to_be_bytes());
+            let mdhd = make_full_box(b"mdhd", 0, 0, &mdhd_b);
+            let mut hdlr_b = vec![0u8; 4];
+            hdlr_b.extend_from_slice(b"pict");
+            hdlr_b.extend_from_slice(&[0u8; 13]);
+            let hdlr = make_full_box(b"hdlr", 0, 0, &hdlr_b);
+            let mut av01_p = vec![0u8; 78];
+            av01_p[24..26].copy_from_slice(&1u16.to_be_bytes());
+            av01_p[26..28].copy_from_slice(&1u16.to_be_bytes());
+            av01_p.extend_from_slice(&make_box(b"av1C", &[0x81, 0x00, 0x0c, 0x00]));
+            let mut stsd_b = 1u32.to_be_bytes().to_vec();
+            stsd_b.extend_from_slice(&make_box(b"av01", &av01_p));
+            let stsd = make_full_box(b"stsd", 0, 0, &stsd_b);
+            let mut stts_b = Vec::new();
+            stts_b.extend_from_slice(&1u32.to_be_bytes());
+            stts_b.extend_from_slice(&1u32.to_be_bytes());
+            stts_b.extend_from_slice(&1u32.to_be_bytes());
+            let stts = make_full_box(b"stts", 0, 0, &stts_b);
+            let mut stsc_b = Vec::new();
+            for _ in 0..4 {
+                stsc_b.extend_from_slice(&1u32.to_be_bytes());
+            }
+            let stsc = make_full_box(b"stsc", 0, 0, &stsc_b);
+            let mut stsz_b = Vec::new();
+            stsz_b.extend_from_slice(&(AV1_1X1_8BIT.len() as u32).to_be_bytes());
+            stsz_b.extend_from_slice(&1u32.to_be_bytes());
+            let stsz = make_full_box(b"stsz", 0, 0, &stsz_b);
+            let mut stco_b = 1u32.to_be_bytes().to_vec();
+            stco_b.extend_from_slice(&off.to_be_bytes());
+            let stco = make_full_box(b"stco", 0, 0, &stco_b);
+            let stbl = make_box(
+                b"stbl",
+                &[
+                    stsd.as_slice(),
+                    stts.as_slice(),
+                    stsc.as_slice(),
+                    stsz.as_slice(),
+                    stco.as_slice(),
+                ]
+                .concat(),
+            );
+            let minf = make_box(b"minf", &stbl);
+            let mdia = make_box(
+                b"mdia",
+                &[mdhd.as_slice(), hdlr.as_slice(), minf.as_slice()].concat(),
+            );
+            make_box(b"trak", &[tkhd.as_slice(), mdia.as_slice()].concat())
+        };
+        let dummy_moov = make_box(b"moov", &[mvhd.as_slice(), &make_trak(0)].concat());
+        let data_off = (ftyp.len() + dummy_moov.len() + 8) as u32;
+        let moov = make_box(b"moov", &[mvhd.as_slice(), &make_trak(data_off)].concat());
+        let mdat = make_box(b"mdat", AV1_1X1_8BIT);
+        [ftyp.as_slice(), moov.as_slice(), mdat.as_slice()].concat()
+    };
+    let check_seq_sweep = |label: &str, seq_bytes: &[u8]| {
+        let mut lo = 0usize;
+        let mut hi = 256 * 1024usize;
+        let probe_seq = |budget: usize| -> (bool, usize, usize) {
+            let cfg = AvifDecodeConfig {
+                n_threads: 1,
+                allocation_limit: Some(budget),
+                ..AvifDecodeConfig::default()
+            };
+            let (res, peak, largest) =
+                measure_allocs(|| av1oxide::avif::AvifSequenceDecoder::with_config(seq_bytes, cfg));
+            let ok = res.is_ok();
+            drop(res);
+            (ok, peak, largest)
+        };
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            let (ok, peak, largest) = probe_seq(mid);
+            assert!(
+                peak <= mid && largest <= mid,
+                "{label} seq mid={mid} ok={ok} peak={peak} largest={largest}"
+            );
+            if ok {
+                hi = mid;
+            } else {
+                lo = mid + 1;
+            }
+        }
+        for budget in hi.saturating_sub(16)..=hi + 32 {
+            let (ok, peak, largest) = probe_seq(budget);
+            assert!(
+                peak <= budget && largest <= budget,
+                "{label} seq budget={budget} (hi={hi}, ok={ok}) peak={peak} largest={largest}"
+            );
+        }
+    };
+    let pure_avis = build_pure_avis();
+    check_seq_sweep("pure_avis_no_top_meta", &pure_avis);
+
+    let ws_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(std::path::Path::parent)
+        .expect("workspace root");
+    let mut candidates = vec![
+        ws_root.join(".cache/libavif-src/tests/data"),
+        ws_root.join(".cache/libavif/tests/data"),
+    ];
+    if let Some(parent) = ws_root.parent() {
+        candidates
+            .push(parent.join("av1oxide_planlar/avif_dogrulama/kaynaklar/libavif/tests/data"));
+    }
+    let corpus_dir = candidates.into_iter().find(|p| p.exists());
+    let Some(corpus_dir) = corpus_dir else {
+        return;
+    };
+
+    let is_forbidden = |name: &str| -> bool {
+        let lower = name.to_ascii_lowercase();
+        lower.starts_with("arc_triomphe")
+            || lower.starts_with("cosmos")
+            || lower.contains("chimera")
+            || lower.contains("netflix")
+    };
+
+    let mut entries: Vec<_> = std::fs::read_dir(&corpus_dir)
+        .expect("read_dir")
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("avif"))
+        .filter(|p| {
+            p.file_name()
+                .and_then(|s| s.to_str())
+                .is_some_and(|n| !is_forbidden(n))
+        })
+        .collect();
+    entries.sort();
+
+    for path in &entries {
+        let name = path.file_name().unwrap().to_string_lossy();
+        let data = std::fs::read(path).expect("read avif");
+        if name == "colors-animated-8bpc.avif" {
+            let (res_2275, peak_2275, max_2275) = measure_allocs(|| {
+                AvifDecoder::with_config(
+                    Cursor::new(&data),
+                    AvifDecodeConfig {
+                        n_threads: 1,
+                        allocation_limit: Some(2_275),
+                        ..AvifDecodeConfig::default()
+                    },
+                )
+            });
+            assert!(
+                peak_2275 <= 2_275 && max_2275 <= 2_275,
+                "colors-animated-8bpc.avif limit=2275: ok={} peak={peak_2275} max={max_2275}",
+                res_2275.is_ok()
+            );
+            drop(res_2275);
+            check_seq_sweep("colors-animated-8bpc.avif", &data);
+        }
+        check_threshold_sweep(&name, &data);
+    }
+    assert!(
+        entries.len() >= 50,
+        "izinli libavif korpusunda en az 50 .avif dosyası taranmalı, taranan: {}",
+        entries.len()
+    );
+}
