@@ -816,9 +816,11 @@ pub(crate) fn build_presented_timeline(
     let eff_ts = u64::try_from(eff_ts_u128)
         .map_err(|_| Error::InvalidData("elst ortak zaman ölçeği u64 taşması"))?;
 
-    // Standart tekrarlayan AVIS döngüsü (`flags & 1 != 0`, `entry_count == 1`, `media_time == 0`):
-    // medya kırpma yapmıyorsa ham zaman çizelgesini doğrudan koru.
-    if (edit_list.flags & 1) != 0 && edit_list.entries.len() == 1 {
+    // Tek girdili, `media_time == 0` düzenleme listesi:
+    // - Tekrarlayan (`flags & 1 != 0`) AVIS döngüsünde medya kırpma yapmıyorsa (`seg_eff >= total_media_end`),
+    // - Tekrarlamayan (`flags & 1 == 0`) durumda da tam medya süresine birebir eşitse (`seg_eff == total_media_end`)
+    //   ve `track.media_duration` ile örtüşüyorsa ham `mdhd.timescale` zaman çizelgesini doğrudan koru.
+    if edit_list.entries.len() == 1 {
         let e = edit_list.entries[0];
         if e.media_time == 0 {
             let total_media_end = track
@@ -840,7 +842,14 @@ pub(crate) fn build_presented_timeline(
                         .ok_or(Error::InvalidData("elst segment_duration taşması"))?,
                 )
             };
-            if seg_eff.is_none_or(|d| d >= total_media_end) {
+            let is_repeating = (edit_list.flags & 1) != 0;
+            let is_identity = if is_repeating {
+                seg_eff.is_none_or(|d| d >= total_media_end)
+            } else {
+                seg_eff.is_none_or(|d| d == total_media_end)
+                    && u128::from(track.media_duration).saturating_mul(m_mul) == total_media_end
+            };
+            if is_identity {
                 return identity_timeline(guard);
             }
         }

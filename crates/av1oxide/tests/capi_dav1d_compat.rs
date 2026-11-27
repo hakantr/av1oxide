@@ -2732,3 +2732,256 @@ fn capi_install_prefix_rlimit_fsize_cleans_partial_stage_files() {
 
     let _ = std::fs::remove_dir_all(&scratch_dir);
 }
+
+/// `6.G.1` (`P2`): `n_fc > 1` halka tamponunda gecikmeli arka plan çözme hatası emekliye
+/// ayrılırken yeni gelen kurtarma `KEY` karesini ve çoklu-OBU (superframe) paketin kalan
+/// alt-karelerini düşürmemeli, hata `dav1d_get_picture` üzerinden eski bozuk paketin
+/// `cached_error_props` bilgileriyle bildirilmelidir.
+#[test]
+fn capi_delayed_decode_error_preserves_superframe_and_recovery_keyframe() {
+    let ivf_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(
+        "tests/fixtures/streams/Syntax_AV1_mainb8ss420_432x240_002_vq_aom_ctest_4.2.stripped.ivf",
+    );
+    let raw = std::fs::read(&ivf_path).expect("IVF fikstürü okunmalı");
+    let ivf = parse_ivf(&raw);
+    assert!(ivf.len() >= 5, "en az 5 karelik IVF fikstürü gerekir");
+
+    let pkt_key = ivf[0].1;
+    let pkt_inter1 = ivf[1].1;
+    let pkt_inter2 = ivf[2].1;
+
+    // `pkt_inter1` içindeki `OBU_FRAME` başlığını (`FrameHeader`) koruyup her karoyu 1 bayt
+    // uzunluğa indirge (`tile_size_minus_1 = 0` + 1 bayt `0x00`): ayrıştırıcı ve
+    // `split_tile_groups` hatasız geçer, arka plan işçi çözümü ise kesinlikle
+    // `MSAC veri sonu aşıldı` (gecikmeli asenkron hata) üretir.
+    let seq = av1oxide::bitstream::parse_sequence_header_obus(pkt_key)
+        .unwrap()
+        .expect("SequenceHeader bulunmalı");
+    let mut fh0_opt = None;
+    {
+        let mut off0 = 0usize;
+        while off0 < pkt_key.len() {
+            let Some(obu) = av1oxide::bitstream::split_next_with(pkt_key, &mut off0, true).unwrap()
+            else {
+                break;
+            };
+            if obu.header.obu_type == av1oxide::bitstream::ObuType::Frame {
+                let mut br = av1oxide::bitstream::BitReader::new(obu.payload);
+                let refs0: [Option<av1oxide::bitstream::FrameHeader>; 8] = Default::default();
+                let ctx = av1oxide::bitstream::FrameHeaderContext {
+                    sequence_header: &seq,
+                    refs: &refs0,
+                    temporal_id: 0,
+                    spatial_id: 0,
+                    strict_std_compliance: false,
+                };
+                fh0_opt = Some(av1oxide::bitstream::FrameHeader::parse(&mut br, &ctx).unwrap());
+                break;
+            }
+        }
+    }
+    let fh0 = fh0_opt.expect("KEY FrameHeader bulunmalı");
+    let mut corrupt_inter1 = Vec::new();
+    let mut off = 0usize;
+    while off < pkt_inter1.len() {
+        let Some(obu) = av1oxide::bitstream::split_next_with(pkt_inter1, &mut off, true).unwrap()
+        else {
+            break;
+        };
+        if obu.header.obu_type == av1oxide::bitstream::ObuType::Frame {
+            let mut br = av1oxide::bitstream::BitReader::new(obu.payload);
+            let refs1: [Option<av1oxide::bitstream::FrameHeader>; 8] =
+                std::array::from_fn(|_| Some(fh0.clone()));
+            let ctx = av1oxide::bitstream::FrameHeaderContext {
+                sequence_header: &seq,
+                refs: &refs1,
+                temporal_id: 0,
+                spatial_id: 0,
+                strict_std_compliance: false,
+            };
+            let fh = av1oxide::bitstream::FrameHeader::parse(&mut br, &ctx).unwrap();
+            br.align_to_byte();
+            let fh_end = br.byte_position();
+            let n_tiles = usize::from(fh.tiling.cols) * usize::from(fh.tiling.rows);
+            let size_bytes = usize::from(fh.tiling.n_bytes);
+            let mut body = obu.payload[..fh_end].to_vec();
+            for t in 0..n_tiles {
+                if t + 1 < n_tiles {
+                    body.resize(body.len() + size_bytes, 0u8);
+                }
+                body.push(0x00);
+            }
+            corrupt_inter1.extend_from_slice(&[0x12, 0x00, 0x32]);
+            let mut rem = body.len();
+            loop {
+                let mut byte = (rem & 0x7F) as u8;
+                rem >>= 7;
+                if rem != 0 {
+                    byte |= 0x80;
+                }
+                corrupt_inter1.push(byte);
+                if rem == 0 {
+                    break;
+                }
+            }
+            corrupt_inter1.extend_from_slice(&body);
+            break;
+        }
+    }
+    assert!(!corrupt_inter1.is_empty());
+
+    // Süper-kare paketi: 2 bağımsız kare (`KEY` + `INTER1`) tek bir `Dav1dData` paketinde.
+    let mut superframe_pkt = Vec::with_capacity(pkt_key.len() + pkt_inter1.len());
+    superframe_pkt.extend_from_slice(pkt_key);
+    superframe_pkt.extend_from_slice(pkt_inter1);
+
+    // Referans pikseller (tek paket, temiz çözüm: KEY, INTER1, INTER2).
+    let ref_planes = |pkts: &[&[u8]]| -> Vec<Vec<Vec<u8>>> {
+        // SAFETY: Bağımsız tek-thread C-ABI referans çözücüsü.
+        unsafe {
+            let mut s = Dav1dSettings::default();
+            dav1d_default_settings(&mut s);
+            s.n_threads = 1;
+            s.max_frame_delay = 1;
+            let mut c: *mut Dav1dContext = ptr::null_mut();
+            assert_eq!(dav1d_open(&mut c, &s), 0);
+            let mut out = Vec::new();
+            let mut pic = Dav1dPicture::default();
+            for &pkt in pkts {
+                let mut d = Dav1dData::default();
+                let dst = dav1d_data_create(&mut d, pkt.len());
+                ptr::copy_nonoverlapping(pkt.as_ptr(), dst, pkt.len());
+                loop {
+                    let sr = dav1d_send_data(c, &mut d);
+                    assert!(sr == 0 || sr == dav1d_err(EAGAIN));
+                    loop {
+                        let gr = dav1d_get_picture(c, &mut pic);
+                        if gr == 0 {
+                            out.push(copy_c_picture_planes(&pic));
+                            dav1d_picture_unref(&mut pic);
+                        } else {
+                            assert_eq!(gr, dav1d_err(EAGAIN));
+                            break;
+                        }
+                    }
+                    if sr == 0 {
+                        break;
+                    }
+                }
+            }
+            loop {
+                let gr = dav1d_get_picture(c, &mut pic);
+                if gr == dav1d_err(EAGAIN) {
+                    break;
+                }
+                assert_eq!(gr, 0);
+                out.push(copy_c_picture_planes(&pic));
+                dav1d_picture_unref(&mut pic);
+            }
+            dav1d_close(&mut c);
+            out
+        }
+    };
+
+    let clean_refs = ref_planes(&[pkt_key, pkt_inter1, pkt_inter2]);
+    assert_eq!(clean_refs.len(), 3);
+
+    // Akış düzeni:
+    //   0: KEY (sağlam)
+    //   1: corrupt_inter1 (arka planda başarısız -> ts=1001, off=2001)
+    //   2: INTER2 (bozuk 1'e bağlı -> arka planda başarısız -> ts=1002, off=2002)
+    //   3: KEY (kurtarma karesi -> ts=1003)
+    //   4: superframe(KEY + INTER1) (1. alt-kare gecikmeli hatayı emekliye ayırırken 2. alt-kare düşmemeli -> ts=1004)
+    //   5: INTER2 (superframe içindeki INTER1'e bağlı -> ts=1005)
+    let stream: &[(&[u8], i64, i64)] = &[
+        (pkt_key, 1000, 2000),
+        (&corrupt_inter1, 1001, 2001),
+        (pkt_inter2, 1002, 2002),
+        (pkt_key, 1003, 2003),
+        (&superframe_pkt, 1004, 2004),
+        (pkt_inter2, 1005, 2005),
+    ];
+
+    for (nt, mfd) in [(4, 4), (14, 4), (4, 2)] {
+        // SAFETY: Her koşu bağımsız `Dav1dContext` açıp kapatır.
+        unsafe {
+            let mut s = Dav1dSettings::default();
+            dav1d_default_settings(&mut s);
+            s.n_threads = nt;
+            s.max_frame_delay = mfd;
+            let mut c: *mut Dav1dContext = ptr::null_mut();
+            assert_eq!(dav1d_open(&mut c, &s), 0);
+
+            let mut decoded: Vec<(i64, Vec<Vec<u8>>)> = Vec::new();
+            let mut err_props_seen: Vec<(i64, i64)> = Vec::new();
+            let mut pic = Dav1dPicture::default();
+
+            for &(pkt, ts, off) in stream {
+                let mut d = Dav1dData::default();
+                let dst = dav1d_data_create(&mut d, pkt.len());
+                ptr::copy_nonoverlapping(pkt.as_ptr(), dst, pkt.len());
+                d.m.timestamp = ts;
+                d.m.offset = off;
+
+                loop {
+                    let sr = dav1d_send_data(c, &mut d);
+                    assert!(
+                        sr == 0 || sr == dav1d_err(EAGAIN),
+                        "t={nt} mfd={mfd} ts={ts}: gecikmeli hata dav1d_send_data'yı kesmemeli (sr={sr})"
+                    );
+                    let gr = dav1d_get_picture(c, &mut pic);
+                    if gr == 0 {
+                        decoded.push((pic.m.timestamp, copy_c_picture_planes(&pic)));
+                        dav1d_picture_unref(&mut pic);
+                    } else if gr != dav1d_err(EAGAIN) {
+                        let mut ep = Dav1dDataProps::default();
+                        assert_eq!(dav1d_get_decode_error_data_props(c, &mut ep), 0);
+                        err_props_seen.push((ep.timestamp, ep.offset));
+                    }
+                    if sr == 0 {
+                        break;
+                    }
+                }
+            }
+            loop {
+                let gr = dav1d_get_picture(c, &mut pic);
+                if gr == dav1d_err(EAGAIN) {
+                    break;
+                }
+                if gr == 0 {
+                    decoded.push((pic.m.timestamp, copy_c_picture_planes(&pic)));
+                    dav1d_picture_unref(&mut pic);
+                } else {
+                    let mut ep = Dav1dDataProps::default();
+                    assert_eq!(dav1d_get_decode_error_data_props(c, &mut ep), 0);
+                    err_props_seen.push((ep.timestamp, ep.offset));
+                }
+            }
+            dav1d_close(&mut c);
+
+            // Hata özellikleri yalnızca bozuk paketlere (`1001/2001` ve bağımlı `1002/2002`) ait olmalı.
+            assert!(
+                err_props_seen.contains(&(1001, 2001)),
+                "t={nt} mfd={mfd} bozuk paket 1001/2001 hata metaverisi bildirilmeli: {err_props_seen:?}"
+            );
+            assert!(
+                err_props_seen.iter().all(|&(t, _)| t == 1001 || t == 1002),
+                "t={nt} mfd={mfd} kurtarma/superframe paketleri hata üretmemeli: {err_props_seen:?}"
+            );
+
+            // Beklenen 5 sağlam kare: ts=1000 (KEY), ts=1003 (kurtarma KEY), ts=1004 (superframe KEY),
+            // ts=1004 (superframe INTER1), ts=1005 (INTER2).
+            let got_ts: Vec<i64> = decoded.iter().map(|(t, _)| *t).collect();
+            assert_eq!(
+                got_ts,
+                vec![1000, 1003, 1004, 1004, 1005],
+                "t={nt} mfd={mfd} kurtarma KEY ve superframe alt-karelerinin tamamı korunmalı"
+            );
+            assert_eq!(decoded[0].1, clean_refs[0]);
+            assert_eq!(decoded[1].1, clean_refs[0]);
+            assert_eq!(decoded[2].1, clean_refs[0]);
+            assert_eq!(decoded[3].1, clean_refs[1]);
+            assert_eq!(decoded[4].1, clean_refs[2]);
+        }
+    }
+}

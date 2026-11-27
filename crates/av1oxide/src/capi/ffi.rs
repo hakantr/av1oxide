@@ -927,6 +927,7 @@ fn pull_ready_nonblocking(ctx: &mut ContextInner) {
                 record_error_props_for_tag(ctx, tag, None);
             }
             cleanup_orphaned_preallocs(ctx);
+            cleanup_all_unused_packet_props(ctx);
             ctx.cached_error = error_to_dav1d(&err);
         }
     }

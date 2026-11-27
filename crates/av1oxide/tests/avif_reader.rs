@@ -2986,7 +2986,17 @@ fn avif_sequence_elst_128k_perf_and_sub_media_tick_precision() {
     assert_eq!(f17.duration_in_timescale, 51);
     assert!((f17.duration_sec - 0.017).abs() < 1e-12);
 
-    // 2. 128 000 örnek × 128 000 `elst` girdisi: `O((S + E + K) log S)` aralık ağacı ile
+    // 2. Tek girdili, kırpmasız ve ötelemesiz `flags = 0` `elst` (`media_time = 0`,
+    //    `segment_duration` tam medya süresine eşit: `5/30 s = 100/600 s`):
+    //    `lcm(30, 600) = 600` yerine ham `mdhd.timescale == 30` korunmalıdır (`6.G.2`).
+    let avis_exact_full = build_synthetic_avis(5, 600, 30, 1, &[(100, 0)]);
+    let info_full = av1oxide::avif::parse_sequence_info(&avis_exact_full)
+        .expect("kırpmasız flags=0 elst AVIS açılmalı");
+    assert_eq!(info_full.frame_count, 5);
+    assert_eq!(info_full.timescale, 30);
+    assert_eq!(info_full.duration_in_timescale, 5);
+
+    // 3. 128 000 örnek × 128 000 `elst` girdisi: `O((S + E + K) log S)` aralık ağacı ile
     //    `parse_sequence_info` 250 ms altında (pratikte birkaç ms) tamamlanmalıdır.
     let mut edits_128k: Vec<(u32, i32)> = Vec::with_capacity(128_000);
     for i in 0..128_000u32 {

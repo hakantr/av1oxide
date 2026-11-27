@@ -45,9 +45,18 @@ pub struct AvifSequenceInfo {
     pub premultiplied_alpha: bool,
     /// Dizideki toplam kare sayısı.
     pub frame_count: usize,
-    /// Medya zaman tabanı (`mdhd.timescale`, saniye başına birim).
+    /// Dizinin zaman tabanı (saniye başına birim):
+    ///
+    /// - Düzenleme listesi (`elst`) bulunmadığında veya medya örneklerini alt-birim düzeyinde
+    ///   kırpıp ötelemediğinde parçanın medya zaman tabanı (`mdhd.timescale`),
+    /// - `elst` alt-birim hassasiyetinde kırpma veya başlangıç gecikmesi uyguladığında
+    ///   yuvarlama kaybını önlemek üzere `lcm(mdhd.timescale, mvhd.timescale)` ortak zaman tabanı,
+    /// - Tek karelik hareketsiz `.avif` girdilerinde `1` (saniye başına birim).
+    ///
+    /// [`Self::duration_in_timescale`], [`AvifFrame::pts_in_timescale`] ve
+    /// [`AvifFrame::duration_in_timescale`] alanlarının tamamı bu zaman tabanı biriminde ifade edilir.
     pub timescale: u64,
-    /// Toplam süre (`timescale` biriminde).
+    /// Toplam süre ([`Self::timescale`] biriminde).
     pub duration_in_timescale: u64,
     /// Toplam süre (saniye).
     pub duration_sec: f64,
@@ -76,9 +85,9 @@ pub struct AvifFrame {
     pub image: AvifImage,
     /// 0-tabanlı kare indeksi.
     pub index: usize,
-    /// Karenin sunum zaman damgası (`timescale` biriminde).
+    /// Karenin sunum zaman damgası ([`AvifSequenceInfo::timescale`] biriminde).
     pub pts_in_timescale: u64,
-    /// Karenin görünme süresi (`timescale` biriminde).
+    /// Karenin görünme süresi ([`AvifSequenceInfo::timescale`] biriminde).
     pub duration_in_timescale: u64,
     /// Karenin sunum zaman damgası (saniye).
     pub pts_sec: f64,
