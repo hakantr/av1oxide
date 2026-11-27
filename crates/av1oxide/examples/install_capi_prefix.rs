@@ -141,7 +141,7 @@ fn stage_action(action: &InstallAction, stage_path: &Path) -> Result<(), String>
     if fs::symlink_metadata(stage_path).is_ok() {
         let _ = fs::remove_file(stage_path);
     }
-    match action {
+    let res = match action {
         InstallAction::CopyFile { src, .. } => fs::copy(src, stage_path).map(|_| ()).map_err(|e| {
             format!(
                 "{} -> {} sahnelenemedi: {e}",
@@ -174,7 +174,11 @@ fn stage_action(action: &InstallAction, stage_path: &Path) -> Result<(), String>
                 })
             }
         }
+    };
+    if res.is_err() {
+        let _ = fs::remove_file(stage_path);
     }
+    res
 }
 
 fn rollback_transaction(
@@ -255,11 +259,11 @@ fn execute_transactional_install(
                 return Err(err);
             }
         };
+        staged_paths.push(stage_path.clone());
         if let Err(err) = stage_action(action, &stage_path) {
             rollback_transaction(&[], &[], &staged_paths, &created_dirs);
             return Err(err);
         }
-        staged_paths.push(stage_path);
     }
 
     // 4. Atomik devreye alma: mevcut hedefleri yedekleyip sahnelenmiş dosyaları `rename` ile geçir.

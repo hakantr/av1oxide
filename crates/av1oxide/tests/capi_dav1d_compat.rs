@@ -1118,7 +1118,8 @@ int main(void) {
     assert(grain_out.seq_hdr != NULL && grain_out.frame_hdr != NULL);
     dav1d_picture_unref(&grain_out);
     dav1d_picture_unref(&pic2);
-    assert(alloc_st.release_calls == 2);
+    /* `grain_out` hemen serbest kalır; `pic2` KEY referans yuvasında tutulduğu için `dav1d_close` ile serbest kalır. */
+    assert(alloc_st.release_calls == 1);
 
     /* Bozuk paketle gerçek C va_list vsnprintf logger geri çağrısı */
     const uint8_t bad_obu[] = { 0x0A, 0x7F, 0xFF };
@@ -1133,6 +1134,7 @@ int main(void) {
 
     dav1d_close(&cc);
     assert(cc == NULL);
+    assert(alloc_st.release_calls == 2);
     return 0;
 }
 "#;
@@ -1882,6 +1884,13 @@ fn capi_decode_frame_type_and_svc_per_obu_parity() {
         }
     }
 
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    struct DecodedCapiFrame {
+        planes: Vec<Vec<u8>>,
+        timestamp: i64,
+        offset: i64,
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn decode_packets_capi(
         api: Dav1dApi,
@@ -1892,7 +1901,7 @@ fn capi_decode_frame_type_and_svc_per_obu_parity() {
         all_layers: c_int,
         apply_grain: c_int,
         while_drain: bool,
-    ) -> Vec<Vec<Vec<u8>>> {
+    ) -> Vec<DecodedCapiFrame> {
         // SAFETY: Her çağrı bağımsız bir `Dav1dContext` açıp kapatır ve tamponları güvenle yönetir.
         unsafe {
             let mut s = Dav1dSettings::default();
@@ -1908,11 +1917,13 @@ fn capi_decode_frame_type_and_svc_per_obu_parity() {
 
             let mut out = Vec::new();
             let mut pic = Dav1dPicture::default();
-            for &pkt in packets {
+            for (idx, &pkt) in packets.iter().enumerate() {
                 let mut data = Dav1dData::default();
                 let dst = (api.data_create)(&mut data, pkt.len());
                 assert!(!dst.is_null());
                 ptr::copy_nonoverlapping(pkt.as_ptr(), dst, pkt.len());
+                data.m.timestamp = 100 + idx as i64;
+                data.m.offset = 1000 + idx as i64;
                 loop {
                     let s_rc = (api.send_data)(c, &mut data);
                     assert!(
@@ -1923,7 +1934,11 @@ fn capi_decode_frame_type_and_svc_per_obu_parity() {
                         loop {
                             let g_rc = (api.get_picture)(c, &mut pic);
                             if g_rc == 0 {
-                                out.push(copy_c_picture_planes(&pic));
+                                out.push(DecodedCapiFrame {
+                                    planes: copy_c_picture_planes(&pic),
+                                    timestamp: pic.m.timestamp,
+                                    offset: pic.m.offset,
+                                });
                                 (api.picture_unref)(&mut pic);
                             } else {
                                 assert_eq!(g_rc, dav1d_err(EAGAIN));
@@ -1933,7 +1948,11 @@ fn capi_decode_frame_type_and_svc_per_obu_parity() {
                     } else {
                         let g_rc = (api.get_picture)(c, &mut pic);
                         if g_rc == 0 {
-                            out.push(copy_c_picture_planes(&pic));
+                            out.push(DecodedCapiFrame {
+                                planes: copy_c_picture_planes(&pic),
+                                timestamp: pic.m.timestamp,
+                                offset: pic.m.offset,
+                            });
                             (api.picture_unref)(&mut pic);
                         } else {
                             assert_eq!(g_rc, dav1d_err(EAGAIN));
@@ -1951,7 +1970,11 @@ fn capi_decode_frame_type_and_svc_per_obu_parity() {
                     break;
                 }
                 assert_eq!(rc, 0);
-                out.push(copy_c_picture_planes(&pic));
+                out.push(DecodedCapiFrame {
+                    planes: copy_c_picture_planes(&pic),
+                    timestamp: pic.m.timestamp,
+                    offset: pic.m.offset,
+                });
                 (api.picture_unref)(&mut pic);
             }
             (api.close)(&mut c);
@@ -2157,15 +2180,19 @@ fn capi_decode_frame_type_and_svc_per_obu_parity() {
                             "{svc_name} {mode_name} all_layers={all_layers} wd={while_drain} t={nt} mfd={mfd}"
                         );
                         if expected_count == ref_tu_l0.len() {
-                            assert_eq!(
-                                got, ref_tu_l0,
-                                "{svc_name} {mode_name} all_layers={all_layers} wd={while_drain} t={nt} mfd={mfd} ref_tu_l0 ile piksel-özdeş olmalı"
-                            );
+                            for (a, b) in got.iter().zip(ref_tu_l0.iter()) {
+                                assert_eq!(
+                                    a.planes, b.planes,
+                                    "{svc_name} {mode_name} all_layers={all_layers} wd={while_drain} t={nt} mfd={mfd} ref_tu_l0 ile piksel-özdeş olmalı"
+                                );
+                            }
                         } else if expected_count == ref_tu_l1.len() {
-                            assert_eq!(
-                                got, ref_tu_l1,
-                                "{svc_name} {mode_name} all_layers={all_layers} wd={while_drain} t={nt} mfd={mfd} ref_tu_l1 ile piksel-özdeş olmalı"
-                            );
+                            for (a, b) in got.iter().zip(ref_tu_l1.iter()) {
+                                assert_eq!(
+                                    a.planes, b.planes,
+                                    "{svc_name} {mode_name} all_layers={all_layers} wd={while_drain} t={nt} mfd={mfd} ref_tu_l1 ile piksel-özdeş olmalı"
+                                );
+                            }
                         }
                         #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
                         if let Some(ref_lib) = ref_dav1d.as_ref() {
@@ -2181,13 +2208,306 @@ fn capi_decode_frame_type_and_svc_per_obu_parity() {
                             );
                             assert_eq!(
                                 got, expected_c,
-                                "{svc_name} {mode_name} all_layers={all_layers} wd={while_drain} t={nt} mfd={mfd} gerçek C libdav1d ile piksel-özdeş olmalı"
+                                "{svc_name} {mode_name} all_layers={all_layers} wd={while_drain} t={nt} mfd={mfd} gerçek C libdav1d ile piksel + timestamp + offset özdeş olmalı"
                             );
                         }
                         #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
                         let _ = &ref_dav1d;
                     }
                 }
+            }
+        }
+    }
+
+    // 3. Çoklu `OBU_TILE_GRP` paketine bölünmüş karelerde (`6.F.1`) `m.timestamp` ve `m.offset`
+    //    değerleri kareyi tamamlayan son karo grubundan değil ilk karo grubundan (`tile[0].data.m`)
+    //    alınmalıdır (`103 / 1003` vs `105 / 1005`).
+    let multi_tg_path = workspace_root.join(".cache/dav1d-test-data/8-bit/data/00000019.ivf");
+    if multi_tg_path.is_file() {
+        let raw = std::fs::read(&multi_tg_path).unwrap();
+        let ivf = parse_ivf(&raw);
+        let obu_pkts = split_to_single_obu_packets(&ivf);
+        // İlk paketteki ilk OBU_TILE_GRP (start == 0) indeksini bul.
+        let mut first_tg_idx = None;
+        for (i, &pkt) in obu_pkts.iter().enumerate() {
+            let obu_type = (pkt[0] >> 3) & 0x0F;
+            if obu_type == 4 {
+                first_tg_idx = Some(i as i64);
+                break;
+            }
+        }
+        let first_tg_idx = first_tg_idx.expect("00000019.ivf içinde OBU_TILE_GRP bulunmalı");
+        for (nt, mfd) in [(1, 1), (4, 2)] {
+            let got = decode_packets_capi(
+                av1oxide_api,
+                &obu_pkts,
+                nt,
+                mfd,
+                DAV1D_DECODEFRAMETYPE_ALL,
+                1,
+                0,
+                true,
+            );
+            assert!(!got.is_empty());
+            assert_eq!(
+                got[0].timestamp,
+                100 + first_tg_idx,
+                "00000019.ivf t={nt} mfd={mfd} ilk kare timestamp ilk tile group'tan gelmeli"
+            );
+            assert_eq!(
+                got[0].offset,
+                1000 + first_tg_idx,
+                "00000019.ivf t={nt} mfd={mfd} ilk kare offset ilk tile group'tan gelmeli"
+            );
+            #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+            if let Some(ref_lib) = ref_dav1d.as_ref() {
+                let expected_c = decode_packets_capi(
+                    ref_lib.api,
+                    &obu_pkts,
+                    nt,
+                    mfd,
+                    DAV1D_DECODEFRAMETYPE_ALL,
+                    1,
+                    0,
+                    true,
+                );
+                assert_eq!(
+                    got, expected_c,
+                    "00000019.ivf t={nt} mfd={mfd} gerçek C libdav1d ile piksel + timestamp + offset özdeş olmalı"
+                );
+            }
+        }
+    }
+}
+
+/// `6.F.2`: `show_existing_frame` yolunda özel `Dav1dPicAllocator` yeniden kullanımı.
+/// `ccvb_film_grain.ivf`'in 3. paketinde (`pkt_idx == 2`, `show_existing_frame`) ayırıcı `-ENOMEM`
+/// döndürse dahi `apply_grain = 0` altında `alloc_picture_callback` hiç çağrılmadığı için
+/// 100 karenin tamamı hatasız çözülür ve kapanışta `live_allocs == 0` sağlanır.
+#[test]
+fn capi_custom_allocator_show_existing_reuses_buffer_and_no_leak() {
+    let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    let ivf_path = workspace_root.join(".cache/dav1d-test-data/8-bit/features/ccvb_film_grain.ivf");
+    if !ivf_path.is_file() {
+        return;
+    }
+    let raw = std::fs::read(&ivf_path).unwrap();
+    let ivf = parse_ivf(&raw);
+    let pkts: Vec<&[u8]> = ivf.iter().map(|&(_, p)| p).collect();
+
+    struct ReuseAllocState {
+        cur_pkt_idx: AtomicUsize,
+        fail_on_pkt_idx: usize,
+        alloc_calls: AtomicUsize,
+        release_calls: AtomicUsize,
+        live_allocs: AtomicUsize,
+    }
+
+    struct RawBuf {
+        _y: Vec<u8>,
+        _u: Vec<u8>,
+        _v: Vec<u8>,
+    }
+
+    extern "C" fn reuse_alloc_cb(pic: *mut Dav1dPicture, cookie: *mut c_void) -> c_int {
+        // SAFETY: `cookie` canlı `ReuseAllocState` ve `pic` geçerli `Dav1dPicture` işaretçisidir.
+        unsafe {
+            let st = &*(cookie as *const ReuseAllocState);
+            let p = &mut *pic;
+            assert!(!p.seq_hdr.is_null(), "alloc_cb içinde seq_hdr dolu olmalı");
+            assert!(
+                !p.frame_hdr.is_null(),
+                "alloc_cb içinde frame_hdr dolu olmalı"
+            );
+            if st.cur_pkt_idx.load(Ordering::SeqCst) == st.fail_on_pkt_idx {
+                return dav1d_err(ENOMEM);
+            }
+            let w = p.p.w as usize;
+            let h = p.p.h as usize;
+            let bps = if p.p.bpc > 8 { 2 } else { 1 };
+            let stride_y = (w * bps + 63) & !63;
+            let cw = w.div_ceil(2);
+            let ch = h.div_ceil(2);
+            let stride_uv = (cw * bps + 63) & !63;
+            let mut y = vec![0u8; stride_y * h + 64];
+            let mut u = vec![0u8; stride_uv * ch + 64];
+            let mut v = vec![0u8; stride_uv * ch + 64];
+            p.data[0] = y.as_mut_ptr() as *mut c_void;
+            p.data[1] = u.as_mut_ptr() as *mut c_void;
+            p.data[2] = v.as_mut_ptr() as *mut c_void;
+            p.stride[0] = stride_y as isize;
+            p.stride[1] = stride_uv as isize;
+            let boxed = Box::new(RawBuf {
+                _y: y,
+                _u: u,
+                _v: v,
+            });
+            p.allocator_data = Box::into_raw(boxed) as *mut c_void;
+            st.alloc_calls.fetch_add(1, Ordering::SeqCst);
+            st.live_allocs.fetch_add(1, Ordering::SeqCst);
+            0
+        }
+    }
+
+    extern "C" fn reuse_release_cb(pic: *mut Dav1dPicture, cookie: *mut c_void) {
+        // SAFETY: `cookie` canlı `ReuseAllocState` ve `pic.allocator_data` `Box::into_raw(RawBuf)`'tır.
+        unsafe {
+            let st = &*(cookie as *const ReuseAllocState);
+            let p = &mut *pic;
+            if !p.allocator_data.is_null() {
+                drop(Box::from_raw(p.allocator_data as *mut RawBuf));
+                p.allocator_data = ptr::null_mut();
+                st.release_calls.fetch_add(1, Ordering::SeqCst);
+                st.live_allocs.fetch_sub(1, Ordering::SeqCst);
+            }
+        }
+    }
+
+    let decode_default = |apply_grain: c_int| -> Vec<Vec<Vec<u8>>> {
+        // SAFETY: Bağımsız varsayılan ayırıcılı `Dav1dContext` referans çözümü.
+        unsafe {
+            let mut s = Dav1dSettings::default();
+            dav1d_default_settings(&mut s);
+            s.n_threads = 1;
+            s.max_frame_delay = 1;
+            s.apply_grain = apply_grain;
+            let mut c: *mut Dav1dContext = ptr::null_mut();
+            assert_eq!(dav1d_open(&mut c, &s), 0);
+            let mut out = Vec::new();
+            let mut pic = Dav1dPicture::default();
+            for &pkt in &pkts {
+                let mut data = Dav1dData::default();
+                let dst = dav1d_data_create(&mut data, pkt.len());
+                ptr::copy_nonoverlapping(pkt.as_ptr(), dst, pkt.len());
+                loop {
+                    let s_rc = dav1d_send_data(c, &mut data);
+                    assert!(s_rc == 0 || s_rc == dav1d_err(EAGAIN));
+                    loop {
+                        let g_rc = dav1d_get_picture(c, &mut pic);
+                        if g_rc == 0 {
+                            out.push(copy_c_picture_planes(&pic));
+                            dav1d_picture_unref(&mut pic);
+                        } else {
+                            assert_eq!(g_rc, dav1d_err(EAGAIN));
+                            break;
+                        }
+                    }
+                    if s_rc == 0 {
+                        break;
+                    }
+                }
+            }
+            loop {
+                let g_rc = dav1d_get_picture(c, &mut pic);
+                if g_rc == dav1d_err(EAGAIN) {
+                    break;
+                }
+                assert_eq!(g_rc, 0);
+                out.push(copy_c_picture_planes(&pic));
+                dav1d_picture_unref(&mut pic);
+            }
+            dav1d_close(&mut c);
+            out
+        }
+    };
+
+    let ref_no_grain = decode_default(0);
+    let ref_with_grain = decode_default(1);
+    assert_eq!(ref_no_grain.len(), 100);
+    assert_eq!(ref_with_grain.len(), 100);
+
+    for (apply_grain, fail_on_pkt, expected) in
+        [(0, 2usize, &ref_no_grain), (1, usize::MAX, &ref_with_grain)]
+    {
+        for (nt, mfd) in [(1, 1), (4, 2)] {
+            let st = ReuseAllocState {
+                cur_pkt_idx: AtomicUsize::new(0),
+                fail_on_pkt_idx: fail_on_pkt,
+                alloc_calls: AtomicUsize::new(0),
+                release_calls: AtomicUsize::new(0),
+                live_allocs: AtomicUsize::new(0),
+            };
+            // SAFETY: Özel ayırıcı ömrü `dav1d_close` sonuna kadar geçerlidir.
+            unsafe {
+                let mut s = Dav1dSettings::default();
+                dav1d_default_settings(&mut s);
+                s.n_threads = nt;
+                s.max_frame_delay = mfd;
+                s.apply_grain = apply_grain;
+                s.allocator = Dav1dPicAllocator {
+                    cookie: (&st as *const ReuseAllocState) as *mut c_void,
+                    alloc_picture_callback: Some(reuse_alloc_cb),
+                    release_picture_callback: Some(reuse_release_cb),
+                };
+
+                let mut c: *mut Dav1dContext = ptr::null_mut();
+                assert_eq!(dav1d_open(&mut c, &s), 0);
+                let mut out = Vec::new();
+                let mut pic = Dav1dPicture::default();
+                for (idx, &pkt) in pkts.iter().enumerate() {
+                    st.cur_pkt_idx.store(idx, Ordering::SeqCst);
+                    let mut data = Dav1dData::default();
+                    let dst = dav1d_data_create(&mut data, pkt.len());
+                    ptr::copy_nonoverlapping(pkt.as_ptr(), dst, pkt.len());
+                    data.m.timestamp = 500 + idx as i64;
+                    loop {
+                        let s_rc = dav1d_send_data(c, &mut data);
+                        assert!(
+                            s_rc == 0 || s_rc == dav1d_err(EAGAIN),
+                            "apply_grain={apply_grain} t={nt} mfd={mfd} pkt={idx} send_data={s_rc}"
+                        );
+                        loop {
+                            let g_rc = dav1d_get_picture(c, &mut pic);
+                            if g_rc == 0 {
+                                out.push(copy_c_picture_planes(&pic));
+                                dav1d_picture_unref(&mut pic);
+                            } else {
+                                assert_eq!(g_rc, dav1d_err(EAGAIN));
+                                break;
+                            }
+                        }
+                        if s_rc == 0 {
+                            break;
+                        }
+                    }
+                }
+                st.cur_pkt_idx.store(pkts.len(), Ordering::SeqCst);
+                loop {
+                    let g_rc = dav1d_get_picture(c, &mut pic);
+                    if g_rc == dav1d_err(EAGAIN) {
+                        break;
+                    }
+                    assert_eq!(g_rc, 0);
+                    out.push(copy_c_picture_planes(&pic));
+                    dav1d_picture_unref(&mut pic);
+                }
+                dav1d_close(&mut c);
+
+                assert_eq!(
+                    out.len(),
+                    100,
+                    "apply_grain={apply_grain} t={nt} mfd={mfd} 100 kare çözülmeli"
+                );
+                assert_eq!(
+                    out, *expected,
+                    "apply_grain={apply_grain} t={nt} mfd={mfd} piksel-özdeş olmalı"
+                );
+                assert!(st.alloc_calls.load(Ordering::SeqCst) > 0);
+                assert_eq!(
+                    st.alloc_calls.load(Ordering::SeqCst),
+                    st.release_calls.load(Ordering::SeqCst),
+                    "apply_grain={apply_grain} t={nt} mfd={mfd} alloc == release olmalı"
+                );
+                assert_eq!(
+                    st.live_allocs.load(Ordering::SeqCst),
+                    0,
+                    "apply_grain={apply_grain} t={nt} mfd={mfd} sızıntı olmamalı"
+                );
             }
         }
     }
@@ -2275,6 +2595,118 @@ fn capi_install_prefix_transactional_preserves_existing_on_conflict() {
             assert!(
                 !name.starts_with(".av1oxide_"),
                 "artakalan geçici dosya olmamalı: {name}"
+            );
+        }
+    }
+
+    let _ = std::fs::remove_dir_all(&scratch_dir);
+}
+
+/// `6.F.5` (`P3`): `RLIMIT_FSIZE = 16 KiB` altında `install_capi_prefix` kopyalama ortasında
+/// yazma hatasına düştüğünde kısmi `.av1oxide_stage_*` dosyalarını temizlemeli ve mevcut
+/// kurulumu bayt-birebir korumalıdır.
+#[cfg(unix)]
+#[test]
+fn capi_install_prefix_rlimit_fsize_cleans_partial_stage_files() {
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let workspace_root = manifest_dir.parent().unwrap().parent().unwrap();
+    let scratch_dir = workspace_root.join(".cache/capi-prefix-rlimit-test");
+    let _ = std::fs::remove_dir_all(&scratch_dir);
+    let prefix_dir = scratch_dir.join("prefix");
+    let target_dir = scratch_dir.join("target");
+
+    // 1. Önce kurucuyu ve C-ABI kütüphanelerini normal sınırlarla ısıtıp geçerli bir kurulum yap.
+    let warmup = Command::new("cargo")
+        .current_dir(workspace_root)
+        .args([
+            "run",
+            "--locked",
+            "--release",
+            "-p",
+            "av1oxide",
+            "--example",
+            "install_capi_prefix",
+            "--",
+        ])
+        .arg(&prefix_dir)
+        .arg("--target-dir")
+        .arg(&target_dir)
+        .output()
+        .expect("ısınma kurulumu çalıştırılmalı");
+    assert!(
+        warmup.status.success(),
+        "ısınma kurulumu başarılı olmalı: {}",
+        String::from_utf8_lossy(&warmup.stderr)
+    );
+
+    let inc_dav1d = prefix_dir.join("include").join("dav1d");
+    let lib_dir = prefix_dir.join("lib");
+    let pc_dir = lib_dir.join("pkgconfig");
+    let sentinel_hdr = inc_dav1d.join("dav1d.h");
+    let sentinel_pc = pc_dir.join("dav1d.pc");
+    let sentinel_keep = prefix_dir.join("keep_unrelated.txt");
+    #[cfg(target_os = "macos")]
+    let sentinel_shared = lib_dir.join("libdav1d.7.dylib");
+    #[cfg(not(target_os = "macos"))]
+    let sentinel_shared = lib_dir.join("libdav1d.so.7.0.0");
+
+    std::fs::write(&sentinel_hdr, b"SENTINEL_RLIMIT_DAV1D_H").unwrap();
+    std::fs::write(&sentinel_pc, b"SENTINEL_RLIMIT_DAV1D_PC").unwrap();
+    std::fs::write(&sentinel_shared, b"SENTINEL_RLIMIT_SHARED").unwrap();
+    std::fs::write(&sentinel_keep, b"SENTINEL_RLIMIT_KEEP").unwrap();
+
+    // 2. Doğrudan derlenmiş `install_capi_prefix` ikilisini `SIGXFSZ` yoksayılı ve
+    //    `RLIMIT_FSIZE = 16 KiB` (`ulimit -f 32` * 512 B) ile çalıştır.
+    let bin_path = workspace_root
+        .join("target")
+        .join("release")
+        .join("examples")
+        .join("install_capi_prefix");
+    let limited = Command::new("sh")
+        .current_dir(workspace_root)
+        .args([
+            "-c",
+            "trap '' XFSZ; ulimit -f 32; exec \"$1\" \"$2\" --target-dir \"$3\"",
+            "sh",
+        ])
+        .arg(&bin_path)
+        .arg(&prefix_dir)
+        .arg(&target_dir)
+        .output()
+        .expect("RLIMIT_FSIZE alt süreci çalıştırılmalı");
+
+    assert!(
+        !limited.status.success(),
+        "16 KiB RLIMIT_FSIZE altında kurulum başarısız olmalı"
+    );
+    assert_eq!(
+        std::fs::read(&sentinel_hdr).unwrap(),
+        b"SENTINEL_RLIMIT_DAV1D_H",
+        "mevcut dav1d.h korunmalı"
+    );
+    assert_eq!(
+        std::fs::read(&sentinel_pc).unwrap(),
+        b"SENTINEL_RLIMIT_DAV1D_PC",
+        "mevcut dav1d.pc korunmalı"
+    );
+    assert_eq!(
+        std::fs::read(&sentinel_shared).unwrap(),
+        b"SENTINEL_RLIMIT_SHARED",
+        "mevcut paylaşımlı kütüphane korunmalı"
+    );
+    assert_eq!(
+        std::fs::read(&sentinel_keep).unwrap(),
+        b"SENTINEL_RLIMIT_KEEP",
+        "ilgisiz dosya korunmalı"
+    );
+
+    // Önek altında hiçbir kısmi `.av1oxide_stage_*` veya `.av1oxide_bak_*` dosyası kalmamalı!
+    for dir in [&prefix_dir, &inc_dav1d, &lib_dir, &pc_dir] {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let name = entry.unwrap().file_name().to_string_lossy().into_owned();
+            assert!(
+                !name.starts_with(".av1oxide_"),
+                "RLIMIT_FSIZE hatasında artakalan geçici dosya olmamalı: {name}"
             );
         }
     }

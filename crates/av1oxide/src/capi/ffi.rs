@@ -112,6 +112,13 @@ impl Drop for RefInner {
     }
 }
 
+/// Özel `Dav1dPicAllocator` ile gönderim aşamasında ayrılan ve referans yuvası
+/// boyunca (`show_existing_frame`) yeniden kullanılabilen resim girişi.
+pub(crate) struct PreallocatedPicture {
+    pub(crate) pic: Dav1dPicture,
+    pub(crate) populated: bool,
+}
+
 /// `Dav1dContext` iç durumu (`dav1d` `src/lib.c` `c->in` / `c->out` / `c->cache` uyumlu).
 pub(crate) struct ContextInner {
     pub(crate) decoder: Decoder,
@@ -130,7 +137,7 @@ pub(crate) struct ContextInner {
     pub(crate) next_packet_tag: u64,
     pub(crate) packet_props: VecDeque<(u64, Dav1dDataProps)>,
     pub(crate) next_prealloc_id: u64,
-    pub(crate) preallocated_pics: VecDeque<(u64, Dav1dPicture)>,
+    pub(crate) preallocated_pics: VecDeque<(u64, PreallocatedPicture)>,
 }
 
 impl Drop for ContextInner {
@@ -140,8 +147,8 @@ impl Drop for ContextInner {
         while let Some((_, mut props)) = self.packet_props.pop_front() {
             data_props_unref_value(&mut props);
         }
-        while let Some((_, mut pic)) = self.preallocated_pics.pop_front() {
-            picture_unref_value(&mut pic);
+        while let Some((_, mut entry)) = self.preallocated_pics.pop_front() {
+            picture_unref_value(&mut entry.pic);
         }
     }
 }
@@ -461,6 +468,41 @@ fn attach_picture_metadata(pic: &mut Dav1dPicture, meta: &OutputCapiMeta) {
     );
 }
 
+fn clear_picture_metadata_refs(pic: &mut Dav1dPicture) {
+    let mut seq_ref = pic.seq_hdr_ref;
+    let mut frame_ref = pic.frame_hdr_ref;
+    let mut cll_ref = pic.content_light_ref;
+    let mut mdcv_ref = pic.mastering_display_ref;
+    let mut itut_ref = pic.itut_t35_ref;
+    pic.seq_hdr = core::ptr::null_mut();
+    pic.seq_hdr_ref = core::ptr::null_mut();
+    pic.frame_hdr = core::ptr::null_mut();
+    pic.frame_hdr_ref = core::ptr::null_mut();
+    pic.content_light = core::ptr::null_mut();
+    pic.content_light_ref = core::ptr::null_mut();
+    pic.mastering_display = core::ptr::null_mut();
+    pic.mastering_display_ref = core::ptr::null_mut();
+    pic.itut_t35 = core::ptr::null_mut();
+    pic.n_itut_t35 = 0;
+    pic.itut_t35_ref = core::ptr::null_mut();
+    data_props_unref_value(&mut pic.m);
+    ref_dec(&mut seq_ref);
+    ref_dec(&mut frame_ref);
+    ref_dec(&mut cll_ref);
+    ref_dec(&mut mdcv_ref);
+    ref_dec(&mut itut_ref);
+}
+
+fn custom_picture_release_snapshot(pic: &Dav1dPicture) -> Dav1dPicture {
+    Dav1dPicture {
+        p: pic.p,
+        data: pic.data,
+        stride: pic.stride,
+        allocator_data: pic.allocator_data,
+        ..Dav1dPicture::default()
+    }
+}
+
 fn preallocate_custom_picture(
     allocator: &Dav1dPicAllocator,
     props: Dav1dDataProps,
@@ -495,7 +537,7 @@ fn preallocate_custom_picture(
         picture_unref_value(&mut pic);
         return Err(rc);
     }
-    let snapshot = pic;
+    let snapshot = custom_picture_release_snapshot(&pic);
     pic.r#ref = ref_into_raw(RefPayload::CustomPicture {
         pic_snapshot: snapshot,
         release_cb,
@@ -555,7 +597,7 @@ fn fill_output_picture(
             picture_unref_value(out);
             return Err(rc);
         }
-        let snapshot = *out;
+        let snapshot = custom_picture_release_snapshot(out);
         let pic_ref = ref_into_raw(RefPayload::CustomPicture {
             pic_snapshot: snapshot,
             release_cb,
@@ -813,13 +855,15 @@ fn is_packet_tag_referenced(ctx: &ContextInner, tag: u64) -> bool {
             .is_some_and(|(_, m)| m.packet_tag == tag)
 }
 
-fn cleanup_unused_packet_props(ctx: &mut ContextInner, tag: u64) {
-    if tag != 0
-        && !is_packet_tag_referenced(ctx, tag)
-        && let Some(pos) = ctx.packet_props.iter().position(|(t, _)| *t == tag)
-        && let Some((_, mut unused_props)) = ctx.packet_props.remove(pos)
-    {
-        data_props_unref_value(&mut unused_props);
+fn cleanup_all_unused_packet_props(ctx: &mut ContextInner) {
+    let mut i = 0;
+    while i < ctx.packet_props.len() {
+        let tag = ctx.packet_props[i].0;
+        if is_packet_tag_referenced(ctx, tag) {
+            i += 1;
+        } else if let Some((_, mut unused_props)) = ctx.packet_props.remove(i) {
+            data_props_unref_value(&mut unused_props);
+        }
     }
 }
 
@@ -840,40 +884,30 @@ fn record_error_props_for_tag(ctx: &mut ContextInner, tag: u64, fallback: Option
     }
 }
 
-fn take_preallocated_pic(ctx: &mut ContextInner, id: u64) -> Option<Dav1dPicture> {
+fn is_prealloc_id_referenced(ctx: &ContextInner, id: u64) -> bool {
     if id == 0 {
-        return None;
+        return false;
     }
-    let pos = ctx
-        .preallocated_pics
-        .iter()
-        .position(|(pid, _)| *pid == id)?;
-    ctx.preallocated_pics.remove(pos).map(|(_, pic)| pic)
-}
-
-fn drop_preallocated_pic(ctx: &mut ContextInner, id: u64) {
-    if let Some(mut pic) = take_preallocated_pic(ctx, id) {
-        picture_unref_value(&mut pic);
-    }
+    ctx.decoder.has_pending_prealloc_id(id)
+        || ctx.decoder.has_ref_slot_prealloc_id(id)
+        || ctx
+            .ready_pic
+            .as_ref()
+            .is_some_and(|(_, m)| m.prealloc_id == id)
+        || ctx
+            .cached_pic
+            .as_ref()
+            .is_some_and(|(_, m)| m.prealloc_id == id)
 }
 
 fn cleanup_orphaned_preallocs(ctx: &mut ContextInner) {
     let mut i = 0;
     while i < ctx.preallocated_pics.len() {
         let id = ctx.preallocated_pics[i].0;
-        let referenced = ctx.decoder.has_pending_prealloc_id(id)
-            || ctx
-                .ready_pic
-                .as_ref()
-                .is_some_and(|(_, m)| m.prealloc_id == id)
-            || ctx
-                .cached_pic
-                .as_ref()
-                .is_some_and(|(_, m)| m.prealloc_id == id);
-        if referenced {
+        if is_prealloc_id_referenced(ctx, id) {
             i += 1;
-        } else if let Some((_, mut pic)) = ctx.preallocated_pics.remove(i) {
-            picture_unref_value(&mut pic);
+        } else if let Some((_, mut entry)) = ctx.preallocated_pics.remove(i) {
+            picture_unref_value(&mut entry.pic);
         }
     }
 }
@@ -926,9 +960,9 @@ fn output_picture_ready(ctx: &mut ContextInner, drain: bool) -> bool {
                 let next = ctx.ready_pic.take();
                 if let Some((_, dropped_meta)) = ctx.cached_pic.take() {
                     ctx.event_flags |= dropped_meta.event_flags;
-                    drop_preallocated_pic(ctx, dropped_meta.prealloc_id);
                     ctx.cached_pic = next;
-                    cleanup_unused_packet_props(ctx, dropped_meta.packet_tag);
+                    cleanup_orphaned_preallocs(ctx);
+                    cleanup_all_unused_packet_props(ctx);
                 } else {
                     ctx.cached_pic = next;
                 }
@@ -973,17 +1007,30 @@ fn gen_picture(ctx: &mut ContextInner) -> c_int {
                 decoder,
                 allocator,
                 pending_in,
+                packet_props,
                 preallocated_pics,
                 next_prealloc_id,
                 ..
             } = ctx;
             let mut prealloc_cb = |req: &PreallocRequest<'_>| -> crate::Result<u64> {
-                let props = clone_data_props(&pending_in.m);
+                let props = if req.packet_tag != 0
+                    && let Some((_, p)) = packet_props.iter().find(|(t, _)| *t == req.packet_tag)
+                {
+                    clone_data_props(p)
+                } else {
+                    clone_data_props(&pending_in.m)
+                };
                 match preallocate_custom_picture(allocator, props, req) {
                     Ok(pic) => {
                         let id = *next_prealloc_id;
                         *next_prealloc_id = next_prealloc_id.wrapping_add(1).max(1);
-                        preallocated_pics.push_back((id, pic));
+                        preallocated_pics.push_back((
+                            id,
+                            PreallocatedPicture {
+                                pic,
+                                populated: false,
+                            },
+                        ));
                         Ok(id)
                     }
                     Err(code) => {
@@ -1009,8 +1056,9 @@ fn gen_picture(ctx: &mut ContextInner) -> c_int {
                     data_unref_value(&mut ctx.pending_in);
                     ctx.pending_offset = 0;
                     ctx.pending_tag = 0;
-                    cleanup_unused_packet_props(ctx, tag);
                 }
+                cleanup_orphaned_preallocs(ctx);
+                cleanup_all_unused_packet_props(ctx);
                 if output_picture_ready(ctx, false) {
                     break;
                 }
@@ -1019,7 +1067,8 @@ fn gen_picture(ctx: &mut ContextInner) -> c_int {
                 data_unref_value(&mut ctx.pending_in);
                 ctx.pending_offset = 0;
                 ctx.pending_tag = 0;
-                cleanup_unused_packet_props(ctx, tag);
+                cleanup_orphaned_preallocs(ctx);
+                cleanup_all_unused_packet_props(ctx);
                 if output_picture_ready(ctx, false) {
                     break;
                 }
@@ -1036,7 +1085,7 @@ fn gen_picture(ctx: &mut ContextInner) -> c_int {
                 record_error_props_for_tag(ctx, err_tag, Some(&fallback_props));
                 let mut fb_drop = fallback_props;
                 data_props_unref_value(&mut fb_drop);
-                cleanup_unused_packet_props(ctx, tag);
+                cleanup_all_unused_packet_props(ctx);
                 if output_picture_ready(ctx, false) {
                     if ctx.cached_error == 0 {
                         ctx.cached_error = code;
@@ -1051,6 +1100,30 @@ fn gen_picture(ctx: &mut ContextInner) -> c_int {
     0
 }
 
+fn take_or_clone_packet_props(
+    ctx: &mut ContextInner,
+    packet_tag: u64,
+    fallback_ts: Option<i64>,
+) -> Dav1dDataProps {
+    let still_pending = is_packet_tag_referenced(ctx, packet_tag);
+    if let Some(pos) = ctx
+        .packet_props
+        .iter()
+        .position(|(tag, _)| *tag == packet_tag)
+    {
+        if still_pending {
+            clone_data_props(&ctx.packet_props[pos].1)
+        } else {
+            ctx.packet_props.remove(pos).unwrap().1
+        }
+    } else {
+        Dav1dDataProps {
+            timestamp: fallback_ts.unwrap_or(i64::MIN),
+            ..Dav1dDataProps::default()
+        }
+    }
+}
+
 fn deliver_ready_picture(ctx: &mut ContextInner, out_ref: &mut Dav1dPicture) -> c_int {
     let max_spatial_id = ctx.decoder.max_spatial_id();
     let item = ctx.cached_pic.take().or_else(|| ctx.ready_pic.take());
@@ -1061,47 +1134,75 @@ fn deliver_ready_picture(ctx: &mut ContextInner, out_ref: &mut Dav1dPicture) -> 
         return dav1d_err(EAGAIN);
     };
     ctx.event_flags |= meta.event_flags;
-    if let Some(mut prealloc_pic) = take_preallocated_pic(ctx, meta.prealloc_id) {
-        if let Err(code) = copy_frame_to_custom_pic(&frame, &mut prealloc_pic) {
-            let err_props = clone_data_props(&prealloc_pic.m);
-            data_props_unref_value(&mut ctx.cached_error_props);
-            ctx.cached_error_props = err_props;
-            picture_unref_value(&mut prealloc_pic);
-            cleanup_unused_packet_props(ctx, meta.packet_tag);
-            return code;
+
+    let has_applied_grain = ctx.decoder.config().apply_grain
+        && meta
+            .frame_hdr
+            .as_ref()
+            .is_some_and(|fh| crate::decode::filmgrain::has_grain(&fh.film_grain.data));
+
+    if meta.prealloc_id != 0
+        && !has_applied_grain
+        && let Some(pos) = ctx
+            .preallocated_pics
+            .iter()
+            .position(|(pid, _)| *pid == meta.prealloc_id)
+    {
+        if !ctx.preallocated_pics[pos].1.populated {
+            if let Err(code) =
+                copy_frame_to_custom_pic(&frame, &mut ctx.preallocated_pics[pos].1.pic)
+            {
+                let err_props = if meta.is_show_existing {
+                    take_or_clone_packet_props(ctx, meta.packet_tag, frame.metadata().timestamp)
+                } else {
+                    clone_data_props(&ctx.preallocated_pics[pos].1.pic.m)
+                };
+                data_props_unref_value(&mut ctx.cached_error_props);
+                ctx.cached_error_props = err_props;
+                cleanup_orphaned_preallocs(ctx);
+                cleanup_all_unused_packet_props(ctx);
+                return code;
+            }
+            ctx.preallocated_pics[pos].1.populated = true;
+        }
+        let still_referenced = is_prealloc_id_referenced(ctx, meta.prealloc_id);
+        let mut delivered = if still_referenced {
+            OwnedPictureRefs::retain(&ctx.preallocated_pics[pos].1.pic).into_picture()
+        } else {
+            ctx.preallocated_pics.remove(pos).unwrap().1.pic
+        };
+        if meta.is_show_existing {
+            let props =
+                take_or_clone_packet_props(ctx, meta.packet_tag, frame.metadata().timestamp);
+            clear_picture_metadata_refs(&mut delivered);
+            delivered.m = props;
+            attach_picture_metadata(&mut delivered, &meta);
         }
         picture_unref_value(out_ref);
-        *out_ref = prealloc_pic;
-        cleanup_unused_packet_props(ctx, meta.packet_tag);
+        *out_ref = delivered;
+        cleanup_orphaned_preallocs(ctx);
+        cleanup_all_unused_packet_props(ctx);
         return 0;
     }
-    let still_pending = is_packet_tag_referenced(ctx, meta.packet_tag);
-    let props = if let Some(pos) = ctx
-        .packet_props
-        .iter()
-        .position(|(tag, _)| *tag == meta.packet_tag)
-    {
-        if still_pending {
-            clone_data_props(&ctx.packet_props[pos].1)
-        } else {
-            ctx.packet_props.remove(pos).unwrap().1
-        }
-    } else {
-        Dav1dDataProps {
-            timestamp: frame.metadata().timestamp.unwrap_or(i64::MIN),
-            ..Dav1dDataProps::default()
-        }
-    };
+
+    if meta.prealloc_id != 0 {
+        cleanup_orphaned_preallocs(ctx);
+    }
+    let props = take_or_clone_packet_props(ctx, meta.packet_tag, frame.metadata().timestamp);
     let err_props_backup = clone_data_props(&props);
     match fill_output_picture(ctx, out_ref, &frame, PictureMetaSource::Owned(&meta), props) {
         Ok(()) => {
             let mut drop_backup = err_props_backup;
             data_props_unref_value(&mut drop_backup);
+            cleanup_orphaned_preallocs(ctx);
+            cleanup_all_unused_packet_props(ctx);
             0
         }
         Err(code) => {
             data_props_unref_value(&mut ctx.cached_error_props);
             ctx.cached_error_props = err_props_backup;
+            cleanup_orphaned_preallocs(ctx);
+            cleanup_all_unused_packet_props(ctx);
             code
         }
     }
@@ -1341,8 +1442,8 @@ pub unsafe extern "C" fn dav1d_flush(c: *mut Dav1dContext) {
         while let Some((_, mut props)) = ctx.packet_props.pop_front() {
             data_props_unref_value(&mut props);
         }
-        while let Some((_, mut pic)) = ctx.preallocated_pics.pop_front() {
-            picture_unref_value(&mut pic);
+        while let Some((_, mut entry)) = ctx.preallocated_pics.pop_front() {
+            picture_unref_value(&mut entry.pic);
         }
     }));
 }

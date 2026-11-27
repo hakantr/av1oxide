@@ -304,6 +304,8 @@ pub(crate) struct FrameSlot {
     pub chroma: ChromaFormat,
     /// Başlık zamanında bilinen bit derinliği.
     pub bd: BitDepth,
+    /// C-ABI özel `Dav1dPicAllocator` ön-tahsis kimliği (`0` = yok).
+    capi_pic_id: u64,
     state: Mutex<SlotState>,
     cv: Condvar,
 }
@@ -315,11 +317,13 @@ impl FrameSlot {
         let height = rf.pic.height;
         let chroma = rf.chroma;
         let bd = rf.bd;
+        let capi_pic_id = rf.capi_pic_id;
         Arc::new(Self {
             width,
             height,
             chroma,
             bd,
+            capi_pic_id,
             state: Mutex::new(SlotState::Ready(rf)),
             cv: Condvar::new(),
         })
@@ -331,15 +335,23 @@ impl FrameSlot {
         height: usize,
         chroma: ChromaFormat,
         bd: BitDepth,
+        capi_pic_id: u64,
     ) -> Arc<Self> {
         Arc::new(Self {
             width,
             height,
             chroma,
             bd,
+            capi_pic_id,
             state: Mutex::new(SlotState::Pending),
             cv: Condvar::new(),
         })
+    }
+
+    /// Bu yuva için C-ABI ön-tahsis kimliğini döndürür (`0` = yok).
+    #[cfg_attr(not(feature = "std"), allow(dead_code))]
+    pub(crate) const fn capi_pic_id(&self) -> u64 {
+        self.capi_pic_id
     }
 
     /// `Loop Restoration` biter bitmez (gecikmeli Film Grain'den **önce**)

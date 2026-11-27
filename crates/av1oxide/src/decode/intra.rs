@@ -507,13 +507,20 @@ pub(crate) struct RefFrame {
     /// kısıtlı aralığı; dav1d resmin kendi `seq_hdr`'ını kullanır,
     /// `src/fg_apply_tmpl.c:172`).
     pub mc_identity: bool,
+    /// C-ABI özel `Dav1dPicAllocator` ön-tahsis kimliği (`0` = yok; `show_existing_frame` paylaşımı).
+    pub capi_pic_id: u64,
 }
 
 impl RefFrame {
     /// dav1d `dav1d_thread_picture_ref` + `c->refs[i]`: çözülen karenin
     /// durumu yuvaya **taşınır** (P38 / `4.A.1`: ikincil `Frame` kopyası yok).
     #[must_use]
-    pub fn from_decoded(decoded: DecodedFrame, hdr: FrameHeader, mc_identity: bool) -> Self {
+    pub fn from_decoded(
+        decoded: DecodedFrame,
+        hdr: FrameHeader,
+        mc_identity: bool,
+        capi_pic_id: u64,
+    ) -> Self {
         Self {
             pic: decoded.pic,
             hdr,
@@ -526,6 +533,7 @@ impl RefFrame {
             chroma: decoded.chroma,
             bd: decoded.bd,
             mc_identity,
+            capi_pic_id,
         }
     }
 
