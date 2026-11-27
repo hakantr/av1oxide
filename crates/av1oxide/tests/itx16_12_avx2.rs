@@ -183,12 +183,6 @@ fn buyuk_oracle_dizini(manifest: &Path) -> Option<PathBuf> {
             return Some(p);
         }
     }
-    let ana_depo = PathBuf::from("/home/hakanbiris/github/av1oxide/.cache/itx-oracle");
-    if ana_depo.join("itx-large-12-input.bin").exists()
-        && ana_depo.join("itx-large-12-expect.bin").exists()
-    {
-        return Some(ana_depo);
-    }
     None
 }
 
@@ -420,8 +414,14 @@ fn test_itx12_avx2_c_oracle_large_vectors() {
     let devir0 = itx_skaler_devir_sayisi();
 
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let large_dir = buyuk_oracle_dizini(&manifest)
-        .expect(".cache/itx-oracle/itx-large-12-{input,expect}.bin bulunmalı");
+    let Some(large_dir) = buyuk_oracle_dizini(&manifest) else {
+        common::on_kosul::eksik(
+            T,
+            common::on_kosul::Neden::OracleVerisiYok,
+            "itx-large-12-{input,expect}.bin yok (.cache/itx-oracle)",
+        );
+        return;
+    };
     let (toplam, wht_disi, avx2_sayisi, skaler_buyuk_sayisi) =
         dogrula_oracle_12bpc(&large_dir, "large", &dsp, &tablo);
     assert_eq!(toplam, 156_000);

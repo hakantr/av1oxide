@@ -21,6 +21,7 @@ fn p53_arm64_itx_aday_sayilari() {
 
 #[cfg(target_arch = "aarch64")]
 mod arm {
+    use super::common::on_kosul::{self, Neden};
     use super::common::sentinel::{OverReadProbe, SentinelBuffer};
     use av1oxide::cpu::CpuFlags;
     use av1oxide::dsp::DspDispatch;
@@ -408,7 +409,7 @@ mod arm {
     }
 
     #[test]
-    fn p53_itx_c_oracle_small_large_extreme_bit_exact() {
+    fn p53_itx_c_oracle_small_bit_exact() {
         let _g = DEVRI_KILIT
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -420,21 +421,51 @@ mod arm {
         let small_n = dogrula_c_oracle_kumesi(&small_dir, "small", &neon)
             .expect("tests/fixtures/itx small kümesi bulunmalı");
         assert_eq!(small_n, 2_808, "small kümesi 3 × 936 = 2 808 blok olmalı");
+        assert_eq!(
+            itx_skaler_devir_sayisi(),
+            devir0,
+            "small C oracle bloklarında skaler devir 0 olmalı"
+        );
+    }
 
-        if !cfg!(debug_assertions) || std::env::var_os("AV1OXIDE_ITX_FULL").is_some() {
-            let cache_dir = manifest.join("../../.cache/itx-oracle");
-            if let Some(large_n) = dogrula_c_oracle_kumesi(&cache_dir, "large", &neon) {
-                assert_eq!(large_n, 468_000, "large kümesi 468 000 blok olmalı");
-            }
-            if let Some(ext_n) = dogrula_c_oracle_kumesi(&cache_dir, "extreme", &neon) {
-                assert_eq!(ext_n, 468_000, "extreme kümesi 468 000 blok olmalı");
-            }
-        }
+    #[test]
+    fn p53_itx_c_oracle_large_ve_extreme_bit_exact() {
+        let _g = DEVRI_KILIT
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let neon = DspDispatch::select(CpuFlags::detect());
+        let devir0 = itx_skaler_devir_sayisi();
+
+        let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let cache_dir = std::env::var_os("ITX_ORACLE_DIR")
+            .or_else(|| std::env::var_os("AV1OXIDE_ITX_ORACLE_DIR"))
+            .map(PathBuf::from)
+            .unwrap_or_else(|| manifest.join("../../.cache/itx-oracle"));
+
+        let Some(large_n) = dogrula_c_oracle_kumesi(&cache_dir, "large", &neon) else {
+            on_kosul::eksik(
+                "itx_arm64::p53_itx_c_oracle_large_ve_extreme_bit_exact",
+                Neden::OracleVerisiYok,
+                "itx-large-{8,10,12}-{input,expect}.bin yok (.cache/itx-oracle)",
+            );
+            return;
+        };
+        assert_eq!(large_n, 468_000, "large kümesi 468 000 blok olmalı");
+
+        let Some(ext_n) = dogrula_c_oracle_kumesi(&cache_dir, "extreme", &neon) else {
+            on_kosul::eksik(
+                "itx_arm64::p53_itx_c_oracle_large_ve_extreme_bit_exact",
+                Neden::OracleVerisiYok,
+                "itx-extreme-{8,10,12}-{input,expect}.bin yok (.cache/itx-oracle)",
+            );
+            return;
+        };
+        assert_eq!(ext_n, 468_000, "extreme kümesi 468 000 blok olmalı");
 
         assert_eq!(
             itx_skaler_devir_sayisi(),
             devir0,
-            "C oracle bloklarında skaler devir 0 olmalı"
+            "large/extreme C oracle bloklarında skaler devir 0 olmalı"
         );
     }
 

@@ -763,7 +763,10 @@ mod oracle_diff {
     #[ignore = "harici C oracle (scripts/oracle/ipred_edge_oracle.c) gerektirir"]
     fn kenar_hazirlama_c_ile_ayni() {
         let oracle = std::env::var("IPRED_EDGE_ORACLE").unwrap_or_else(|_| {
-            "/home/hakan/github/av1oxide/.cache/ipred-edge-oracle/ipred_edge_oracle".into()
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../.cache/ipred-edge-oracle/ipred_edge_oracle")
+                .to_string_lossy()
+                .into_owned()
         });
         let mut rng = Rng(0x1234_5678_9abc_def1);
         let mut cases = Vec::new();

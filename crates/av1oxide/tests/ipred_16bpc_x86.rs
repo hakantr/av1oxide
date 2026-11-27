@@ -187,19 +187,17 @@ fn fixture_dir() -> PathBuf {
 }
 
 fn cache_dir() -> PathBuf {
-    let local = Path::new(env!("CARGO_MANIFEST_DIR"))
+    if let Ok(env_dir) = std::env::var("IPRED_ORACLE_DIR") {
+        let p = PathBuf::from(env_dir);
+        if p.exists() {
+            return p;
+        }
+    }
+    Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("..")
         .join("..")
         .join(".cache")
-        .join("ipred-oracle");
-    if local.exists() {
-        return local;
-    }
-    let fallback = PathBuf::from("/home/hakanbiris/github/av1oxide/.cache/ipred-oracle");
-    if fallback.exists() {
-        return fallback;
-    }
-    local
+        .join("ipred-oracle")
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

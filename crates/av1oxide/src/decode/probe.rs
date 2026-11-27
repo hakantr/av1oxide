@@ -440,10 +440,13 @@ mod tests {
     use super::*;
     use std::sync::Mutex;
 
-    static CAPTURED: Mutex<Vec<u8>> = Mutex::new(Vec::new());
+    static CAPTURED: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
 
     fn capture(data: &[u8]) {
-        CAPTURED.lock().unwrap().extend_from_slice(data);
+        // Paralel çalışan diğer birim testlerinin `begin_frame` (`RPL0`) kayıtlarını dışla.
+        if data.starts_with(b"RPL2") {
+            CAPTURED.lock().unwrap().push(data.to_vec());
+        }
     }
 
     /// `RPL2` kaydı itx'in **gerçekten** yazdığı konumu (`dst_x`,`dst_y`)
@@ -454,17 +457,20 @@ mod tests {
         let _ = set_target(Target {
             frame: u32::MAX,
             plane: 0,
-            x: 2,
-            y: 3,
+            x: 99_992,
+            y: 99_993,
         });
         let before = vec![0u8; 4 * 4 * 2];
         let coeffs = vec![0i32; 1024];
         let after = vec![7u8; 4 * 4 * 2];
         tx_record(
-            0, 10, 0, 2, 3, 4, 4, 0, 9, 12, 6, 7, &before, &coeffs, &after,
+            0, 10, 0, 99_992, 99_993, 4, 4, 0, 9, 12, 6, 7, &before, &coeffs, &after,
         );
-        let data = CAPTURED.lock().unwrap().clone();
-        assert!(data.starts_with(b"RPL2"), "kayıt büyüsü");
+        let records = CAPTURED.lock().unwrap().clone();
+        let data = records
+            .into_iter()
+            .find(|r| r.starts_with(b"RPL2"))
+            .expect("RPL2 kaydı yakalanmalı");
         assert_eq!(data[4], 0, "düzlem");
         assert_eq!(data[5], 10, "bpc");
         assert_eq!(&data[36..40], &6u32.to_le_bytes(), "dst_x");

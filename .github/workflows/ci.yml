@@ -42,8 +42,18 @@ jobs:
           toolchain: "1.100.0"
       - name: Release test suite (workspace, all-features)
         env:
-          CARGO_PROFILE_RELEASE_STRIP: none
+          AV1OXIDE_ATLAMA_KAYDI: ${{ runner.temp }}/atlama-x86_64.log
         run: cargo test --locked --release --workspace --all-features
+      - name: Print skipped test summary (x86_64)
+        if: always()
+        shell: bash
+        run: |
+          if [ -f "${RUNNER_TEMP}/atlama-x86_64.log" ]; then
+            echo "=== Skipped test preconditions (x86_64) ==="
+            cat "${RUNNER_TEMP}/atlama-x86_64.log"
+          else
+            echo "No skipped preconditions recorded (x86_64)."
+          fi
       - name: Release unit tests (av1oxide no_std + alloc)
         run: cargo test --locked --release -p av1oxide --no-default-features --lib
       - name: Verify documented C-ABI prefix install, SONAME, 19 symbols, and dynamic C link
@@ -68,8 +78,32 @@ jobs:
           toolchain: "1.100.0"
       - name: Release test suite (workspace, all-features)
         env:
-          CARGO_PROFILE_RELEASE_STRIP: none
+          AV1OXIDE_ATLAMA_KAYDI: ${{ runner.temp }}/atlama-arm64.log
         run: cargo test --locked --release --workspace --all-features
+      - name: Print skipped test summary (ARM64)
+        if: always()
+        shell: bash
+        run: |
+          if [ -f "${RUNNER_TEMP}/atlama-arm64.log" ]; then
+            echo "=== Skipped test preconditions (ARM64) ==="
+            cat "${RUNNER_TEMP}/atlama-arm64.log"
+          else
+            echo "No skipped preconditions recorded (ARM64)."
+          fi
+      - name: Mandatory ARM64 NEON repo-fixture suite (zero skips allowed)
+        env:
+          AV1OXIDE_ORACLES_REQUIRED: "1"
+        run: >-
+          cargo test --locked --release -p av1oxide
+          --test cdef_arm64
+          --test fg_arm64
+          --test ipred_arm64
+          --test itx_arm64
+          --test lf_lr_arm64
+          --test mc_arm64
+          --test msac_arm64
+          --test refmvs_pal_arm64
+          -- --skip full_c_oracle --skip large_c_oracle --skip large_ve_extreme
       - name: Verify documented C-ABI prefix install, install_name, and 19 symbols
         shell: bash
         run: |

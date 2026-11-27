@@ -121,12 +121,6 @@ fn find_oracle_dir() -> Option<PathBuf> {
     {
         return Some(local);
     }
-    let shared = PathBuf::from("/home/hakanbiris/github/av1oxide/.cache/loopfilter-oracle");
-    if shared.join("loopfilter-input.bin").is_file()
-        && shared.join("loopfilter-expect.bin").is_file()
-    {
-        return Some(shared);
-    }
     None
 }
 

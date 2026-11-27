@@ -484,13 +484,12 @@ fn p43_itx8_avx512_oracle_small_ve_large_bit_exact() {
     );
     assert_eq!(small_wht, 6, "itx-small-8 içinde 6 WHT bloğu olmalı");
 
-    let env_dir = std::env::var_os("AV1OXIDE_ITX_ORACLE_DIR").map(PathBuf::from);
-    let host_cache = Path::new("/home/hakanbiris/github/av1oxide/.cache/itx-oracle");
+    let env_dir = std::env::var_os("AV1OXIDE_ITX_ORACLE_DIR")
+        .or_else(|| std::env::var_os("ITX_ORACLE_DIR"))
+        .map(PathBuf::from);
     let rel_cache = manifest.join("../../.cache/itx-oracle");
     let large_dir = if let Some(d) = env_dir.filter(|d| d.join("itx-large-8-input.bin").is_file()) {
         d
-    } else if host_cache.join("itx-large-8-input.bin").is_file() {
-        host_cache.to_path_buf()
     } else {
         rel_cache
     };

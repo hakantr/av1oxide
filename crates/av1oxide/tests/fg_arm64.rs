@@ -298,6 +298,13 @@ fn lut_bytes(h: &mut Sha256, lut: &GrainLut, w: usize, hgt: usize) {
     }
 }
 
+fn fg_fixture_dir() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("fixtures")
+        .join("fg")
+}
+
 fn find_fg_oracle_dir() -> Option<PathBuf> {
     if let Ok(d) = std::env::var("FG_ORACLE_OUT") {
         let p = PathBuf::from(d);
@@ -315,6 +322,192 @@ fn find_fg_oracle_dir() -> Option<PathBuf> {
         return Some(local);
     }
     None
+}
+
+#[cfg(target_arch = "aarch64")]
+fn verify_fg_oracle_files(
+    neon_dsps: &[FgDsp; 3],
+    cases_path: &Path,
+    expect_path: &Path,
+    min_per_bd: usize,
+) {
+    let cases = std::fs::read(cases_path)
+        .unwrap_or_else(|e| panic!("{} okunamadı: {e}", cases_path.display()));
+    let expect = std::fs::read(expect_path)
+        .unwrap_or_else(|e| panic!("{} okunamadı: {e}", expect_path.display()));
+    assert_eq!(cases.len() % REC_SIZE, 0);
+    assert_eq!(expect.len(), (cases.len() / REC_SIZE) * 32);
+
+    let mut lut: Box<GrainLut> = Box::new(EMPTY_LUT);
+    let mut lut2: Box<GrainLut> = Box::new(EMPTY_LUT);
+    let mut verified = [0usize; 3];
+
+    for (ci, rec) in cases.chunks(REC_SIZE).enumerate() {
+        let e = parse_case(rec);
+        if e.kind == 4 {
+            continue;
+        }
+        let (bd, bi) = match e.bd {
+            8 => (FgBitDepth::B8, 0),
+            10 => (FgBitDepth::B10, 1),
+            _ => (FgBitDepth::B12, 2),
+        };
+        let bpp = bd.bytes();
+        let max = bd.bitdepth_max();
+        let gctr = 128i32 << (e.bd - 8);
+        let dsp = &neon_dsps[bi];
+        let mut s = e.seed;
+        let mut h = Sha256::new();
+        let d = &e.d;
+
+        match e.kind {
+            0 | 1 => {
+                *lut = EMPTY_LUT;
+                (dsp.generate_grain_y)(&mut lut, d, bd);
+                if e.kind == 0 {
+                    lut_bytes(&mut h, &lut, GRAIN_WIDTH, GRAIN_HEIGHT);
+                } else {
+                    *lut2 = EMPTY_LUT;
+                    (dsp.generate_grain_uv[e.layout])(&mut lut2, &lut, d, e.uv, bd);
+                    let cw = if e.layout != 2 {
+                        SUB_GRAIN_WIDTH
+                    } else {
+                        GRAIN_WIDTH
+                    };
+                    let ch = if e.layout == 0 {
+                        SUB_GRAIN_HEIGHT
+                    } else {
+                        GRAIN_HEIGHT
+                    };
+                    lut_bytes(&mut h, &lut2, cw, ch);
+                }
+            }
+            _ => {
+                let (sx, sy) = if e.kind == 3 {
+                    (usize::from(e.layout != 2), usize::from(e.layout == 0))
+                } else {
+                    (0, 0)
+                };
+                let stride = e.stride_px * bpp;
+                let lstride = e.luma_stride_px * bpp;
+                let luma_w = ((e.pw - 1) << sx) + sx + 1;
+                let luma_rows = ((e.bh - 1) << sy) + 1;
+                let src_len = (e.bh - 1) * stride + e.pw * bpp;
+                let dst_len = stride * e.bh;
+                let luma_len = (luma_rows - 1) * lstride + luma_w * bpp;
+
+                let mut src = vec![0x3Cu8; src_len];
+                let mut dst_sb = SentinelBuffer::with_defaults(dst_len);
+                dst_sb.data_mut().fill(0x5A);
+                let mut luma = vec![0x3Cu8; luma_len];
+                let mut scaling = vec![0x3Cu8; max as usize + 1];
+
+                for (y, row) in lut.iter_mut().enumerate() {
+                    for (x, v) in row.iter_mut().enumerate() {
+                        *v = val(
+                            e.lut_pat,
+                            x as i32,
+                            y as i32,
+                            sm64(&mut s),
+                            -gctr,
+                            gctr - 1,
+                            e.bd,
+                        ) as i16;
+                    }
+                }
+                for (i, v) in scaling.iter_mut().enumerate() {
+                    *v = val(e.scal_pat, i as i32, 0, sm64(&mut s), 0, 255, 8) as u8;
+                }
+                for y in 0..e.bh {
+                    for x in 0..e.pw {
+                        let v = val(e.pix_pat, x as i32, y as i32, sm64(&mut s), 0, max, e.bd);
+                        store_px(&mut src, y * e.stride_px + x, bpp, v);
+                    }
+                }
+                for y in 0..luma_rows {
+                    for x in 0..luma_w {
+                        let v = val(
+                            e.pix_pat,
+                            x as i32 + 1,
+                            y as i32,
+                            sm64(&mut s),
+                            0,
+                            max,
+                            e.bd,
+                        );
+                        store_px(&mut luma, y * e.luma_stride_px + x, bpp, v);
+                    }
+                }
+
+                if e.kind == 2 {
+                    (dsp.fgy_32x32xn)(
+                        dst_sb.data_mut(),
+                        &src,
+                        stride,
+                        d,
+                        e.pw,
+                        &scaling,
+                        &lut,
+                        e.bh,
+                        e.row_num,
+                        bd,
+                    );
+                } else {
+                    (dsp.fguv_32x32xn[e.layout])(
+                        dst_sb.data_mut(),
+                        &src,
+                        stride,
+                        d,
+                        e.pw,
+                        &scaling,
+                        &lut,
+                        e.bh,
+                        e.row_num,
+                        &luma,
+                        lstride,
+                        e.uv,
+                        e.is_id,
+                        bd,
+                    );
+                }
+                dst_sb
+                    .verify()
+                    .unwrap_or_else(|err| panic!("FG SentinelBuffer ihlali ci={ci}: {err:?}"));
+                let dst = dst_sb.data();
+                for (i, &b) in dst.iter().enumerate() {
+                    let inside = i / stride < e.bh && i % stride < e.pw * bpp;
+                    assert!(
+                        inside || b == 0x5A,
+                        "FG bölge dışı yazdı ci={ci} kind={} bd={}",
+                        e.kind,
+                        e.bd
+                    );
+                }
+                for y in 0..e.bh {
+                    h.update(&dst[y * stride..y * stride + e.pw * bpp]);
+                }
+            }
+        }
+
+        let got = h.finish();
+        let want = &expect[ci * 32..(ci + 1) * 32];
+        assert_eq!(
+            &got[..],
+            want,
+            "FG ARM64 NEON ≠ dav1d C oracle: ci={ci} kind={} bd={} layout={} pw={} bh={}",
+            e.kind,
+            e.bd,
+            e.layout,
+            e.pw,
+            e.bh
+        );
+        verified[bi] += 1;
+    }
+
+    assert!(
+        verified[0] >= min_per_bd && verified[1] >= min_per_bd && verified[2] >= min_per_bd,
+        "tüm bpc'lerde yeterli C oracle çağrısı doğrulanmalı (min={min_per_bd}): {verified:?}"
+    );
 }
 
 #[test]
@@ -357,7 +550,7 @@ fn f5d_fg_arm64_aday_ve_kurulum() {
 
 #[cfg(target_arch = "aarch64")]
 #[test]
-fn f5d_fg_arm64_c_oracle_sentinel_overread_ve_skaler_devir() {
+fn f5d_fg_arm64_small_c_oracle_sentinel_overread_ve_skaler_devir() {
     #[cfg(target_arch = "aarch64")]
     {
         let _kilit = SAYAC
@@ -372,192 +565,17 @@ fn f5d_fg_arm64_c_oracle_sentinel_overread_ve_skaler_devir() {
             *d_neon.for_bit_depth(BitDepth::Twelve).fg(),
         ];
 
-        // 1) C Oracle (`fg-quick-cases.bin` / `fg-quick-expect.bin`) bit-exact SHA-256 doğrulaması
-        let Some(dir) = find_fg_oracle_dir() else {
-            on_kosul::eksik(
-                "fg_arm64::f5d_fg_arm64_c_oracle_sentinel_overread_ve_skaler_devir",
-                Neden::OracleVerisiYok,
-                "fg-quick-cases.bin yok (.cache/fg-oracle)",
-            );
-            return;
-        };
-        let cases = std::fs::read(dir.join("fg-quick-cases.bin")).expect("fg-quick-cases.bin");
-        let expect = std::fs::read(dir.join("fg-quick-expect.bin")).expect("fg-quick-expect.bin");
-        assert_eq!(cases.len() % REC_SIZE, 0);
-        assert_eq!(expect.len(), (cases.len() / REC_SIZE) * 32);
-
-        let mut lut: Box<GrainLut> = Box::new(EMPTY_LUT);
-        let mut lut2: Box<GrainLut> = Box::new(EMPTY_LUT);
-        let mut verified = [0usize; 3];
-
-        for (ci, rec) in cases.chunks(REC_SIZE).enumerate() {
-            let e = parse_case(rec);
-            if e.kind == 4 {
-                continue;
-            }
-            let (bd, bi) = match e.bd {
-                8 => (FgBitDepth::B8, 0),
-                10 => (FgBitDepth::B10, 1),
-                _ => (FgBitDepth::B12, 2),
-            };
-            let bpp = bd.bytes();
-            let max = bd.bitdepth_max();
-            let gctr = 128i32 << (e.bd - 8);
-            let dsp = &neon_dsps[bi];
-            let mut s = e.seed;
-            let mut h = Sha256::new();
-            let d = &e.d;
-
-            match e.kind {
-                0 | 1 => {
-                    *lut = EMPTY_LUT;
-                    (dsp.generate_grain_y)(&mut lut, d, bd);
-                    if e.kind == 0 {
-                        lut_bytes(&mut h, &lut, GRAIN_WIDTH, GRAIN_HEIGHT);
-                    } else {
-                        *lut2 = EMPTY_LUT;
-                        (dsp.generate_grain_uv[e.layout])(&mut lut2, &lut, d, e.uv, bd);
-                        let cw = if e.layout != 2 {
-                            SUB_GRAIN_WIDTH
-                        } else {
-                            GRAIN_WIDTH
-                        };
-                        let ch = if e.layout == 0 {
-                            SUB_GRAIN_HEIGHT
-                        } else {
-                            GRAIN_HEIGHT
-                        };
-                        lut_bytes(&mut h, &lut2, cw, ch);
-                    }
-                }
-                _ => {
-                    let (sx, sy) = if e.kind == 3 {
-                        (usize::from(e.layout != 2), usize::from(e.layout == 0))
-                    } else {
-                        (0, 0)
-                    };
-                    let stride = e.stride_px * bpp;
-                    let lstride = e.luma_stride_px * bpp;
-                    let luma_w = ((e.pw - 1) << sx) + sx + 1;
-                    let luma_rows = ((e.bh - 1) << sy) + 1;
-                    let src_len = (e.bh - 1) * stride + e.pw * bpp;
-                    let dst_len = stride * e.bh;
-                    let luma_len = (luma_rows - 1) * lstride + luma_w * bpp;
-
-                    let mut src = vec![0x3Cu8; src_len];
-                    let mut dst_sb = SentinelBuffer::with_defaults(dst_len);
-                    dst_sb.data_mut().fill(0x5A);
-                    let mut luma = vec![0x3Cu8; luma_len];
-                    let mut scaling = vec![0x3Cu8; max as usize + 1];
-
-                    for (y, row) in lut.iter_mut().enumerate() {
-                        for (x, v) in row.iter_mut().enumerate() {
-                            *v = val(
-                                e.lut_pat,
-                                x as i32,
-                                y as i32,
-                                sm64(&mut s),
-                                -gctr,
-                                gctr - 1,
-                                e.bd,
-                            ) as i16;
-                        }
-                    }
-                    for (i, v) in scaling.iter_mut().enumerate() {
-                        *v = val(e.scal_pat, i as i32, 0, sm64(&mut s), 0, 255, 8) as u8;
-                    }
-                    for y in 0..e.bh {
-                        for x in 0..e.pw {
-                            let v = val(e.pix_pat, x as i32, y as i32, sm64(&mut s), 0, max, e.bd);
-                            store_px(&mut src, y * e.stride_px + x, bpp, v);
-                        }
-                    }
-                    for y in 0..luma_rows {
-                        for x in 0..luma_w {
-                            let v = val(
-                                e.pix_pat,
-                                x as i32 + 1,
-                                y as i32,
-                                sm64(&mut s),
-                                0,
-                                max,
-                                e.bd,
-                            );
-                            store_px(&mut luma, y * e.luma_stride_px + x, bpp, v);
-                        }
-                    }
-
-                    if e.kind == 2 {
-                        (dsp.fgy_32x32xn)(
-                            dst_sb.data_mut(),
-                            &src,
-                            stride,
-                            d,
-                            e.pw,
-                            &scaling,
-                            &lut,
-                            e.bh,
-                            e.row_num,
-                            bd,
-                        );
-                    } else {
-                        (dsp.fguv_32x32xn[e.layout])(
-                            dst_sb.data_mut(),
-                            &src,
-                            stride,
-                            d,
-                            e.pw,
-                            &scaling,
-                            &lut,
-                            e.bh,
-                            e.row_num,
-                            &luma,
-                            lstride,
-                            e.uv,
-                            e.is_id,
-                            bd,
-                        );
-                    }
-                    dst_sb
-                        .verify()
-                        .unwrap_or_else(|err| panic!("FG SentinelBuffer ihlali ci={ci}: {err:?}"));
-                    let dst = dst_sb.data();
-                    for (i, &b) in dst.iter().enumerate() {
-                        let inside = i / stride < e.bh && i % stride < e.pw * bpp;
-                        assert!(
-                            inside || b == 0x5A,
-                            "FG bölge dışı yazdı ci={ci} kind={} bd={}",
-                            e.kind,
-                            e.bd
-                        );
-                    }
-                    for y in 0..e.bh {
-                        h.update(&dst[y * stride..y * stride + e.pw * bpp]);
-                    }
-                }
-            }
-
-            let got = h.finish();
-            let want = &expect[ci * 32..(ci + 1) * 32];
-            assert_eq!(
-                &got[..],
-                want,
-                "FG ARM64 NEON ≠ dav1d C oracle: ci={ci} kind={} bd={} layout={} pw={} bh={}",
-                e.kind,
-                e.bd,
-                e.layout,
-                e.pw,
-                e.bh
-            );
-            verified[bi] += 1;
-        }
-
-        assert!(
-            verified[0] >= 1000 && verified[1] >= 1000 && verified[2] >= 1000,
-            "tüm bpc'lerde yeterli C oracle çağrısı doğrulanmalı: {verified:?}"
+        // 1) Depo içi küçük C Oracle (`tests/fixtures/fg/fg-small-{cases,expect}.bin`, 24/24 hücre)
+        let fdir = fg_fixture_dir();
+        verify_fg_oracle_files(
+            &neon_dsps,
+            &fdir.join("fg-small-cases.bin"),
+            &fdir.join("fg-small-expect.bin"),
+            96,
         );
 
         // 2) OverReadProbe (fgy ve fguv, 8/10/12 bpc, tekil genişlikler pw ∈ {1, 3, 7, 15, 33})
+        let mut lut: Box<GrainLut> = Box::new(EMPTY_LUT);
         let mut fg_data = FilmGrainData {
             seed: 0xBEEF,
             scaling_shift: 8,
@@ -601,11 +619,9 @@ fn f5d_fg_arm64_c_oracle_sentinel_overread_ve_skaler_devir() {
                                 *ch = v.to_le_bytes();
                             }
                         }
-                        // Validated bytes copied back into a tight OverReadProbe slice check:
                         let s_slice = if bpp == 1 {
                             &inp[probe.data_offset()..probe.data_offset() + src_len]
                         } else {
-                            // 16bpc pikseller `max` içinde olmalı (scaling[px] indeksi için):
                             &valid_src[..]
                         };
                         (dsp.fgy_32x32xn)(
@@ -637,5 +653,40 @@ fn f5d_fg_arm64_c_oracle_sentinel_overread_ve_skaler_devir() {
             FgBitDepth::B10, // yanlış bit derinliği -> skaler devir
         );
         assert!(fg_skaler_devir_sayisi() > devir_once);
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[test]
+fn f5d_fg_arm64_full_c_oracle() {
+    #[cfg(target_arch = "aarch64")]
+    {
+        let _kilit = SAYAC
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let devir_once = fg_skaler_devir_sayisi();
+
+        let Some(dir) = find_fg_oracle_dir() else {
+            on_kosul::eksik(
+                "fg_arm64::f5d_fg_arm64_full_c_oracle",
+                Neden::OracleVerisiYok,
+                "fg-quick-cases.bin yok (.cache/fg-oracle)",
+            );
+            return;
+        };
+
+        let d_neon = DspDispatch::select(CpuFlags::detect());
+        let neon_dsps: [FgDsp; 3] = [
+            *d_neon.for_bit_depth(BitDepth::Eight).fg(),
+            *d_neon.for_bit_depth(BitDepth::Ten).fg(),
+            *d_neon.for_bit_depth(BitDepth::Twelve).fg(),
+        ];
+        verify_fg_oracle_files(
+            &neon_dsps,
+            &dir.join("fg-quick-cases.bin"),
+            &dir.join("fg-quick-expect.bin"),
+            1000,
+        );
+        assert_eq!(fg_skaler_devir_sayisi(), devir_once);
     }
 }

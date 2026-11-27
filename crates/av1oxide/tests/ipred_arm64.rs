@@ -72,6 +72,15 @@ fn fixture_dir() -> PathBuf {
 }
 
 fn large_oracle_dir() -> Option<PathBuf> {
+    if let Ok(env_dir) = std::env::var("IPRED_ORACLE_DIR") {
+        let p = PathBuf::from(env_dir);
+        if p.join("ipred-large-8-input.bin").is_file()
+            && p.join("ipred-large-10-input.bin").is_file()
+            && p.join("ipred-large-12-input.bin").is_file()
+        {
+            return Some(p);
+        }
+    }
     let local = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("..")
         .join("..")
@@ -498,7 +507,7 @@ fn f5d_ipred_arm64_aday_ve_66_yuva_kurulumu() {
 
 #[cfg(target_arch = "aarch64")]
 #[test]
-fn f5d_ipred_arm64_small_ve_large_c_oracle_sentinel_overread_ve_skaler_devir() {
+fn f5d_ipred_arm64_small_c_oracle_sentinel_overread_ve_skaler_devir() {
     #[cfg(target_arch = "aarch64")]
     {
         let _kilit = SAYAC
@@ -508,16 +517,8 @@ fn f5d_ipred_arm64_small_ve_large_c_oracle_sentinel_overread_ve_skaler_devir() {
 
         let d_neon = DspDispatch::select(CpuFlags::detect());
         let small_dir = fixture_dir();
-        let Some(large_dir) = large_oracle_dir() else {
-            on_kosul::eksik(
-                "ipred_arm64::f5d_ipred_arm64_small_ve_large_c_oracle_sentinel_overread_ve_skaler_devir",
-                Neden::OracleVerisiYok,
-                "ipred-large-{8,10,12}-input.bin yok (.cache/ipred-oracle)",
-            );
-            return;
-        };
 
-        let mut total_blocks = 0usize;
+        let mut total_small = 0usize;
         for (bd_num, bd_enum) in [
             (8u8, BitDepth::Eight),
             (10u8, BitDepth::Ten),
@@ -528,17 +529,11 @@ fn f5d_ipred_arm64_small_ve_large_c_oracle_sentinel_overread_ve_skaler_devir() {
             let s_ex = small_dir.join(format!("ipred-small-{bd_num}-expect.bin"));
             let n_s = verify_ipred_oracle_pair(ipred, bd_num, &s_in, &s_ex, "small");
             assert!(n_s >= 900, "small oracle bd={bd_num}: {n_s}");
-
-            let l_in = large_dir.join(format!("ipred-large-{bd_num}-input.bin"));
-            let l_ex = large_dir.join(format!("ipred-large-{bd_num}-expect.bin"));
-            let n_l = verify_ipred_oracle_pair(ipred, bd_num, &l_in, &l_ex, "large");
-            assert!(n_l >= 350_000, "large oracle bd={bd_num}: {n_l}");
-
-            total_blocks += n_s + n_l;
+            total_small += n_s;
         }
         assert!(
-            total_blocks >= 1_100_000,
-            "toplam IPRED oracle bloğu >= 1.1M olmalı: {total_blocks}"
+            total_small >= 2_700,
+            "toplam IPRED small oracle bloğu >= 2 700 olmalı: {total_small}"
         );
 
         // SentinelBuffer + OverReadProbe + tekil dst_stride (`w + 1`, `w + 3` piksel):
@@ -640,5 +635,46 @@ fn f5d_ipred_arm64_small_ve_large_c_oracle_sentinel_overread_ve_skaler_devir() {
             ipred_skaler_devir_sayisi() > devir_once,
             "bozuk pal_pred nibble 0x88 skalere devretmeli"
         );
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[test]
+fn f5d_ipred_arm64_large_c_oracle() {
+    #[cfg(target_arch = "aarch64")]
+    {
+        let _kilit = SAYAC
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let devir_once = ipred_skaler_devir_sayisi();
+
+        let Some(large_dir) = large_oracle_dir() else {
+            on_kosul::eksik(
+                "ipred_arm64::f5d_ipred_arm64_large_c_oracle",
+                Neden::OracleVerisiYok,
+                "ipred-large-{8,10,12}-input.bin yok (.cache/ipred-oracle)",
+            );
+            return;
+        };
+
+        let d_neon = DspDispatch::select(CpuFlags::detect());
+        let mut total_large = 0usize;
+        for (bd_num, bd_enum) in [
+            (8u8, BitDepth::Eight),
+            (10u8, BitDepth::Ten),
+            (12u8, BitDepth::Twelve),
+        ] {
+            let ipred = d_neon.for_bit_depth(bd_enum).ipred();
+            let l_in = large_dir.join(format!("ipred-large-{bd_num}-input.bin"));
+            let l_ex = large_dir.join(format!("ipred-large-{bd_num}-expect.bin"));
+            let n_l = verify_ipred_oracle_pair(ipred, bd_num, &l_in, &l_ex, "large");
+            assert!(n_l >= 350_000, "large oracle bd={bd_num}: {n_l}");
+            total_large += n_l;
+        }
+        assert!(
+            total_large >= 1_100_000,
+            "toplam IPRED large oracle bloğu >= 1.1M olmalı: {total_large}"
+        );
+        assert_eq!(ipred_skaler_devir_sayisi(), devir_once);
     }
 }

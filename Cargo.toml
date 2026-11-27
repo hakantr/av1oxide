@@ -46,7 +46,7 @@ redundant_explicit_links = "allow"
 [profile.release]
 opt-level = 3
 lto = "thin"
-strip = "symbols"
+strip = "none"
 incremental = false
 
 [profile.robust]

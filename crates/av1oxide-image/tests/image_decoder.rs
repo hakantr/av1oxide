@@ -18,6 +18,20 @@ const AV1_1X1_8BIT: &[u8] = &[
     0xBE, 0x2E, 0xC7, 0xDA, 0xEE, 0x96,
 ];
 
+/// 1×1, 10-bit (Profile 0, `high_bitdepth = 1`) 4:2:0 AV1 anahtar kare OBU'su.
+const AV1_1X1_10BIT: &[u8] = &[
+    0x12, 0x00, 0x0A, 0x09, 0x00, 0x00, 0x00, 0x00, 0x00, 0x7D, 0xFC, 0xE0, 0x20, 0x32, 0x17, 0x10,
+    0x01, 0x91, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x68, 0xD2, 0x16, 0x8C, 0x64,
+    0xBE, 0x2E, 0xC7, 0xDA, 0xEE, 0x96,
+];
+
+/// 1×1, 12-bit (Profile 2, `high_bitdepth = 1`, `twelve_bit = 1`) 4:2:0 AV1 anahtar kare OBU'su.
+const AV1_1X1_12BIT: &[u8] = &[
+    0x12, 0x00, 0x0A, 0x09, 0x40, 0x00, 0x00, 0x00, 0x00, 0x7D, 0xFC, 0xF1, 0x84, 0x32, 0x17, 0x10,
+    0x01, 0x91, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x68, 0xD2, 0x16, 0x8C, 0x64,
+    0xBE, 0x2E, 0xC7, 0xDA, 0xEE, 0x96,
+];
+
 fn make_box(fourcc: &[u8; 4], payload: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(8 + payload.len());
     out.extend_from_slice(&((8 + payload.len()) as u32).to_be_bytes());
@@ -318,62 +332,104 @@ fn limits_reject_oversized_dimensions_and_allocation() {
 }
 
 #[test]
-fn real_10bit_and_12bit_avif_scale_to_full_u16_range_when_corpus_present() {
-    let base = std::path::Path::new("/home/hakan/github/av1oxide_planlar/avif_dogrulama/kaynaklar");
-    if !base.exists() {
-        return;
-    }
-
-    let cases = [
-        (
-            base.join("av1-avif/testFiles/Link-U/fox.profile0.10bpc.yuv420.avif"),
-            ColorType::Rgb16,
-            10u32,
-        ),
-        (
-            base.join("av1-avif/testFiles/Link-U/fox.profile2.12bpc.yuv420.avif"),
-            ColorType::Rgb16,
-            12u32,
-        ),
-    ];
-
-    let mut tested = 0usize;
-    for (path, expected_ct, depth_bits) in cases {
-        if !path.exists() {
-            continue;
-        }
-        let bytes = std::fs::read(&path).expect("test avif okunmalı");
-        let av1_img = av1oxide::avif::decode(&bytes).expect("av1oxide decode");
-        let dec = AvifDecoder::new(Cursor::new(&bytes)).expect("AvifDecoder");
-        let expected_color = if av1_img.has_alpha() {
-            ColorType::Rgba16
-        } else {
-            expected_ct
-        };
-        assert_eq!(dec.color_type(), expected_color);
-        assert_eq!(dec.dimensions(), (av1_img.width(), av1_img.height()));
-
-        let dyn_img = DynamicImage::from_decoder(dec).expect("DynamicImage 16-bit");
-        let max_src = (1u32 << depth_bits) - 1;
+fn embedded_10bit_and_12bit_avif_scale_to_full_u16_range_rgb16_and_rgba16() {
+    for (obu, depth_bits) in [(AV1_1X1_10BIT, 10u8), (AV1_1X1_12BIT, 12u8)] {
+        let max_src = (1u32 << u32::from(depth_bits)) - 1;
         let half = max_src / 2;
-        if av1_img.has_alpha() {
-            let expected = av1_img.to_rgba16().unwrap();
-            let actual = dyn_img.into_rgba16();
-            for (&s, &a) in expected.pixels.iter().zip(actual.as_raw().iter()) {
-                let scaled = ((u32::from(s) * 65_535 + half) / max_src) as u16;
-                assert_eq!(a, scaled);
-            }
-        } else {
-            let expected = av1_img.to_rgb16().unwrap();
-            let actual = dyn_img.into_rgb16();
-            for (&s, &a) in expected.pixels.iter().zip(actual.as_raw().iter()) {
-                let scaled = ((u32::from(s) * 65_535 + half) / max_src) as u16;
-                assert_eq!(a, scaled);
-            }
+
+        // 1. RGB16 (alfa yok)
+        let avif_rgb = build_synthetic_avif(obu, None, 1, 1, depth_bits, None, None);
+        let av1_rgb = av1oxide::avif::decode(&avif_rgb).expect("gömülü 10/12-bit RGB AVIF");
+        assert_eq!(av1_rgb.bit_depth().bits(), u32::from(depth_bits));
+        let dec_rgb = AvifDecoder::new(Cursor::new(&avif_rgb)).expect("AvifDecoder RGB16");
+        assert_eq!(dec_rgb.color_type(), ColorType::Rgb16);
+        assert_eq!(dec_rgb.dimensions(), (1, 1));
+        let dyn_rgb = DynamicImage::from_decoder(dec_rgb).expect("DynamicImage RGB16");
+        let expected_rgb = av1_rgb.to_rgb16().unwrap();
+        let actual_rgb = dyn_rgb.into_rgb16();
+        assert_eq!(actual_rgb.as_raw().len(), 3);
+        for (&s, &a) in expected_rgb.pixels.iter().zip(actual_rgb.as_raw().iter()) {
+            let scaled = ((u32::from(s) * 65_535 + half) / max_src) as u16;
+            assert_eq!(a, scaled, "bd={depth_bits} RGB16 s={s}");
         }
-        tested += 1;
+
+        // 2. RGBA16 (alfa var)
+        let avif_rgba = build_synthetic_avif(obu, Some(obu), 1, 1, depth_bits, None, None);
+        let av1_rgba = av1oxide::avif::decode(&avif_rgba).expect("gömülü 10/12-bit RGBA AVIF");
+        assert!(av1_rgba.has_alpha());
+        let dec_rgba = AvifDecoder::new(Cursor::new(&avif_rgba)).expect("AvifDecoder RGBA16");
+        assert_eq!(dec_rgba.color_type(), ColorType::Rgba16);
+        assert_eq!(dec_rgba.dimensions(), (1, 1));
+        let dyn_rgba = DynamicImage::from_decoder(dec_rgba).expect("DynamicImage RGBA16");
+        let expected_rgba = av1_rgba.to_rgba16().unwrap();
+        let actual_rgba = dyn_rgba.into_rgba16();
+        assert_eq!(actual_rgba.as_raw().len(), 4);
+        for (&s, &a) in expected_rgba.pixels.iter().zip(actual_rgba.as_raw().iter()) {
+            let scaled = ((u32::from(s) * 65_535 + half) / max_src) as u16;
+            assert_eq!(a, scaled, "bd={depth_bits} RGBA16 s={s}");
+        }
     }
-    assert!(tested >= 1, "en az bir 10/12-bit AVIF test edilmeli");
+
+    // Opsiyonel harici korpus: `AV1OXIDE_AVIF_CORPUS_DIR` tanımlıysa tüm vakalar eksiksiz sınanır.
+    if let Ok(corpus_dir) = std::env::var("AV1OXIDE_AVIF_CORPUS_DIR") {
+        let base = std::path::PathBuf::from(corpus_dir);
+        let cases = [
+            (
+                base.join("av1-avif/testFiles/Link-U/fox.profile0.10bpc.yuv420.avif"),
+                ColorType::Rgb16,
+                10u32,
+            ),
+            (
+                base.join("av1-avif/testFiles/Link-U/fox.profile2.12bpc.yuv420.avif"),
+                ColorType::Rgb16,
+                12u32,
+            ),
+        ];
+
+        let mut tested = 0usize;
+        for (path, expected_ct, depth_bits) in &cases {
+            let bytes = std::fs::read(path).unwrap_or_else(|e| {
+                panic!(
+                    "AV1OXIDE_AVIF_CORPUS_DIR dosyası okunamadı ({}): {e}",
+                    path.display()
+                )
+            });
+            let av1_img = av1oxide::avif::decode(&bytes).expect("av1oxide decode");
+            let dec = AvifDecoder::new(Cursor::new(&bytes)).expect("AvifDecoder");
+            let expected_color = if av1_img.has_alpha() {
+                ColorType::Rgba16
+            } else {
+                *expected_ct
+            };
+            assert_eq!(dec.color_type(), expected_color);
+            assert_eq!(dec.dimensions(), (av1_img.width(), av1_img.height()));
+
+            let dyn_img = DynamicImage::from_decoder(dec).expect("DynamicImage 16-bit");
+            let max_src = (1u32 << depth_bits) - 1;
+            let half = max_src / 2;
+            if av1_img.has_alpha() {
+                let expected = av1_img.to_rgba16().unwrap();
+                let actual = dyn_img.into_rgba16();
+                for (&s, &a) in expected.pixels.iter().zip(actual.as_raw().iter()) {
+                    let scaled = ((u32::from(s) * 65_535 + half) / max_src) as u16;
+                    assert_eq!(a, scaled);
+                }
+            } else {
+                let expected = av1_img.to_rgb16().unwrap();
+                let actual = dyn_img.into_rgb16();
+                for (&s, &a) in expected.pixels.iter().zip(actual.as_raw().iter()) {
+                    let scaled = ((u32::from(s) * 65_535 + half) / max_src) as u16;
+                    assert_eq!(a, scaled);
+                }
+            }
+            tested += 1;
+        }
+        assert_eq!(
+            tested,
+            cases.len(),
+            "AV1OXIDE_AVIF_CORPUS_DIR içindeki tüm 10/12-bit vakaları sınanmalı"
+        );
+    }
 }
 
 #[derive(Debug)]
@@ -481,12 +537,11 @@ fn allocation_limit_enforced_before_full_read_and_across_header_and_decode() {
     let ref_img = decode_avif_bytes(&avif).expect("decode_avif_bytes");
     assert_eq!(img_ok.to_rgb8(), ref_img.to_rgb8());
 
-    // 6. Gerçek lisans-onaylı korpus dosyası (>21 KiB) mevcutsa allocation_limit=1 anında reddetmeli.
-    let fox_path = std::path::Path::new(
-        "/home/hakan/github/av1oxide_planlar/avif_dogrulama/kaynaklar/av1-avif/testFiles/Link-U/fox.profile0.10bpc.yuv420.avif",
-    );
-    if fox_path.exists() {
-        let fox_bytes = std::fs::read(fox_path).expect("fox avif okunmalı");
+    // 6. Opsiyonel `AV1OXIDE_AVIF_CORPUS_DIR` tanımlıysa gerçek >21 KiB AVIF allocation_limit=1 ile anında reddetmeli.
+    if let Ok(corpus_dir) = std::env::var("AV1OXIDE_AVIF_CORPUS_DIR") {
+        let fox_path = std::path::PathBuf::from(corpus_dir)
+            .join("av1-avif/testFiles/Link-U/fox.profile0.10bpc.yuv420.avif");
+        let fox_bytes = std::fs::read(&fox_path).expect("fox avif okunmalı");
         assert!(fox_bytes.len() > 21 * 1024);
         let fox_read = Arc::new(AtomicUsize::new(0));
         let fox_err = AvifDecoder::with_config(

@@ -109,10 +109,6 @@ fn find_oracle_dir() -> Option<PathBuf> {
     if local.join("lr-quick-cases.bin").is_file() && local.join("lr-quick-expect.bin").is_file() {
         return Some(local);
     }
-    let shared = PathBuf::from("/home/hakanbiris/github/av1oxide/.cache/lr-oracle");
-    if shared.join("lr-quick-cases.bin").is_file() && shared.join("lr-quick-expect.bin").is_file() {
-        return Some(shared);
-    }
     None
 }
 

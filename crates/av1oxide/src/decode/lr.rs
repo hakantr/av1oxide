@@ -771,7 +771,12 @@ fn apply_parallel_sbrows(
     // için tek bir `8 * max_stride` geçici `lpf` ayırmasını defterden geçir.
     let mut max_lpf_stride = 0usize;
     for (p, &stride) in pic.stride.iter().enumerate() {
-        if (st.restore_planes >> p) & 1 != 0 {
+        if (st.restore_planes >> p) & 1 != 0
+            && st
+                .mask
+                .iter()
+                .any(|sb| sb[p].iter().any(|u| u.kind != LR_NONE))
+        {
             max_lpf_stride = max_lpf_stride.max(stride);
         }
     }

@@ -148,6 +148,12 @@ fn skip_bytes<R: Read>(r: &mut R, mut n: usize) {
 }
 
 fn find_large_oracle_dir(root: &Path) -> Option<PathBuf> {
+    if let Ok(env_dir) = std::env::var("IPRED_ORACLE_DIR") {
+        let p = PathBuf::from(env_dir);
+        if p.join("ipred-large-8-input.bin").exists() {
+            return Some(p);
+        }
+    }
     let local = root
         .join("..")
         .join("..")
@@ -155,10 +161,6 @@ fn find_large_oracle_dir(root: &Path) -> Option<PathBuf> {
         .join("ipred-oracle");
     if local.join("ipred-large-8-input.bin").exists() {
         return Some(local);
-    }
-    let shared = PathBuf::from("/home/hakanbiris/github/av1oxide/.cache/ipred-oracle");
-    if shared.join("ipred-large-8-input.bin").exists() {
-        return Some(shared);
     }
     None
 }

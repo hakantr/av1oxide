@@ -547,9 +547,283 @@ fn f5d_lf_ve_lr_arm64_aday_ve_kurulum() {
     }
 }
 
+fn lf_fixture_dir() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("fixtures")
+        .join("loopfilter")
+}
+
+fn lr_fixture_dir() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("fixtures")
+        .join("lr")
+}
+
+fn find_lf_oracle_dir() -> Option<PathBuf> {
+    if let Ok(d) = std::env::var("LOOPFILTER_ORACLE_OUT") {
+        let p = PathBuf::from(d);
+        if p.join("loopfilter-input.bin").is_file() && p.join("loopfilter-expect.bin").is_file() {
+            return Some(p);
+        }
+    }
+    let local = repo_root().join(".cache/loopfilter-oracle");
+    if local.join("loopfilter-input.bin").is_file() && local.join("loopfilter-expect.bin").is_file()
+    {
+        return Some(local);
+    }
+    None
+}
+
+fn find_lr_oracle_dir() -> Option<PathBuf> {
+    if let Ok(d) = std::env::var("LR_ORACLE_OUT") {
+        let p = PathBuf::from(d);
+        if p.join("lr-quick-cases.bin").is_file() && p.join("lr-quick-expect.bin").is_file() {
+            return Some(p);
+        }
+    }
+    let local = repo_root().join(".cache/lr-oracle");
+    if local.join("lr-quick-cases.bin").is_file() && local.join("lr-quick-expect.bin").is_file() {
+        return Some(local);
+    }
+    None
+}
+
+#[cfg(target_arch = "aarch64")]
+fn verify_lf_oracle_files(
+    lf_dsps: &[LoopFilterDsp; 3],
+    input_path: &Path,
+    expect_path: &Path,
+    min_per_bd: usize,
+) {
+    let input = std::fs::read(input_path)
+        .unwrap_or_else(|e| panic!("{} okunamadı: {e}", input_path.display()));
+    let expect = std::fs::read(expect_path)
+        .unwrap_or_else(|e| panic!("{} okunamadı: {e}", expect_path.display()));
+    assert_eq!(input.len(), expect.len());
+    let lim = oracle_lut();
+    let mut p = 0usize;
+    let mut verified = [0usize; 3];
+
+    while p + 12 <= input.len() {
+        let h0u = u32::from_le_bytes([input[p], input[p + 1], input[p + 2], input[p + 3]]);
+        let h1u = u32::from_le_bytes([input[p + 4], input[p + 5], input[p + 6], input[p + 7]]);
+        let stride_bytes = usize::from(u16::from_le_bytes([input[p + 8], input[p + 9]]));
+        let offp = usize::from(u16::from_le_bytes([input[p + 10], input[p + 11]]));
+        p += 12;
+
+        let bd = (h0u & 0xff) as usize;
+        let func = ((h0u >> 8) & 0xff) as usize;
+        let n = (h1u >> 16) as usize;
+
+        let mut vmask = [0u32; 4];
+        for v in &mut vmask {
+            *v = u32::from_le_bytes([input[p], input[p + 1], input[p + 2], input[p + 3]]);
+            p += 4;
+        }
+        let lsize = usize::from(u16::from_le_bytes([input[p], input[p + 1]]));
+        p += 2;
+        let lb = &input[p..p + lsize];
+        p += lsize;
+
+        let bpp = if bd > 8 { 2 } else { 1 };
+        let plane_len = 64 * 64 * bpp;
+        let in_plane = &input[p..p + plane_len];
+        let exp_plane = &expect[p..p + plane_len];
+        p += plane_len;
+
+        let (dsp, bi): (&LoopFilterDsp, usize) = match bd {
+            8 => (&lf_dsps[0], 0),
+            10 => (&lf_dsps[1], 1),
+            12 => (&lf_dsps[2], 2),
+            _ => continue,
+        };
+
+        let plane_idx = usize::from(func >= 2);
+        let dir = func & 1;
+
+        let mut l_raw = [[0u8; 4]; 544];
+        for (i, e) in l_raw.iter_mut().enumerate() {
+            e.copy_from_slice(&lb[i * 4..i * 4 + 4]);
+        }
+
+        let mut mask = vec![0u8; 32 * 32];
+        let mut level = vec![[0u8; 4]; 32 * 32];
+        let mut mask_hi = vec![0u8; 32 * 32];
+        let mut level_hi = vec![[0u8; 4]; 32 * 32];
+
+        let (w4, y0, count, has_second_half) = if dir == 0 {
+            assert_eq!(offp, 8 * bpp);
+            for gy in 0..n {
+                let bit = 1u32 << gy;
+                let v = if vmask[2] & bit != 0 {
+                    3
+                } else if vmask[1] & bit != 0 {
+                    2
+                } else {
+                    u8::from(vmask[0] & bit != 0)
+                };
+                mask[gy * 32 + 2] = v;
+                level[gy * 32 + 2] = l_raw[32 + gy * 32];
+                level[gy * 32 + 1] = l_raw[32 + gy * 32 - 1];
+            }
+            (3usize, 0usize, n, false)
+        } else if bd == 8 {
+            assert_eq!(offp, 8 * stride_bytes);
+            for gx in 0..n {
+                let bit = 1u32 << gx;
+                let v = if vmask[2] & bit != 0 {
+                    3
+                } else if vmask[1] & bit != 0 {
+                    2
+                } else {
+                    u8::from(vmask[0] & bit != 0)
+                };
+                mask[2 * 32 + gx] = v;
+                level[2 * 32 + gx] = l_raw[32 + gx];
+                level[32 + gx] = l_raw[gx];
+            }
+            (n, 2usize, 1usize, false)
+        } else {
+            let gy0 = offp / (4 * stride_bytes);
+            assert_eq!(offp, gy0 * 4 * stride_bytes);
+            let w_first = n.min(8);
+            for gx in 0..w_first {
+                let bit = 1u32 << gx;
+                let v = if vmask[2] & bit != 0 {
+                    3
+                } else if vmask[1] & bit != 0 {
+                    2
+                } else {
+                    u8::from(vmask[0] & bit != 0)
+                };
+                mask[gy0 * 32 + gx] = v;
+                level[gy0 * 32 + gx] = l_raw[32 + gx];
+                level[(gy0 - 1) * 32 + gx] = l_raw[gx];
+            }
+            if n > 8 {
+                for gx in 8..n {
+                    let bit = 1u32 << gx;
+                    let v = if vmask[2] & bit != 0 {
+                        3
+                    } else if vmask[1] & bit != 0 {
+                        2
+                    } else {
+                        u8::from(vmask[0] & bit != 0)
+                    };
+                    mask_hi[gy0 * 32 + (gx - 8)] = v;
+                    level_hi[gy0 * 32 + (gx - 8)] = l_raw[32 + gx];
+                    level_hi[(gy0 - 1) * 32 + (gx - 8)] = l_raw[gx];
+                }
+            }
+            (w_first, gy0, 1usize, n > 8)
+        };
+
+        let mut sb = SentinelBuffer::with_defaults(plane_len);
+        sb.data_mut().copy_from_slice(in_plane);
+        dsp.loop_filter_sb[plane_idx][dir](
+            sb.data_mut(),
+            stride_bytes,
+            &mask,
+            32,
+            &level,
+            32,
+            0,
+            &lim,
+            w4,
+            y0,
+            count,
+        );
+        if has_second_half {
+            let data = sb.data_mut();
+            dsp.loop_filter_sb[plane_idx][dir](
+                &mut data[stride_bytes..],
+                stride_bytes,
+                &mask_hi,
+                32,
+                &level_hi,
+                32,
+                0,
+                &lim,
+                n - 8,
+                y0,
+                count,
+            );
+        }
+        sb.verify().expect("LF SentinelBuffer ihlali");
+        assert_eq!(
+            sb.data(),
+            exp_plane,
+            "LF ARM64 NEON ≠ dav1d C oracle: bd={bd} func={func} rec={}",
+            verified[bi]
+        );
+        verified[bi] += 1;
+    }
+
+    assert!(
+        verified[0] >= min_per_bd && verified[1] >= min_per_bd && verified[2] >= min_per_bd,
+        "LF C oracle 8/10/12 bpc kayıtları tam doğrulanmalı (min={min_per_bd}): {verified:?}"
+    );
+}
+
+#[cfg(target_arch = "aarch64")]
+fn verify_lr_oracle_files(
+    lr_dsps: &[LrDsp; 3],
+    cases_path: &Path,
+    expect_path: &Path,
+    min_per_bd: usize,
+) {
+    let cases = std::fs::read(cases_path)
+        .unwrap_or_else(|e| panic!("{} okunamadı: {e}", cases_path.display()));
+    let expect = std::fs::read(expect_path)
+        .unwrap_or_else(|e| panic!("{} okunamadı: {e}", expect_path.display()));
+    assert_eq!(&cases[..8], b"AV1OLRC1");
+    assert_eq!(&expect[..8], b"AV1OLRE1");
+    let n_cases = u32::from_le_bytes([cases[12], cases[13], cases[14], cases[15]]) as usize;
+    assert_eq!(cases.len(), 16 + n_cases * LR_REC_BYTES);
+    assert_eq!(expect.len(), 12 + n_cases * 32);
+
+    let mut verified = [0usize; 3];
+    for ci in 0..n_cases {
+        let rec = &cases[16 + ci * LR_REC_BYTES..16 + (ci + 1) * LR_REC_BYTES];
+        let c = LrCase::parse(rec);
+        let bi = match c.bd {
+            8 => 0,
+            10 => 1,
+            12 => 2,
+            _ => continue,
+        };
+        let dsp = &lr_dsps[bi];
+        let kernel: LrFilterFn = match c.func {
+            0 => dsp.wiener[0],
+            1 => dsp.wiener[1],
+            2 => dsp.sgr[0],
+            3 => dsp.sgr[1],
+            _ => dsp.sgr[2],
+        };
+        let cb = fill_lr_case(&c);
+        let out = run_lr_kernel_on_case(kernel, &c, &cb)
+            .unwrap_or_else(|e| panic!("LR ci={ci} ({c:?}): {e}"));
+        let got = sha(&out);
+        let want = &expect[12 + ci * 32..12 + (ci + 1) * 32];
+        assert_eq!(
+            &got[..],
+            want,
+            "LR ARM64 NEON ≠ dav1d C oracle: ci={ci} ({c:?})"
+        );
+        verified[bi] += 1;
+    }
+
+    assert!(
+        verified[0] >= min_per_bd && verified[1] >= min_per_bd && verified[2] >= min_per_bd,
+        "LR C oracle 8/10/12 bpc kayıtları tam doğrulanmalı (min={min_per_bd}): {verified:?}"
+    );
+}
+
 #[cfg(target_arch = "aarch64")]
 #[test]
-fn f5d_lf_arm64_c_oracle_sentinel_overread_ve_skaler_devir() {
+fn f5d_lf_arm64_small_c_oracle_sentinel_overread_ve_skaler_devir() {
     #[cfg(target_arch = "aarch64")]
     {
         let _kilit = SAYAC
@@ -557,190 +831,23 @@ fn f5d_lf_arm64_c_oracle_sentinel_overread_ve_skaler_devir() {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let devir_once = lf_skaler_devir_sayisi();
 
-        let lf_dir = repo_root().join(".cache/loopfilter-oracle");
-        if !lf_dir.join("loopfilter-input.bin").is_file() {
-            on_kosul::eksik(
-                "lf_lr_arm64::f5d_lf_arm64_c_oracle_sentinel_overread_ve_skaler_devir",
-                Neden::OracleVerisiYok,
-                "loopfilter-input.bin yok (.cache/loopfilter-oracle)",
-            );
-            return;
-        }
-
         let d_neon = DspDispatch::select(CpuFlags::detect());
-        let lf_8 = *d_neon.for_bit_depth(BitDepth::Eight).lf();
-        let lf_10 = *d_neon.for_bit_depth(BitDepth::Ten).lf();
-        let lf_12 = *d_neon.for_bit_depth(BitDepth::Twelve).lf();
-
-        let input = std::fs::read(lf_dir.join("loopfilter-input.bin")).expect("lf input");
-        let expect = std::fs::read(lf_dir.join("loopfilter-expect.bin")).expect("lf expect");
-        assert_eq!(input.len(), expect.len());
-        let lim = oracle_lut();
-        let mut p = 0usize;
-        let mut verified = [0usize; 3];
-
-        while p + 12 <= input.len() {
-            let h0u = u32::from_le_bytes([input[p], input[p + 1], input[p + 2], input[p + 3]]);
-            let h1u = u32::from_le_bytes([input[p + 4], input[p + 5], input[p + 6], input[p + 7]]);
-            let stride_bytes = usize::from(u16::from_le_bytes([input[p + 8], input[p + 9]]));
-            let offp = usize::from(u16::from_le_bytes([input[p + 10], input[p + 11]]));
-            p += 12;
-
-            let bd = (h0u & 0xff) as usize;
-            let func = ((h0u >> 8) & 0xff) as usize;
-            let n = (h1u >> 16) as usize;
-
-            let mut vmask = [0u32; 4];
-            for v in &mut vmask {
-                *v = u32::from_le_bytes([input[p], input[p + 1], input[p + 2], input[p + 3]]);
-                p += 4;
-            }
-            let lsize = usize::from(u16::from_le_bytes([input[p], input[p + 1]]));
-            p += 2;
-            let lb = &input[p..p + lsize];
-            p += lsize;
-
-            let bpp = if bd > 8 { 2 } else { 1 };
-            let plane_len = 64 * 64 * bpp;
-            let in_plane = &input[p..p + plane_len];
-            let exp_plane = &expect[p..p + plane_len];
-            p += plane_len;
-
-            let (dsp, bi): (&LoopFilterDsp, usize) = match bd {
-                8 => (&lf_8, 0),
-                10 => (&lf_10, 1),
-                12 => (&lf_12, 2),
-                _ => continue,
-            };
-
-            let plane_idx = usize::from(func >= 2);
-            let dir = func & 1;
-
-            let mut l_raw = [[0u8; 4]; 544];
-            for (i, e) in l_raw.iter_mut().enumerate() {
-                e.copy_from_slice(&lb[i * 4..i * 4 + 4]);
-            }
-
-            let mut mask = vec![0u8; 32 * 32];
-            let mut level = vec![[0u8; 4]; 32 * 32];
-            let mut mask_hi = vec![0u8; 32 * 32];
-            let mut level_hi = vec![[0u8; 4]; 32 * 32];
-
-            let (w4, y0, count, has_second_half) = if dir == 0 {
-                assert_eq!(offp, 8 * bpp);
-                for gy in 0..n {
-                    let bit = 1u32 << gy;
-                    let v = if vmask[2] & bit != 0 {
-                        3
-                    } else if vmask[1] & bit != 0 {
-                        2
-                    } else {
-                        u8::from(vmask[0] & bit != 0)
-                    };
-                    mask[gy * 32 + 2] = v;
-                    level[gy * 32 + 2] = l_raw[32 + gy * 32];
-                    level[gy * 32 + 1] = l_raw[32 + gy * 32 - 1];
-                }
-                (3usize, 0usize, n, false)
-            } else if bd == 8 {
-                assert_eq!(offp, 8 * stride_bytes);
-                for gx in 0..n {
-                    let bit = 1u32 << gx;
-                    let v = if vmask[2] & bit != 0 {
-                        3
-                    } else if vmask[1] & bit != 0 {
-                        2
-                    } else {
-                        u8::from(vmask[0] & bit != 0)
-                    };
-                    mask[2 * 32 + gx] = v;
-                    level[2 * 32 + gx] = l_raw[32 + gx];
-                    level[32 + gx] = l_raw[gx];
-                }
-                (n, 2usize, 1usize, false)
-            } else {
-                let gy0 = offp / (4 * stride_bytes);
-                assert_eq!(offp, gy0 * 4 * stride_bytes);
-                let w_first = n.min(8);
-                for gx in 0..w_first {
-                    let bit = 1u32 << gx;
-                    let v = if vmask[2] & bit != 0 {
-                        3
-                    } else if vmask[1] & bit != 0 {
-                        2
-                    } else {
-                        u8::from(vmask[0] & bit != 0)
-                    };
-                    mask[gy0 * 32 + gx] = v;
-                    level[gy0 * 32 + gx] = l_raw[32 + gx];
-                    level[(gy0 - 1) * 32 + gx] = l_raw[gx];
-                }
-                if n > 8 {
-                    for gx in 8..n {
-                        let bit = 1u32 << gx;
-                        let v = if vmask[2] & bit != 0 {
-                            3
-                        } else if vmask[1] & bit != 0 {
-                            2
-                        } else {
-                            u8::from(vmask[0] & bit != 0)
-                        };
-                        mask_hi[gy0 * 32 + (gx - 8)] = v;
-                        level_hi[gy0 * 32 + (gx - 8)] = l_raw[32 + gx];
-                        level_hi[(gy0 - 1) * 32 + (gx - 8)] = l_raw[gx];
-                    }
-                }
-                (w_first, gy0, 1usize, n > 8)
-            };
-
-            let mut sb = SentinelBuffer::with_defaults(plane_len);
-            sb.data_mut().copy_from_slice(in_plane);
-            dsp.loop_filter_sb[plane_idx][dir](
-                sb.data_mut(),
-                stride_bytes,
-                &mask,
-                32,
-                &level,
-                32,
-                0,
-                &lim,
-                w4,
-                y0,
-                count,
-            );
-            if has_second_half {
-                let data = sb.data_mut();
-                dsp.loop_filter_sb[plane_idx][dir](
-                    &mut data[stride_bytes..],
-                    stride_bytes,
-                    &mask_hi,
-                    32,
-                    &level_hi,
-                    32,
-                    0,
-                    &lim,
-                    n - 8,
-                    y0,
-                    count,
-                );
-            }
-            sb.verify().expect("LF SentinelBuffer ihlali");
-            assert_eq!(
-                sb.data(),
-                exp_plane,
-                "LF ARM64 NEON ≠ dav1d C oracle: bd={bd} func={func} rec={}",
-                verified[bi]
-            );
-            verified[bi] += 1;
-        }
-
-        assert!(
-            verified[0] >= 500 && verified[1] >= 500 && verified[2] >= 500,
-            "LF C oracle 8/10/12 bpc kayıtları tam doğrulanmalı: {verified:?}"
+        let lf_dsps = [
+            *d_neon.for_bit_depth(BitDepth::Eight).lf(),
+            *d_neon.for_bit_depth(BitDepth::Ten).lf(),
+            *d_neon.for_bit_depth(BitDepth::Twelve).lf(),
+        ];
+        let fdir = lf_fixture_dir();
+        verify_lf_oracle_files(
+            &lf_dsps,
+            &fdir.join("loopfilter-small-input.bin"),
+            &fdir.join("loopfilter-small-expect.bin"),
+            8,
         );
         assert_eq!(lf_skaler_devir_sayisi(), devir_once);
 
         // Dar düzlem sınırında (`gx == 1` iken `wd = 4` -> dar 8 baytlık `dst`) OverReadProbe:
+        let lim = oracle_lut();
         let probe = OverReadProbe::new(4 * 8, 64, 4 * 8);
         let mut out_a = [0u8; 32];
         let mut out_b = [0u8; 32];
@@ -751,13 +858,25 @@ fn f5d_lf_arm64_c_oracle_sentinel_overread_ve_skaler_devir() {
         probe
             .run_pair(&mut out_a, &mut out_b, |inp, out| {
                 out.copy_from_slice(&inp[probe.data_offset()..probe.data_offset() + 32]);
-                lf_8.loop_filter_sb[0][0](out, 8, &mask_small, 2, &lvl_small, 2, 0, &lim, 2, 0, 1);
+                lf_dsps[0].loop_filter_sb[0][0](
+                    out,
+                    8,
+                    &mask_small,
+                    2,
+                    &lvl_small,
+                    2,
+                    0,
+                    &lim,
+                    2,
+                    0,
+                    1,
+                );
             })
             .expect("LF dar düzlem OverReadProbe taşması");
 
         // Sözleşme dışı kısa `dst` güvenli skaler devir:
         let mut kisa = [0u8; 2];
-        lf_8.loop_filter_sb[0][0](
+        lf_dsps[0].loop_filter_sb[0][0](
             &mut kisa,
             8,
             &mask_small,
@@ -776,23 +895,48 @@ fn f5d_lf_arm64_c_oracle_sentinel_overread_ve_skaler_devir() {
 
 #[cfg(target_arch = "aarch64")]
 #[test]
-fn f5d_lr_arm64_c_oracle_sentinel_overread_ve_skaler_devir() {
+fn f5d_lf_arm64_full_c_oracle() {
+    #[cfg(target_arch = "aarch64")]
+    {
+        let _kilit = SAYAC
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let devir_once = lf_skaler_devir_sayisi();
+
+        let Some(lf_dir) = find_lf_oracle_dir() else {
+            on_kosul::eksik(
+                "lf_lr_arm64::f5d_lf_arm64_full_c_oracle",
+                Neden::OracleVerisiYok,
+                "loopfilter-input.bin yok (.cache/loopfilter-oracle)",
+            );
+            return;
+        };
+
+        let d_neon = DspDispatch::select(CpuFlags::detect());
+        let lf_dsps = [
+            *d_neon.for_bit_depth(BitDepth::Eight).lf(),
+            *d_neon.for_bit_depth(BitDepth::Ten).lf(),
+            *d_neon.for_bit_depth(BitDepth::Twelve).lf(),
+        ];
+        verify_lf_oracle_files(
+            &lf_dsps,
+            &lf_dir.join("loopfilter-input.bin"),
+            &lf_dir.join("loopfilter-expect.bin"),
+            500,
+        );
+        assert_eq!(lf_skaler_devir_sayisi(), devir_once);
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[test]
+fn f5d_lr_arm64_small_c_oracle_sentinel_overread_ve_skaler_devir() {
     #[cfg(target_arch = "aarch64")]
     {
         let _kilit = SAYAC
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let devir_once = lr_skaler_devir_sayisi();
-
-        let lr_dir = repo_root().join(".cache/lr-oracle");
-        if !lr_dir.join("lr-quick-cases.bin").is_file() {
-            on_kosul::eksik(
-                "lf_lr_arm64::f5d_lr_arm64_c_oracle_sentinel_overread_ve_skaler_devir",
-                Neden::OracleVerisiYok,
-                "lr-quick-cases.bin yok (.cache/lr-oracle)",
-            );
-            return;
-        }
 
         let d_neon = DspDispatch::select(CpuFlags::detect());
         let lr_dsps: [LrDsp; 3] = [
@@ -801,50 +945,12 @@ fn f5d_lr_arm64_c_oracle_sentinel_overread_ve_skaler_devir() {
             *d_neon.for_bit_depth(BitDepth::Twelve).lr(),
         ];
 
-        let cases = std::fs::read(lr_dir.join("lr-quick-cases.bin")).expect("lr-quick-cases.bin");
-        let expect =
-            std::fs::read(lr_dir.join("lr-quick-expect.bin")).expect("lr-quick-expect.bin");
-        assert_eq!(&cases[..8], b"AV1OLRC1");
-        assert_eq!(&expect[..8], b"AV1OLRE1");
-        let n_cases = u32::from_le_bytes([cases[12], cases[13], cases[14], cases[15]]) as usize;
-        assert_eq!(cases.len(), 16 + n_cases * LR_REC_BYTES);
-        assert_eq!(expect.len(), 12 + n_cases * 32);
-
-        let mut verified = [0usize; 3];
-        for ci in 0..n_cases {
-            let rec = &cases[16 + ci * LR_REC_BYTES..16 + (ci + 1) * LR_REC_BYTES];
-            let c = LrCase::parse(rec);
-            let bi = match c.bd {
-                8 => 0,
-                10 => 1,
-                12 => 2,
-                _ => continue,
-            };
-            // 12-bpc SGR skaler kaldığı için yine de tablo üzerinden doğrulanır (skaler devir sayacını artırmaz!).
-            let dsp = &lr_dsps[bi];
-            let kernel: LrFilterFn = match c.func {
-                0 => dsp.wiener[0],
-                1 => dsp.wiener[1],
-                2 => dsp.sgr[0],
-                3 => dsp.sgr[1],
-                _ => dsp.sgr[2],
-            };
-            let cb = fill_lr_case(&c);
-            let out = run_lr_kernel_on_case(kernel, &c, &cb)
-                .unwrap_or_else(|e| panic!("LR ci={ci} ({c:?}): {e}"));
-            let got = sha(&out);
-            let want = &expect[12 + ci * 32..12 + (ci + 1) * 32];
-            assert_eq!(
-                &got[..],
-                want,
-                "LR ARM64 NEON ≠ dav1d C oracle: ci={ci} ({c:?})"
-            );
-            verified[bi] += 1;
-        }
-
-        assert!(
-            verified[0] >= 2000 && verified[1] >= 2000 && verified[2] >= 2000,
-            "LR C oracle 8/10/12 bpc kayıtları tam doğrulanmalı: {verified:?}"
+        let fdir = lr_fixture_dir();
+        verify_lr_oracle_files(
+            &lr_dsps,
+            &fdir.join("lr-small-cases.bin"),
+            &fdir.join("lr-small-expect.bin"),
+            80,
         );
 
         // OverReadProbe: Wiener ve SGR dar genişliklerde (`w ∈ {1, 3, 7, 15, 33}`) `lpf` ve `left` sınırı
@@ -925,5 +1031,40 @@ fn f5d_lr_arm64_c_oracle_sentinel_overread_ve_skaler_devir() {
             LrBitDepth::B10,
         );
         assert!(lr_skaler_devir_sayisi() > devir_once);
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[test]
+fn f5d_lr_arm64_full_c_oracle() {
+    #[cfg(target_arch = "aarch64")]
+    {
+        let _kilit = SAYAC
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let devir_once = lr_skaler_devir_sayisi();
+
+        let Some(lr_dir) = find_lr_oracle_dir() else {
+            on_kosul::eksik(
+                "lf_lr_arm64::f5d_lr_arm64_full_c_oracle",
+                Neden::OracleVerisiYok,
+                "lr-quick-cases.bin yok (.cache/lr-oracle)",
+            );
+            return;
+        };
+
+        let d_neon = DspDispatch::select(CpuFlags::detect());
+        let lr_dsps: [LrDsp; 3] = [
+            *d_neon.for_bit_depth(BitDepth::Eight).lr(),
+            *d_neon.for_bit_depth(BitDepth::Ten).lr(),
+            *d_neon.for_bit_depth(BitDepth::Twelve).lr(),
+        ];
+        verify_lr_oracle_files(
+            &lr_dsps,
+            &lr_dir.join("lr-quick-cases.bin"),
+            &lr_dir.join("lr-quick-expect.bin"),
+            2000,
+        );
+        assert_eq!(lr_skaler_devir_sayisi(), devir_once);
     }
 }

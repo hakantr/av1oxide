@@ -159,12 +159,6 @@ fn buyuk_oracle_dizini(manifest: &Path) -> Option<PathBuf> {
             return Some(p);
         }
     }
-    let ana_depo = PathBuf::from("/home/hakanbiris/github/av1oxide/.cache/itx-oracle");
-    if ana_depo.join("itx-large-8-input.bin").exists()
-        && ana_depo.join("itx-large-8-expect.bin").exists()
-    {
-        return Some(ana_depo);
-    }
     None
 }
 
