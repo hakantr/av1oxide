@@ -1,6 +1,6 @@
 [package]
 name = "av1oxide-image"
-version = "0.1.0"
+version = "0.1.1"
 description = "image::ImageDecoder integration crate for av1oxide::avif (100% safe Rust, zero external codec dependencies)"
 edition.workspace = true
 rust-version.workspace = true
@@ -10,7 +10,7 @@ documentation = "https://docs.rs/av1oxide-image"
 readme = "README.md"
 keywords = ["avif", "av1", "image", "decoder"]
 categories = ["multimedia::images", "multimedia::encoding"]
-include = ["src/**", "Cargo.toml", "README.md", "LICENSE"]
+include = ["src/**", "Cargo.toml", "README.md", "README.tr.md", "LICENSE"]
 
 [lints]
 workspace = true

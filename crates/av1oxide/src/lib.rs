@@ -1,4 +1,4 @@
-//! # av1oxide — %100 Kararlı Rust AV1 Video ve AVIF Görüntü Çözücüsü (`v0.5.0`)
+//! # av1oxide — %100 Kararlı Rust AV1 Video ve AVIF Görüntü Çözücüsü (`v0.5.1`)
 //!
 //! `av1oxide`, VideoLAN [`dav1d`](https://code.videolan.org/videolan/dav1d) (`1.5.4`)
 //! AV1 video çözücüsünün **%100 kararlı Rust** (`rustc 1.100.0`, Edition 2024) ve
@@ -113,7 +113,7 @@
 //! - `crates/av1oxide/src` altındaki `218` kaynak dosyadan `124`'ü doğrudan `#![forbid(unsafe_code)]`
 //!   taşır (kalan `5` üst modül kökü `0` `unsafe` bloğu içerir); yalnız [`audit::UNSAFE_EXEMPTIONS`]
 //!   içindeki `88` `x86_64`/`aarch64` SIMD dosyası ve `1` C-ABI sınır dosyası (`capi/ffi.rs`)
-//!   dar kapsamlı işlemler için muaf tutulur (`0` güvensiz işlev imzası, `392` blok).
+//!   dar kapsamlı işlemler için muaf tutulur (`0` güvensiz işlev imzası, `397` blok).
 //!
 //! ## Bağımlılık Politikası
 //!

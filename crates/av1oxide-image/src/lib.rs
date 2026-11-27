@@ -1,8 +1,8 @@
-//! `av1oxide::avif` için [`image::ImageDecoder`] (`image 0.25`) köprü paketi.
+//! [`image::ImageDecoder`] (`image 0.25`) integration crate for [`av1oxide::avif`].
 //!
-//! Bu paket `%100 #![forbid(unsafe_code)]` altında derlenir, ana `av1oxide`
-//! paketine `image` bağımlılığı eklemeden AVIF görüntü çözme desteğini `image`
-//! ekosistemine bağlar ve `image` paketini `default-features = false` ile kullanır.
+//! This crate compiles under `#![forbid(unsafe_code)]`, integrates AVIF decoding
+//! with the `image` crate ecosystem without adding an `image` dependency to the
+//! core `av1oxide` crate, and depends on `image` with `default-features = false`.
 
 #![forbid(unsafe_code)]
 #![deny(unused_crate_dependencies)]
@@ -19,33 +19,33 @@ use image::{
     Limits,
 };
 
-/// [`av1oxide::avif`] arka ucunu kullanan [`image::ImageDecoder`] gerçekleştirimi.
+/// [`image::ImageDecoder`] implementation backed by [`av1oxide::avif`].
 ///
-/// `8-bit` AVIF görüntüleri `ColorType::Rgb8` / `ColorType::Rgba8` olarak, `10-bit`
-/// ve `12-bit` AVIF görüntüleri ise `image` sözleşmesi uyarınca tam `[0..=65535]`
-/// dinamik aralığına ölçeklenerek `ColorType::Rgb16` / `ColorType::Rgba16` (yerel
-/// bayt sırası) biçiminde döndürülür.
+/// `8-bit` AVIF images decode as `ColorType::Rgb8` / `ColorType::Rgba8`. `10-bit`
+/// and `12-bit` AVIF images are scaled to the full `[0..=65535]` dynamic range
+/// required by the `image` crate contract and returned as `ColorType::Rgb16` /
+/// `ColorType::Rgba16` in native byte order.
 ///
-/// ## Tek Ayrıştırma ve Doğrudan Çıktı Yazımı
+/// ## Single-Pass Parsing and Direct Output Writing
 ///
-/// - [`AvifDecoder::with_config`] akışı yalnızca bir kez okuyup [`AvifPrepared`] ile
-///   kapsayıcı/üst veri yapısını (`cmin` açma dâhil) tek seferde ayrıştırır.
-/// - [`ImageDecoder::read_image`] ikinci bir kutu ayrıştırması yapmadan düzlemleri çözer,
-///   ardından ham girdi baytlarını serbest bırakıp `AvifImage::write_*_into` metodlarıyla
-///   doğrudan çağıranın `buf: &mut [u8]` dilimine (`0` ara RGB/RGBA vektörüyle) yazar.
+/// - [`AvifDecoder::with_config`] reads the stream once and parses container boxes
+///   and metadata (including `cmin` decompression) in a single pass via [`AvifPrepared`].
+/// - [`ImageDecoder::read_image`] decodes image planes without a second container parse,
+///   releases the raw input bytes immediately, and writes converted pixels directly into
+///   the caller-provided `buf: &mut [u8]` slice via `AvifImage::write_*_into` with zero
+///   intermediate RGB/RGBA allocation.
 ///
-/// ## Bellek Bütçesi Kapsamı (`allocation_limit` ve `Limits::max_alloc`)
+/// ## Memory Budget Scope (`allocation_limit` and `Limits::max_alloc`)
 ///
-/// - [`AvifDecoder::with_config`] akıştan okuduğu iç `raw_bytes` tamponunu okuma başlamadan
-///   önce `Read::take(limit + 1)` ile sınırlar; ardından kalan bütçeyi (`limit - raw_bytes.len()`)
-///   [`AvifPrepared::from_vec`] çağrısına aktararak `cmin`/`infe` açma ve `ICC`/`Exif`/`XMP`
-///   başlık tahsislerini aynı tavan içinde tutar.
-/// - [`ImageDecoder::set_limits`] çağrısı hem çıktı boyutunu (`total_bytes()`) hem de adaptörün
-///   halihazırda tuttuğu girdi + kapsayıcı + üst veri belleğini `limits.max_alloc` tavanına
-///   karşı denetler.
-/// - [`ImageDecoder::read_image`] aşamasında iç çözücü tamponları toplam tavan içinden
-///   `raw_bytes.len()` düşülerek sınırlandırılır; çağıranın dışarıda ayırıp `read_image`
-///   çağrısına geçirdiği `&mut [u8]` çıktı dilimi kütüphanenin iç tahsis sayacına dâhil değildir.
+/// - [`AvifDecoder::with_config`] bounds stream ingestion with `Read::take(limit + 1)`
+///   before reading into memory, then forwards the remaining budget (`limit - raw_bytes.len()`)
+///   to [`AvifPrepared::from_vec`] so `cmin`/`infe` decompression and `ICC`/`Exif`/`XMP`
+///   metadata allocations remain within the same ceiling.
+/// - [`ImageDecoder::set_limits`] validates both the output size (`total_bytes()`) and
+///   the input/container/metadata memory already held by the adapter against `limits.max_alloc`.
+/// - During [`ImageDecoder::read_image`], internal decoder allocations are capped by
+///   subtracting `raw_bytes.len()` from the effective ceiling; the caller-owned `&mut [u8]`
+///   output buffer passed to `read_image` is outside the library's internal allocation counter.
 #[derive(Clone, Debug)]
 pub struct AvifDecoder<R: Read> {
     prepared: AvifPrepared,
@@ -55,21 +55,21 @@ pub struct AvifDecoder<R: Read> {
 }
 
 impl<R: Read> AvifDecoder<R> {
-    /// Varsayılan [`AvifDecodeConfig`] ile yeni bir [`AvifDecoder`] oluşturur.
+    /// Creates a new [`AvifDecoder`] using the default [`AvifDecodeConfig`].
     ///
-    /// Akış baytları okunur ve piksel çözümüne geçilmeden önce kapsayıcı ve başlık bilgisi
-    /// ([`AvifPrepared::from_vec`]) tek geçişte ayrıştırılır; böylece `dimensions`, `color_type`,
-    /// metaveri ve `set_limits` kontrolleri piksel tahsisi yapılmadan yürütülebilir.
+    /// Stream bytes are read and container/header metadata are parsed in a single pass
+    /// ([`AvifPrepared::from_vec`]) before pixel decoding starts, allowing `dimensions`,
+    /// `color_type`, metadata access, and `set_limits` checks prior to pixel buffer allocation.
     pub fn new(reader: R) -> ImageResult<Self> {
         Self::with_config(reader, AvifDecodeConfig::default())
     }
 
-    /// Özel [`AvifDecodeConfig`] yapılandırmasıyla yeni bir [`AvifDecoder`] oluşturur.
+    /// Creates a new [`AvifDecoder`] with a custom [`AvifDecodeConfig`].
     ///
-    /// `config.allocation_limit` tanımlıysa okuma başlamadan önce `Read::take(limit + 1)` ile
-    /// girdi boyutu sınırlandırılır; girdi `limit` bayttan büyükse başlık ayrıştırılmadan
-    /// `LimitErrorKind::InsufficientMemory` döndürülür. Kalan bütçe (`limit - raw_bytes.len()`)
-    /// [`AvifPrepared::from_vec`] çağrısına iletilir.
+    /// When `config.allocation_limit` is set, input reading is bounded with
+    /// `Read::take(limit + 1)` before reading starts; if the input exceeds `limit` bytes,
+    /// `LimitErrorKind::InsufficientMemory` is returned before header parsing. The remaining
+    /// budget (`limit - raw_bytes.len()`) is passed to [`AvifPrepared::from_vec`].
     pub fn with_config(mut reader: R, config: AvifDecodeConfig) -> ImageResult<Self> {
         let mut raw_bytes = Vec::new();
         let header_cfg = if let Some(limit) = config.allocation_limit {
@@ -98,7 +98,7 @@ impl<R: Read> AvifDecoder<R> {
         })
     }
 
-    /// Ayrıştırılmış AVIF üst verisine salt-okunur erişim döndürür.
+    /// Returns read-only access to the parsed AVIF header and metadata.
     #[must_use]
     pub const fn info(&self) -> &AvifInfo {
         self.prepared.info()
@@ -255,15 +255,15 @@ fn map_av1oxide_error(err: Error) -> ImageError {
     }
 }
 
-/// Bellek içi AVIF bayt dilimini doğrudan [`DynamicImage`] olarak çözer.
+/// Decodes an in-memory AVIF byte slice directly into a [`DynamicImage`].
 pub fn decode_avif_bytes(data: &[u8]) -> ImageResult<DynamicImage> {
     let decoder = AvifDecoder::new(Cursor::new(data))?;
     DynamicImage::from_decoder(decoder)
 }
 
-/// `image::hooks` sistemine `.avif` uzantısı için `av1oxide-image` çözücü kancasını kaydeder.
+/// Registers the `av1oxide-image` decoding hook for the `.avif` extension with `image::hooks`.
 ///
-/// Kanca ilk kez eklendiyse `true`, `.avif` için daha önce bir kanca tanımlanmışsa `false` döner.
+/// Returns `true` if the hook was newly installed, or `false` if a hook for `.avif` was already registered.
 pub fn register_decoding_hook() -> bool {
     image::hooks::register_decoding_hook(
         "avif".into(),

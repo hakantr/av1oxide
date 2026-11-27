@@ -83,7 +83,7 @@ fn capi_version_settings_and_sequence_header() {
     // OBU dilimlerini geçerli yaşam süreleriyle kullanır.
     unsafe {
         let v = CStr::from_ptr(dav1d_version()).to_str().unwrap();
-        assert_eq!(v, "0.5.0");
+        assert_eq!(v, "0.5.1");
         assert_eq!(dav1d_version_api(), 0x0007_0000);
 
         dav1d_default_settings(ptr::null_mut());
@@ -921,7 +921,7 @@ static const uint8_t PKT0[] = {
 
 int main(void) {
     assert(dav1d_version_api() == 0x00070000U);
-    assert(strcmp(dav1d_version(), "0.5.0") == 0);
+    assert(strcmp(dav1d_version(), "0.5.1") == 0);
 
     Dav1dSequenceHeader seq = { 0 };
     assert(dav1d_parse_sequence_header(&seq, PKT0, sizeof(PKT0)) == 0);
