@@ -73,37 +73,222 @@ const EDGE_NEEDS: [Edges; 14] = [
 /// `av1_mode_to_angle_map`: `VERT..VERT_LEFT` için temel açılar.
 const MODE_TO_ANGLE: [i32; 8] = [90, 180, 45, 135, 113, 157, 203, 67];
 
-/// Bayt ofsetinden piksel okur.
-#[inline]
-pub(crate) fn px_get(bytes: &[u8], off: usize, bd: BitDepth) -> u16 {
-    if bd.bytes_per_sample() == 1 {
+#[inline(always)]
+fn px_get_bpp<const BPP: usize>(bytes: &[u8], off: usize) -> u16 {
+    if BPP == 1 {
         u16::from(bytes[off])
     } else {
         u16::from_le_bytes([bytes[off], bytes[off + 1]])
     }
 }
 
-/// Bayt ofsetine piksel yazar.
-#[inline]
-pub(crate) fn px_set(bytes: &mut [u8], off: usize, value: u16, bd: BitDepth) {
-    if bd.bytes_per_sample() == 1 {
+#[inline(always)]
+fn px_set_bpp<const BPP: usize>(bytes: &mut [u8], off: usize, value: u16) {
+    if BPP == 1 {
         bytes[off] = value as u8;
     } else {
         bytes[off..off + 2].copy_from_slice(&value.to_le_bytes());
     }
 }
 
-/// Kenar tamponunu `count` piksel aynı değerle doldurur.
+/// `_memset` / `_memset_pattern16` kütüphane çağrısına düşmeden sabit genişlikli
+/// yazmaç saklamalarıyla kenar tamponunu `count` piksel aynı değerle doldurur.
 #[inline(always)]
-fn px_fill(bytes: &mut [u8], off: usize, value: u16, count: usize, bd: BitDepth) {
-    if bd.bytes_per_sample() == 1 {
-        bytes[off..off + count].fill(value as u8);
+fn px_fill_bpp<const BPP: usize>(bytes: &mut [u8], off: usize, value: u16, count: usize) {
+    if BPP == 1 {
+        let v = value as u8;
+        let dst = &mut bytes[off..off + count];
+        match count {
+            0 => {}
+            1 => dst[0] = v,
+            2 => dst.copy_from_slice(&[v; 2]),
+            4 => dst.copy_from_slice(&[v; 4]),
+            8 => dst.copy_from_slice(&[v; 8]),
+            16 => dst.copy_from_slice(&[v; 16]),
+            32 => dst.copy_from_slice(&[v; 32]),
+            64 => dst.copy_from_slice(&[v; 64]),
+            _ => {
+                let mut i = 0;
+                while i < dst.len() {
+                    dst[i] = v;
+                    i += 1;
+                }
+            }
+        }
     } else {
-        let pair = value.to_le_bytes();
-        bytes[off..off + count * 2]
-            .as_chunks_mut::<2>()
-            .0
-            .fill(pair);
+        let p = value.to_le_bytes();
+        let dst = &mut bytes[off..off + count * 2];
+        match count {
+            0 => {}
+            1 => dst.copy_from_slice(&p),
+            2 => dst.copy_from_slice([p; 2].as_flattened()),
+            4 => dst.copy_from_slice([p; 4].as_flattened()),
+            8 => dst.copy_from_slice([p; 8].as_flattened()),
+            16 => dst.copy_from_slice([p; 16].as_flattened()),
+            32 => dst.copy_from_slice([p; 32].as_flattened()),
+            64 => dst.copy_from_slice([p; 64].as_flattened()),
+            _ => {
+                for c in dst.as_chunks_mut::<2>().0 {
+                    *c = p;
+                }
+            }
+        }
+    }
+}
+
+/// `_memcpy` sistem çağrısına düşmeden satır içi sabit genişliklerle üst kenar kopyalar.
+#[inline(always)]
+fn copy_edge_row(edge: &mut [u8], dst_off: usize, src: &[u8], src_off: usize, nbytes: usize) {
+    let d = &mut edge[dst_off..dst_off + nbytes];
+    let s = &src[src_off..src_off + nbytes];
+    match nbytes {
+        0 => {}
+        4 => d.copy_from_slice(&s[..4]),
+        8 => d.copy_from_slice(&s[..8]),
+        16 => d.copy_from_slice(&s[..16]),
+        32 => d.copy_from_slice(&s[..32]),
+        64 => d.copy_from_slice(&s[..64]),
+        128 => d.copy_from_slice(&s[..128]),
+        _ => {
+            let mut i = 0;
+            while i + 8 <= nbytes {
+                d[i..i + 8].copy_from_slice(&s[i..i + 8]);
+                i += 8;
+            }
+            while i < nbytes {
+                d[i] = s[i];
+                i += 1;
+            }
+        }
+    }
+}
+
+/// Sol ve alt-sol sütun piksellerini ters sırayla (`edge[out_off..out_off + count*BPP]`)
+/// toplar; 4/8/16 satırlık yaygın blok yüksekliklerinde döngüsüz ve tek dilim sınır
+/// kontrolüyle çalışır.
+#[inline(always)]
+fn gather_left_rev<const BPP: usize>(
+    edge: &mut [u8],
+    out_off: usize,
+    dst: &[u8],
+    s0: usize,
+    stride: usize,
+    count: usize,
+) {
+    if count == 0 {
+        return;
+    }
+    if BPP == 1 {
+        if count == 4 && stride <= 0x00ff_ffff {
+            let s = stride & 0x00ff_ffff;
+            let d = &dst[s0..s0 + 3 * s + 1];
+            edge[out_off..out_off + 4].copy_from_slice(&[d[3 * s], d[2 * s], d[s], d[0]]);
+            return;
+        }
+        if count == 8 && stride <= 0x00ff_ffff {
+            let s = stride & 0x00ff_ffff;
+            let d = &dst[s0..s0 + 7 * s + 1];
+            edge[out_off..out_off + 8].copy_from_slice(&[
+                d[7 * s],
+                d[6 * s],
+                d[5 * s],
+                d[4 * s],
+                d[3 * s],
+                d[2 * s],
+                d[s],
+                d[0],
+            ]);
+            return;
+        }
+        if count == 16 && stride <= 0x00ff_ffff {
+            let s = stride & 0x00ff_ffff;
+            let d = &dst[s0..s0 + 15 * s + 1];
+            edge[out_off..out_off + 16].copy_from_slice(&[
+                d[15 * s],
+                d[14 * s],
+                d[13 * s],
+                d[12 * s],
+                d[11 * s],
+                d[10 * s],
+                d[9 * s],
+                d[8 * s],
+                d[7 * s],
+                d[6 * s],
+                d[5 * s],
+                d[4 * s],
+                d[3 * s],
+                d[2 * s],
+                d[s],
+                d[0],
+            ]);
+            return;
+        }
+        if stride >= 1 {
+            let d = &dst[s0..s0 + (count - 1) * stride + 1];
+            for (out, row) in edge[out_off..out_off + count]
+                .iter_mut()
+                .rev()
+                .zip(d.chunks(stride))
+            {
+                *out = row[0];
+            }
+        } else {
+            px_fill_bpp::<1>(edge, out_off, u16::from(dst[s0]), count);
+        }
+    } else {
+        if count == 4 && stride <= 0x00ff_ffff {
+            let s = stride & 0x00ff_ffff;
+            let d = &dst[s0..s0 + 3 * s + 2];
+            edge[out_off..out_off + 8].copy_from_slice(&[
+                d[3 * s],
+                d[3 * s + 1],
+                d[2 * s],
+                d[2 * s + 1],
+                d[s],
+                d[s + 1],
+                d[0],
+                d[1],
+            ]);
+            return;
+        }
+        if count == 8 && stride <= 0x00ff_ffff {
+            let s = stride & 0x00ff_ffff;
+            let d = &dst[s0..s0 + 7 * s + 2];
+            edge[out_off..out_off + 16].copy_from_slice(&[
+                d[7 * s],
+                d[7 * s + 1],
+                d[6 * s],
+                d[6 * s + 1],
+                d[5 * s],
+                d[5 * s + 1],
+                d[4 * s],
+                d[4 * s + 1],
+                d[3 * s],
+                d[3 * s + 1],
+                d[2 * s],
+                d[2 * s + 1],
+                d[s],
+                d[s + 1],
+                d[0],
+                d[1],
+            ]);
+            return;
+        }
+        if stride >= 2 {
+            let d = &dst[s0..s0 + (count - 1) * stride + 2];
+            for (out, row) in edge[out_off..out_off + count * 2]
+                .as_chunks_mut::<2>()
+                .0
+                .iter_mut()
+                .rev()
+                .zip(d.chunks(stride))
+            {
+                *out = [row[0], row[1]];
+            }
+        } else {
+            let v = u16::from_le_bytes([dst[s0], dst[s0 + 1]]);
+            px_fill_bpp::<2>(edge, out_off, v, count);
+        }
     }
 }
 
@@ -323,7 +508,6 @@ fn prepare_intra_edges_core<const BPP: usize>(
     topleft_off: usize,
     bd: BitDepth,
 ) -> Prepared {
-    let bpp = BPP;
     let bitdepth_max = bd.max_sample() as u16;
     let mid = (bitdepth_max as i32 + 1) >> 1;
     let mut mode = mode_in;
@@ -366,80 +550,29 @@ fn prepare_intra_edges_core<const BPP: usize>(
 
     if need.left {
         let sz = th << 2;
-        let left_off = topleft_off - sz * bpp;
+        let left_off = topleft_off - sz * BPP;
         if have_left {
             let px_have = sz.min(h.saturating_sub(y) << 2);
-            if BPP == 1 {
-                let s = dst_off.saturating_sub(1);
-                if px_have == 4 && sz == 4 {
-                    let s1 = s + stride;
-                    let s2 = s1 + stride;
-                    let s3 = s2 + stride;
-                    let bytes = [dst[s3], dst[s2], dst[s1], dst[s]];
-                    edge[left_off..left_off + 4].copy_from_slice(&bytes);
-                } else if px_have == 8 && sz == 8 {
-                    let s1 = s + stride;
-                    let s2 = s1 + stride;
-                    let s3 = s2 + stride;
-                    let s4 = s3 + stride;
-                    let s5 = s4 + stride;
-                    let s6 = s5 + stride;
-                    let s7 = s6 + stride;
-                    let bytes = [
-                        dst[s7], dst[s6], dst[s5], dst[s4], dst[s3], dst[s2], dst[s1], dst[s],
-                    ];
-                    edge[left_off..left_off + 8].copy_from_slice(&bytes);
-                } else {
-                    let mut si = s;
-                    for out in edge[left_off + (sz - px_have)..left_off + sz]
-                        .iter_mut()
-                        .rev()
-                    {
-                        *out = dst[si];
-                        si += stride;
-                    }
-                }
-            } else {
-                let s = dst_off.saturating_sub(2);
-                if px_have == 4 && sz == 4 {
-                    let s1 = s + stride;
-                    let s2 = s1 + stride;
-                    let s3 = s2 + stride;
-                    let bytes = [
-                        dst[s3],
-                        dst[s3 + 1],
-                        dst[s2],
-                        dst[s2 + 1],
-                        dst[s1],
-                        dst[s1 + 1],
-                        dst[s],
-                        dst[s + 1],
-                    ];
-                    edge[left_off..left_off + 8].copy_from_slice(&bytes);
-                } else {
-                    let mut si = s;
-                    for out in edge[left_off + (sz - px_have) * 2..left_off + sz * 2]
-                        .as_chunks_mut::<2>()
-                        .0
-                        .iter_mut()
-                        .rev()
-                    {
-                        *out = [dst[si], dst[si + 1]];
-                        si += stride;
-                    }
-                }
-            }
+            let s0 = dst_off.saturating_sub(BPP);
+            gather_left_rev::<BPP>(
+                edge,
+                left_off + (sz - px_have) * BPP,
+                dst,
+                s0,
+                stride,
+                px_have,
+            );
             if px_have < sz {
-                let value = px_get(edge, left_off + (sz - px_have) * bpp, bd);
-                px_fill(edge, left_off, value, sz - px_have, bd);
+                let value = px_get_bpp::<BPP>(edge, left_off + (sz - px_have) * BPP);
+                px_fill_bpp::<BPP>(edge, left_off, value, sz - px_have);
             }
         } else {
             let value = if have_top {
-                px_get(dst, dst_top_off, bd)
+                px_get_bpp::<BPP>(dst, dst_top_off)
             } else {
                 (mid + 1) as u16
             };
-            px_fill(edge, left_off, value, sz, bd);
+            px_fill_bpp::<BPP>(edge, left_off, value, sz);
         }
 
         if need.bottomleft {
@@ -447,95 +580,58 @@ fn prepare_intra_edges_core<const BPP: usize>(
                 have_left && y + th < h && edge_flags & EDGE_I444_LEFT_HAS_BOTTOM != 0;
             if have_bottomleft {
                 let px_have = sz.min((h - y - th) << 2);
-                if BPP == 1 {
-                    let mut s = (dst_off + sz * stride).saturating_sub(1);
-                    for out in edge[left_off - px_have..left_off].iter_mut().rev() {
-                        *out = dst[s];
-                        s += stride;
-                    }
-                } else {
-                    let mut s = (dst_off + sz * stride).saturating_sub(2);
-                    for out in edge[left_off - px_have * 2..left_off]
-                        .as_chunks_mut::<2>()
-                        .0
-                        .iter_mut()
-                        .rev()
-                    {
-                        *out = [dst[s], dst[s + 1]];
-                        s += stride;
-                    }
-                }
+                let s0 = (dst_off + sz * stride).saturating_sub(BPP);
+                gather_left_rev::<BPP>(edge, left_off - px_have * BPP, dst, s0, stride, px_have);
                 if px_have < sz {
-                    let value = px_get(edge, left_off - px_have * bpp, bd);
-                    px_fill(edge, left_off - sz * bpp, value, sz - px_have, bd);
+                    let value = px_get_bpp::<BPP>(edge, left_off - px_have * BPP);
+                    px_fill_bpp::<BPP>(edge, left_off - sz * BPP, value, sz - px_have);
                 }
             } else {
-                let value = px_get(edge, left_off, bd);
-                px_fill(edge, left_off - sz * bpp, value, sz, bd);
+                let value = px_get_bpp::<BPP>(edge, left_off);
+                px_fill_bpp::<BPP>(edge, left_off - sz * BPP, value, sz);
             }
         }
     }
 
     if need.top {
         let sz = tw << 2;
-        let top_off = topleft_off + bpp;
+        let top_off = topleft_off + BPP;
         if have_top {
             let px_have = sz.min(w.saturating_sub(x) << 2);
-            let nbytes = px_have * bpp;
-            if BPP == 1 && nbytes == 4 {
-                let b = [
-                    dst[dst_top_off],
-                    dst[dst_top_off + 1],
-                    dst[dst_top_off + 2],
-                    dst[dst_top_off + 3],
-                ];
-                edge[top_off..top_off + 4].copy_from_slice(&b);
-            } else if BPP == 1 && nbytes == 8 {
-                let b: [u8; 8] = dst[dst_top_off..dst_top_off + 8].try_into().unwrap();
-                edge[top_off..top_off + 8].copy_from_slice(&b);
-            } else {
-                edge[top_off..top_off + nbytes]
-                    .copy_from_slice(&dst[dst_top_off..dst_top_off + nbytes]);
-            }
+            let nbytes = px_have * BPP;
+            copy_edge_row(edge, top_off, dst, dst_top_off, nbytes);
             if px_have < sz {
                 let src = if px_have == 0 {
                     topleft_off
                 } else {
-                    top_off + (px_have - 1) * bpp
+                    top_off + (px_have - 1) * BPP
                 };
-                let value = px_get(edge, src, bd);
-                px_fill(edge, top_off + px_have * bpp, value, sz - px_have, bd);
+                let value = px_get_bpp::<BPP>(edge, src);
+                px_fill_bpp::<BPP>(edge, top_off + px_have * BPP, value, sz - px_have);
             }
         } else {
             let value = if have_left {
-                px_get(dst, dst_off.saturating_sub(bpp), bd)
+                px_get_bpp::<BPP>(dst, dst_off.saturating_sub(BPP))
             } else {
                 (mid - 1) as u16
             };
-            px_fill(edge, top_off, value, sz, bd);
+            px_fill_bpp::<BPP>(edge, top_off, value, sz);
         }
 
         if need.topright {
             let have_topright = have_top && x + tw < w && edge_flags & EDGE_I444_TOP_HAS_RIGHT != 0;
             if have_topright {
                 let px_have = sz.min((w - x - tw) << 2);
-                let off_add = sz * bpp;
-                let nbytes = px_have * bpp;
-                edge[top_off + off_add..top_off + off_add + nbytes]
-                    .copy_from_slice(&dst[dst_top_off + off_add..dst_top_off + off_add + nbytes]);
+                let off_add = sz * BPP;
+                let nbytes = px_have * BPP;
+                copy_edge_row(edge, top_off + off_add, dst, dst_top_off + off_add, nbytes);
                 if px_have < sz {
-                    let value = px_get(edge, top_off + (sz + px_have - 1) * bpp, bd);
-                    px_fill(
-                        edge,
-                        top_off + (sz + px_have) * bpp,
-                        value,
-                        sz - px_have,
-                        bd,
-                    );
+                    let value = px_get_bpp::<BPP>(edge, top_off + (sz + px_have - 1) * BPP);
+                    px_fill_bpp::<BPP>(edge, top_off + (sz + px_have) * BPP, value, sz - px_have);
                 }
             } else {
-                let value = px_get(edge, top_off + (sz - 1) * bpp, bd);
-                px_fill(edge, top_off + sz * bpp, value, sz, bd);
+                let value = px_get_bpp::<BPP>(edge, top_off + (sz - 1) * BPP);
+                px_fill_bpp::<BPP>(edge, top_off + sz * BPP, value, sz);
             }
         }
     }
@@ -543,22 +639,22 @@ fn prepare_intra_edges_core<const BPP: usize>(
     if need.topleft {
         let value = if have_left {
             if have_top {
-                px_get(dst, dst_top_off.saturating_sub(bpp), bd)
+                px_get_bpp::<BPP>(dst, dst_top_off.saturating_sub(BPP))
             } else {
-                px_get(dst, dst_off.saturating_sub(bpp), bd)
+                px_get_bpp::<BPP>(dst, dst_off.saturating_sub(BPP))
             }
         } else if have_top {
-            px_get(dst, dst_top_off, bd)
+            px_get_bpp::<BPP>(dst, dst_top_off)
         } else {
             mid as u16
         };
-        px_set(edge, topleft_off, value, bd);
+        px_set_bpp::<BPP>(edge, topleft_off, value);
         if mode == 7 && tw + th >= 6 && filter_edge {
-            let l = px_get(edge, topleft_off - bpp, bd) as i32;
-            let t = px_get(edge, topleft_off + bpp, bd) as i32;
-            let c = px_get(edge, topleft_off, bd) as i32;
+            let l = px_get_bpp::<BPP>(edge, topleft_off - BPP) as i32;
+            let t = px_get_bpp::<BPP>(edge, topleft_off + BPP) as i32;
+            let c = i32::from(value);
             let filtered = ((l + t) * 5 + c * 6 + 8) >> 4;
-            px_set(edge, topleft_off, filtered as u16, bd);
+            px_set_bpp::<BPP>(edge, topleft_off, filtered as u16);
         }
     }
 

@@ -1,4 +1,4 @@
-//! `aarch64` MSAC entropi çözücü hızlı çekirdekleri (`P54` / `F5d` — `F5-MSAC`, `P55` / `F5e`).
+//! `aarch64` MSAC entropi çözücü hızlı çekirdekleri (`P54` / `F5d` — `F5-MSAC`, `P55` / `F5e`, `Faz P4`).
 //!
 //! Referans: `dav1d` `src/arm/msac.h` + `src/arm/64/msac.S` (`99f3354`).
 //! Bu modül 7 ARM64 MSAC işlevini (`decode_symbol_adapt4_neon`,
@@ -149,7 +149,8 @@ pub(super) fn bool_equi_neon(s: &mut MsacContext<'_>) -> u32 {
     let new_rng = if ge { r.wrapping_sub(v) } else { v };
     let bit = u32::from(!ge);
 
-    let d = 15 ^ (31 ^ new_rng.leading_zeros());
+    let d = 0xbfffu32.wrapping_sub(new_rng) >> 14;
+    debug_assert_eq!(d, 15 ^ (31 ^ new_rng.leading_zeros()));
     let old_cnt = s.cnt;
     s.dif = new_dif << d;
     s.rng = new_rng << d;

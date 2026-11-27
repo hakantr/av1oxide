@@ -10,17 +10,24 @@
 #![allow(clippy::too_many_arguments, clippy::needless_range_loop)]
 
 use core::arch::aarch64::{
-    int16x8_t, uint16x8_t, vaddq_s32, vaddvq_s32, vcombine_u16, vcreate_u16, vdupq_n_s16,
-    vdupq_n_s32, vget_high_s16, vget_high_u8, vget_high_u16, vget_lane_u64, vget_low_s16,
-    vget_low_u8, vget_low_u16, vmaxq_s16, vmaxq_s32, vminq_s16, vminq_s32, vmlal_high_s16,
-    vmlal_s16, vmovl_s16, vmovl_u8, vmovl_u16, vmovn_high_u32, vmovn_u16, vmovn_u32,
-    vmull_high_s16, vmull_s16, vreinterpret_u64_u16, vreinterpretq_s16_u16, vreinterpretq_s32_u32,
-    vreinterpretq_u8_u16, vreinterpretq_u16_u8, vreinterpretq_u32_s32, vrhadd_u8, vrhaddq_u16,
-    vrshlq_s32, vshrq_n_s32, vuzp1_u8, vuzp1q_u16, vuzp2_u8, vuzp2q_u16,
+    int16x4_t, int16x8_t, int32x4_t, uint8x8_t, uint8x16_t, uint8x16x4_t, uint16x8_t, vaddq_s16,
+    vaddq_s32, vaddvq_s32, vcombine_s16, vcombine_u8, vcombine_u16, vcreate_u16, vdup_n_s16,
+    vdup_n_u8, vdupq_n_s16, vdupq_n_s32, vdupq_n_u8, vget_high_s16, vget_high_u8, vget_high_u16,
+    vget_lane_u64, vget_low_s16, vget_low_u8, vget_low_u16, vmax_s16, vmax_u8, vmaxq_s16,
+    vmaxq_s32, vmaxq_u8, vmin_s16, vmin_u8, vminq_s16, vminq_s32, vminq_u8, vmlal_high_s16,
+    vmlal_s16, vmovl_high_u8, vmovl_s16, vmovl_u8, vmovl_u16, vmovn_high_u32, vmovn_u16, vmovn_u32,
+    vmull_high_s16, vmull_s16, vmulq_s16, vorr_u8, vorrq_u8, vqmovn_u16, vqmovun_high_s16,
+    vqmovun_high_s32, vqmovun_s16, vqmovun_s32, vqrdmulhq_s16, vqtbl4_u8, vqtbl4q_u8,
+    vreinterpret_u64_u16, vreinterpretq_s16_u16, vreinterpretq_s32_u32, vreinterpretq_u8_u16,
+    vreinterpretq_u16_u8, vreinterpretq_u32_s32, vrhadd_u8, vrhaddq_u8, vrhaddq_u16, vrshlq_s32,
+    vrshrn_high_n_s32, vrshrn_n_s32, vshrq_n_s32, vsub_u8, vsubq_u8, vuzp1_u8, vuzp1q_u8,
+    vuzp1q_u16, vuzp2_u8, vuzp2q_u8, vuzp2q_u16,
 };
 
 use super::giris::store_i16x8;
-use super::mem::{chunk, chunk_mut, load_i16x8, load_u8x8, load_u8x16, store_u8x8, store_u8x16};
+use super::mem::{
+    chunk, chunk_mut, load_i16x4, load_i16x8, load_u8x8, load_u8x16, store_u8x8, store_u8x16,
+};
 use crate::bitstream::frame_header::FilmGrainData;
 use crate::cpu::NeonToken;
 use crate::dsp::fg::{
@@ -437,6 +444,112 @@ macro_rules! apply_noise8 {
     }};
 }
 
+#[derive(Clone, Copy)]
+struct ScaleLut256 {
+    t0: uint8x16x4_t,
+    t1: uint8x16x4_t,
+    t2: uint8x16x4_t,
+    t3: uint8x16x4_t,
+}
+
+#[target_feature(enable = "neon")]
+#[inline]
+fn build_scale_lut256(scaling: &[u8]) -> ScaleLut256 {
+    let grp = |base: usize| {
+        uint8x16x4_t(
+            load_u8x16(chunk::<u8, 16>(scaling, base)),
+            load_u8x16(chunk::<u8, 16>(scaling, base + 16)),
+            load_u8x16(chunk::<u8, 16>(scaling, base + 32)),
+            load_u8x16(chunk::<u8, 16>(scaling, base + 48)),
+        )
+    };
+    ScaleLut256 {
+        t0: grp(0),
+        t1: grp(64),
+        t2: grp(128),
+        t3: grp(192),
+    }
+}
+
+#[target_feature(enable = "neon")]
+#[inline]
+fn lookup_scale256_x16(lut: &ScaleLut256, idx: uint8x16_t) -> uint8x16_t {
+    let r0 = vqtbl4q_u8(lut.t0, idx);
+    let r1 = vqtbl4q_u8(lut.t1, vsubq_u8(idx, vdupq_n_u8(64)));
+    let r2 = vqtbl4q_u8(lut.t2, vsubq_u8(idx, vdupq_n_u8(128)));
+    let r3 = vqtbl4q_u8(lut.t3, vsubq_u8(idx, vdupq_n_u8(192)));
+    vorrq_u8(vorrq_u8(r0, r1), vorrq_u8(r2, r3))
+}
+
+#[target_feature(enable = "neon")]
+#[inline]
+fn lookup_scale256_x8(lut: &ScaleLut256, idx: uint8x8_t) -> uint8x8_t {
+    let r0 = vqtbl4_u8(lut.t0, idx);
+    let r1 = vqtbl4_u8(lut.t1, vsub_u8(idx, vdup_n_u8(64)));
+    let r2 = vqtbl4_u8(lut.t2, vsub_u8(idx, vdup_n_u8(128)));
+    let r3 = vqtbl4_u8(lut.t3, vsub_u8(idx, vdup_n_u8(192)));
+    vorr_u8(vorr_u8(r0, r1), vorr_u8(r2, r3))
+}
+
+#[target_feature(enable = "neon")]
+#[inline]
+fn apply_noise_8bpc_x16(
+    s_u8: uint8x16_t,
+    sc_u8: uint8x16_t,
+    g0: int16x8_t,
+    g1: int16x8_t,
+    mul_shift: int16x8_t,
+    min_u8: uint8x16_t,
+    max_u8: uint8x16_t,
+) -> uint8x16_t {
+    let sc_lo = vreinterpretq_s16_u16(vmovl_u8(vget_low_u8(sc_u8)));
+    let sc_hi = vreinterpretq_s16_u16(vmovl_high_u8(sc_u8));
+    let n_lo = vqrdmulhq_s16(vmulq_s16(sc_lo, g0), mul_shift);
+    let n_hi = vqrdmulhq_s16(vmulq_s16(sc_hi, g1), mul_shift);
+    let s_lo = vreinterpretq_s16_u16(vmovl_u8(vget_low_u8(s_u8)));
+    let s_hi = vreinterpretq_s16_u16(vmovl_high_u8(s_u8));
+    let out = vqmovun_high_s16(vqmovun_s16(vaddq_s16(s_lo, n_lo)), vaddq_s16(s_hi, n_hi));
+    vminq_u8(vmaxq_u8(out, min_u8), max_u8)
+}
+
+#[target_feature(enable = "neon")]
+#[inline]
+fn apply_noise_8bpc_x8(
+    s_u8: uint8x8_t,
+    sc_u8: uint8x8_t,
+    g: int16x8_t,
+    mul_shift: int16x8_t,
+    min_u8: uint8x8_t,
+    max_u8: uint8x8_t,
+) -> uint8x8_t {
+    let sc_s16 = vreinterpretq_s16_u16(vmovl_u8(sc_u8));
+    let s_s16 = vreinterpretq_s16_u16(vmovl_u8(s_u8));
+    let n_s16 = vqrdmulhq_s16(vmulq_s16(sc_s16, g), mul_shift);
+    let out = vqmovun_s16(vaddq_s16(s_s16, n_s16));
+    vmin_u8(vmax_u8(out, min_u8), max_u8)
+}
+
+#[target_feature(enable = "neon")]
+#[inline]
+fn blend_horiz8<const SX: usize>(
+    old_pair: &[i16; 2],
+    new_g: int16x8_t,
+    w0_4: int16x4_t,
+    w1_4: int16x4_t,
+    gmin4: int16x4_t,
+    gmax4: int16x4_t,
+) -> int16x8_t {
+    let old_arr = if SX == 0 {
+        [old_pair[0], old_pair[1], 0, 0]
+    } else {
+        [old_pair[0], 0, 0, 0]
+    };
+    let old4 = load_i16x4(&old_arr);
+    let sum4 = vmlal_s16(vmull_s16(old4, w0_4), vget_low_s16(new_g), w1_4);
+    let r4 = vmin_s16(vmax_s16(vrshrn_n_s32::<5>(sum4), gmin4), gmax4);
+    vcombine_s16(r4, vget_high_s16(new_g))
+}
+
 #[target_feature(enable = "neon")]
 #[inline]
 fn blend_grain8(
@@ -449,22 +562,61 @@ fn blend_grain8(
 ) -> int16x8_t {
     let w0v = vdupq_n_s16(w0);
     let w1v = vdupq_n_s16(w1);
-    let neg5 = vdupq_n_s32(-5);
-    let lo = vrshlq_s32(
-        vmlal_s16(
-            vmull_s16(vget_low_s16(old_g), vget_low_s16(w0v)),
-            vget_low_s16(new_g),
-            vget_low_s16(w1v),
-        ),
-        neg5,
+    let lo = vmlal_s16(
+        vmull_s16(vget_low_s16(old_g), vget_low_s16(w0v)),
+        vget_low_s16(new_g),
+        vget_low_s16(w1v),
     );
-    let hi = vrshlq_s32(vmlal_high_s16(vmull_high_s16(old_g, w0v), new_g, w1v), neg5);
-    let p_u16 = vmovn_high_u32(
-        vmovn_u32(vreinterpretq_u32_s32(lo)),
-        vreinterpretq_u32_s32(hi),
-    );
-    let p_s16 = vreinterpretq_s16_u16(p_u16);
+    let hi = vmlal_high_s16(vmull_high_s16(old_g, w0v), new_g, w1v);
+    let p_s16 = vrshrn_high_n_s32::<5>(vrshrn_n_s32::<5>(lo), hi);
     vminq_s16(vmaxq_s16(p_s16, gmin), gmax)
+}
+
+#[target_feature(enable = "neon")]
+#[inline]
+fn load_grain8_blended<const SX: usize>(
+    grain_lut: &GrainLut,
+    offx0: usize,
+    offy0: usize,
+    offx_left: usize,
+    offy_left: usize,
+    offx_top: usize,
+    offy_top: usize,
+    offx_corner: usize,
+    offy_corner: usize,
+    bstep: usize,
+    bstep_y: usize,
+    x: usize,
+    y: usize,
+    do_h: bool,
+    do_v: bool,
+    w0_h4: int16x4_t,
+    w1_h4: int16x4_t,
+    w0_v: i16,
+    w1_v: i16,
+    gmin4: int16x4_t,
+    gmax4: int16x4_t,
+    gmin_v: int16x8_t,
+    gmax_v: int16x8_t,
+) -> int16x8_t {
+    let mut g = load_i16x8(chunk::<i16, 8>(&grain_lut[offy0 + y], offx0 + x));
+    if do_h {
+        let old2 = chunk::<i16, 2>(&grain_lut[offy_left + y], offx_left + bstep);
+        g = blend_horiz8::<SX>(old2, g, w0_h4, w1_h4, gmin4, gmax4);
+    }
+    if do_v {
+        let mut top = load_i16x8(chunk::<i16, 8>(
+            &grain_lut[offy_top + bstep_y + y],
+            offx_top + x,
+        ));
+        if do_h {
+            let old_top2 =
+                chunk::<i16, 2>(&grain_lut[offy_corner + bstep_y + y], offx_corner + bstep);
+            top = blend_horiz8::<SX>(old_top2, top, w0_h4, w1_h4, gmin4, gmax4);
+        }
+        g = blend_grain8(top, g, w0_v, w1_v, gmin_v, gmax_v);
+    }
+    g
 }
 
 #[inline(always)]
@@ -520,6 +672,21 @@ pub(super) fn fgy_neon<const BPC: u32, const SCALE_N: usize>(
     let mut offsets = [[0i32; 2]; 2];
     let stride_px = stride / bpp;
 
+    let gmin4 = vdup_n_s16(grain_min as i16);
+    let gmax4 = vdup_n_s16(grain_max as i16);
+    let w0_h4 = load_i16x4(&[27, 17, 0, 0]);
+    let w1_h4 = load_i16x4(&[17, 27, 32, 32]);
+    let lut256 = if BPC == 8 {
+        Some(build_scale_lut256(scaling))
+    } else {
+        None
+    };
+    let mul_shift8 = vdupq_n_s16(1i16 << (15 - shift));
+    let min_u8_16 = vdupq_n_u8(min_value as u8);
+    let max_u8_16 = vdupq_n_u8(max_value as u8);
+    let min_u8_8 = vdup_n_u8(min_value as u8);
+    let max_u8_8 = vdup_n_u8(max_value as u8);
+
     let add_scalar = |dst: &mut [u8], x: usize, y: usize, bx: usize, grain: i32| {
         let idx = y * stride_px + bx + x;
         let s = load_px_scalar::<BPC>(src, idx);
@@ -545,23 +712,183 @@ pub(super) fn fgy_neon<const BPC: u32, const SCALE_N: usize>(
         };
         let xstart = if overlap && bx != 0 { bw.min(2) } else { 0 };
         let (offx0, offy0) = ofset(offsets[0][0], 0, 0);
+        let (offx_left, offy_left) = if xstart > 0 {
+            ofset(offsets[1][0], 0, 0)
+        } else {
+            (0, 0)
+        };
+        let (offx_top, offy_top) = if ystart > 0 {
+            ofset(offsets[0][1], 0, 0)
+        } else {
+            (0, 0)
+        };
+        let (offx_corner, offy_corner) = if xstart > 0 && ystart > 0 {
+            ofset(offsets[1][1], 0, 0)
+        } else {
+            (0, 0)
+        };
+
+        if bw >= 8 {
+            for y in 0..bh {
+                let do_v = y < ystart;
+                let (w0_v, w1_v) = if do_v {
+                    (W_OV[0][y][0] as i16, W_OV[0][y][1] as i16)
+                } else {
+                    (0, 0)
+                };
+                let mut x = 0usize;
+                if let Some(ref sl256) = lut256 {
+                    while x + 16 <= bw {
+                        let byte_off = y * stride + bx + x;
+                        let s_u8 = load_u8x16(chunk::<u8, 16>(src, byte_off));
+                        let sc_u8 = lookup_scale256_x16(sl256, s_u8);
+                        let g0 = load_grain8_blended::<0>(
+                            grain_lut,
+                            offx0,
+                            offy0,
+                            offx_left,
+                            offy_left,
+                            offx_top,
+                            offy_top,
+                            offx_corner,
+                            offy_corner,
+                            FG_BLOCK_SIZE,
+                            FG_BLOCK_SIZE,
+                            x,
+                            y,
+                            x == 0 && xstart > 0,
+                            do_v,
+                            w0_h4,
+                            w1_h4,
+                            w0_v,
+                            w1_v,
+                            gmin4,
+                            gmax4,
+                            gmin_v,
+                            gmax_v,
+                        );
+                        let g1 = load_grain8_blended::<0>(
+                            grain_lut,
+                            offx0,
+                            offy0,
+                            offx_left,
+                            offy_left,
+                            offx_top,
+                            offy_top,
+                            offx_corner,
+                            offy_corner,
+                            FG_BLOCK_SIZE,
+                            FG_BLOCK_SIZE,
+                            x + 8,
+                            y,
+                            false,
+                            do_v,
+                            w0_h4,
+                            w1_h4,
+                            w0_v,
+                            w1_v,
+                            gmin4,
+                            gmax4,
+                            gmin_v,
+                            gmax_v,
+                        );
+                        let out = apply_noise_8bpc_x16(
+                            s_u8, sc_u8, g0, g1, mul_shift8, min_u8_16, max_u8_16,
+                        );
+                        store_u8x16(chunk_mut::<u8, 16>(dst, byte_off), out);
+                        x += 16;
+                    }
+                    if x + 8 <= bw {
+                        let byte_off = y * stride + bx + x;
+                        let s_u8 = load_u8x8(chunk::<u8, 8>(src, byte_off));
+                        let sc_u8 = lookup_scale256_x8(sl256, s_u8);
+                        let g0 = load_grain8_blended::<0>(
+                            grain_lut,
+                            offx0,
+                            offy0,
+                            offx_left,
+                            offy_left,
+                            offx_top,
+                            offy_top,
+                            offx_corner,
+                            offy_corner,
+                            FG_BLOCK_SIZE,
+                            FG_BLOCK_SIZE,
+                            x,
+                            y,
+                            x == 0 && xstart > 0,
+                            do_v,
+                            w0_h4,
+                            w1_h4,
+                            w0_v,
+                            w1_v,
+                            gmin4,
+                            gmax4,
+                            gmin_v,
+                            gmax_v,
+                        );
+                        let out =
+                            apply_noise_8bpc_x8(s_u8, sc_u8, g0, mul_shift8, min_u8_8, max_u8_8);
+                        store_u8x8(chunk_mut::<u8, 8>(dst, byte_off), out);
+                        x += 8;
+                    }
+                } else {
+                    while x + 8 <= bw {
+                        let byte_off = y * stride + (bx + x) * bpp;
+                        let s_v = load_px8::<BPC>(src, byte_off);
+                        let sc_v = scale_lookup8!(s_v, scaling, SCALE_N);
+                        let g_v = load_grain8_blended::<0>(
+                            grain_lut,
+                            offx0,
+                            offy0,
+                            offx_left,
+                            offy_left,
+                            offx_top,
+                            offy_top,
+                            offx_corner,
+                            offy_corner,
+                            FG_BLOCK_SIZE,
+                            FG_BLOCK_SIZE,
+                            x,
+                            y,
+                            x == 0 && xstart > 0,
+                            do_v,
+                            w0_h4,
+                            w1_h4,
+                            w0_v,
+                            w1_v,
+                            gmin4,
+                            gmax4,
+                            gmin_v,
+                            gmax_v,
+                        );
+                        let out = apply_noise8!(s_v, sc_v, g_v, neg_shift, min_v, max_v);
+                        store_px8::<BPC>(dst, byte_off, out);
+                        x += 8;
+                    }
+                }
+                while x < bw {
+                    let grain = if do_v {
+                        let g_cur = scalar::sample_lut(grain_lut, &offsets, 0, 0, 0, 0, x, y);
+                        let g_old = scalar::sample_lut(grain_lut, &offsets, 0, 0, 0, 1, x, y);
+                        scalar::round2(g_old * W_OV[0][y][0] + g_cur * W_OV[0][y][1], 5)
+                            .clamp(grain_min, grain_max)
+                    } else {
+                        i32::from(grain_lut[offy0 + y][offx0 + x])
+                    };
+                    add_scalar(dst, x, y, bx, grain);
+                    x += 1;
+                }
+            }
+            bx += FG_BLOCK_SIZE;
+            continue;
+        }
 
         for y in ystart..bh {
             let lut_row = &grain_lut[offy0 + y];
-            let mut x = xstart;
-            while x + 8 <= bw {
-                let byte_off = y * stride + (bx + x) * bpp;
-                let s_v = load_px8::<BPC>(src, byte_off);
-                let sc_v = scale_lookup8!(s_v, scaling, SCALE_N);
-                let g_v = load_i16x8(chunk::<i16, 8>(lut_row, offx0 + x));
-                let out = apply_noise8!(s_v, sc_v, g_v, neg_shift, min_v, max_v);
-                store_px8::<BPC>(dst, byte_off, out);
-                x += 8;
-            }
-            while x < bw {
+            for x in xstart..bw {
                 let grain = i32::from(lut_row[offx0 + x]);
                 add_scalar(dst, x, y, bx, grain);
-                x += 1;
             }
             for x in 0..xstart {
                 let grain = scalar::sample_lut(grain_lut, &offsets, 0, 0, 0, 0, x, y);
@@ -573,31 +900,13 @@ pub(super) fn fgy_neon<const BPC: u32, const SCALE_N: usize>(
         }
 
         if ystart > 0 {
-            let (offx_top, offy_top) = ofset(offsets[0][1], 0, 0);
             for y in 0..ystart {
-                let lut_new = &grain_lut[offy0 + y];
-                let lut_old = &grain_lut[offy_top + FG_BLOCK_SIZE + y];
-                let w0 = W_OV[0][y][0] as i16;
-                let w1 = W_OV[0][y][1] as i16;
-                let mut x = xstart;
-                while x + 8 <= bw {
-                    let byte_off = y * stride + (bx + x) * bpp;
-                    let s_v = load_px8::<BPC>(src, byte_off);
-                    let sc_v = scale_lookup8!(s_v, scaling, SCALE_N);
-                    let g_new = load_i16x8(chunk::<i16, 8>(lut_new, offx0 + x));
-                    let g_old = load_i16x8(chunk::<i16, 8>(lut_old, offx_top + x));
-                    let g_v = blend_grain8(g_old, g_new, w0, w1, gmin_v, gmax_v);
-                    let out = apply_noise8!(s_v, sc_v, g_v, neg_shift, min_v, max_v);
-                    store_px8::<BPC>(dst, byte_off, out);
-                    x += 8;
-                }
-                while x < bw {
+                for x in xstart..bw {
                     let grain = scalar::sample_lut(grain_lut, &offsets, 0, 0, 0, 0, x, y);
                     let old = scalar::sample_lut(grain_lut, &offsets, 0, 0, 0, 1, x, y);
                     let grain = scalar::round2(old * W_OV[0][y][0] + grain * W_OV[0][y][1], 5)
                         .clamp(grain_min, grain_max);
                     add_scalar(dst, x, y, bx, grain);
-                    x += 1;
                 }
                 for x in 0..xstart {
                     let top = scalar::sample_lut(grain_lut, &offsets, 0, 0, 0, 1, x, y);
@@ -617,6 +926,91 @@ pub(super) fn fgy_neon<const BPC: u32, const SCALE_N: usize>(
             }
         }
         bx += FG_BLOCK_SIZE;
+    }
+}
+
+#[target_feature(enable = "neon")]
+#[inline]
+fn load_luma_avg_8bpc_x16<const SX: usize>(luma: &[u8], byte_off: usize) -> uint8x16_t {
+    if SX == 0 {
+        load_u8x16(chunk::<u8, 16>(luma, byte_off))
+    } else {
+        let v0 = load_u8x16(chunk::<u8, 16>(luma, byte_off));
+        let v1 = load_u8x16(chunk::<u8, 16>(luma, byte_off + 16));
+        vrhaddq_u8(vuzp1q_u8(v0, v1), vuzp2q_u8(v0, v1))
+    }
+}
+
+#[target_feature(enable = "neon")]
+#[inline]
+fn load_luma_avg_8bpc_x8<const SX: usize>(luma: &[u8], byte_off: usize) -> uint8x8_t {
+    if SX == 0 {
+        load_u8x8(chunk::<u8, 8>(luma, byte_off))
+    } else {
+        let raw = load_u8x16(chunk::<u8, 16>(luma, byte_off));
+        let lo = vget_low_u8(raw);
+        let hi = vget_high_u8(raw);
+        vrhadd_u8(vuzp1_u8(lo, hi), vuzp2_u8(lo, hi))
+    }
+}
+
+#[target_feature(enable = "neon")]
+#[inline]
+fn uv_scale_8bpc_x8(
+    avg_u8: uint8x8_t,
+    s_u8: uint8x8_t,
+    csfl: bool,
+    lm_v: int16x8_t,
+    um_v: int16x8_t,
+    off_v: int32x4_t,
+) -> uint8x8_t {
+    if csfl {
+        avg_u8
+    } else {
+        let avg_s = vreinterpretq_s16_u16(vmovl_u8(avg_u8));
+        let s_s = vreinterpretq_s16_u16(vmovl_u8(s_u8));
+        let c_lo = vmlal_s16(
+            vmull_s16(vget_low_s16(avg_s), vget_low_s16(lm_v)),
+            vget_low_s16(s_s),
+            vget_low_s16(um_v),
+        );
+        let c_hi = vmlal_high_s16(vmull_high_s16(avg_s, lm_v), s_s, um_v);
+        let v_lo = vaddq_s32(vshrq_n_s32::<6>(c_lo), off_v);
+        let v_hi = vaddq_s32(vshrq_n_s32::<6>(c_hi), off_v);
+        vqmovn_u16(vqmovun_high_s32(vqmovun_s32(v_lo), v_hi))
+    }
+}
+
+#[target_feature(enable = "neon")]
+#[inline]
+fn uv_scale_8bpc_x16(
+    avg_u8: uint8x16_t,
+    s_u8: uint8x16_t,
+    csfl: bool,
+    lm_v: int16x8_t,
+    um_v: int16x8_t,
+    off_v: int32x4_t,
+) -> uint8x16_t {
+    if csfl {
+        avg_u8
+    } else {
+        let lo = uv_scale_8bpc_x8(
+            vget_low_u8(avg_u8),
+            vget_low_u8(s_u8),
+            false,
+            lm_v,
+            um_v,
+            off_v,
+        );
+        let hi = uv_scale_8bpc_x8(
+            vget_high_u8(avg_u8),
+            vget_high_u8(s_u8),
+            false,
+            lm_v,
+            um_v,
+            off_v,
+        );
+        vcombine_u8(lo, hi)
     }
 }
 
@@ -720,6 +1114,29 @@ pub(super) fn fguv_neon<const BPC: u32, const SX: usize, const SY: usize, const 
     let stride_px = stride / bpp;
     let luma_stride_px = luma_stride / bpp;
 
+    let gmin4 = vdup_n_s16(grain_min as i16);
+    let gmax4 = vdup_n_s16(grain_max as i16);
+    let w0_h4 = if SX == 0 {
+        load_i16x4(&[27, 17, 0, 0])
+    } else {
+        load_i16x4(&[23, 0, 0, 0])
+    };
+    let w1_h4 = if SX == 0 {
+        load_i16x4(&[17, 27, 32, 32])
+    } else {
+        load_i16x4(&[22, 32, 32, 32])
+    };
+    let lut256 = if BPC == 8 {
+        Some(build_scale_lut256(scaling))
+    } else {
+        None
+    };
+    let mul_shift8 = vdupq_n_s16(1i16 << (15 - shift));
+    let min_u8_16 = vdupq_n_u8(min_value as u8);
+    let max_u8_16 = vdupq_n_u8(max_value as u8);
+    let min_u8_8 = vdup_n_u8(min_value as u8);
+    let max_u8_8 = vdup_n_u8(max_value as u8);
+
     let add_scalar = |dst: &mut [u8], x: usize, y: usize, bx: usize, grain: i32| {
         let lx = (bx + x) << SX;
         let ly = y << SY;
@@ -763,26 +1180,193 @@ pub(super) fn fguv_neon<const BPC: u32, const SX: usize, const SY: usize, const 
             0
         };
         let (offx0, offy0) = ofset(offsets[0][0], SX, SY);
+        let (offx_left, offy_left) = if xstart > 0 {
+            ofset(offsets[1][0], SX, SY)
+        } else {
+            (0, 0)
+        };
+        let (offx_top, offy_top) = if ystart > 0 {
+            ofset(offsets[0][1], SX, SY)
+        } else {
+            (0, 0)
+        };
+        let (offx_corner, offy_corner) = if xstart > 0 && ystart > 0 {
+            ofset(offsets[1][1], SX, SY)
+        } else {
+            (0, 0)
+        };
+
+        if bw >= 8 {
+            for y in 0..bh {
+                let do_v = y < ystart;
+                let (w0_v, w1_v) = if do_v {
+                    (W_OV[SY][y][0] as i16, W_OV[SY][y][1] as i16)
+                } else {
+                    (0, 0)
+                };
+                let mut x = 0usize;
+                if let Some(ref sl256) = lut256 {
+                    while x + 16 <= bw {
+                        let byte_off = y * stride + bx + x;
+                        let luma_off = (y << SY) * luma_stride + ((bx + x) << SX);
+                        let s_u8 = load_u8x16(chunk::<u8, 16>(src, byte_off));
+                        let avg_u8 = load_luma_avg_8bpc_x16::<SX>(luma, luma_off);
+                        let idx_u8 = uv_scale_8bpc_x16(avg_u8, s_u8, csfl, lm_v, um_v, off_v);
+                        let sc_u8 = lookup_scale256_x16(sl256, idx_u8);
+                        let g0 = load_grain8_blended::<SX>(
+                            grain_lut,
+                            offx0,
+                            offy0,
+                            offx_left,
+                            offy_left,
+                            offx_top,
+                            offy_top,
+                            offx_corner,
+                            offy_corner,
+                            bstep,
+                            bstep_y,
+                            x,
+                            y,
+                            x == 0 && xstart > 0,
+                            do_v,
+                            w0_h4,
+                            w1_h4,
+                            w0_v,
+                            w1_v,
+                            gmin4,
+                            gmax4,
+                            gmin_v,
+                            gmax_v,
+                        );
+                        let g1 = load_grain8_blended::<SX>(
+                            grain_lut,
+                            offx0,
+                            offy0,
+                            offx_left,
+                            offy_left,
+                            offx_top,
+                            offy_top,
+                            offx_corner,
+                            offy_corner,
+                            bstep,
+                            bstep_y,
+                            x + 8,
+                            y,
+                            false,
+                            do_v,
+                            w0_h4,
+                            w1_h4,
+                            w0_v,
+                            w1_v,
+                            gmin4,
+                            gmax4,
+                            gmin_v,
+                            gmax_v,
+                        );
+                        let out = apply_noise_8bpc_x16(
+                            s_u8, sc_u8, g0, g1, mul_shift8, min_u8_16, max_u8_16,
+                        );
+                        store_u8x16(chunk_mut::<u8, 16>(dst, byte_off), out);
+                        x += 16;
+                    }
+                    if x + 8 <= bw {
+                        let byte_off = y * stride + bx + x;
+                        let luma_off = (y << SY) * luma_stride + ((bx + x) << SX);
+                        let s_u8 = load_u8x8(chunk::<u8, 8>(src, byte_off));
+                        let avg_u8 = load_luma_avg_8bpc_x8::<SX>(luma, luma_off);
+                        let idx_u8 = uv_scale_8bpc_x8(avg_u8, s_u8, csfl, lm_v, um_v, off_v);
+                        let sc_u8 = lookup_scale256_x8(sl256, idx_u8);
+                        let g0 = load_grain8_blended::<SX>(
+                            grain_lut,
+                            offx0,
+                            offy0,
+                            offx_left,
+                            offy_left,
+                            offx_top,
+                            offy_top,
+                            offx_corner,
+                            offy_corner,
+                            bstep,
+                            bstep_y,
+                            x,
+                            y,
+                            x == 0 && xstart > 0,
+                            do_v,
+                            w0_h4,
+                            w1_h4,
+                            w0_v,
+                            w1_v,
+                            gmin4,
+                            gmax4,
+                            gmin_v,
+                            gmax_v,
+                        );
+                        let out =
+                            apply_noise_8bpc_x8(s_u8, sc_u8, g0, mul_shift8, min_u8_8, max_u8_8);
+                        store_u8x8(chunk_mut::<u8, 8>(dst, byte_off), out);
+                        x += 8;
+                    }
+                } else {
+                    while x + 8 <= bw {
+                        let byte_off = y * stride + (bx + x) * bpp;
+                        let luma_off = (y << SY) * luma_stride + ((bx + x) << SX) * bpp;
+                        let s_v = load_px8::<BPC>(src, byte_off);
+                        let avg_v = load_luma_avg8::<BPC, SX>(luma, luma_off);
+                        let idx_v =
+                            uv_scale_vec8!(avg_v, s_v, csfl, lm_v, um_v, off_v, scale_max_v);
+                        let sc_v = scale_lookup8!(idx_v, scaling, SCALE_N);
+                        let g_v = load_grain8_blended::<SX>(
+                            grain_lut,
+                            offx0,
+                            offy0,
+                            offx_left,
+                            offy_left,
+                            offx_top,
+                            offy_top,
+                            offx_corner,
+                            offy_corner,
+                            bstep,
+                            bstep_y,
+                            x,
+                            y,
+                            x == 0 && xstart > 0,
+                            do_v,
+                            w0_h4,
+                            w1_h4,
+                            w0_v,
+                            w1_v,
+                            gmin4,
+                            gmax4,
+                            gmin_v,
+                            gmax_v,
+                        );
+                        let out = apply_noise8!(s_v, sc_v, g_v, neg_shift, min_v, max_v);
+                        store_px8::<BPC>(dst, byte_off, out);
+                        x += 8;
+                    }
+                }
+                while x < bw {
+                    let grain = if do_v {
+                        let g_cur = scalar::sample_lut(grain_lut, &offsets, SX, SY, 0, 0, x, y);
+                        let g_old = scalar::sample_lut(grain_lut, &offsets, SX, SY, 0, 1, x, y);
+                        scalar::round2(g_old * W_OV[SY][y][0] + g_cur * W_OV[SY][y][1], 5)
+                            .clamp(grain_min, grain_max)
+                    } else {
+                        i32::from(grain_lut[offy0 + y][offx0 + x])
+                    };
+                    add_scalar(dst, x, y, bx, grain);
+                    x += 1;
+                }
+            }
+            bx += bstep;
+            continue;
+        }
 
         for y in ystart..bh {
             let lut_row = &grain_lut[offy0 + y];
-            let mut x = xstart;
-            while x + 8 <= bw {
-                let byte_off = y * stride + (bx + x) * bpp;
-                let luma_off = (y << SY) * luma_stride + ((bx + x) << SX) * bpp;
-                let s_v = load_px8::<BPC>(src, byte_off);
-                let avg_v = load_luma_avg8::<BPC, SX>(luma, luma_off);
-                let idx_v = uv_scale_vec8!(avg_v, s_v, csfl, lm_v, um_v, off_v, scale_max_v);
-                let sc_v = scale_lookup8!(idx_v, scaling, SCALE_N);
-                let g_v = load_i16x8(chunk::<i16, 8>(lut_row, offx0 + x));
-                let out = apply_noise8!(s_v, sc_v, g_v, neg_shift, min_v, max_v);
-                store_px8::<BPC>(dst, byte_off, out);
-                x += 8;
-            }
-            while x < bw {
+            for x in xstart..bw {
                 let grain = i32::from(lut_row[offx0 + x]);
                 add_scalar(dst, x, y, bx, grain);
-                x += 1;
             }
             for x in 0..xstart {
                 let grain = scalar::sample_lut(grain_lut, &offsets, SX, SY, 0, 0, x, y);
@@ -794,34 +1378,13 @@ pub(super) fn fguv_neon<const BPC: u32, const SX: usize, const SY: usize, const 
         }
 
         if ystart > 0 {
-            let (offx_top, offy_top) = ofset(offsets[0][1], SX, SY);
             for y in 0..ystart {
-                let lut_new = &grain_lut[offy0 + y];
-                let lut_old = &grain_lut[offy_top + bstep_y + y];
-                let w0 = W_OV[SY][y][0] as i16;
-                let w1 = W_OV[SY][y][1] as i16;
-                let mut x = xstart;
-                while x + 8 <= bw {
-                    let byte_off = y * stride + (bx + x) * bpp;
-                    let luma_off = (y << SY) * luma_stride + ((bx + x) << SX) * bpp;
-                    let s_v = load_px8::<BPC>(src, byte_off);
-                    let avg_v = load_luma_avg8::<BPC, SX>(luma, luma_off);
-                    let idx_v = uv_scale_vec8!(avg_v, s_v, csfl, lm_v, um_v, off_v, scale_max_v);
-                    let sc_v = scale_lookup8!(idx_v, scaling, SCALE_N);
-                    let g_new = load_i16x8(chunk::<i16, 8>(lut_new, offx0 + x));
-                    let g_old = load_i16x8(chunk::<i16, 8>(lut_old, offx_top + x));
-                    let g_v = blend_grain8(g_old, g_new, w0, w1, gmin_v, gmax_v);
-                    let out = apply_noise8!(s_v, sc_v, g_v, neg_shift, min_v, max_v);
-                    store_px8::<BPC>(dst, byte_off, out);
-                    x += 8;
-                }
-                while x < bw {
+                for x in xstart..bw {
                     let grain = scalar::sample_lut(grain_lut, &offsets, SX, SY, 0, 0, x, y);
                     let old = scalar::sample_lut(grain_lut, &offsets, SX, SY, 0, 1, x, y);
                     let grain = scalar::round2(old * W_OV[SY][y][0] + grain * W_OV[SY][y][1], 5)
                         .clamp(grain_min, grain_max);
                     add_scalar(dst, x, y, bx, grain);
-                    x += 1;
                 }
                 for x in 0..xstart {
                     let top = scalar::sample_lut(grain_lut, &offsets, SX, SY, 0, 1, x, y);

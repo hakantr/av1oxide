@@ -182,6 +182,36 @@ impl RefMvs {
         Self::new_with_reuse(width, height, dsp, Vec::new(), butce, false)
     }
 
+    /// `Key` / `Intra` (`!allow_intrabc`) karelerde tam `iw4 × ih4` ızgarası
+    /// ayırmadan hafif `RefMvs` kabuğu kurar.
+    pub(crate) fn new_empty(width: usize, height: usize, dsp: RefmvsDsp) -> Self {
+        let iw4 = ((width + 7) >> 3) << 1;
+        let ih4 = ((height + 7) >> 3) << 1;
+        Self {
+            dsp,
+            grid: Vec::new(),
+            iw4,
+            ih4,
+            x_base: 0,
+            y_base: 0,
+            stride: iw4,
+            frame: 0,
+            seq: core::sync::atomic::AtomicU32::new(0),
+            sign_bias: [0; 7],
+            mfmv_sign: [0; 7],
+            pocdiff: [0; 7],
+            use_ref_frame_mvs: false,
+            hdr_use_ref_frame_mvs: false,
+            rp_proj: alloc::sync::Arc::new(Vec::new()),
+            rp_stride: 0,
+            gmv: [WarpedMotionParams::default(); 7],
+            hp: false,
+            force_integer_mv: false,
+            mfmv: MfmvPlan::default(),
+            temporal_hits: core::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
     /// Havuzdan geri dönüştürülmüş `old_grid` varsa kapasitesi eşleştiğinde
     /// yeniden kullanarak `RefMvs` kurar (`F8b-1`).
     ///

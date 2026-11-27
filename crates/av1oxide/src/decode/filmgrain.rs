@@ -387,7 +387,7 @@ pub(crate) fn apply_grain_in_place(
     let u_stride = frame.plane(PlaneType::U).map_or(0, |p| p.stride());
     let v_stride = frame.plane(PlaneType::V).map_or(0, |p| p.stride());
     let pad_luma = (do_u || do_v) && (w & ss_x) != 0;
-    let need_luma_save = (do_u || do_v) && (do_y || pad_luma);
+    let need_luma_save = pad_luma;
 
     let band_max = FG_BLOCK_SIZE.min(h);
     let bh_max = (band_max + ss_y) >> ss_y;
@@ -476,6 +476,60 @@ pub(crate) fn apply_grain_in_place(
                 pad_luma,
             );
         }
+        let mut c_traces: [Option<(usize, u64)>; 2] = [None, None];
+        if let Some(l) = layout.filter(|_| do_u || do_v) {
+            let bh = (band + ss_y) >> ss_y;
+            let planes = frame.planes_mut();
+            if let Some((y_pl, uv_pls)) = planes.split_first_mut() {
+                // U ve V düzlemlerini Y düzlemi yerinde değiştirilmeden önce sentezle;
+                // böylece çift genişlikli karelerde (`!pad_luma`) luma şeridi kopyalanmaz.
+                let (luma_ref, lstride_ref): (&[u8], usize) = match luma_strip.as_deref() {
+                    Some(lbuf) => (lbuf, luma_save_stride),
+                    None => (&y_pl.data()[y0 * y_stride..], y_stride),
+                };
+                for pl in 0..2 {
+                    let active = if pl == 0 { do_u } else { do_v };
+                    if !active {
+                        continue;
+                    }
+                    let Some(c_pl) = uv_pls.get_mut(pl) else {
+                        continue;
+                    };
+                    let c_stride = c_pl.stride();
+                    let uv_off = (y0 * c_stride) >> ss_y;
+                    let len = bh * c_stride;
+                    src_strip[..len].copy_from_slice(&c_pl.data()[uv_off..uv_off + len]);
+                    let si = if data.chroma_scaling_from_luma {
+                        0
+                    } else {
+                        1 + pl
+                    };
+                    crate::dsp::profil_olc!(
+                        FgUv,
+                        (dsp.fguv_32x32xn[l.index()])(
+                            &mut c_pl.data_mut()[uv_off..uv_off + len],
+                            &src_strip[..len],
+                            c_stride,
+                            data,
+                            cpw,
+                            &prep.scaling[si],
+                            &prep.luts[1 + pl],
+                            bh,
+                            row,
+                            luma_ref,
+                            lstride_ref,
+                            pl,
+                            is_id,
+                            bd,
+                        )
+                    );
+                    if trace.is_some() {
+                        let hsh = rows_hash(&c_pl.data()[uv_off..], c_stride, bh, cpw * bpp);
+                        c_traces[pl] = Some((bh, hsh));
+                    }
+                }
+            }
+        }
         if do_y && let Some(y_pl) = frame.plane_mut(PlaneType::Y) {
             let off = y0 * y_stride;
             let len = band * y_stride;
@@ -500,61 +554,15 @@ pub(crate) fn apply_grain_in_place(
                 crate::trace_eprintln!("Y {pic} {row} {band} {w} {hsh}");
             }
         }
-        let Some(l) = layout.filter(|_| do_u || do_v) else {
-            continue;
-        };
-        let bh = (band + ss_y) >> ss_y;
-        let planes = frame.planes_mut();
-        let Some((y_pl, uv_pls)) = planes.split_first_mut() else {
-            continue;
-        };
-        let (luma_ref, lstride_ref): (&[u8], usize) = match luma_strip.as_deref() {
-            Some(lbuf) => (lbuf, luma_save_stride),
-            None => (&y_pl.data()[y0 * y_stride..], y_stride),
-        };
-        for pl in 0..2 {
-            let active = if pl == 0 { do_u } else { do_v };
-            if !active {
-                continue;
-            }
-            let Some(c_pl) = uv_pls.get_mut(pl) else {
-                continue;
-            };
-            let c_stride = c_pl.stride();
-            let uv_off = (y0 * c_stride) >> ss_y;
-            let len = bh * c_stride;
-            src_strip[..len].copy_from_slice(&c_pl.data()[uv_off..uv_off + len]);
-            let si = if data.chroma_scaling_from_luma {
-                0
-            } else {
-                1 + pl
-            };
-            crate::dsp::profil_olc!(
-                FgUv,
-                (dsp.fguv_32x32xn[l.index()])(
-                    &mut c_pl.data_mut()[uv_off..uv_off + len],
-                    &src_strip[..len],
-                    c_stride,
-                    data,
-                    cpw,
-                    &prep.scaling[si],
-                    &prep.luts[1 + pl],
-                    bh,
-                    row,
-                    luma_ref,
-                    lstride_ref,
-                    pl,
-                    is_id,
-                    bd,
-                )
-            );
-            if let Some(pic) = trace {
-                let hsh = rows_hash(&c_pl.data()[uv_off..], c_stride, bh, cpw * bpp);
-                crate::trace_eprintln!(
-                    "C {pic} {} {row} {bh} {cpw} {} {hsh}",
-                    pl + 1,
-                    u8::from(is_id)
-                );
+        if let Some(pic) = trace {
+            for (pl, entry) in c_traces.into_iter().enumerate() {
+                if let Some((bh, hsh)) = entry {
+                    crate::trace_eprintln!(
+                        "C {pic} {} {row} {bh} {cpw} {} {hsh}",
+                        pl + 1,
+                        u8::from(is_id)
+                    );
+                }
             }
         }
     }

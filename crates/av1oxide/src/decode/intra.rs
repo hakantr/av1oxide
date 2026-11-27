@@ -625,6 +625,201 @@ impl Default for BlockContext {
 }
 
 /// `reset_context` (`decode.c:2396-2422`) — anahtar/intra kare dalı.
+#[inline(always)]
+fn splat_n<T: Copy, const N: usize>(slice: &mut [T], off: usize, val: T) {
+    slice[off..off + N].copy_from_slice(&[val; N]);
+}
+
+/// Küçük komşuluk bağlam dilimlerini (`1..=32` eleman) `_memset` kütüphane
+/// çağrısına düşmeden sabit genişlikli yazmaç saklamalarıyla doldurur.
+#[inline(always)]
+fn fill_small<T: Copy>(slice: &mut [T], off: usize, count: usize, val: T) {
+    let dst = &mut slice[off..off + count];
+    match count {
+        0 => {}
+        1 => dst[0] = val,
+        2 => dst.copy_from_slice(&[val; 2]),
+        4 => dst.copy_from_slice(&[val; 4]),
+        8 => dst.copy_from_slice(&[val; 8]),
+        16 => dst.copy_from_slice(&[val; 16]),
+        32 => dst.copy_from_slice(&[val; 32]),
+        _ => {
+            let mut i = 0;
+            while i < dst.len() {
+                dst[i] = val;
+                i += 1;
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+#[inline(always)]
+fn fill_intra_side_n<const N: usize>(
+    ctx: &mut BlockContext,
+    pal_uv_sz: &mut [u8; 32],
+    off: usize,
+    lsz: i8,
+    y_mode_nofilt: u8,
+    pal_sz0: u8,
+    seg_pred: u8,
+    skip: u8,
+    uv_pal_sz: u8,
+    is_inter_frame: bool,
+) {
+    splat_n::<i8, N>(&mut ctx.tx_intra, off, lsz);
+    splat_n::<i8, N>(&mut ctx.tx, off, lsz);
+    splat_n::<u8, N>(&mut ctx.mode, off, y_mode_nofilt);
+    splat_n::<u8, N>(&mut ctx.pal_sz, off, pal_sz0);
+    splat_n::<u8, N>(&mut ctx.seg_pred, off, seg_pred);
+    splat_n::<u8, N>(&mut ctx.skip_mode, off, 0);
+    splat_n::<u8, N>(&mut ctx.intra, off, 1);
+    splat_n::<u8, N>(&mut ctx.skip, off, skip);
+    splat_n::<u8, N>(pal_uv_sz, off, uv_pal_sz);
+    if is_inter_frame {
+        splat_n::<u8, N>(&mut ctx.comp_type, off, 0);
+        splat_n::<i8, N>(&mut ctx.ref_pair[0], off, -1);
+        splat_n::<i8, N>(&mut ctx.ref_pair[1], off, -1);
+        splat_n::<u8, N>(&mut ctx.filter[0], off, N_SWITCHABLE_FILTERS);
+        splat_n::<u8, N>(&mut ctx.filter[1], off, N_SWITCHABLE_FILTERS);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+#[inline]
+fn fill_intra_side_ctx(
+    ctx: &mut BlockContext,
+    pal_uv_sz: &mut [u8; 32],
+    off: usize,
+    log2_sz: u8,
+    lsz: i8,
+    y_mode_nofilt: u8,
+    pal_sz0: u8,
+    seg_pred: u8,
+    skip: u8,
+    uv_pal_sz: u8,
+    is_inter_frame: bool,
+) {
+    match log2_sz {
+        0 => fill_intra_side_n::<1>(
+            ctx,
+            pal_uv_sz,
+            off,
+            lsz,
+            y_mode_nofilt,
+            pal_sz0,
+            seg_pred,
+            skip,
+            uv_pal_sz,
+            is_inter_frame,
+        ),
+        1 => fill_intra_side_n::<2>(
+            ctx,
+            pal_uv_sz,
+            off,
+            lsz,
+            y_mode_nofilt,
+            pal_sz0,
+            seg_pred,
+            skip,
+            uv_pal_sz,
+            is_inter_frame,
+        ),
+        2 => fill_intra_side_n::<4>(
+            ctx,
+            pal_uv_sz,
+            off,
+            lsz,
+            y_mode_nofilt,
+            pal_sz0,
+            seg_pred,
+            skip,
+            uv_pal_sz,
+            is_inter_frame,
+        ),
+        3 => fill_intra_side_n::<8>(
+            ctx,
+            pal_uv_sz,
+            off,
+            lsz,
+            y_mode_nofilt,
+            pal_sz0,
+            seg_pred,
+            skip,
+            uv_pal_sz,
+            is_inter_frame,
+        ),
+        4 => fill_intra_side_n::<16>(
+            ctx,
+            pal_uv_sz,
+            off,
+            lsz,
+            y_mode_nofilt,
+            pal_sz0,
+            seg_pred,
+            skip,
+            uv_pal_sz,
+            is_inter_frame,
+        ),
+        _ => fill_intra_side_n::<32>(
+            ctx,
+            pal_uv_sz,
+            off,
+            lsz,
+            y_mode_nofilt,
+            pal_sz0,
+            seg_pred,
+            skip,
+            uv_pal_sz,
+            is_inter_frame,
+        ),
+    }
+}
+
+#[inline(always)]
+fn fill_inter_side_n<const N: usize>(
+    ctx: &mut BlockContext,
+    pal_uv_sz: &mut [u8; 32],
+    off: usize,
+    val: i8,
+    seg_pred: u8,
+    b: &Av1Block,
+) {
+    splat_n::<u8, N>(&mut ctx.seg_pred, off, seg_pred);
+    splat_n::<u8, N>(&mut ctx.skip_mode, off, u8::from(b.skip_mode));
+    splat_n::<u8, N>(&mut ctx.intra, off, 0);
+    splat_n::<u8, N>(&mut ctx.skip, off, u8::from(b.skip));
+    splat_n::<u8, N>(&mut ctx.pal_sz, off, 0);
+    splat_n::<i8, N>(&mut ctx.tx_intra, off, val);
+    splat_n::<u8, N>(&mut ctx.comp_type, off, b.comp_type);
+    splat_n::<u8, N>(&mut ctx.filter[0], off, b.filter[0]);
+    splat_n::<u8, N>(&mut ctx.filter[1], off, b.filter[1]);
+    splat_n::<u8, N>(&mut ctx.mode, off, b.inter_mode);
+    splat_n::<i8, N>(&mut ctx.ref_pair[0], off, b.ref0);
+    splat_n::<i8, N>(&mut ctx.ref_pair[1], off, b.ref1);
+    splat_n::<u8, N>(pal_uv_sz, off, 0);
+}
+
+#[inline]
+fn fill_inter_side_ctx(
+    ctx: &mut BlockContext,
+    pal_uv_sz: &mut [u8; 32],
+    off: usize,
+    log2_sz: u8,
+    seg_pred: u8,
+    b: &Av1Block,
+) {
+    let val = log2_sz as i8;
+    match log2_sz {
+        0 => fill_inter_side_n::<1>(ctx, pal_uv_sz, off, val, seg_pred, b),
+        1 => fill_inter_side_n::<2>(ctx, pal_uv_sz, off, val, seg_pred, b),
+        2 => fill_inter_side_n::<4>(ctx, pal_uv_sz, off, val, seg_pred, b),
+        3 => fill_inter_side_n::<8>(ctx, pal_uv_sz, off, val, seg_pred, b),
+        4 => fill_inter_side_n::<16>(ctx, pal_uv_sz, off, val, seg_pred, b),
+        _ => fill_inter_side_n::<32>(ctx, pal_uv_sz, off, val, seg_pred, b),
+    }
+}
+
 fn reset_context(ctx: &mut BlockContext, keyframe: bool) {
     ctx.intra.fill(u8::from(keyframe));
     ctx.uvmode.fill(DC_PRED);
@@ -2232,14 +2427,18 @@ impl<'a> Dec<'a> {
             frame_segmap_stride: segmap_stride,
             pal: [[0u16; 8]; 3],
             frame_no: 0,
-            refmvs: RefMvs::new_with_reuse(
-                width,
-                height,
-                *dsp.refmvs(),
-                core::mem::take(&mut work_bufs.refmvs_grid),
-                butce,
-                tiles_cover_frame && need_refmvs,
-            )?,
+            refmvs: if !need_refmvs {
+                RefMvs::new_empty(width, height, *dsp.refmvs())
+            } else {
+                RefMvs::new_with_reuse(
+                    width,
+                    height,
+                    *dsp.refmvs(),
+                    core::mem::take(&mut work_bufs.refmvs_grid),
+                    butce,
+                    tiles_cover_frame,
+                )?
+            },
             refs,
             prev_segmap,
             refpoc: [0; 7],
@@ -2905,8 +3104,13 @@ impl<'a> Dec<'a> {
                 let bx8 = (self.bx & 31) >> 1;
                 let by8 = (self.by & 31) >> 1;
                 let ai = self.bx >> 5;
-                self.blocks.above[self.above_base + ai].partition[bx8..bx8 + hsz].fill(al);
-                self.blocks.left.partition[by8..by8 + hsz].fill(al_left);
+                fill_small(
+                    &mut self.blocks.above[self.above_base + ai].partition,
+                    bx8,
+                    hsz,
+                    al,
+                );
+                fill_small(&mut self.blocks.left.partition, by8, hsz, al_left);
             }
             return Ok(());
         }
@@ -2950,8 +3154,13 @@ impl<'a> Dec<'a> {
                 let bx8 = (self.bx & 31) >> 1;
                 let by8 = (self.by & 31) >> 1;
                 let ai = self.bx >> 5;
-                self.blocks.above[self.above_base + ai].partition[bx8..bx8 + hsz].fill(al);
-                self.blocks.left.partition[by8..by8 + hsz].fill(al_left);
+                fill_small(
+                    &mut self.blocks.above[self.above_base + ai].partition,
+                    bx8,
+                    hsz,
+                    al,
+                );
+                fill_small(&mut self.blocks.left.partition, by8, hsz, al_left);
             }
             return Ok(());
         }
@@ -2997,8 +3206,13 @@ impl<'a> Dec<'a> {
             let bx8 = (self.bx & 31) >> 1;
             let by8 = (self.by & 31) >> 1;
             let ai = self.bx >> 5;
-            self.blocks.above[self.above_base + ai].partition[bx8..bx8 + hsz].fill(al);
-            self.blocks.left.partition[by8..by8 + hsz].fill(al_left);
+            fill_small(
+                &mut self.blocks.above[self.above_base + ai].partition,
+                bx8,
+                hsz,
+                al,
+            );
+            fill_small(&mut self.blocks.left.partition, by8, hsz, al_left);
         }
         Ok(())
     }
@@ -3588,71 +3802,54 @@ impl<'a> Dec<'a> {
         let pal_sz0 = b.pal_sz[0];
         let pal_sz1 = b.pal_sz[1];
         if b.intra {
-            for i in 0..2 {
-                let (off, count, lsz) = if i == 0 {
-                    (bx4, 1usize << b_dim[2], t_dim[2])
-                } else {
-                    (by4, 1usize << b_dim[3], t_dim[3])
-                };
-                let ctx = if i == 0 {
-                    &mut self.blocks.above[self.above_base + ai]
-                } else {
-                    &mut self.blocks.left
-                };
-                ctx.tx_intra[off..off + count].fill(lsz as i8);
-                ctx.tx[off..off + count].fill(lsz as i8);
-                ctx.mode[off..off + count].fill(y_mode_nofilt);
-                ctx.pal_sz[off..off + count].fill(pal_sz0);
-                ctx.seg_pred[off..off + count].fill(seg_pred);
-                ctx.skip_mode[off..off + count].fill(0);
-                ctx.intra[off..off + count].fill(1);
-                ctx.skip[off..off + count].fill(u8::from(b.skip));
-                // dav1d `decode.c:1248-1249`: `pal_sz_uv` **her** blokta yazılır;
-                // kroma yoksa 0 yazılır. Yalnız `has_chroma` iken yazmak, kromasız
-                // (ör. 4:2:0'da çift x'te 4×16) bloğun sol/üst kroma palet
-                // boyutunu **bayat** bırakır ve sonraki bloğun palet önbelleğini
-                // (ve dolayısıyla MSAC bit tüketimini) dav1d'den kaydırır.
-                let uv_pal_sz = if has_chroma { pal_sz1 } else { 0 };
-                if i == 0 {
-                    self.blocks.above_pal_uv_sz[self.above_base + ai][off..off + count]
-                        .fill(uv_pal_sz);
-                } else {
-                    self.blocks.left_pal_uv_sz[off..off + count].fill(uv_pal_sz);
-                }
-            }
-            if is_inter_frame {
-                // dav1d `decode.c:1229-1246`: inter karelerde intra blok
-                // komşuluk bağlamı da inter alanlarını nötrler.
-                for i in 0..2 {
-                    let off = if i == 0 { bx4 } else { by4 };
-                    let count = 1usize << b_dim[2 + i];
-                    let ctx = if i == 0 {
-                        &mut self.blocks.above[self.above_base + ai]
-                    } else {
-                        &mut self.blocks.left
-                    };
-                    ctx.comp_type[off..off + count].fill(0);
-                    ctx.ref_pair[0][off..off + count].fill(-1);
-                    ctx.ref_pair[1][off..off + count].fill(-1);
-                    ctx.filter[0][off..off + count].fill(N_SWITCHABLE_FILTERS);
-                    ctx.filter[1][off..off + count].fill(N_SWITCHABLE_FILTERS);
-                }
-            }
+            let above_idx = self.above_base + ai;
+            let uv_pal_sz = if has_chroma { pal_sz1 } else { 0 };
+            fill_intra_side_ctx(
+                &mut self.blocks.above[above_idx],
+                &mut self.blocks.above_pal_uv_sz[above_idx],
+                bx4,
+                b_dim[2],
+                t_dim[2] as i8,
+                y_mode_nofilt,
+                pal_sz0,
+                seg_pred,
+                u8::from(b.skip),
+                uv_pal_sz,
+                is_inter_frame,
+            );
+            fill_intra_side_ctx(
+                &mut self.blocks.left,
+                &mut self.blocks.left_pal_uv_sz,
+                by4,
+                b_dim[3],
+                t_dim[3] as i8,
+                y_mode_nofilt,
+                pal_sz0,
+                seg_pred,
+                u8::from(b.skip),
+                uv_pal_sz,
+                is_inter_frame,
+            );
             if pal_sz0 != 0 {
                 for x in 0..bw4 {
-                    self.blocks.above_pal[self.above_base + ai][bx4 + x] = self.pal;
+                    self.blocks.above_pal[above_idx][bx4 + x] = self.pal;
                 }
                 for y in 0..bh4 {
                     self.blocks.left_pal[by4 + y] = self.pal;
                 }
             }
             if has_chroma {
-                self.blocks.above[self.above_base + ai].uvmode[cbx4..cbx4 + cbw4].fill(uv_mode);
-                self.blocks.left.uvmode[cby4..cby4 + cbh4].fill(uv_mode);
+                fill_small(
+                    &mut self.blocks.above[above_idx].uvmode,
+                    cbx4,
+                    cbw4,
+                    uv_mode,
+                );
+                fill_small(&mut self.blocks.left.uvmode, cby4, cbh4, uv_mode);
                 if pal_sz1 != 0 {
                     for pl in 1..3 {
                         for x in 0..bw4 {
-                            self.blocks.above_pal[self.above_base + ai][bx4 + x][pl] = self.pal[pl];
+                            self.blocks.above_pal[above_idx][bx4 + x][pl] = self.pal[pl];
                         }
                         for y in 0..bh4 {
                             self.blocks.left_pal[by4 + y][pl] = self.pal[pl];
@@ -3671,6 +3868,7 @@ impl<'a> Dec<'a> {
             // dalın onlar için de çalışması `skip_mode`/`tx_intra`/`mode`/
             // `pal_sz`/`seg_pred` alanlarını sıfırlıyordu (T39: test2136
             // kare 2'de skip_mode CDF bağlamı 1 yerine 0 → MSAC kayması).
+            let above_idx = self.above_base + ai;
             for i in 0..2 {
                 let (off, count, val) = if i == 0 {
                     (bx4, 1usize << b_dim[2], b_dim[2])
@@ -3678,26 +3876,31 @@ impl<'a> Dec<'a> {
                     (by4, 1usize << b_dim[3], b_dim[3])
                 };
                 let ctx = if i == 0 {
-                    &mut self.blocks.above[self.above_base + ai]
+                    &mut self.blocks.above[above_idx]
                 } else {
                     &mut self.blocks.left
                 };
-                ctx.tx_intra[off..off + count].fill(val as i8);
-                ctx.mode[off..off + count].fill(DC_PRED);
-                ctx.pal_sz[off..off + count].fill(0);
-                ctx.seg_pred[off..off + count].fill(seg_pred);
-                ctx.skip_mode[off..off + count].fill(0);
-                ctx.intra[off..off + count].fill(0);
-                ctx.skip[off..off + count].fill(u8::from(b.skip));
+                fill_small(&mut ctx.tx_intra, off, count, val as i8);
+                fill_small(&mut ctx.mode, off, count, DC_PRED);
+                fill_small(&mut ctx.pal_sz, off, count, 0);
+                fill_small(&mut ctx.seg_pred, off, count, seg_pred);
+                fill_small(&mut ctx.skip_mode, off, count, 0);
+                fill_small(&mut ctx.intra, off, count, 0);
+                fill_small(&mut ctx.skip, off, count, u8::from(b.skip));
                 if i == 0 {
-                    self.blocks.above_pal_uv_sz[self.above_base + ai][off..off + count].fill(0);
+                    fill_small(&mut self.blocks.above_pal_uv_sz[above_idx], off, count, 0);
                 } else {
-                    self.blocks.left_pal_uv_sz[off..off + count].fill(0);
+                    fill_small(&mut self.blocks.left_pal_uv_sz, off, count, 0);
                 }
             }
             if has_chroma {
-                self.blocks.above[self.above_base + ai].uvmode[cbx4..cbx4 + cbw4].fill(DC_PRED);
-                self.blocks.left.uvmode[cby4..cby4 + cbh4].fill(DC_PRED);
+                fill_small(
+                    &mut self.blocks.above[above_idx].uvmode,
+                    cbx4,
+                    cbw4,
+                    DC_PRED,
+                );
+                fill_small(&mut self.blocks.left.uvmode, cby4, cbh4, DC_PRED);
             }
         }
         if self.hdr.segmentation.enabled && self.hdr.segmentation.update_map {
@@ -4476,12 +4679,13 @@ impl<'a> Dec<'a> {
             init_y += 16;
         }
         if b.skip && !probe_on {
-            self.blocks.above[self.above_base + ai].lcoef[bx4..bx4 + w4].fill(0x40);
-            self.blocks.left.lcoef[by4..by4 + h4].fill(0x40);
+            let above_idx = self.above_base + ai;
+            fill_small(&mut self.blocks.above[above_idx].lcoef, bx4, w4, 0x40);
+            fill_small(&mut self.blocks.left.lcoef, by4, h4, 0x40);
             if has_chroma {
                 for pl in 0..2 {
-                    self.blocks.above[self.above_base + ai].ccoef[pl][cbx4..cbx4 + cw4].fill(0x40);
-                    self.blocks.left.ccoef[pl][cby4..cby4 + ch4].fill(0x40);
+                    fill_small(&mut self.blocks.above[above_idx].ccoef[pl], cbx4, cw4, 0x40);
+                    fill_small(&mut self.blocks.left.ccoef[pl], cby4, ch4, 0x40);
                 }
             }
         }
@@ -4754,31 +4958,18 @@ impl<'a> Dec<'a> {
         let eob = result.eob;
         if chroma {
             let pl = plane - 1;
-            let a_c = &mut self.blocks.above[self.above_base + ai].ccoef[pl];
-            let l_c = &mut self.blocks.left.ccoef[pl];
-            if ctw == 1 {
-                a_c[cbx4] = res_ctx;
-            } else {
-                a_c[cbx4..cbx4 + ctw].fill(res_ctx);
-            }
-            if cth == 1 {
-                l_c[cby4] = res_ctx;
-            } else {
-                l_c[cby4..cby4 + cth].fill(res_ctx);
-            }
+            let above_idx = self.above_base + ai;
+            fill_small(
+                &mut self.blocks.above[above_idx].ccoef[pl],
+                cbx4,
+                ctw,
+                res_ctx,
+            );
+            fill_small(&mut self.blocks.left.ccoef[pl], cby4, cth, res_ctx);
         } else {
-            let a_l = &mut self.blocks.above[self.above_base + ai].lcoef;
-            let l_l = &mut self.blocks.left.lcoef;
-            if ctw == 1 {
-                a_l[bx4] = res_ctx;
-            } else {
-                a_l[bx4..bx4 + ctw].fill(res_ctx);
-            }
-            if cth == 1 {
-                l_l[by4] = res_ctx;
-            } else {
-                l_l[by4..by4 + cth].fill(res_ctx);
-            }
+            let above_idx = self.above_base + ai;
+            fill_small(&mut self.blocks.above[above_idx].lcoef, bx4, ctw, res_ctx);
+            fill_small(&mut self.blocks.left.lcoef, by4, cth, res_ctx);
         }
         if eob >= 0 {
             let Some(tx_type) = TxType::from_index(usize::from(result.txtp)) else {
@@ -4972,31 +5163,18 @@ impl<'a> Dec<'a> {
         let txtp = result.txtp;
         if chroma {
             let pl = plane - 1;
-            let a_c = &mut self.blocks.above[self.above_base + ai].ccoef[pl];
-            let l_c = &mut self.blocks.left.ccoef[pl];
-            if ctw == 1 {
-                a_c[cbx4] = res_ctx;
-            } else {
-                a_c[cbx4..cbx4 + ctw].fill(res_ctx);
-            }
-            if cth == 1 {
-                l_c[cby4] = res_ctx;
-            } else {
-                l_c[cby4..cby4 + cth].fill(res_ctx);
-            }
+            let above_idx = self.above_base + ai;
+            fill_small(
+                &mut self.blocks.above[above_idx].ccoef[pl],
+                cbx4,
+                ctw,
+                res_ctx,
+            );
+            fill_small(&mut self.blocks.left.ccoef[pl], cby4, cth, res_ctx);
         } else {
-            let a_l = &mut self.blocks.above[self.above_base + ai].lcoef;
-            let l_l = &mut self.blocks.left.lcoef;
-            if ctw == 1 {
-                a_l[bx4] = res_ctx;
-            } else {
-                a_l[bx4..bx4 + ctw].fill(res_ctx);
-            }
-            if cth == 1 {
-                l_l[by4] = res_ctx;
-            } else {
-                l_l[by4..by4 + cth].fill(res_ctx);
-            }
+            let above_idx = self.above_base + ai;
+            fill_small(&mut self.blocks.above[above_idx].lcoef, bx4, ctw, res_ctx);
+            fill_small(&mut self.blocks.left.lcoef, by4, cth, res_ctx);
         }
         if eob >= 0 {
             let Some(tx_size) = TxSize::from_index(usize::from(tx)) else {
@@ -5659,8 +5837,9 @@ impl<'a> Dec<'a> {
             let valh = if is_split { TX_4X4 } else { txh };
             let nw = 1usize << dim[2];
             let nh = 1usize << dim[3];
-            self.blocks.above[self.above_base + ai].tx[bx4..bx4 + nw].fill(valw as i8);
-            self.blocks.left.tx[by4..by4 + nh].fill(valh as i8);
+            let above_idx = self.above_base + ai;
+            fill_small(&mut self.blocks.above[above_idx].tx, bx4, nw, valw as i8);
+            fill_small(&mut self.blocks.left.tx, by4, nh, valh as i8);
         }
     }
 
@@ -5693,15 +5872,22 @@ impl<'a> Dec<'a> {
             if switchable {
                 let nw = 1usize << b_dim[2];
                 let nh = 1usize << b_dim[3];
-                self.blocks.above[self.above_base + ai].tx[bx4..bx4 + nw].fill(TX_4X4 as i8);
-                self.blocks.left.tx[by4..by4 + nh].fill(TX_4X4 as i8);
+                let above_idx = self.above_base + ai;
+                fill_small(&mut self.blocks.above[above_idx].tx, bx4, nw, TX_4X4 as i8);
+                fill_small(&mut self.blocks.left.tx, by4, nh, TX_4X4 as i8);
             }
         } else if !switchable || b.skip {
             if switchable {
                 let nw = 1usize << b_dim[2];
                 let nh = 1usize << b_dim[3];
-                self.blocks.above[self.above_base + ai].tx[bx4..bx4 + nw].fill(b_dim[2] as i8);
-                self.blocks.left.tx[by4..by4 + nh].fill(b_dim[3] as i8);
+                let above_idx = self.above_base + ai;
+                fill_small(
+                    &mut self.blocks.above[above_idx].tx,
+                    bx4,
+                    nw,
+                    b_dim[2] as i8,
+                );
+                fill_small(&mut self.blocks.left.tx, by4, nh, b_dim[3] as i8);
             }
             b.uvtx = t::MAX_TXFM_SIZE_FOR_BS[usize::from(bs)][layout_idx];
         } else {
@@ -5935,16 +6121,22 @@ impl<'a> Dec<'a> {
             let ai = self.bx >> 5;
             let nw = 1usize << b_dim[2];
             let nh = 1usize << b_dim[3];
-            self.blocks.above[self.above_base + ai].lcoef[bx4..bx4 + nw].fill(0x40);
-            self.blocks.left.lcoef[by4..by4 + nh].fill(0x40);
+            let above_idx = self.above_base + ai;
+            fill_small(&mut self.blocks.above[above_idx].lcoef, bx4, nw, 0x40);
+            fill_small(&mut self.blocks.left.lcoef, by4, nh, 0x40);
             if has_chroma {
                 let cbx4 = bx4 >> ss_hor;
                 let cby4 = by4 >> ss_ver;
                 let cbw4 = (bw4 + ss_hor) >> ss_hor;
                 let cbh4 = (bh4 + ss_ver) >> ss_ver;
                 for pl in 0..2 {
-                    self.blocks.above[self.above_base + ai].ccoef[pl][cbx4..cbx4 + cbw4].fill(0x40);
-                    self.blocks.left.ccoef[pl][cby4..cby4 + cbh4].fill(0x40);
+                    fill_small(
+                        &mut self.blocks.above[above_idx].ccoef[pl],
+                        cbx4,
+                        cbw4,
+                        0x40,
+                    );
+                    fill_small(&mut self.blocks.left.ccoef[pl], cby4, cbh4, 0x40);
                 }
             }
             return Ok(());
@@ -6243,14 +6435,24 @@ impl<'a> Dec<'a> {
         } else {
             (txw.min(self.bw - bx), txh.min(self.bh - by))
         };
+        let above_idx = self.above_base + ai;
         if chroma {
             let pl = plane - 1;
-            self.blocks.above[self.above_base + ai].ccoef[pl][cbx4..cbx4 + ctw]
-                .fill(result.res_ctx);
-            self.blocks.left.ccoef[pl][cby4..cby4 + cth].fill(result.res_ctx);
+            fill_small(
+                &mut self.blocks.above[above_idx].ccoef[pl],
+                cbx4,
+                ctw,
+                result.res_ctx,
+            );
+            fill_small(&mut self.blocks.left.ccoef[pl], cby4, cth, result.res_ctx);
         } else {
-            self.blocks.above[self.above_base + ai].lcoef[bx4..bx4 + ctw].fill(result.res_ctx);
-            self.blocks.left.lcoef[by4..by4 + cth].fill(result.res_ctx);
+            fill_small(
+                &mut self.blocks.above[above_idx].lcoef,
+                bx4,
+                ctw,
+                result.res_ctx,
+            );
+            fill_small(&mut self.blocks.left.lcoef, by4, cth, result.res_ctx);
         }
         if result.eob >= 0 {
             let Some(tx_size) = TxSize::from_index(usize::from(tx)) else {
@@ -7490,40 +7692,35 @@ impl Dec<'_> {
                 b.inter_mode,
             );
         }
-        for i in 0..2 {
-            let off = if i == 0 { bx4 } else { by4 };
-            let count = 1usize << b_dim[2 + i];
-            let val = b_dim[2 + i] as i8;
-            let ctx = if i == 0 {
-                &mut self.blocks.above[self.above_base + ai]
-            } else {
-                &mut self.blocks.left
-            };
-            ctx.seg_pred[off..off + count].fill(seg_pred);
-            ctx.skip_mode[off..off + count].fill(u8::from(b.skip_mode));
-            ctx.intra[off..off + count].fill(0);
-            ctx.skip[off..off + count].fill(u8::from(b.skip));
-            ctx.pal_sz[off..off + count].fill(0);
-            ctx.tx_intra[off..off + count].fill(val);
-            ctx.comp_type[off..off + count].fill(b.comp_type);
-            ctx.filter[0][off..off + count].fill(b.filter[0]);
-            ctx.filter[1][off..off + count].fill(b.filter[1]);
-            ctx.mode[off..off + count].fill(b.inter_mode);
-            ctx.ref_pair[0][off..off + count].fill(b.ref0);
-            ctx.ref_pair[1][off..off + count].fill(b.ref1);
-            if i == 0 {
-                self.blocks.above_pal_uv_sz[self.above_base + ai][off..off + count].fill(0);
-            } else {
-                self.blocks.left_pal_uv_sz[off..off + count].fill(0);
-            }
-        }
+        let above_idx = self.above_base + ai;
+        fill_inter_side_ctx(
+            &mut self.blocks.above[above_idx],
+            &mut self.blocks.above_pal_uv_sz[above_idx],
+            bx4,
+            b_dim[2],
+            seg_pred,
+            b,
+        );
+        fill_inter_side_ctx(
+            &mut self.blocks.left,
+            &mut self.blocks.left_pal_uv_sz,
+            by4,
+            b_dim[3],
+            seg_pred,
+            b,
+        );
         if has_chroma {
             let cbx4 = bx4 >> self.ss_hor;
             let cby4 = by4 >> self.ss_ver;
             let cbw4 = (bw4 + self.ss_hor) >> self.ss_hor;
             let cbh4 = (bh4 + self.ss_ver) >> self.ss_ver;
-            self.blocks.above[self.above_base + ai].uvmode[cbx4..cbx4 + cbw4].fill(DC_PRED);
-            self.blocks.left.uvmode[cby4..cby4 + cbh4].fill(DC_PRED);
+            fill_small(
+                &mut self.blocks.above[above_idx].uvmode,
+                cbx4,
+                cbw4,
+                DC_PRED,
+            );
+            fill_small(&mut self.blocks.left.uvmode, cby4, cbh4, DC_PRED);
         }
         self.tools.inter_single_ref += u64::from(!is_comp);
         Ok(())
@@ -9707,8 +9904,12 @@ pub(crate) fn decode_frame(
     let tmvs_stride = ((hdr.width[0] as usize + 127) & !127) >> 3;
     let ih8 = (hdr.height as usize + 7) >> 3;
     let tmvs_len = tmvs_stride * ih8.max(1);
-    let old_tmvs = buf_pool.take_tmvs_vec(tmvs_len, has_limit);
-    let mut tmvs = butce.reuse_vec(old_tmvs, tmvs_len, TemporalBlock::default())?;
+    let mut tmvs = if !is_inter {
+        Vec::new()
+    } else {
+        let old_tmvs = buf_pool.take_tmvs_vec(tmvs_len, has_limit);
+        butce.reuse_vec(old_tmvs, tmvs_len, TemporalBlock::default())?
+    };
     if is_inter {
         dec.refmvs.save_temporal(&mut tmvs, tmvs_stride);
     }
@@ -9764,7 +9965,9 @@ pub(crate) fn decode_frame(
         work_bufs.lr_mask = lr.mask;
     }
     work_bufs.scratch = Some(dec.scratch);
-    work_bufs.refmvs_grid = dec.refmvs.grid;
+    if !dec.refmvs.grid.is_empty() {
+        work_bufs.refmvs_grid = dec.refmvs.grid;
+    }
     if let Ok(rp) = Arc::try_unwrap(dec.refmvs.rp_proj) {
         work_bufs.refmvs_rp_proj = rp;
     }
