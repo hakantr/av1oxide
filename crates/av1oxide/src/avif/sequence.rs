@@ -432,9 +432,8 @@ impl<'a> AvifSequenceDecoder<'a> {
                 }
             }
 
-            let timescale = color_track.media_timescale;
-            let (presented, duration_in_timescale) =
-                build_presented_timeline(color_track, &mut state_guard)?;
+            let (presented, duration_in_timescale, timescale) =
+                build_presented_timeline(color_track, &butce, &mut state_guard)?;
             let duration_sec = if timescale > 0 {
                 (duration_in_timescale as f64) / (timescale as f64)
             } else {

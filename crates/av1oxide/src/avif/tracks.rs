@@ -759,13 +759,25 @@ fn parse_elst(payload: &[u8], guard: &mut ButceTutucu) -> Result<EditList> {
     Ok(EditList { flags, entries })
 }
 
-/// Parçanın `elst` düzenleme listesini uygulayarak sunum zaman çizelgesini (`PresentedSample`)
-/// ve toplam sunum süresini (`media_timescale` biriminde) üretir.
+const fn gcd_u64(mut a: u64, mut b: u64) -> u64 {
+    while b != 0 {
+        let r = a % b;
+        a = b;
+        b = r;
+    }
+    a
+}
+
+/// Parçanın `elst` düzenleme listesini uygulayarak sunum zaman çizelgesini (`PresentedSample`),
+/// toplam sunum süresini ve etkin zaman ölçeğini (`lcm(media_timescale, movie_timescale)`)
+/// `O((S + E + K) log S)` karmaşıklıkta üretir.
 pub(crate) fn build_presented_timeline(
     track: &ParsedTrack<'_>,
+    butce: &Arc<Butce>,
     guard: &mut ButceTutucu,
-) -> Result<(Vec<PresentedSample>, u64)> {
-    let identity_timeline = |guard: &mut ButceTutucu| -> Result<(Vec<PresentedSample>, u64)> {
+) -> Result<(Vec<PresentedSample>, u64, u64)> {
+    let media_ts = track.media_timescale.max(1);
+    let identity_timeline = |guard: &mut ButceTutucu| -> Result<(Vec<PresentedSample>, u64, u64)> {
         let n = track.samples.len();
         reserve_table_budget(n, core::mem::size_of::<PresentedSample>(), guard)?;
         let mut out = Vec::new();
@@ -780,7 +792,7 @@ pub(crate) fn build_presented_timeline(
                 duration_in_timescale: s.duration_in_timescale,
             });
         }
-        Ok((out, track.media_duration))
+        Ok((out, track.media_duration, track.media_timescale))
     };
 
     let Some(ref edit_list) = track.edit_list else {
@@ -790,23 +802,19 @@ pub(crate) fn build_presented_timeline(
         return identity_timeline(guard);
     }
 
-    let media_ts = track.media_timescale.max(1);
     let movie_ts = if track.movie_timescale > 0 {
         track.movie_timescale
     } else {
         media_ts
     };
-
-    let scale_seg_dur = |seg_dur: u64| -> Result<Option<u64>> {
-        if seg_dur == 0 {
-            return Ok(None);
-        }
-        let scaled_u128 = (u128::from(seg_dur) * u128::from(media_ts) + u128::from(movie_ts) / 2)
-            / u128::from(movie_ts);
-        let scaled = u64::try_from(scaled_u128)
-            .map_err(|_| Error::InvalidData("elst segment_duration dönüştürme taşması"))?;
-        Ok(Some(scaled))
-    };
+    let g = gcd_u64(media_ts, movie_ts).max(1);
+    let m_mul = u128::from(movie_ts / g);
+    let v_mul = u128::from(media_ts / g);
+    let eff_ts_u128 = u128::from(media_ts)
+        .checked_mul(m_mul)
+        .ok_or(Error::InvalidData("elst ortak zaman ölçeği taşması"))?;
+    let eff_ts = u64::try_from(eff_ts_u128)
+        .map_err(|_| Error::InvalidData("elst ortak zaman ölçeği u64 taşması"))?;
 
     // Standart tekrarlayan AVIS döngüsü (`flags & 1 != 0`, `entry_count == 1`, `media_time == 0`):
     // medya kırpma yapmıyorsa ham zaman çizelgesini doğrudan koru.
@@ -816,67 +824,244 @@ pub(crate) fn build_presented_timeline(
             let total_media_end = track
                 .samples
                 .iter()
-                .map(|s| s.pts_in_timescale.saturating_add(s.duration_in_timescale))
+                .map(|s| {
+                    u128::from(s.pts_in_timescale)
+                        .saturating_add(u128::from(s.duration_in_timescale))
+                        .saturating_mul(m_mul)
+                })
                 .max()
                 .unwrap_or(0);
-            let seg_media = scale_seg_dur(e.segment_duration)?;
-            if seg_media.is_none_or(|d| d >= total_media_end) {
+            let seg_eff = if e.segment_duration == 0 {
+                None
+            } else {
+                Some(
+                    u128::from(e.segment_duration)
+                        .checked_mul(v_mul)
+                        .ok_or(Error::InvalidData("elst segment_duration taşması"))?,
+                )
+            };
+            if seg_eff.is_none_or(|d| d >= total_media_end) {
                 return identity_timeline(guard);
             }
         }
     }
 
+    let n = track.samples.len();
+    if n == 0 {
+        return Err(Error::InvalidData(
+            "elst zaman çizelgesi hiç görünür kare üretmedi",
+        ));
+    }
+
+    #[derive(Clone, Copy)]
+    struct SampleInterval {
+        start: u128,
+        end: u128,
+        raw_index: usize,
+    }
+
+    // Geçici sıralı aralık dizisi + düz maksimum-bitiş aralık ağacı (`O(S)` bellek, `Butce` altında).
+    let tree_size = n.next_power_of_two();
+    let intervals_bytes = n
+        .checked_mul(core::mem::size_of::<SampleInterval>())
+        .ok_or(Error::InvalidData("elst aralık dizisi boyut taşması"))?;
+    let tree_nodes = tree_size
+        .checked_mul(2)
+        .ok_or(Error::InvalidData("elst aralık ağacı boyut taşması"))?;
+    let tree_bytes = tree_nodes
+        .checked_mul(core::mem::size_of::<u128>())
+        .ok_or(Error::InvalidData("elst aralık ağacı bayt taşması"))?;
+    let stack_cap = 128usize;
+    let stack_bytes = stack_cap * core::mem::size_of::<(usize, usize, usize)>();
+    let temp_total = intervals_bytes
+        .checked_add(tree_bytes)
+        .and_then(|v| v.checked_add(stack_bytes))
+        .ok_or(Error::InvalidData("elst geçici bellek taşması"))?;
+    let _temp_guard = Butce::tut(butce, temp_total)?;
+
+    let mut intervals: Vec<SampleInterval> = Vec::new();
+    intervals
+        .try_reserve_exact(n)
+        .map_err(|_| Error::AllocationFailed {
+            requested: intervals_bytes,
+        })?;
+    for (raw_index, sample) in track.samples.iter().enumerate() {
+        let start = u128::from(sample.pts_in_timescale)
+            .checked_mul(m_mul)
+            .ok_or(Error::InvalidData("elst örnek zaman damgası taşması"))?;
+        let dur = u128::from(sample.duration_in_timescale)
+            .checked_mul(m_mul)
+            .ok_or(Error::InvalidData("elst örnek süresi taşması"))?;
+        let end = start.saturating_add(dur);
+        intervals.push(SampleInterval {
+            start,
+            end,
+            raw_index,
+        });
+    }
+    intervals.sort_unstable_by(|a, b| {
+        a.start
+            .cmp(&b.start)
+            .then_with(|| a.raw_index.cmp(&b.raw_index))
+    });
+
+    let mut tree_max_end: Vec<u128> = Vec::new();
+    tree_max_end
+        .try_reserve_exact(tree_nodes)
+        .map_err(|_| Error::AllocationFailed {
+            requested: tree_bytes,
+        })?;
+    tree_max_end.resize(tree_nodes, 0u128);
+    for (i, iv) in intervals.iter().enumerate() {
+        tree_max_end[tree_size + i] = iv.end;
+    }
+    for node in (1..tree_size).rev() {
+        tree_max_end[node] = tree_max_end[node * 2].max(tree_max_end[node * 2 + 1]);
+    }
+
+    let mut stack: Vec<(usize, usize, usize)> = Vec::new();
+    stack
+        .try_reserve_exact(stack_cap)
+        .map_err(|_| Error::AllocationFailed {
+            requested: stack_bytes,
+        })?;
+
     let mut presented: Vec<PresentedSample> = Vec::new();
-    let mut timeline_pts: u64 = 0;
+    let mut timeline_pts_u128: u128 = 0;
+
+    let push_sample = |presented: &mut Vec<PresentedSample>,
+                       guard: &mut ButceTutucu,
+                       raw_index: usize,
+                       pres_pts_u128: u128,
+                       clipped_dur_u128: u128,
+                       seg_max_end: &mut u128|
+     -> Result<()> {
+        if presented.len() >= MAX_TRACK_SAMPLES {
+            return Err(Error::BudgetExceeded {
+                requested: presented.len() + 1,
+                limit: MAX_TRACK_SAMPLES,
+            });
+        }
+        let pres_pts = u64::try_from(pres_pts_u128)
+            .map_err(|_| Error::InvalidData("elst sunum zaman damgası u64 taşması"))?;
+        let clipped_dur = u64::try_from(clipped_dur_u128)
+            .map_err(|_| Error::InvalidData("elst kırpılmış süre u64 taşması"))?;
+        guard.ekle(core::mem::size_of::<PresentedSample>())?;
+        presented
+            .try_reserve(1)
+            .map_err(|_| Error::AllocationFailed {
+                requested: core::mem::size_of::<PresentedSample>(),
+            })?;
+        presented.push(PresentedSample {
+            raw_index,
+            pts_in_timescale: pres_pts,
+            duration_in_timescale: clipped_dur,
+        });
+        *seg_max_end = (*seg_max_end).max(pres_pts_u128.saturating_add(clipped_dur_u128));
+        Ok(())
+    };
 
     for entry in &edit_list.entries {
-        let seg_dur_media = scale_seg_dur(entry.segment_duration)?;
+        let seg_dur_eff = if entry.segment_duration == 0 {
+            None
+        } else {
+            Some(
+                u128::from(entry.segment_duration)
+                    .checked_mul(v_mul)
+                    .ok_or(Error::InvalidData("elst segment_duration taşması"))?,
+            )
+        };
         if entry.media_time == -1 {
-            timeline_pts = timeline_pts.saturating_add(seg_dur_media.unwrap_or(0));
+            timeline_pts_u128 = timeline_pts_u128.saturating_add(seg_dur_eff.unwrap_or(0));
             continue;
         }
-        let edit_start = entry.media_time as u64;
-        let edit_end = seg_dur_media.map(|d| edit_start.saturating_add(d));
-        let mut seg_max_end = timeline_pts;
+        let edit_start = u128::from(entry.media_time as u64)
+            .checked_mul(m_mul)
+            .ok_or(Error::InvalidData("elst media_time taşması"))?;
+        let edit_end = seg_dur_eff.map(|d| edit_start.saturating_add(d));
+        let mut seg_max_end = timeline_pts_u128;
+        let seg_start_idx = presented.len();
 
-        for (raw_index, sample) in track.samples.iter().enumerate() {
-            let s_start = sample.pts_in_timescale;
-            let s_end = s_start.saturating_add(sample.duration_in_timescale);
-            let clip_start = s_start.max(edit_start);
-            let clip_end = match edit_end {
-                Some(ee) => s_end.min(ee),
-                None => s_end,
-            };
-            let include = clip_end > clip_start
-                || (sample.duration_in_timescale == 0
-                    && s_start == edit_start
-                    && edit_end.is_none_or(|ee| s_start < ee));
-            if include {
-                if presented.len() >= MAX_TRACK_SAMPLES {
-                    return Err(Error::BudgetExceeded {
-                        requested: presented.len() + 1,
-                        limit: MAX_TRACK_SAMPLES,
-                    });
+        // 1. Pozitif kesişimli örnekleri (`s_start < edit_end && s_end > edit_start`)
+        //    düz maksimum-bitiş aralık ağacında `O(log S + k)` sürede bul.
+        if tree_max_end[1] > edit_start && edit_end.is_none_or(|ee| intervals[0].start < ee) {
+            stack.clear();
+            stack.push((1usize, 0usize, tree_size - 1));
+            while let Some((node, l, r)) = stack.pop() {
+                if l >= n || tree_max_end[node] <= edit_start {
+                    continue;
                 }
-                let clipped_dur = clip_end.saturating_sub(clip_start);
-                let pres_pts = timeline_pts.saturating_add(clip_start - edit_start);
-                guard.ekle(core::mem::size_of::<PresentedSample>())?;
-                presented
-                    .try_reserve(1)
-                    .map_err(|_| Error::AllocationFailed {
-                        requested: core::mem::size_of::<PresentedSample>(),
-                    })?;
-                presented.push(PresentedSample {
-                    raw_index,
-                    pts_in_timescale: pres_pts,
-                    duration_in_timescale: clipped_dur,
-                });
-                seg_max_end = seg_max_end.max(pres_pts.saturating_add(clipped_dur));
+                if edit_end.is_some_and(|ee| intervals[l].start >= ee) {
+                    continue;
+                }
+                if l == r {
+                    let iv = intervals[l];
+                    let clip_start = iv.start.max(edit_start);
+                    let clip_end = match edit_end {
+                        Some(ee) => iv.end.min(ee),
+                        None => iv.end,
+                    };
+                    if clip_end > clip_start {
+                        let clipped_dur = clip_end - clip_start;
+                        let pres_pts = timeline_pts_u128.saturating_add(clip_start - edit_start);
+                        push_sample(
+                            &mut presented,
+                            guard,
+                            iv.raw_index,
+                            pres_pts,
+                            clipped_dur,
+                            &mut seg_max_end,
+                        )?;
+                    }
+                    continue;
+                }
+                let mid = l + (r - l) / 2;
+                let left = node * 2;
+                let right = left + 1;
+                if mid + 1 < n
+                    && tree_max_end[right] > edit_start
+                    && edit_end.is_none_or(|ee| intervals[mid + 1].start < ee)
+                {
+                    stack.push((right, mid + 1, r));
+                }
+                if tree_max_end[left] > edit_start
+                    && edit_end.is_none_or(|ee| intervals[l].start < ee)
+                {
+                    stack.push((left, l, mid));
+                }
             }
         }
 
-        timeline_pts = match seg_dur_media {
-            Some(d) => timeline_pts.saturating_add(d),
+        // 2. Sıfır süreli sınır durumu (`duration == 0 && s_start == edit_start && s_start < edit_end`):
+        //    sıralı aralık dizisinde `O(log S)` ikili arama ile yakala.
+        if edit_end.is_none_or(|ee| edit_start < ee) {
+            let mut idx = intervals.partition_point(|iv| iv.start < edit_start);
+            while idx < n && intervals[idx].start == edit_start {
+                let iv = intervals[idx];
+                if iv.end == iv.start {
+                    push_sample(
+                        &mut presented,
+                        guard,
+                        iv.raw_index,
+                        timeline_pts_u128,
+                        0,
+                        &mut seg_max_end,
+                    )?;
+                }
+                idx += 1;
+            }
+        }
+
+        if presented.len() > seg_start_idx + 1 {
+            presented[seg_start_idx..].sort_unstable_by(|a, b| {
+                a.pts_in_timescale
+                    .cmp(&b.pts_in_timescale)
+                    .then_with(|| a.raw_index.cmp(&b.raw_index))
+            });
+        }
+
+        timeline_pts_u128 = match seg_dur_eff {
+            Some(d) => timeline_pts_u128.saturating_add(d),
             None => seg_max_end,
         };
     }
@@ -887,7 +1072,9 @@ pub(crate) fn build_presented_timeline(
         ));
     }
 
-    Ok((presented, timeline_pts))
+    let total_duration = u64::try_from(timeline_pts_u128)
+        .map_err(|_| Error::InvalidData("elst toplam süre u64 taşması"))?;
+    Ok((presented, total_duration, eff_ts))
 }
 
 fn parse_tref(

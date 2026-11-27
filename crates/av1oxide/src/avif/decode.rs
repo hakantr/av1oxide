@@ -426,9 +426,10 @@ fn find_direct_alpha_item(container: &AvifContainer<'_>, target_id: u32) -> Resu
 fn find_alpha_source(
     container: &AvifContainer<'_>,
     primary_id: u32,
-) -> Result<Option<AlphaSource>> {
+    butce: &Arc<Butce>,
+) -> Result<Option<(AlphaSource, ButceTutucu)>> {
     if let Some(aid) = find_direct_alpha_item(container, primary_id)? {
-        return Ok(Some(AlphaSource::Direct(aid)));
+        return Ok(Some((AlphaSource::Direct(aid), ButceTutucu::bos(butce))));
     }
     let Some(info) = container.item_info(primary_id) else {
         return Ok(None);
@@ -438,7 +439,19 @@ fn find_alpha_source(
         if tile_ids.is_empty() {
             return Ok(None);
         }
-        let mut alpha_tiles: Vec<u32> = Vec::with_capacity(tile_ids.len());
+        let bytes = tile_ids
+            .len()
+            .checked_mul(core::mem::size_of::<u32>())
+            .ok_or(Error::SizeOverflow {
+                stage: SizeStage::TotalAllocation,
+                lhs: tile_ids.len(),
+                rhs: core::mem::size_of::<u32>(),
+            })?;
+        let guard = Butce::tut(butce, bytes)?;
+        let mut alpha_tiles: Vec<u32> = Vec::new();
+        alpha_tiles
+            .try_reserve_exact(tile_ids.len())
+            .map_err(|_| Error::AllocationFailed { requested: bytes })?;
         for &tid in &tile_ids {
             if let Some(aid) = find_direct_alpha_item(container, tid)? {
                 alpha_tiles.push(aid);
@@ -446,10 +459,13 @@ fn find_alpha_source(
                 return Ok(None);
             }
         }
-        return Ok(Some(AlphaSource::GridTiles {
-            grid_item_id: primary_id,
-            alpha_tile_ids: alpha_tiles,
-        }));
+        return Ok(Some((
+            AlphaSource::GridTiles {
+                grid_item_id: primary_id,
+                alpha_tile_ids: alpha_tiles,
+            },
+            guard,
+        )));
     }
     Ok(None)
 }
@@ -827,8 +843,9 @@ fn parse_info_from_container(
         }
     }
 
-    let alpha_src = find_alpha_source(container, primary_id)?;
-    let premultiplied_alpha = is_premultiplied_alpha(container, primary_id, alpha_src.as_ref());
+    let alpha_src_opt = find_alpha_source(container, primary_id, butce)?;
+    let alpha_src = alpha_src_opt.as_ref().map(|(s, _)| s);
+    let premultiplied_alpha = is_premultiplied_alpha(container, primary_id, alpha_src);
     let (exif, xmp, meta_guard) = extract_metadata_items(container, primary_id, butce)?;
     _info_guard.birlestir(meta_guard);
     let gain_map_metadata = find_and_validate_tmap(
@@ -1671,27 +1688,89 @@ fn decode_grid_tiles_into_canvas(
     }
 
     let has_dups = is_alpha && (1..tile_ids.len()).any(|i| tile_ids[..i].contains(&tile_ids[i]));
-    let mut unique_ids: Vec<u32> = Vec::with_capacity(num_tiles);
-    let mut cells_by_unique: Vec<Vec<(usize, usize)>> = Vec::with_capacity(num_tiles);
+    let mut grid_plan_guard = ButceTutucu::bos(butce);
+    let mut dedup_unique_ids: Vec<u32> = Vec::new();
+    let mut cell_head: Vec<u32> = Vec::new();
+    let mut cell_next: Vec<u32> = Vec::new();
+
     if has_dups {
-        let mut unique_set = crate::avif::boxes::FxIndexSet::with_capacity_and_hasher(
-            num_tiles,
-            rustc_hash::FxBuildHasher,
-        );
+        let pairs_bytes = num_tiles
+            .checked_mul(core::mem::size_of::<(u32, u32)>())
+            .ok_or(Error::SizeOverflow {
+                stage: SizeStage::TotalAllocation,
+                lhs: num_tiles,
+                rhs: core::mem::size_of::<(u32, u32)>(),
+            })?;
+        let flat_bytes = num_tiles
+            .checked_mul(core::mem::size_of::<u32>() * 3)
+            .ok_or(Error::SizeOverflow {
+                stage: SizeStage::TotalAllocation,
+                lhs: num_tiles,
+                rhs: core::mem::size_of::<u32>() * 3,
+            })?;
+        let total_plan_bytes = pairs_bytes
+            .checked_add(flat_bytes)
+            .ok_or(Error::SizeOverflow {
+                stage: SizeStage::TotalAllocation,
+                lhs: pairs_bytes,
+                rhs: flat_bytes,
+            })?;
+        grid_plan_guard.ekle(total_plan_bytes)?;
+
+        let mut pairs: Vec<(u32, u32)> = Vec::new();
+        pairs
+            .try_reserve_exact(num_tiles)
+            .map_err(|_| Error::AllocationFailed {
+                requested: pairs_bytes,
+            })?;
         for (cell_idx, &tid) in tile_ids.iter().enumerate() {
-            let (u_idx, inserted) = unique_set.insert_full(tid);
-            if inserted {
-                unique_ids.push(tid);
-                cells_by_unique.push(Vec::new());
+            pairs.push((tid, cell_idx as u32));
+        }
+        pairs.sort_unstable();
+
+        dedup_unique_ids
+            .try_reserve_exact(num_tiles)
+            .map_err(|_| Error::AllocationFailed {
+                requested: num_tiles * core::mem::size_of::<u32>(),
+            })?;
+        cell_head
+            .try_reserve_exact(num_tiles)
+            .map_err(|_| Error::AllocationFailed {
+                requested: num_tiles * core::mem::size_of::<u32>(),
+            })?;
+        cell_next
+            .try_reserve_exact(num_tiles)
+            .map_err(|_| Error::AllocationFailed {
+                requested: num_tiles * core::mem::size_of::<u32>(),
+            })?;
+        cell_next.resize(num_tiles, u32::MAX);
+
+        let mut p_idx = 0usize;
+        while p_idx < pairs.len() {
+            let tid = pairs[p_idx].0;
+            let run_start = p_idx;
+            while p_idx < pairs.len() && pairs[p_idx].0 == tid {
+                p_idx += 1;
             }
-            cells_by_unique[u_idx].push((cell_idx / cols, cell_idx % cols));
+            // Ters sırada zincirle ki okuma sırasında hücreler artan `(r, c)` sırasıyla gezilsin.
+            let mut head = u32::MAX;
+            for k in (run_start..p_idx).rev() {
+                let c_idx = pairs[k].1;
+                cell_next[c_idx as usize] = head;
+                head = c_idx;
+            }
+            dedup_unique_ids.push(tid);
+            cell_head.push(head);
         }
-    } else {
-        unique_ids.extend_from_slice(tile_ids);
-        for cell_idx in 0..num_tiles {
-            cells_by_unique.push(alloc::vec![(cell_idx / cols, cell_idx % cols)]);
-        }
+        drop(pairs);
+        grid_plan_guard.dusur(pairs_bytes);
     }
+
+    let unique_ids: &[u32] = if has_dups {
+        &dedup_unique_ids
+    } else {
+        tile_ids
+    };
     let num_unique = unique_ids.len();
     let total_threads = resolve_effective_threads(config.n_threads);
 
@@ -1806,9 +1885,13 @@ fn decode_grid_tiles_into_canvas(
 
     // İlk dalgadaki tüm karoları tuvale yaz ve tamponlarını bir sonraki dalgadan önce serbest bırak.
     for (i, tile) in first_wave.drain(..).enumerate() {
-        copy_tile_into_canvas(
+        copy_tile_for_unique_index(
             &tile,
-            &cells_by_unique[i],
+            i,
+            cols,
+            has_dups,
+            &cell_head,
+            &cell_next,
             &geom,
             &mut y_canvas,
             &mut u_canvas,
@@ -1834,9 +1917,13 @@ fn decode_grid_tiles_into_canvas(
         )?;
         for (i, tile) in wave_tiles.drain(..).enumerate() {
             validate_grid_tile(&tile, tile_w, tile_h, bit_depth, chroma_format, is_alpha)?;
-            copy_tile_into_canvas(
+            copy_tile_for_unique_index(
                 &tile,
-                &cells_by_unique[offset + i],
+                offset + i,
+                cols,
+                has_dups,
+                &cell_head,
+                &cell_next,
                 &geom,
                 &mut y_canvas,
                 &mut u_canvas,
@@ -1846,6 +1933,7 @@ fn decode_grid_tiles_into_canvas(
         }
         offset = end;
     }
+    drop((dedup_unique_ids, cell_head, cell_next, grid_plan_guard));
 
     Ok(PlanarBuffer {
         width: grid.output_width,
@@ -1875,11 +1963,31 @@ fn decode_grid_wave(
     depth: usize,
     butce: &Arc<Butce>,
 ) -> Result<Vec<PlanarBuffer>> {
+    let wave_vec_bytes = wave_ids
+        .len()
+        .checked_mul(core::mem::size_of::<PlanarBuffer>())
+        .ok_or(Error::SizeOverflow {
+            stage: SizeStage::TotalAllocation,
+            lhs: wave_ids.len(),
+            rhs: core::mem::size_of::<PlanarBuffer>(),
+        })?;
+    let _wave_guard = Butce::tut(butce, wave_vec_bytes)?;
+
     #[cfg(all(feature = "std", not(target_arch = "wasm32")))]
     if wave_ids.len() > 1 {
-        let mut wave_tiles: Vec<PlanarBuffer> = Vec::with_capacity(wave_ids.len());
+        let mut wave_tiles: Vec<PlanarBuffer> = Vec::new();
+        wave_tiles
+            .try_reserve_exact(wave_ids.len())
+            .map_err(|_| Error::AllocationFailed {
+                requested: wave_vec_bytes,
+            })?;
         std::thread::scope(|s| {
-            let mut handles = Vec::with_capacity(wave_ids.len());
+            let mut handles = Vec::new();
+            handles
+                .try_reserve_exact(wave_ids.len())
+                .map_err(|_| Error::AllocationFailed {
+                    requested: wave_ids.len() * core::mem::size_of::<usize>(),
+                })?;
             for &tid in wave_ids {
                 let butce_w = Arc::clone(butce);
                 handles.push(s.spawn(move || {
@@ -1897,7 +2005,12 @@ fn decode_grid_wave(
         return Ok(wave_tiles);
     }
 
-    let mut wave_tiles: Vec<PlanarBuffer> = Vec::with_capacity(wave_ids.len());
+    let mut wave_tiles: Vec<PlanarBuffer> = Vec::new();
+    wave_tiles
+        .try_reserve_exact(wave_ids.len())
+        .map_err(|_| Error::AllocationFailed {
+            requested: wave_vec_bytes,
+        })?;
     for &tid in wave_ids {
         wave_tiles.push(decode_item_planar(
             container,
@@ -1982,6 +2095,33 @@ fn copy_tile_slice<T: Copy>(
                 }
             }
         }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn copy_tile_for_unique_index(
+    tile: &PlanarBuffer,
+    u_idx: usize,
+    cols: usize,
+    has_dups: bool,
+    cell_head: &[u32],
+    cell_next: &[u32],
+    g: &GridCanvasGeom,
+    y_canvas: &mut PlaneStorage,
+    u_canvas: &mut PlaneStorage,
+    v_canvas: &mut PlaneStorage,
+) {
+    if !has_dups {
+        let cell = [(u_idx / cols, u_idx % cols)];
+        copy_tile_into_canvas(tile, &cell, g, y_canvas, u_canvas, v_canvas);
+        return;
+    }
+    let mut cur = cell_head[u_idx];
+    while cur != u32::MAX {
+        let idx = cur as usize;
+        let cell = [(idx / cols, idx % cols)];
+        copy_tile_into_canvas(tile, &cell, g, y_canvas, u_canvas, v_canvas);
+        cur = cell_next[idx];
     }
 }
 
@@ -2177,10 +2317,11 @@ fn decode_from_container(
         }
     }
 
-    let alpha_src = find_alpha_source(container, primary_id)?;
-    let premultiplied_alpha = is_premultiplied_alpha(container, primary_id, alpha_src.as_ref());
+    let alpha_src_opt = find_alpha_source(container, primary_id, &butce)?;
+    let alpha_src = alpha_src_opt.as_ref().map(|(s, _)| s);
+    let premultiplied_alpha = is_premultiplied_alpha(container, primary_id, alpha_src);
 
-    let alpha_plane = if let Some(ref src) = alpha_src {
+    let alpha_plane = if let Some(src) = alpha_src {
         let alpha_buf = match src {
             AlphaSource::Direct(aid) => {
                 let mut ab =
@@ -2296,6 +2437,16 @@ fn decode_from_container(
                         _ => {}
                     }
                 }
+                // İkinci `alt_icc_profile` kopyası ve `Box<AvifImage>` tahsisini klonlamadan
+                // önce bütçeye kaydet (`gm_image._butce_tutucu` her ikisini de taşır).
+                let mut gm_guard = gm_buf.budget_guard;
+                let extra_gm_bytes = gm_meta
+                    .alt_icc_profile
+                    .as_ref()
+                    .map_or(0, Vec::len)
+                    .saturating_add(core::mem::size_of::<AvifImage>());
+                gm_guard.ekle(extra_gm_bytes)?;
+                let gm_meta_copy = gm_meta.clone();
                 let gm_image = AvifImage {
                     width: gm_buf.width,
                     height: gm_buf.height,
@@ -2319,10 +2470,10 @@ fn decode_from_container(
                     gain_map: None,
                     effective_threads,
                     butce: Some(Arc::clone(&butce)),
-                    _butce_tutucu: Some(Arc::new(gm_buf.budget_guard)),
+                    _butce_tutucu: Some(Arc::new(gm_guard)),
                 };
                 Some(GainMap {
-                    metadata: gm_meta.clone(),
+                    metadata: gm_meta_copy,
                     image: Box::new(gm_image),
                 })
             } else {

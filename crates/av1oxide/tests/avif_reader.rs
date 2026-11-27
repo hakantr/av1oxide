@@ -2814,19 +2814,20 @@ fn avif_sequence_tkhd_orientation_and_elst_timeline() {
     );
     let mut seq = AvifSequenceDecoder::new(&avis_elst).expect("elst AVIS açılmalı");
     assert_eq!(seq.info().frame_count, 2);
-    assert_eq!(seq.info().duration_in_timescale, 25);
+    assert_eq!(seq.info().timescale, 60);
+    assert_eq!(seq.info().duration_in_timescale, 50);
 
     let f0 = seq.next_frame().unwrap().expect("sunum karesi 0 (INTER1)");
     assert_eq!(f0.index, 0);
-    assert_eq!(f0.pts_in_timescale, 5);
-    assert_eq!(f0.duration_in_timescale, 10);
+    assert_eq!(f0.pts_in_timescale, 10);
+    assert_eq!(f0.duration_in_timescale, 20);
     assert!(!f0.is_keyframe);
     assert_eq!(f0.image, ref_frames[1]);
 
     let f1 = seq.next_frame().unwrap().expect("sunum karesi 1 (INTER2)");
     assert_eq!(f1.index, 1);
-    assert_eq!(f1.pts_in_timescale, 15);
-    assert_eq!(f1.duration_in_timescale, 10);
+    assert_eq!(f1.pts_in_timescale, 30);
+    assert_eq!(f1.duration_in_timescale, 20);
     assert!(!f1.is_keyframe);
     assert_eq!(f1.image, ref_frames[2]);
     assert!(seq.next_frame().unwrap().is_none());
@@ -2835,9 +2836,170 @@ fn avif_sequence_tkhd_orientation_and_elst_timeline() {
     let seek0 = seq
         .nth_frame(0)
         .expect("nth_frame(0) pre-roll ile çözülmeli");
-    assert_eq!(seek0.pts_in_timescale, 5);
+    assert_eq!(seek0.pts_in_timescale, 10);
     assert_eq!(seek0.image, ref_frames[1]);
     let seek1 = seq.nth_frame(1).expect("nth_frame(1) çözülmeli");
-    assert_eq!(seek1.pts_in_timescale, 15);
+    assert_eq!(seek1.pts_in_timescale, 30);
     assert_eq!(seek1.image, ref_frames[2]);
+}
+
+/// `6.F.3`: AVIS `elst` `O((S + E + K) log S)` aralık ağacı (128k × 128k `< 250 ms`) ve
+/// `lcm(media_ts, movie_ts)` kesin kesişimi (`movie_ts=1000, media_ts=30` üzerinde `16 ms` / `17 ms`).
+#[test]
+fn avif_sequence_elst_128k_perf_and_sub_media_tick_precision() {
+    use std::time::Instant;
+
+    const P: i32 = 0x0001_0000;
+    const W: i32 = 0x4000_0000;
+    let identity = [P, 0, 0, 0, P, 0, 0, 0, W];
+
+    let build_synthetic_avis = |sample_count: u32,
+                                movie_ts: u32,
+                                media_ts: u32,
+                                sample_delta: u32,
+                                elst_entries: &[(u32, i32)]|
+     -> Vec<u8> {
+        let ftyp = make_ftyp(b"avis", &[*b"msf1", *b"avif", *b"miaf"]);
+
+        let mut mvhd_body = vec![0u8; 96];
+        mvhd_body[8..12].copy_from_slice(&movie_ts.to_be_bytes());
+        mvhd_body[12..16].copy_from_slice(&sample_count.saturating_mul(sample_delta).to_be_bytes());
+        let mvhd = make_full_box(b"mvhd", 0, 0, &mvhd_body);
+
+        let make_trak = |chunk_offset: u32| -> Vec<u8> {
+            let mut tkhd_body = vec![0u8; 80];
+            tkhd_body[8..12].copy_from_slice(&1u32.to_be_bytes());
+            tkhd_body[16..20]
+                .copy_from_slice(&sample_count.saturating_mul(sample_delta).to_be_bytes());
+            for (i, &val) in identity.iter().enumerate() {
+                tkhd_body[36 + i * 4..40 + i * 4].copy_from_slice(&val.to_be_bytes());
+            }
+            tkhd_body[72..76].copy_from_slice(&(1u32 << 16).to_be_bytes());
+            tkhd_body[76..80].copy_from_slice(&(1u32 << 16).to_be_bytes());
+            let tkhd = make_full_box(b"tkhd", 0, 3, &tkhd_body);
+
+            let mut elst_body = Vec::with_capacity(4 + elst_entries.len() * 12);
+            elst_body.extend_from_slice(&(elst_entries.len() as u32).to_be_bytes());
+            for &(sd, mt) in elst_entries {
+                elst_body.extend_from_slice(&sd.to_be_bytes());
+                elst_body.extend_from_slice(&mt.to_be_bytes());
+                elst_body.extend_from_slice(&1i16.to_be_bytes());
+                elst_body.extend_from_slice(&0i16.to_be_bytes());
+            }
+            let edts = make_box(b"edts", &make_full_box(b"elst", 0, 0, &elst_body));
+
+            let mut mdhd_body = vec![0u8; 20];
+            mdhd_body[8..12].copy_from_slice(&media_ts.to_be_bytes());
+            mdhd_body[12..16]
+                .copy_from_slice(&sample_count.saturating_mul(sample_delta).to_be_bytes());
+            let mdhd = make_full_box(b"mdhd", 0, 0, &mdhd_body);
+
+            let mut hdlr_body = Vec::new();
+            hdlr_body.extend_from_slice(&0u32.to_be_bytes());
+            hdlr_body.extend_from_slice(b"pict");
+            hdlr_body.extend_from_slice(&[0u8; 13]);
+            let hdlr = make_full_box(b"hdlr", 0, 0, &hdlr_body);
+
+            let mut av01_payload = vec![0u8; 78];
+            av01_payload[24..26].copy_from_slice(&1u16.to_be_bytes());
+            av01_payload[26..28].copy_from_slice(&1u16.to_be_bytes());
+            av01_payload.extend_from_slice(&make_box(b"av1C", &[0x81, 0x00, 0x0C, 0x00]));
+            let mut stsd_body = 1u32.to_be_bytes().to_vec();
+            stsd_body.extend_from_slice(&make_box(b"av01", &av01_payload));
+            let stsd = make_full_box(b"stsd", 0, 0, &stsd_body);
+
+            let mut stts_body = Vec::new();
+            stts_body.extend_from_slice(&1u32.to_be_bytes());
+            stts_body.extend_from_slice(&sample_count.to_be_bytes());
+            stts_body.extend_from_slice(&sample_delta.to_be_bytes());
+            let stts = make_full_box(b"stts", 0, 0, &stts_body);
+
+            let mut stsc_body = Vec::new();
+            stsc_body.extend_from_slice(&1u32.to_be_bytes());
+            stsc_body.extend_from_slice(&1u32.to_be_bytes());
+            stsc_body.extend_from_slice(&1u32.to_be_bytes());
+            stsc_body.extend_from_slice(&1u32.to_be_bytes());
+            let stsc = make_full_box(b"stsc", 0, 0, &stsc_body);
+
+            // Sabit `sample_size` ile 128k örnek aynı `SAMPLE_1X1_AV1_OBU` yığınını paylaşır.
+            let mut stsz_body = Vec::new();
+            stsz_body.extend_from_slice(&(SAMPLE_1X1_AV1_OBU.len() as u32).to_be_bytes());
+            stsz_body.extend_from_slice(&sample_count.to_be_bytes());
+            let stsz = make_full_box(b"stsz", 0, 0, &stsz_body);
+
+            let mut stco_body = Vec::with_capacity(4 + (sample_count as usize) * 4);
+            stco_body.extend_from_slice(&sample_count.to_be_bytes());
+            for _ in 0..sample_count {
+                stco_body.extend_from_slice(&chunk_offset.to_be_bytes());
+            }
+            let stco = make_full_box(b"stco", 0, 0, &stco_body);
+
+            let mut stbl_body = Vec::new();
+            for b in [&stsd, &stts, &stsc, &stsz, &stco] {
+                stbl_body.extend_from_slice(b);
+            }
+            let stbl = make_box(b"stbl", &stbl_body);
+            let minf = make_box(b"minf", &stbl);
+            let mut mdia_body = Vec::new();
+            for b in [&mdhd, &hdlr, &minf] {
+                mdia_body.extend_from_slice(b);
+            }
+            let mdia = make_box(b"mdia", &mdia_body);
+
+            let mut trak_body = tkhd;
+            trak_body.extend_from_slice(&edts);
+            trak_body.extend_from_slice(&mdia);
+            make_box(b"trak", &trak_body)
+        };
+
+        let dummy_moov = make_box(b"moov", &[mvhd.as_slice(), &make_trak(0)].concat());
+        let data_off = (ftyp.len() + dummy_moov.len() + 8) as u32;
+        let moov = make_box(b"moov", &[mvhd.as_slice(), &make_trak(data_off)].concat());
+        let mdat = make_box(b"mdat", SAMPLE_1X1_AV1_OBU);
+
+        let mut file = ftyp;
+        file.extend_from_slice(&moov);
+        file.extend_from_slice(&mdat);
+        file
+    };
+
+    // 1. Alt-medya-birimi kesin kesişimi: `movie_ts = 1000`, `media_ts = 30`, 1 örnek `[0, 1)`.
+    //    `segment_duration = 16` (16 ms) ve `17` (17 ms) her ikisi de `1` kare üretmeli ve
+    //    `eff_ts = 3000` ölçeğinde tam `0.016` ve `0.017` saniye döndürmelidir.
+    let avis_16ms = build_synthetic_avis(1, 1000, 30, 1, &[(16, 0)]);
+    let mut dec_16 = AvifSequenceDecoder::new(&avis_16ms).expect("16 ms elst geçerli olmalı");
+    assert_eq!(dec_16.info().frame_count, 1);
+    assert_eq!(dec_16.info().timescale, 3000);
+    assert_eq!(dec_16.info().duration_in_timescale, 48);
+    assert!((dec_16.info().duration_sec - 0.016).abs() < 1e-12);
+    let f16 = dec_16.next_frame().unwrap().unwrap();
+    assert_eq!(f16.duration_in_timescale, 48);
+    assert!((f16.duration_sec - 0.016).abs() < 1e-12);
+
+    let avis_17ms = build_synthetic_avis(1, 1000, 30, 1, &[(17, 0)]);
+    let mut dec_17 = AvifSequenceDecoder::new(&avis_17ms).expect("17 ms elst geçerli olmalı");
+    assert_eq!(dec_17.info().frame_count, 1);
+    assert_eq!(dec_17.info().timescale, 3000);
+    assert_eq!(dec_17.info().duration_in_timescale, 51);
+    assert!((dec_17.info().duration_sec - 0.017).abs() < 1e-12);
+    let f17 = dec_17.next_frame().unwrap().unwrap();
+    assert_eq!(f17.duration_in_timescale, 51);
+    assert!((f17.duration_sec - 0.017).abs() < 1e-12);
+
+    // 2. 128 000 örnek × 128 000 `elst` girdisi: `O((S + E + K) log S)` aralık ağacı ile
+    //    `parse_sequence_info` 250 ms altında (pratikte birkaç ms) tamamlanmalıdır.
+    let mut edits_128k: Vec<(u32, i32)> = Vec::with_capacity(128_000);
+    for i in 0..128_000u32 {
+        edits_128k.push((1, i as i32));
+    }
+    let avis_128k = build_synthetic_avis(128_000, 1000, 1000, 1, &edits_128k);
+    let t0 = Instant::now();
+    let info_128k = av1oxide::avif::parse_sequence_info(&avis_128k)
+        .expect("128k × 128k AVIS parse_sequence_info başarılı olmalı");
+    let elapsed = t0.elapsed();
+    assert_eq!(info_128k.frame_count, 128_000);
+    assert!(
+        elapsed.as_millis() < 250,
+        "128k × 128k elst ayrıştırması < 250 ms olmalı, ölçülen: {elapsed:?}"
+    );
 }

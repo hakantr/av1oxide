@@ -319,3 +319,321 @@ fn avif_budget_precheck_never_allocates_oversized_metadata_before_rejecting() {
         "büyük iloc extent dizisi reddedilmeden önce {max_iloc} B ayırmamalı"
     );
 }
+
+/// `6.F.4`: GainMap ikinci `alt_icc_profile` kopyası + `Box<AvifImage>` ve Grid planlama
+/// vektörlerinin (`!has_dups` sıfır-tahsis ve `has_dups` düz dizi) `Butce` tarafından
+/// tahsis öncesinde eksiksiz sayıldığını doğrular.
+#[test]
+fn avif_budget_accounts_gainmap_second_icc_and_grid_planning() {
+    let (ftyp, hdlr, pitm, _) = make_base_parts();
+
+    // 1. Ana görüntüde 3 144 B ICC + `tmap` öğesinde 3 144 B `alt_icc_profile` içeren GainMap AVIF.
+    let icc_size = 3144usize;
+    let mut primary_icc_payload = b"rICC".to_vec();
+    primary_icc_payload.resize(4 + icc_size, 0x11);
+    let colr_primary = make_box(b"colr", &primary_icc_payload);
+
+    let mut alt_icc_payload = b"rICC".to_vec();
+    alt_icc_payload.resize(4 + icc_size, 0x22);
+    let colr_tmap = make_box(b"colr", &alt_icc_payload);
+
+    // ISO 21496-1 `tmap` yükü (version=0, minimum_version=0, writer_version=0, single-channel,
+    // use_base_colour_space=0).
+    let mut tmap_payload = Vec::new();
+    tmap_payload.push(0u8); // version
+    tmap_payload.extend_from_slice(&0u16.to_be_bytes()); // minimum_version
+    tmap_payload.extend_from_slice(&0u16.to_be_bytes()); // writer_version
+    tmap_payload.push(0x00u8); // is_multichannel = 0, use_base_colour_space = 0
+    tmap_payload.extend_from_slice(&0u32.to_be_bytes()); // base_hdr_headroom_n
+    tmap_payload.extend_from_slice(&1u32.to_be_bytes()); // base_hdr_headroom_d
+    tmap_payload.extend_from_slice(&1u32.to_be_bytes()); // alternate_hdr_headroom_n
+    tmap_payload.extend_from_slice(&1u32.to_be_bytes()); // alternate_hdr_headroom_d
+    // 1 kanal: gain_map_min, gain_map_max, gamma, base_offset, alternate_offset
+    tmap_payload.extend_from_slice(&0i32.to_be_bytes());
+    tmap_payload.extend_from_slice(&1u32.to_be_bytes());
+    tmap_payload.extend_from_slice(&1i32.to_be_bytes());
+    tmap_payload.extend_from_slice(&1u32.to_be_bytes());
+    tmap_payload.extend_from_slice(&1u32.to_be_bytes());
+    tmap_payload.extend_from_slice(&1u32.to_be_bytes());
+    tmap_payload.extend_from_slice(&0i32.to_be_bytes());
+    tmap_payload.extend_from_slice(&1u32.to_be_bytes());
+    tmap_payload.extend_from_slice(&0i32.to_be_bytes());
+    tmap_payload.extend_from_slice(&1u32.to_be_bytes());
+
+    let make_infe = |id: u16, ty: &[u8; 4]| -> Vec<u8> {
+        let mut b = Vec::new();
+        b.extend_from_slice(&id.to_be_bytes());
+        b.extend_from_slice(&0u16.to_be_bytes());
+        b.extend_from_slice(ty);
+        b.push(0);
+        make_full_box(b"infe", 2, 0, &b)
+    };
+    let mut iinf_body = 3u16.to_be_bytes().to_vec();
+    iinf_body.extend_from_slice(&make_infe(1, b"av01")); // primary
+    iinf_body.extend_from_slice(&make_infe(2, b"av01")); // gain map image
+    iinf_body.extend_from_slice(&make_infe(3, b"tmap")); // tmap derived item
+    let iinf = make_full_box(b"iinf", 0, 0, &iinf_body);
+
+    let mut dimg_body = Vec::new();
+    dimg_body.extend_from_slice(&3u16.to_be_bytes()); // from tmap (3)
+    dimg_body.extend_from_slice(&2u16.to_be_bytes()); // count = 2
+    dimg_body.extend_from_slice(&1u16.to_be_bytes()); // base = 1
+    dimg_body.extend_from_slice(&2u16.to_be_bytes()); // gainmap = 2
+    let iref = make_full_box(b"iref", 0, 0, &make_box(b"dimg", &dimg_body));
+
+    let mut ispe_body = Vec::new();
+    ispe_body.extend_from_slice(&1u32.to_be_bytes());
+    ispe_body.extend_from_slice(&1u32.to_be_bytes());
+    let mut ipco_body = make_full_box(b"ispe", 0, 0, &ispe_body); // prop 1
+    ipco_body.extend_from_slice(&make_box(b"av1C", &[0x81, 0x00, 0x0C, 0x00])); // prop 2
+    ipco_body.extend_from_slice(&colr_primary); // prop 3
+    ipco_body.extend_from_slice(&colr_tmap); // prop 4
+    let ipco = make_box(b"ipco", &ipco_body);
+
+    let mut ipma_body = 3u32.to_be_bytes().to_vec();
+    ipma_body.extend_from_slice(&1u16.to_be_bytes());
+    ipma_body.push(3);
+    ipma_body.extend_from_slice(&[0x01, 0x82, 0x03]);
+    ipma_body.extend_from_slice(&2u16.to_be_bytes());
+    ipma_body.push(2);
+    ipma_body.extend_from_slice(&[0x01, 0x82]);
+    ipma_body.extend_from_slice(&3u16.to_be_bytes());
+    ipma_body.push(2);
+    ipma_body.extend_from_slice(&[0x01, 0x04]);
+    let ipma = make_full_box(b"ipma", 0, 0, &ipma_body);
+    let iprp = make_box(b"iprp", &[ipco.as_slice(), ipma.as_slice()].concat());
+
+    let mut idat_payload = Vec::new();
+    let off1 = 0u32;
+    idat_payload.extend_from_slice(SAMPLE_1X1_AV1_OBU);
+    let off2 = idat_payload.len() as u32;
+    idat_payload.extend_from_slice(SAMPLE_1X1_AV1_OBU);
+    let off3 = idat_payload.len() as u32;
+    idat_payload.extend_from_slice(&tmap_payload);
+    let idat = make_box(b"idat", &idat_payload);
+
+    let mut iloc_body = vec![0x44u8, 0x00];
+    iloc_body.extend_from_slice(&3u16.to_be_bytes());
+    for (id, off, len) in [
+        (1u16, off1, SAMPLE_1X1_AV1_OBU.len() as u32),
+        (2u16, off2, SAMPLE_1X1_AV1_OBU.len() as u32),
+        (3u16, off3, tmap_payload.len() as u32),
+    ] {
+        iloc_body.extend_from_slice(&id.to_be_bytes());
+        iloc_body.extend_from_slice(&1u16.to_be_bytes());
+        iloc_body.extend_from_slice(&0u16.to_be_bytes());
+        iloc_body.extend_from_slice(&1u16.to_be_bytes());
+        iloc_body.extend_from_slice(&off.to_be_bytes());
+        iloc_body.extend_from_slice(&len.to_be_bytes());
+    }
+    let iloc = make_full_box(b"iloc", 1, 0, &iloc_body);
+
+    let mut ftyp_gm_payload = Vec::new();
+    ftyp_gm_payload.extend_from_slice(b"avif");
+    ftyp_gm_payload.extend_from_slice(&0u32.to_be_bytes());
+    ftyp_gm_payload.extend_from_slice(b"mif1");
+    ftyp_gm_payload.extend_from_slice(b"tmap");
+    let ftyp_gm = make_box(b"ftyp", &ftyp_gm_payload);
+
+    let mut altr_body = Vec::new();
+    altr_body.extend_from_slice(&10u32.to_be_bytes()); // group_id
+    altr_body.extend_from_slice(&2u32.to_be_bytes()); // num_entities_in_group
+    altr_body.extend_from_slice(&3u32.to_be_bytes()); // tmap (preferred)
+    altr_body.extend_from_slice(&1u32.to_be_bytes()); // primary
+    let grpl = make_box(b"grpl", &make_full_box(b"altr", 0, 0, &altr_body));
+
+    let mut meta_gm = Vec::new();
+    for b in [&hdlr, &pitm, &iinf, &iref, &grpl, &iprp, &iloc, &idat] {
+        meta_gm.extend_from_slice(b);
+    }
+    let mut avif_gm = ftyp_gm;
+    avif_gm.extend_from_slice(&make_full_box(b"meta", 0, 0, &meta_gm));
+
+    // Tam çözümle: hem ana ICC hem iki `alt_icc_profile` mevcut ve `allocation_peak` ikisini de saymalı.
+    let cfg_full = AvifDecodeConfig {
+        decode_gain_map: true,
+        n_threads: 1,
+        ..AvifDecodeConfig::default()
+    };
+    let img_full = decode_with(&avif_gm, &cfg_full).expect("GainMap AVIF çözülmeli");
+    assert_eq!(img_full.icc_profile().map(<[u8]>::len), Some(icc_size));
+    assert_eq!(
+        img_full
+            .gain_map_metadata()
+            .and_then(|m| m.alt_icc_profile.as_ref())
+            .map(Vec::len),
+        Some(icc_size)
+    );
+    assert_eq!(
+        img_full
+            .gain_map()
+            .and_then(|g| g.metadata.alt_icc_profile.as_ref())
+            .map(Vec::len),
+        Some(icc_size)
+    );
+
+    // `decode_gain_map = false` ile başarı eşiği vs `decode_gain_map = true` ile eşik farkı:
+    // ikinci `alt_icc_profile` (3 144 B) + `size_of::<AvifImage>()` bütçeye eklendiği için
+    // `decode_gain_map = false`'un geçtiği en sıkı sınırdan +2048 B eklenmiş sınırda
+    // `decode_gain_map = true` ikinci `3 144 B` kopyayı ayırmadan `BudgetExceeded` vermelidir!
+    let mut lo = 1024usize;
+    let mut hi = 4 * 1024 * 1024usize;
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        let c = AvifDecodeConfig {
+            decode_gain_map: false,
+            n_threads: 1,
+            allocation_limit: Some(mid),
+            ..AvifDecodeConfig::default()
+        };
+        if decode_with(&avif_gm, &c).is_ok() {
+            hi = mid;
+        } else {
+            lo = mid + 1;
+        }
+    }
+    let min_without_gm = lo;
+
+    let mut lo2 = min_without_gm;
+    let mut hi2 = 4 * 1024 * 1024usize;
+    while lo2 < hi2 {
+        let mid = lo2 + (hi2 - lo2) / 2;
+        let c = AvifDecodeConfig {
+            decode_gain_map: true,
+            n_threads: 1,
+            allocation_limit: Some(mid),
+            ..AvifDecodeConfig::default()
+        };
+        if decode_with(&avif_gm, &c).is_ok() {
+            hi2 = mid;
+        } else {
+            lo2 = mid + 1;
+        }
+    }
+    let min_with_gm = lo2;
+    assert!(
+        min_with_gm >= min_without_gm + icc_size,
+        "ikinci GainMap alt_icc_profile ({icc_size} B) bütçe eşiğine yansımalı: without={min_without_gm}, with={min_with_gm}"
+    );
+
+    // 2. 4×4 Grid AVIF (hem tekrarsız `!has_dups` renk ızgarası hem 16 renk karosunun
+    //    ortak bir alfa karosuna `auxl` ile bağlandığı `has_dups` alfa ızgarası):
+    //    bütçe altında hem başarı hem sıkı sınırda `BudgetExceeded` doğrulanır.
+    let grid_desc: [u8; 8] = [0, 0, 3, 3, 0, 4, 0, 4]; // 4x4 grid, 4x4 çıktı
+    let mut iinf_g_body = 18u16.to_be_bytes().to_vec();
+    iinf_g_body.extend_from_slice(&make_infe(1, b"grid")); // primary color grid
+    for id in 2u16..=17u16 {
+        iinf_g_body.extend_from_slice(&make_infe(id, b"av01")); // 16 color tiles
+    }
+    iinf_g_body.extend_from_slice(&make_infe(18, b"av01")); // 1 shared alpha tile
+    let iinf_g = make_full_box(b"iinf", 0, 0, &iinf_g_body);
+
+    let mut dimg_color = Vec::new();
+    dimg_color.extend_from_slice(&1u16.to_be_bytes());
+    dimg_color.extend_from_slice(&16u16.to_be_bytes());
+    for id in 2u16..=17u16 {
+        dimg_color.extend_from_slice(&id.to_be_bytes());
+    }
+    let mut auxl_alpha = Vec::new();
+    auxl_alpha.extend_from_slice(&18u16.to_be_bytes()); // from shared alpha tile 18
+    auxl_alpha.extend_from_slice(&16u16.to_be_bytes()); // to all 16 color tiles
+    for id in 2u16..=17u16 {
+        auxl_alpha.extend_from_slice(&id.to_be_bytes());
+    }
+    let mut iref_g_body = make_box(b"dimg", &dimg_color);
+    iref_g_body.extend_from_slice(&make_box(b"auxl", &auxl_alpha));
+    let iref_g = make_full_box(b"iref", 0, 0, &iref_g_body);
+
+    let mut ispe4 = Vec::new();
+    ispe4.extend_from_slice(&4u32.to_be_bytes());
+    ispe4.extend_from_slice(&4u32.to_be_bytes());
+    let mut ispe1 = Vec::new();
+    ispe1.extend_from_slice(&1u32.to_be_bytes());
+    ispe1.extend_from_slice(&1u32.to_be_bytes());
+    let auxc_alpha = make_full_box(
+        b"auxC",
+        0,
+        0,
+        b"urn:mpeg:mpegB:cicp:systems:auxiliary:alpha\0",
+    );
+    let mut ipco_g = make_full_box(b"ispe", 0, 0, &ispe4); // prop 1
+    ipco_g.extend_from_slice(&make_full_box(b"ispe", 0, 0, &ispe1)); // prop 2
+    ipco_g.extend_from_slice(&make_box(b"av1C", &[0x81, 0x00, 0x0C, 0x00])); // prop 3
+    ipco_g.extend_from_slice(&auxc_alpha); // prop 4
+    let ipco_g_box = make_box(b"ipco", &ipco_g);
+
+    let mut ipma_g_body = 18u32.to_be_bytes().to_vec();
+    ipma_g_body.extend_from_slice(&1u16.to_be_bytes());
+    ipma_g_body.push(1);
+    ipma_g_body.push(0x01);
+    for id in 2u16..=17u16 {
+        ipma_g_body.extend_from_slice(&id.to_be_bytes());
+        ipma_g_body.push(2);
+        ipma_g_body.extend_from_slice(&[0x02, 0x83]);
+    }
+    ipma_g_body.extend_from_slice(&18u16.to_be_bytes());
+    ipma_g_body.push(3);
+    ipma_g_body.extend_from_slice(&[0x02, 0x83, 0x84]);
+    let ipma_g = make_full_box(b"ipma", 0, 0, &ipma_g_body);
+    let iprp_g = make_box(
+        b"iprp",
+        &[ipco_g_box.as_slice(), ipma_g.as_slice()].concat(),
+    );
+
+    let mut idat_g_payload = Vec::new();
+    idat_g_payload.extend_from_slice(&grid_desc);
+    let tile_off = idat_g_payload.len() as u32;
+    idat_g_payload.extend_from_slice(SAMPLE_1X1_AV1_OBU);
+    let idat_g = make_box(b"idat", &idat_g_payload);
+
+    let mut iloc_g_body = vec![0x44u8, 0x00];
+    iloc_g_body.extend_from_slice(&18u16.to_be_bytes());
+    for id in 1u16..=18u16 {
+        let (off, len) = if id == 1 {
+            (0u32, grid_desc.len() as u32)
+        } else {
+            (tile_off, SAMPLE_1X1_AV1_OBU.len() as u32)
+        };
+        iloc_g_body.extend_from_slice(&id.to_be_bytes());
+        iloc_g_body.extend_from_slice(&1u16.to_be_bytes());
+        iloc_g_body.extend_from_slice(&0u16.to_be_bytes());
+        iloc_g_body.extend_from_slice(&1u16.to_be_bytes());
+        iloc_g_body.extend_from_slice(&off.to_be_bytes());
+        iloc_g_body.extend_from_slice(&len.to_be_bytes());
+    }
+    let iloc_g = make_full_box(b"iloc", 1, 0, &iloc_g_body);
+
+    let mut meta_g = Vec::new();
+    for b in [&hdlr, &pitm, &iinf_g, &iref_g, &iprp_g, &iloc_g, &idat_g] {
+        meta_g.extend_from_slice(b);
+    }
+    let mut avif_grid = ftyp;
+    avif_grid.extend_from_slice(&make_full_box(b"meta", 0, 0, &meta_g));
+
+    let img_grid = decode_with(
+        &avif_grid,
+        &AvifDecodeConfig {
+            n_threads: 1,
+            ..AvifDecodeConfig::default()
+        },
+    )
+    .expect("4x4 renk + tekrarlı alfa grid çözülmeli");
+    assert_eq!((img_grid.width(), img_grid.height()), (4, 4));
+    assert!(img_grid.alpha_plane().is_some());
+
+    let (res_tight_grid, max_tight_grid, _) = measure_allocs(|| {
+        decode_with(
+            &avif_grid,
+            &AvifDecodeConfig {
+                n_threads: 1,
+                allocation_limit: Some(1024),
+                ..AvifDecodeConfig::default()
+            },
+        )
+    });
+    assert!(matches!(res_tight_grid, Err(Error::BudgetExceeded { .. })));
+    assert!(
+        max_tight_grid <= 4096,
+        "sıkı bütçeli grid reddi aşırı tekil tahsis yapmamalı: {max_tight_grid}"
+    );
+}
