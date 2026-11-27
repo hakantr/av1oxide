@@ -1526,7 +1526,7 @@ fn build_synthetic_avis_with_alpha(
                           chunk_offset: u32,
                           keyframes_1based: &[u32]|
      -> Vec<u8> {
-        // tkhd v0: 80 bayt gövde (20 + 52 + 8)
+        // tkhd v0: 80 bayt gövde (20 + 52 + 8) + standart birim matris
         let mut tkhd_body = vec![0u8; 80];
         tkhd_body[8..12].copy_from_slice(&track_id.to_be_bytes());
         let track_dur = if infinite_loop {
@@ -1535,6 +1535,9 @@ fn build_synthetic_avis_with_alpha(
             (sample_sizes.len() as u32) * 3 // 3 oynatma = 2 ek tekrar
         };
         tkhd_body[16..20].copy_from_slice(&track_dur.to_be_bytes());
+        tkhd_body[36..40].copy_from_slice(&0x0001_0000i32.to_be_bytes()); // a = 1.0
+        tkhd_body[52..56].copy_from_slice(&0x0001_0000i32.to_be_bytes()); // d = 1.0
+        tkhd_body[68..72].copy_from_slice(&0x4000_0000i32.to_be_bytes()); // w = 1.0 (2.30)
         // width = 1 << 16, height = 1 << 16
         tkhd_body[72..76].copy_from_slice(&(1u32 << 16).to_be_bytes());
         tkhd_body[76..80].copy_from_slice(&(1u32 << 16).to_be_bytes());
@@ -2373,6 +2376,9 @@ fn avif_sequence_ctts_v0_and_signed_v1_pts() {
             let mut tkhd_body = vec![0u8; 80];
             tkhd_body[8..12].copy_from_slice(&1u32.to_be_bytes());
             tkhd_body[16..20].copy_from_slice(&30u32.to_be_bytes());
+            tkhd_body[36..40].copy_from_slice(&0x0001_0000i32.to_be_bytes()); // a = 1.0
+            tkhd_body[52..56].copy_from_slice(&0x0001_0000i32.to_be_bytes()); // d = 1.0
+            tkhd_body[68..72].copy_from_slice(&0x4000_0000i32.to_be_bytes()); // w = 1.0 (2.30)
             tkhd_body[72..76].copy_from_slice(&(1u32 << 16).to_be_bytes());
             tkhd_body[76..80].copy_from_slice(&(1u32 << 16).to_be_bytes());
             let tkhd = make_full_box(b"tkhd", 0, 3, &tkhd_body);
@@ -2489,4 +2495,349 @@ fn avif_sequence_ctts_v0_and_signed_v1_pts() {
         AvifSequenceDecoder::new(&avis_neg),
         Err(Error::InvalidData(_))
     ));
+}
+
+/// `6.E.4` (`P2-4`): Bitişik olmayan uzamsal katman kimliklerinde (`spatial_id = {0, 2}`)
+/// `a1lx` + `lsel = 2` eşleşmesi ve mevcut olmayan `lsel = 1` reddi.
+#[test]
+fn avif_lsel_non_contiguous_spatial_id_with_a1lx() {
+    let td_and_seq: &[u8] = &SAMPLE_1X1_AV1_OBU[..13];
+    const LAYER0_FRAME_PAYLOAD: &[u8] = &[
+        0x00, 0x00, 0xFF, 0x64, 0x40, 0x00, 0x00, 0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x68, 0xD2,
+        0x16, 0x8C, 0x64, 0xBE, 0x2E, 0xC7, 0xDA, 0xEE, 0x96,
+    ];
+    let layer2_frame_payload: &[u8] = &SAMPLE_1X1_AV1_OBU[15..];
+
+    let mut layered_obu = Vec::new();
+    layered_obu.extend_from_slice(td_and_seq);
+    // Katman dilimi 0: spatial_id = 0 (ext = 0x00)
+    layered_obu.push(0x36);
+    layered_obu.push(0x00);
+    layered_obu.push(LAYER0_FRAME_PAYLOAD.len() as u8);
+    layered_obu.extend_from_slice(LAYER0_FRAME_PAYLOAD);
+    let layer0_total_len = layered_obu.len();
+    // Katman dilimi 1: spatial_id = 2 (bit [4:3] = 2 -> ext = 0x10)
+    layered_obu.push(0x36);
+    layered_obu.push(0x10);
+    layered_obu.push(layer2_frame_payload.len() as u8);
+    layered_obu.extend_from_slice(layer2_frame_payload);
+
+    let build_avif = |lsel: u16| -> Vec<u8> {
+        let ftyp = make_ftyp(b"avif", &[*b"mif1"]);
+        let hdlr = make_hdlr_pict();
+        let pitm = make_full_box(b"pitm", 0, 0, &1u16.to_be_bytes());
+        let mut iinf_body = 1u16.to_be_bytes().to_vec();
+        iinf_body.extend_from_slice(&make_infe_v2(1, b"av01", None));
+        let iinf = make_full_box(b"iinf", 0, 0, &iinf_body);
+
+        let mut a1lx_body = vec![0u8];
+        a1lx_body.extend_from_slice(&(layer0_total_len as u16).to_be_bytes());
+        a1lx_body.extend_from_slice(&0u16.to_be_bytes());
+        a1lx_body.extend_from_slice(&0u16.to_be_bytes());
+
+        let mut ipco_body = make_ispe(1, 1);
+        ipco_body.extend_from_slice(&make_box(b"lsel", &lsel.to_be_bytes()));
+        ipco_body.extend_from_slice(&make_box(b"a1lx", &a1lx_body));
+        let ipco = make_box(b"ipco", &ipco_body);
+
+        let mut ipma_body = Vec::new();
+        ipma_body.extend_from_slice(&1u32.to_be_bytes());
+        ipma_body.extend_from_slice(&1u16.to_be_bytes());
+        ipma_body.push(3);
+        ipma_body.extend_from_slice(&[0x01, 0x82, 0x03]);
+        let ipma = make_full_box(b"ipma", 0, 0, &ipma_body);
+        let mut iprp_body = ipco;
+        iprp_body.extend_from_slice(&ipma);
+        let iprp = make_box(b"iprp", &iprp_body);
+
+        let idat = make_box(b"idat", &layered_obu);
+        let mut iloc_body = vec![0x44u8, 0x00];
+        iloc_body.extend_from_slice(&1u16.to_be_bytes());
+        iloc_body.extend_from_slice(&1u16.to_be_bytes());
+        iloc_body.extend_from_slice(&1u16.to_be_bytes());
+        iloc_body.extend_from_slice(&0u16.to_be_bytes());
+        iloc_body.extend_from_slice(&1u16.to_be_bytes());
+        iloc_body.extend_from_slice(&0u32.to_be_bytes());
+        iloc_body.extend_from_slice(&(layered_obu.len() as u32).to_be_bytes());
+        let iloc = make_full_box(b"iloc", 1, 0, &iloc_body);
+
+        let mut meta_children = Vec::new();
+        for b in [&hdlr, &pitm, &iinf, &iprp, &iloc, &idat] {
+            meta_children.extend_from_slice(b);
+        }
+        let mut file = ftyp;
+        file.extend_from_slice(&make_full_box(b"meta", 0, 0, &meta_children));
+        file
+    };
+
+    // lsel = 2: a1lx'te 2 dilim olsa da 2. dilim spatial_id=2 taşıdığı için başarıyla çözülmeli.
+    let img_l2 = decode(&build_avif(2)).expect("bitişik olmayan spatial_id=2 lsel=2 ile çözülmeli");
+    assert_eq!(img_l2.y_plane_u8(), Some(&[190u8][..]));
+
+    // lsel = 1: hiçbir a1lx diliminde spatial_id=1 yok -> InvalidData.
+    assert!(matches!(decode(&build_avif(1)), Err(Error::InvalidData(_))));
+
+    // lsel = 0xFFFF: tüm katmanlar -> spatial_id=2 çözülür.
+    let img_all = decode(&build_avif(0xFFFF)).expect("lsel=0xFFFF ile çözülmeli");
+    assert_eq!(img_all.y_plane_u8(), Some(&[190u8][..]));
+}
+
+/// `6.E.4` (`P2-5`): AVIS `tkhd` 3×3 yönelim matrisi (90°/180°/ayna + geçersiz matris reddi)
+/// ve `flags = 0` `elst` zaman çizelgesi (`media_time = -1` boş düzenleme + `media_time > 0`
+/// `KEY -> INTER` sessiz `pre-roll` ve `next_frame`/`nth_frame` eşliği).
+#[test]
+fn avif_sequence_tkhd_orientation_and_elst_timeline() {
+    const P: i32 = 0x0001_0000;
+    const N: i32 = -0x0001_0000;
+    const W: i32 = 0x4000_0000;
+
+    // 432x240 gerçek KEY -> INTER1 -> INTER2 IVF fikstürünün ilk 3 paketini oku.
+    let ivf_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(
+        "tests/fixtures/streams/Syntax_AV1_mainb8ss420_432x240_002_vq_aom_ctest_4.2.stripped.ivf",
+    );
+    let raw_ivf = fs::read(&ivf_path).expect("IVF fikstürü okunmalı");
+    let mut ivf_pkts: Vec<Vec<u8>> = Vec::new();
+    let mut pos = 32usize;
+    while pos + 12 <= raw_ivf.len() && ivf_pkts.len() < 3 {
+        let sz = u32::from_le_bytes(raw_ivf[pos..pos + 4].try_into().unwrap()) as usize;
+        pos += 12;
+        ivf_pkts.push(raw_ivf[pos..pos + sz].to_vec());
+        pos += sz;
+    }
+    assert_eq!(ivf_pkts.len(), 3);
+
+    type ElstEntryV0 = (u32, i32, i16, i16);
+
+    #[allow(clippy::too_many_arguments)]
+    let build_avis = |samples: &[&[u8]],
+                      w: u32,
+                      h: u32,
+                      matrix: [i32; 9],
+                      movie_ts: u32,
+                      media_ts: u32,
+                      sample_delta: u32,
+                      elst_v0: Option<(u32, &[ElstEntryV0])>,
+                      keyframes_1based: &[u32]|
+     -> Vec<u8> {
+        let ftyp = make_ftyp(b"avis", &[*b"msf1", *b"avif", *b"miaf"]);
+
+        let mut mvhd_body = vec![0u8; 96];
+        mvhd_body[8..12].copy_from_slice(&movie_ts.to_be_bytes());
+        mvhd_body[12..16].copy_from_slice(&((samples.len() as u32) * sample_delta).to_be_bytes());
+        let mvhd = make_full_box(b"mvhd", 0, 0, &mvhd_body);
+
+        let make_trak = |chunk_offset: u32| -> Vec<u8> {
+            let mut tkhd_body = vec![0u8; 80];
+            tkhd_body[8..12].copy_from_slice(&1u32.to_be_bytes());
+            tkhd_body[16..20]
+                .copy_from_slice(&((samples.len() as u32) * sample_delta).to_be_bytes());
+            for (i, &val) in matrix.iter().enumerate() {
+                tkhd_body[36 + i * 4..40 + i * 4].copy_from_slice(&val.to_be_bytes());
+            }
+            tkhd_body[72..76].copy_from_slice(&(w << 16).to_be_bytes());
+            tkhd_body[76..80].copy_from_slice(&(h << 16).to_be_bytes());
+            let tkhd = make_full_box(b"tkhd", 0, 3, &tkhd_body);
+
+            let edts_opt = elst_v0.map(|(flags, entries)| {
+                let mut elst_body = Vec::new();
+                elst_body.extend_from_slice(&(entries.len() as u32).to_be_bytes());
+                for &(sd, mt, r_int, r_frac) in entries {
+                    elst_body.extend_from_slice(&sd.to_be_bytes());
+                    elst_body.extend_from_slice(&mt.to_be_bytes());
+                    elst_body.extend_from_slice(&r_int.to_be_bytes());
+                    elst_body.extend_from_slice(&r_frac.to_be_bytes());
+                }
+                make_box(b"edts", &make_full_box(b"elst", 0, flags, &elst_body))
+            });
+
+            let mut mdhd_body = vec![0u8; 20];
+            mdhd_body[8..12].copy_from_slice(&media_ts.to_be_bytes());
+            mdhd_body[12..16]
+                .copy_from_slice(&((samples.len() as u32) * sample_delta).to_be_bytes());
+            let mdhd = make_full_box(b"mdhd", 0, 0, &mdhd_body);
+
+            let mut hdlr_body = Vec::new();
+            hdlr_body.extend_from_slice(&0u32.to_be_bytes());
+            hdlr_body.extend_from_slice(b"pict");
+            hdlr_body.extend_from_slice(&[0u8; 13]);
+            let hdlr = make_full_box(b"hdlr", 0, 0, &hdlr_body);
+
+            let mut av01_payload = vec![0u8; 78];
+            av01_payload[24..26].copy_from_slice(&(w as u16).to_be_bytes());
+            av01_payload[26..28].copy_from_slice(&(h as u16).to_be_bytes());
+            av01_payload.extend_from_slice(&make_box(b"av1C", &[0x81, 0x00, 0x0C, 0x00]));
+            let mut stsd_body = 1u32.to_be_bytes().to_vec();
+            stsd_body.extend_from_slice(&make_box(b"av01", &av01_payload));
+            let stsd = make_full_box(b"stsd", 0, 0, &stsd_body);
+
+            let mut stts_body = Vec::new();
+            stts_body.extend_from_slice(&1u32.to_be_bytes());
+            stts_body.extend_from_slice(&(samples.len() as u32).to_be_bytes());
+            stts_body.extend_from_slice(&sample_delta.to_be_bytes());
+            let stts = make_full_box(b"stts", 0, 0, &stts_body);
+
+            let mut stsc_body = Vec::new();
+            stsc_body.extend_from_slice(&1u32.to_be_bytes());
+            stsc_body.extend_from_slice(&1u32.to_be_bytes());
+            stsc_body.extend_from_slice(&(samples.len() as u32).to_be_bytes());
+            stsc_body.extend_from_slice(&1u32.to_be_bytes());
+            let stsc = make_full_box(b"stsc", 0, 0, &stsc_body);
+
+            let mut stsz_body = Vec::new();
+            stsz_body.extend_from_slice(&0u32.to_be_bytes());
+            stsz_body.extend_from_slice(&(samples.len() as u32).to_be_bytes());
+            for s in samples {
+                stsz_body.extend_from_slice(&(s.len() as u32).to_be_bytes());
+            }
+            let stsz = make_full_box(b"stsz", 0, 0, &stsz_body);
+
+            let mut stco_body = 1u32.to_be_bytes().to_vec();
+            stco_body.extend_from_slice(&chunk_offset.to_be_bytes());
+            let stco = make_full_box(b"stco", 0, 0, &stco_body);
+
+            let mut stss_body = (keyframes_1based.len() as u32).to_be_bytes().to_vec();
+            for &kf in keyframes_1based {
+                stss_body.extend_from_slice(&kf.to_be_bytes());
+            }
+            let stss = make_full_box(b"stss", 0, 0, &stss_body);
+
+            let mut stbl_body = Vec::new();
+            for b in [&stsd, &stts, &stsc, &stsz, &stco, &stss] {
+                stbl_body.extend_from_slice(b);
+            }
+            let stbl = make_box(b"stbl", &stbl_body);
+            let minf = make_box(b"minf", &stbl);
+            let mut mdia_body = Vec::new();
+            for b in [&mdhd, &hdlr, &minf] {
+                mdia_body.extend_from_slice(b);
+            }
+            let mdia = make_box(b"mdia", &mdia_body);
+
+            let mut trak_body = tkhd;
+            if let Some(edts) = edts_opt {
+                trak_body.extend_from_slice(&edts);
+            }
+            trak_body.extend_from_slice(&mdia);
+            make_box(b"trak", &trak_body)
+        };
+
+        let mut mdat_payload = Vec::new();
+        for s in samples {
+            mdat_payload.extend_from_slice(s);
+        }
+        let dummy_moov = make_box(b"moov", &[mvhd.as_slice(), &make_trak(0)].concat());
+        let data_off = (ftyp.len() + dummy_moov.len() + 8) as u32;
+        let moov = make_box(b"moov", &[mvhd.as_slice(), &make_trak(data_off)].concat());
+        let mdat = make_box(b"mdat", &mdat_payload);
+
+        let mut file = ftyp;
+        file.extend_from_slice(&moov);
+        file.extend_from_slice(&mdat);
+        file
+    };
+
+    let pkt_refs: Vec<&[u8]> = ivf_pkts.iter().map(Vec::as_slice).collect();
+    let identity = [P, 0, 0, 0, P, 0, 0, 0, W];
+
+    // Referans: elst'siz ve birim matrisli 3 ham kare (KEY, INTER1, INTER2).
+    let base_avis = build_avis(&pkt_refs, 432, 240, identity, 30, 30, 10, None, &[1]);
+    let mut base_dec = AvifSequenceDecoder::new(&base_avis).unwrap();
+    let mut ref_frames = Vec::new();
+    while let Some(f) = base_dec.next_frame().unwrap() {
+        ref_frames.push(f.image);
+    }
+    assert_eq!(ref_frames.len(), 3);
+    assert_eq!((ref_frames[0].width(), ref_frames[0].height()), (432, 240));
+
+    // 1. `tkhd` 90° CCW (`[0, -P, P, 0]`, ötelemeli `x=100, y=200`): boyut 432x240 -> 240x432
+    //    ve piksel (x=0, y=0) == eski (x=431, y=0).
+    let rot90_ccw = [0, N, 0, P, 0, 0, 100, 200, W];
+    let avis_rot90 = build_avis(&pkt_refs[..1], 432, 240, rot90_ccw, 30, 30, 10, None, &[1]);
+    let mut dec_rot90 = AvifSequenceDecoder::new(&avis_rot90).unwrap();
+    assert_eq!(
+        (dec_rot90.info().width, dec_rot90.info().height),
+        (240, 432)
+    );
+    let f_rot90 = dec_rot90.next_frame().unwrap().unwrap();
+    assert_eq!((f_rot90.image.width(), f_rot90.image.height()), (240, 432));
+    let ref_y = ref_frames[0].y_plane_u8().unwrap();
+    let rot90_y = f_rot90.image.y_plane_u8().unwrap();
+    assert_eq!(rot90_y[0], ref_y[431]);
+    assert_eq!(rot90_y[431 * 240 + 239], ref_y[239 * 432]);
+
+    // 2. `tkhd` 180° (`[-P, 0, 0, -P]`): boyut 432x240, piksel (0,0) == eski (431, 239).
+    let rot180 = [N, 0, 0, 0, N, 0, 0, 0, W];
+    let avis_rot180 = build_avis(&pkt_refs[..1], 432, 240, rot180, 30, 30, 10, None, &[1]);
+    let f_rot180 = AvifSequenceDecoder::new(&avis_rot180)
+        .unwrap()
+        .next_frame()
+        .unwrap()
+        .unwrap();
+    let rot180_y = f_rot180.image.y_plane_u8().unwrap();
+    assert_eq!(rot180_y[0], ref_y[239 * 432 + 431]);
+
+    // 3. `tkhd` yatay ayna (`[-P, 0, 0, P]`): piksel (0,0) == eski (431, 0).
+    let mir_h = [N, 0, 0, 0, P, 0, 0, 0, W];
+    let avis_mir = build_avis(&pkt_refs[..1], 432, 240, mir_h, 30, 30, 10, None, &[1]);
+    let f_mir = AvifSequenceDecoder::new(&avis_mir)
+        .unwrap()
+        .next_frame()
+        .unwrap()
+        .unwrap();
+    let mir_y = f_mir.image.y_plane_u8().unwrap();
+    assert_eq!(mir_y[0], ref_y[431]);
+    assert_eq!(mir_y[431], ref_y[0]);
+
+    // 4. Geçersiz (ölçeklemeli / eğimli) `tkhd` matrisi -> Error::Unsupported.
+    let bad_mat = [2 * P, 0, 0, 0, 2 * P, 0, 0, 0, W];
+    let avis_bad_mat = build_avis(&pkt_refs[..1], 432, 240, bad_mat, 30, 30, 10, None, &[1]);
+    assert!(matches!(
+        AvifSequenceDecoder::new(&avis_bad_mat),
+        Err(Error::Unsupported(_))
+    ));
+
+    // 5. `flags = 0` `elst`: 5 birimlik boş düzenleme (`media_time = -1`) + `media_time = 10`,
+    //    `segment_duration = 20` (farklı `movie_ts = 60`, `media_ts = 30` ölçeklemesi:
+    //    movie 10 -> media 5, movie 40 -> media 20).
+    //    Ham 0 (KEY, t=0..10) gizli pre-roll olarak çözülüp Ham 1 (INTER1) ve Ham 2 (INTER2) sunulmalı!
+    let elst_entries = [(10u32, -1i32, 1i16, 0i16), (40u32, 10i32, 1i16, 0i16)];
+    let avis_elst = build_avis(
+        &pkt_refs,
+        432,
+        240,
+        identity,
+        60,
+        30,
+        10,
+        Some((0, &elst_entries)),
+        &[1],
+    );
+    let mut seq = AvifSequenceDecoder::new(&avis_elst).expect("elst AVIS açılmalı");
+    assert_eq!(seq.info().frame_count, 2);
+    assert_eq!(seq.info().duration_in_timescale, 25);
+
+    let f0 = seq.next_frame().unwrap().expect("sunum karesi 0 (INTER1)");
+    assert_eq!(f0.index, 0);
+    assert_eq!(f0.pts_in_timescale, 5);
+    assert_eq!(f0.duration_in_timescale, 10);
+    assert!(!f0.is_keyframe);
+    assert_eq!(f0.image, ref_frames[1]);
+
+    let f1 = seq.next_frame().unwrap().expect("sunum karesi 1 (INTER2)");
+    assert_eq!(f1.index, 1);
+    assert_eq!(f1.pts_in_timescale, 15);
+    assert_eq!(f1.duration_in_timescale, 10);
+    assert!(!f1.is_keyframe);
+    assert_eq!(f1.image, ref_frames[2]);
+    assert!(seq.next_frame().unwrap().is_none());
+
+    // Geriye ve ileriye `nth_frame` de pre-roll ile birebir aynı pikselleri vermeli.
+    let seek0 = seq
+        .nth_frame(0)
+        .expect("nth_frame(0) pre-roll ile çözülmeli");
+    assert_eq!(seek0.pts_in_timescale, 5);
+    assert_eq!(seek0.image, ref_frames[1]);
+    let seek1 = seq.nth_frame(1).expect("nth_frame(1) çözülmeli");
+    assert_eq!(seek1.pts_in_timescale, 15);
+    assert_eq!(seek1.image, ref_frames[2]);
 }

@@ -1099,39 +1099,62 @@ fn decode_av01_item(
 
     let (payload, payload_guard) = container.resolve_item_data(item_id, butce)?;
 
-    // `lsel` (0..=3) ile birlikte `a1lx` mevcutsa `libavif` (`read.c:743-756`) gibi katman
-    // sayısı ve önek bayt uzunluğu doğrulanır.
+    // `lsel` (0..=3) ile birlikte `a1lx` mevcutsa her `a1lx` katman diliminin taşıdığı gerçek
+    // OBU `spatial_id` değeri taranır; böylece bitişik olmayan uzamsal katman kimliklerinde
+    // (ör. `spatial_id = {0, 2}`, `lsel = 2`) doğru önek dilimi seçilir.
     let target_layer_id = layer_sel.filter(|&ls| ls != 0xFFFF);
     let decode_payload: &[u8] = if let Some(target_layer) = target_layer_id {
         if let Some(a1lx) = a1lx_opt {
-            let mut layer_sizes = [0usize; 4];
+            let mut layer_ranges = [(0usize, 0usize); 4];
             let mut layer_count = 0usize;
             let mut sum = 0usize;
             for &sz in &a1lx {
                 if sz == 0 {
                     break;
                 }
-                sum = sum
+                let end = sum
                     .checked_add(sz)
                     .ok_or(Error::InvalidData("a1lx katman boyut toplamı taşması"))?;
-                if sum > payload.len() {
+                if end > payload.len() {
                     return Err(Error::InvalidData(
                         "a1lx katman boyutları öğe boyutunu aşıyor",
                     ));
                 }
-                layer_sizes[layer_count] = sz;
+                layer_ranges[layer_count] = (sum, end);
                 layer_count += 1;
+                sum = end;
             }
             if sum < payload.len() && layer_count < 4 {
-                layer_sizes[layer_count] = payload.len() - sum;
+                layer_ranges[layer_count] = (sum, payload.len());
                 layer_count += 1;
             }
-            if usize::from(target_layer) >= layer_count {
-                return Err(Error::InvalidData(
-                    "lsel hedef katmanı a1lx katman sayısını aşıyor",
-                ));
+            let mut matched_prefix_end: Option<usize> = None;
+            for &(chunk_start, chunk_end) in &layer_ranges[..layer_count] {
+                let chunk = &payload[chunk_start..chunk_end];
+                let mut off = 0usize;
+                while let Some(obu) =
+                    crate::bitstream::split_next_with(chunk, &mut off, config.strict)?
+                {
+                    if matches!(
+                        obu.header.obu_type,
+                        crate::bitstream::ObuType::Frame
+                            | crate::bitstream::ObuType::FrameHeader
+                            | crate::bitstream::ObuType::RedundantFrameHeader
+                    ) {
+                        let sid = obu.header.extension.map_or(0u8, |e| e.spatial_id);
+                        if u16::from(sid) == target_layer {
+                            matched_prefix_end = Some(chunk_end);
+                            break;
+                        }
+                    }
+                }
+                if matched_prefix_end.is_some() {
+                    break;
+                }
             }
-            let prefix_len: usize = layer_sizes[..=usize::from(target_layer)].iter().sum();
+            let prefix_len = matched_prefix_end.ok_or(Error::InvalidData(
+                "lsel hedef katmanı a1lx katman dilimlerinde bulunamadı",
+            ))?;
             &payload[..prefix_len]
         } else {
             &payload

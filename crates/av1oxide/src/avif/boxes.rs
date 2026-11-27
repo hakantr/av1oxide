@@ -3,7 +3,7 @@
 
 #![forbid(unsafe_code)]
 
-use alloc::borrow::{Cow, ToOwned};
+use alloc::borrow::Cow;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -295,6 +295,11 @@ pub(crate) fn decompress_by_fourcc(
     }
 }
 
+pub(crate) fn read_i16_be(buf: &[u8], offset: usize) -> Option<i16> {
+    let bytes = buf.get(offset..offset.checked_add(2)?)?;
+    Some(i16::from_be_bytes([bytes[0], bytes[1]]))
+}
+
 pub(crate) fn read_u16_be(buf: &[u8], offset: usize) -> Option<u16> {
     let bytes = buf.get(offset..offset.checked_add(2)?)?;
     Some(u16::from_be_bytes([bytes[0], bytes[1]]))
@@ -317,6 +322,13 @@ pub(crate) fn read_u64_be(buf: &[u8], offset: usize) -> Option<u64> {
     ]))
 }
 
+pub(crate) fn read_i64_be(buf: &[u8], offset: usize) -> Option<i64> {
+    let bytes = buf.get(offset..offset.checked_add(8)?)?;
+    Some(i64::from_be_bytes([
+        bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+    ]))
+}
+
 fn read_uint_n(buf: &[u8], offset: usize, size: usize) -> Option<u64> {
     match size {
         0 => Some(0),
@@ -326,7 +338,8 @@ fn read_uint_n(buf: &[u8], offset: usize, size: usize) -> Option<u64> {
     }
 }
 
-fn read_cstring(buf: &[u8], offset: usize) -> Result<(String, usize)> {
+/// NUL sonlandırmalı UTF-8 ISOBMFF dizesini yığın tahsisi yapmadan ödünç dilim olarak okur.
+fn read_cstr_slice(buf: &[u8], offset: usize) -> Result<(&str, usize)> {
     let tail = buf
         .get(offset..)
         .ok_or(Error::InvalidData("ISOBMFF dize ofseti sınır dışında"))?;
@@ -334,7 +347,33 @@ fn read_cstring(buf: &[u8], offset: usize) -> Result<(String, usize)> {
         memchr::memchr(0, tail).ok_or(Error::InvalidData("ISOBMFF dizesi NUL ile sonlanmıyor"))?;
     let s = core::str::from_utf8(&tail[..nul_pos])
         .map_err(|_| Error::InvalidData("ISOBMFF dizesi geçerli UTF-8 değil"))?;
-    Ok((s.to_owned(), offset + nul_pos + 1))
+    Ok((s, offset + nul_pos + 1))
+}
+
+/// Dize uzunluğunu tahsisten **önce** bütçe defterine işler ve `try_reserve_exact` ile ayırır.
+fn alloc_string_budgeted(s: &str, guard: &mut ButceTutucu) -> Result<String> {
+    if s.is_empty() {
+        return Ok(String::new());
+    }
+    guard.ekle(s.len())?;
+    let mut out = String::new();
+    out.try_reserve_exact(s.len()).map_err(|_| {
+        guard.dusur(s.len());
+        Error::AllocationFailed { requested: s.len() }
+    })?;
+    out.push_str(s);
+    Ok(out)
+}
+
+/// Bayt dilimini tahsisten **önce** bütçe defterine işler ve `kopya_vec` ile ayırır.
+fn copy_slice_budgeted(src: &[u8], guard: &mut ButceTutucu) -> Result<Vec<u8>> {
+    if src.is_empty() {
+        return Ok(Vec::new());
+    }
+    guard.ekle(src.len())?;
+    kopya_vec(src).inspect_err(|_| {
+        guard.dusur(src.len());
+    })
 }
 
 /// Verilen dilim içindeki sıradaki ISOBMFF kutusunu okur.
@@ -807,24 +846,32 @@ fn parse_iinf(
             "iinf içindeki infe sayısı kutu boyutunu aşıyor",
         ));
     }
+    let slot_size = core::mem::size_of::<(u32, ItemInfoEntry)>();
     let reserve_n = (entry_count as usize).min(256);
-    items
-        .try_reserve(reserve_n)
-        .map_err(|_| Error::AllocationFailed {
-            requested: reserve_n.saturating_mul(core::mem::size_of::<(u32, ItemInfoEntry)>()),
+    let mut pre_reserved = reserve_n.saturating_mul(slot_size);
+    if pre_reserved > 0 {
+        guard.ekle(pre_reserved)?;
+        items.try_reserve(reserve_n).map_err(|_| {
+            guard.dusur(pre_reserved);
+            Error::AllocationFailed {
+                requested: pre_reserved,
+            }
         })?;
+    }
     let mut parsed = 0u32;
     while let Some(child) = read_box_header(body, offset)? {
         offset = child.next_offset;
         if &child.box_type == b"infe" {
-            let entry = parse_infe(child.payload)?;
-            let entry_bytes = core::mem::size_of::<(u32, ItemInfoEntry)>()
-                .saturating_add(entry.item_name.len())
-                .saturating_add(entry.content_type.len())
-                .saturating_add(entry.content_encoding.len());
-            guard.ekle(entry_bytes)?;
+            let entry = parse_infe(child.payload, guard)?;
+            if pre_reserved >= slot_size {
+                pre_reserved -= slot_size;
+            } else {
+                let extra = slot_size - pre_reserved;
+                pre_reserved = 0;
+                guard.ekle(extra)?;
+            }
             if let Some(prev) = items.insert(entry.item_id, entry) {
-                let prev_bytes = core::mem::size_of::<(u32, ItemInfoEntry)>()
+                let prev_bytes = slot_size
                     .saturating_add(prev.item_name.len())
                     .saturating_add(prev.content_type.len())
                     .saturating_add(prev.content_encoding.len());
@@ -832,6 +879,9 @@ fn parse_iinf(
             }
             parsed += 1;
         }
+    }
+    if pre_reserved > 0 {
+        guard.dusur(pre_reserved);
     }
     if parsed < entry_count {
         return Err(Error::InvalidData(
@@ -841,7 +891,7 @@ fn parse_iinf(
     Ok(())
 }
 
-fn parse_infe(payload: &[u8]) -> Result<ItemInfoEntry> {
+fn parse_infe(payload: &[u8], guard: &mut ButceTutucu) -> Result<ItemInfoEntry> {
     let (ver, flags, body) = read_full_box(payload)?;
     if !(2..=3).contains(&ver) {
         return Err(Error::Unsupported("yalnızca infe v2 ve v3 desteklenir"));
@@ -866,25 +916,30 @@ fn parse_infe(payload: &[u8]) -> Result<ItemInfoEntry> {
     let item_type = [body[pos], body[pos + 1], body[pos + 2], body[pos + 3]];
     pos += 4;
 
-    let (item_name, next_pos) = if pos < body.len() {
-        read_cstring(body, pos)?
+    let (item_name_s, next_pos) = if pos < body.len() {
+        read_cstr_slice(body, pos)?
     } else {
-        (String::new(), pos)
+        ("", pos)
     };
     pos = next_pos;
 
-    let (content_type, content_encoding) = if item_type == *b"mime" && pos < body.len() {
-        let (ct, next_pos) = read_cstring(body, pos)?;
+    let (content_type_s, content_encoding_s) = if item_type == *b"mime" && pos < body.len() {
+        let (ct, next_pos) = read_cstr_slice(body, pos)?;
         let ce = if next_pos < body.len() {
-            let (enc, _) = read_cstring(body, next_pos)?;
+            let (enc, _) = read_cstr_slice(body, next_pos)?;
             enc
         } else {
-            String::new()
+            ""
         };
         (ct, ce)
     } else {
-        (String::new(), String::new())
+        ("", "")
     };
+
+    // Tüm dize baytları yığın tahsisinden ÖNCE bütçe defterinden geçirilir.
+    let item_name = alloc_string_budgeted(item_name_s, guard)?;
+    let content_type = alloc_string_budgeted(content_type_s, guard)?;
+    let content_encoding = alloc_string_budgeted(content_encoding_s, guard)?;
 
     Ok(ItemInfoEntry {
         item_id,
@@ -960,9 +1015,8 @@ pub(crate) fn parse_property_boxes(
                 if body.len() < 1 + num_channels {
                     return Err(Error::InvalidData("kesik pixi kanal listesi"));
                 }
-                ItemProperty::Pixi {
-                    bits_per_channel: body[1..1 + num_channels].to_vec(),
-                }
+                let bits_per_channel = copy_slice_budgeted(&body[1..1 + num_channels], guard)?;
+                ItemProperty::Pixi { bits_per_channel }
             }
             b"av1C" => {
                 if prop_box.payload.len() < 4 {
@@ -1180,8 +1234,9 @@ pub(crate) fn parse_property_boxes(
                 if ver != 0 {
                     return Err(Error::Unsupported("auxC sürümü 0 dışında desteklenmiyor"));
                 }
-                let (aux_type, next_pos) = read_cstring(body, 0)?;
-                let subtype = body.get(next_pos..).unwrap_or(&[]).to_vec();
+                let (aux_type_s, next_pos) = read_cstr_slice(body, 0)?;
+                let aux_type = alloc_string_budgeted(aux_type_s, guard)?;
+                let subtype = copy_slice_budgeted(body.get(next_pos..).unwrap_or(&[]), guard)?;
                 ItemProperty::AuxC { aux_type, subtype }
             }
             b"auxi" if is_track => {
@@ -1189,8 +1244,9 @@ pub(crate) fn parse_property_boxes(
                 if ver != 0 {
                     return Err(Error::Unsupported("auxi sürümü 0 dışında desteklenmiyor"));
                 }
-                let (aux_type, next_pos) = read_cstring(body, 0)?;
-                let subtype = body.get(next_pos..).unwrap_or(&[]).to_vec();
+                let (aux_type_s, next_pos) = read_cstr_slice(body, 0)?;
+                let aux_type = alloc_string_budgeted(aux_type_s, guard)?;
+                let subtype = copy_slice_budgeted(body.get(next_pos..).unwrap_or(&[]), guard)?;
                 ItemProperty::AuxC { aux_type, subtype }
             }
             b"cmpC" => {
@@ -1203,14 +1259,7 @@ pub(crate) fn parse_property_boxes(
             }
             other => ItemProperty::Unknown(*other),
         };
-        let prop_bytes = core::mem::size_of::<ItemProperty>().saturating_add(match &p {
-            ItemProperty::Pixi { bits_per_channel } => bits_per_channel.len(),
-            ItemProperty::AuxC { aux_type, subtype } => {
-                aux_type.len().saturating_add(subtype.len())
-            }
-            _ => 0,
-        });
-        guard.ekle(prop_bytes)?;
+        guard.ekle(core::mem::size_of::<ItemProperty>())?;
         properties.push(p);
     }
     Ok(())
@@ -1232,12 +1281,18 @@ fn parse_ipma(
     if (entry_count as usize) > max_entries {
         return Err(Error::InvalidData("ipma entry_count kutu boyutunu aşıyor"));
     }
+    let slot_size = core::mem::size_of::<(u32, Vec<PropertyAssoc>)>();
     let reserve_n = (entry_count as usize).min(256);
-    associations
-        .try_reserve(reserve_n)
-        .map_err(|_| Error::AllocationFailed {
-            requested: reserve_n.saturating_mul(core::mem::size_of::<(u32, Vec<PropertyAssoc>)>()),
+    let mut pre_reserved = reserve_n.saturating_mul(slot_size);
+    if pre_reserved > 0 {
+        guard.ekle(pre_reserved)?;
+        associations.try_reserve(reserve_n).map_err(|_| {
+            guard.dusur(pre_reserved);
+            Error::AllocationFailed {
+                requested: pre_reserved,
+            }
         })?;
+    }
     let large_index = (flags & 1) != 0;
     let assoc_stride = if large_index { 2usize } else { 1usize };
 
@@ -1264,12 +1319,20 @@ fn parse_ipma(
             return Err(Error::InvalidData("kesik ipma özellik listesi"));
         }
         let is_new_key = !associations.contains_key(&item_id);
-        let entry_bytes = (if is_new_key {
-            core::mem::size_of::<(u32, Vec<PropertyAssoc>)>()
+        let key_bytes = if is_new_key {
+            if pre_reserved >= slot_size {
+                pre_reserved -= slot_size;
+                0
+            } else {
+                let extra = slot_size - pre_reserved;
+                pre_reserved = 0;
+                extra
+            }
         } else {
             0
-        })
-        .saturating_add(assoc_count.saturating_mul(core::mem::size_of::<PropertyAssoc>()));
+        };
+        let entry_bytes = key_bytes
+            .saturating_add(assoc_count.saturating_mul(core::mem::size_of::<PropertyAssoc>()));
         guard.ekle(entry_bytes)?;
 
         let mut list: Vec<PropertyAssoc> = Vec::new();
@@ -1303,6 +1366,9 @@ fn parse_ipma(
         }
 
         associations.entry(item_id).or_default().extend(list);
+    }
+    if pre_reserved > 0 {
+        guard.dusur(pre_reserved);
     }
     Ok(())
 }
@@ -1355,12 +1421,18 @@ fn parse_iloc(
     if (item_count as usize) > max_items {
         return Err(Error::InvalidData("iloc item_count kutu boyutunu aşıyor"));
     }
+    let slot_size = core::mem::size_of::<(u32, IlocItem)>();
     let reserve_n = (item_count as usize).min(256);
-    locations
-        .try_reserve(reserve_n)
-        .map_err(|_| Error::AllocationFailed {
-            requested: reserve_n.saturating_mul(core::mem::size_of::<(u32, IlocItem)>()),
+    let mut pre_reserved = reserve_n.saturating_mul(slot_size);
+    if pre_reserved > 0 {
+        guard.ekle(pre_reserved)?;
+        locations.try_reserve(reserve_n).map_err(|_| {
+            guard.dusur(pre_reserved);
+            Error::AllocationFailed {
+                requested: pre_reserved,
+            }
         })?;
+    }
     let ext_stride = (if ver == 1 || ver == 2 { index_size } else { 0 })
         .saturating_add(offset_size)
         .saturating_add(length_size);
@@ -1404,7 +1476,15 @@ fn parse_iloc(
                 return Err(Error::InvalidData("kesik iloc extent dizisi"));
             }
         }
-        let item_bytes = core::mem::size_of::<(u32, IlocItem)>()
+        let slot_extra = if pre_reserved >= slot_size {
+            pre_reserved -= slot_size;
+            0
+        } else {
+            let extra = slot_size - pre_reserved;
+            pre_reserved = 0;
+            extra
+        };
+        let item_bytes = slot_extra
             .saturating_add(extent_count.saturating_mul(core::mem::size_of::<IlocExtent>()));
         guard.ekle(item_bytes)?;
 
@@ -1446,13 +1526,16 @@ fn parse_iloc(
                 extents,
             },
         ) {
-            let prev_bytes = core::mem::size_of::<(u32, IlocItem)>().saturating_add(
+            let prev_bytes = slot_size.saturating_add(
                 prev.extents
                     .len()
                     .saturating_mul(core::mem::size_of::<IlocExtent>()),
             );
             guard.dusur(prev_bytes);
         }
+    }
+    if pre_reserved > 0 {
+        guard.dusur(pre_reserved);
     }
     Ok(())
 }

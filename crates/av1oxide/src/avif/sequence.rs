@@ -18,7 +18,10 @@ use crate::avif::image::{
     AvifDecodeConfig, AvifImage, CleanAperture, ColorInfo, ContentLightLevel, MasteringDisplay,
     PixelAspectRatio, PlaneStorage,
 };
-use crate::avif::tracks::{LoopCount, ParsedTrack, TrackSample, parse_movie};
+use crate::avif::tracks::{
+    LoopCount, ParsedTrack, PresentedSample, TrackSample, build_presented_timeline,
+    compose_d4_transforms, parse_movie,
+};
 use crate::bitstream::obu::parse_sequence_header_obus;
 use crate::bitstream::seq_header::PixelLayout;
 use crate::error::{Error, Result};
@@ -140,6 +143,10 @@ fn extract_track_properties(
             _ => {}
         }
     }
+    let (eff_irot, eff_imir) =
+        compose_d4_transforms(transforms.irot, transforms.imir, track.tkhd_matrix);
+    transforms.irot = eff_irot;
+    transforms.imir = eff_imir;
 
     let mut bit_depth: Option<BitDepth> = None;
     let mut chroma_format: Option<ChromaFormat> = None;
@@ -266,14 +273,43 @@ fn check_alpha_track_transform_compat(
 }
 
 struct TrackSequenceState {
-    color_samples: Vec<TrackSample>,
-    alpha_samples: Option<Vec<TrackSample>>,
+    raw_color_samples: Vec<TrackSample>,
+    raw_alpha_samples: Option<Vec<TrackSample>>,
+    presented: Vec<PresentedSample>,
     color_config_obus: Vec<u8>,
     alpha_config_obus: Vec<u8>,
     transforms: TrackTransforms,
     color_decoder: Option<Decoder>,
     alpha_decoder: Option<Decoder>,
-    next_index: usize,
+    decoder_raw_next: usize,
+    next_pres_index: usize,
+}
+
+impl TrackSequenceState {
+    fn is_raw_keyframe(&self, raw_index: usize) -> bool {
+        let Some(cs) = self.raw_color_samples.get(raw_index) else {
+            return false;
+        };
+        if !cs.is_keyframe {
+            return false;
+        }
+        if let Some(ref alphas) = self.raw_alpha_samples {
+            alphas.get(raw_index).is_some_and(|a| a.is_keyframe)
+        } else {
+            true
+        }
+    }
+
+    fn nearest_raw_keyframe(&self, raw_index: usize) -> usize {
+        let mut idx = raw_index.min(self.raw_color_samples.len().saturating_sub(1));
+        while idx > 0 {
+            if self.is_raw_keyframe(idx) {
+                return idx;
+            }
+            idx -= 1;
+        }
+        0
+    }
 }
 
 enum SequenceBackend {
@@ -397,7 +433,8 @@ impl<'a> AvifSequenceDecoder<'a> {
             }
 
             let timescale = color_track.media_timescale;
-            let duration_in_timescale = color_track.media_duration;
+            let (presented, duration_in_timescale) =
+                build_presented_timeline(color_track, &mut state_guard)?;
             let duration_sec = if timescale > 0 {
                 (duration_in_timescale as f64) / (timescale as f64)
             } else {
@@ -414,7 +451,7 @@ impl<'a> AvifSequenceDecoder<'a> {
                 .len()
                 .saturating_mul(core::mem::size_of::<TrackSample>());
             state_guard.ekle(color_sample_bytes)?;
-            let color_samples = color_track.samples.clone();
+            let raw_color_samples = color_track.samples.clone();
 
             let info = AvifSequenceInfo {
                 width: post_w,
@@ -423,7 +460,7 @@ impl<'a> AvifSequenceDecoder<'a> {
                 chroma_format: color_bundle.chroma_format,
                 has_alpha: alpha_track.is_some(),
                 premultiplied_alpha,
-                frame_count: color_samples.len(),
+                frame_count: presented.len(),
                 timescale,
                 duration_in_timescale,
                 duration_sec,
@@ -438,14 +475,16 @@ impl<'a> AvifSequenceDecoder<'a> {
             };
 
             let state = TrackSequenceState {
-                color_samples,
-                alpha_samples,
+                raw_color_samples,
+                raw_alpha_samples: alpha_samples,
+                presented,
                 color_config_obus: color_bundle.av1c_config_obus,
                 alpha_config_obus,
                 transforms: color_bundle.transforms,
                 color_decoder: None,
                 alpha_decoder: None,
-                next_index: 0,
+                decoder_raw_next: 0,
+                next_pres_index: 0,
             };
 
             Ok(Self {
@@ -520,17 +559,10 @@ impl<'a> AvifSequenceDecoder<'a> {
         match &self.backend {
             SequenceBackend::Still { .. } => index == 0,
             SequenceBackend::Track(st) => {
-                let Some(cs) = st.color_samples.get(index) else {
+                let Some(pres) = st.presented.get(index) else {
                     return false;
                 };
-                if !cs.is_keyframe {
-                    return false;
-                }
-                if let Some(ref alphas) = st.alpha_samples {
-                    alphas.get(index).is_some_and(|a| a.is_keyframe)
-                } else {
-                    true
-                }
+                st.is_raw_keyframe(pres.raw_index)
             }
         }
     }
@@ -556,7 +588,8 @@ impl<'a> AvifSequenceDecoder<'a> {
             SequenceBackend::Track(st) => {
                 st.color_decoder = None;
                 st.alpha_decoder = None;
-                st.next_index = 0;
+                st.decoder_raw_next = 0;
+                st.next_pres_index = 0;
             }
         }
     }
@@ -581,14 +614,14 @@ impl<'a> AvifSequenceDecoder<'a> {
                 }))
             }
             SequenceBackend::Track(_) => {
-                let idx = match &self.backend {
-                    SequenceBackend::Track(st) => st.next_index,
+                let pres_idx = match &self.backend {
+                    SequenceBackend::Track(st) => st.next_pres_index,
                     SequenceBackend::Still { .. } => unreachable!(),
                 };
-                if idx >= self.info.frame_count {
+                if pres_idx >= self.info.frame_count {
                     return Ok(None);
                 }
-                self.decode_next_track_frame(true)
+                self.decode_presented_frame(pres_idx).map(Some)
             }
         }
     }
@@ -597,7 +630,8 @@ impl<'a> AvifSequenceDecoder<'a> {
     ///
     /// Hedef kare geçerli konumun gerisindeyse veya ileri bir ortak anahtar kareye atlamak
     /// mümkünse çözücü en yakın ortak `stss` anahtar karesinden başlatılır ve ara kareler
-    /// bellekte biriktirilmeden yalnızca referans güncellemesi için çözülür.
+    /// (`elst` `media_time > 0` ön-çözüm `pre-roll` kareleri dâhil) bellekte biriktirilmeden
+    /// yalnızca referans güncellemesi için çözülür.
     pub fn nth_frame(&mut self, index: usize) -> Result<AvifFrame> {
         if index >= self.info.frame_count {
             return Err(Error::InvalidData(
@@ -611,58 +645,89 @@ impl<'a> AvifSequenceDecoder<'a> {
                 self.next_frame()?
                     .ok_or(Error::InvalidData("tek karelik AVIF çözülemedi"))
             }
-            SequenceBackend::Track(st) => {
-                let cur_next = st.next_index;
-                if index == cur_next {
-                    return self
-                        .next_frame()?
-                        .ok_or(Error::InvalidData("sıradaki kare çözülemedi"));
-                }
-                let nearest_kf = self.nearest_keyframe(index);
-                if (nearest_kf > cur_next || index < cur_next)
-                    && let SequenceBackend::Track(st_mut) = &mut self.backend
-                {
-                    st_mut.color_decoder = None;
-                    st_mut.alpha_decoder = None;
-                    st_mut.next_index = nearest_kf;
-                }
-                loop {
-                    let cur = match &self.backend {
-                        SequenceBackend::Track(s) => s.next_index,
-                        SequenceBackend::Still { .. } => unreachable!(),
-                    };
-                    let is_target = cur == index;
-                    let frame_opt = self.decode_next_track_frame(is_target)?;
-                    if is_target {
-                        return frame_opt
-                            .ok_or(Error::InvalidData("hedef kare AVIF dizisinden çözülemedi"));
-                    }
-                }
-            }
+            SequenceBackend::Track(_) => self.decode_presented_frame(index),
         }
     }
 
-    fn decode_next_track_frame(&mut self, build_output: bool) -> Result<Option<AvifFrame>> {
-        let is_keyframe_idx = {
-            let idx = match &self.backend {
-                SequenceBackend::Track(st) => st.next_index,
-                SequenceBackend::Still { .. } => return Ok(None),
-            };
-            self.is_keyframe(idx)
+    fn decode_presented_frame(&mut self, pres_index: usize) -> Result<AvifFrame> {
+        let (pres, is_keyframe) = match &self.backend {
+            SequenceBackend::Track(st) => {
+                let pres = *st.presented.get(pres_index).ok_or(Error::InvalidData(
+                    "istenen kare indeksi AVIF dizisi sınırları dışında",
+                ))?;
+                let kf = st.is_raw_keyframe(pres.raw_index);
+                (pres, kf)
+            }
+            SequenceBackend::Still { .. } => {
+                return Err(Error::InvalidState("parça çözücü durumu bekleniyordu"));
+            }
         };
 
+        let target_raw = pres.raw_index;
+        if let SequenceBackend::Track(st) = &mut self.backend {
+            let nearest_raw_kf = st.nearest_raw_keyframe(target_raw);
+            if target_raw < st.decoder_raw_next || nearest_raw_kf > st.decoder_raw_next {
+                st.color_decoder = None;
+                st.alpha_decoder = None;
+                st.decoder_raw_next = nearest_raw_kf;
+            }
+        }
+
+        loop {
+            let cur_raw = match &self.backend {
+                SequenceBackend::Track(st) => st.decoder_raw_next,
+                SequenceBackend::Still { .. } => unreachable!(),
+            };
+            if cur_raw < target_raw {
+                let _ = self.decode_next_raw_sample(false)?;
+            } else {
+                break;
+            }
+        }
+
+        let image = self
+            .decode_next_raw_sample(true)?
+            .ok_or(Error::InvalidData("hedef kare AVIF dizisinden çözülemedi"))?;
+        if let SequenceBackend::Track(st) = &mut self.backend {
+            st.next_pres_index = pres_index + 1;
+        }
+
+        let ts = self.info.timescale;
+        let pts_sec = if ts > 0 {
+            (pres.pts_in_timescale as f64) / (ts as f64)
+        } else {
+            0.0
+        };
+        let duration_sec = if ts > 0 {
+            (pres.duration_in_timescale as f64) / (ts as f64)
+        } else {
+            0.0
+        };
+
+        Ok(AvifFrame {
+            image,
+            index: pres_index,
+            pts_in_timescale: pres.pts_in_timescale,
+            duration_in_timescale: pres.duration_in_timescale,
+            pts_sec,
+            duration_sec,
+            is_keyframe,
+        })
+    }
+
+    fn decode_next_raw_sample(&mut self, build_output: bool) -> Result<Option<AvifImage>> {
         let SequenceBackend::Track(st) = &mut self.backend else {
             return Ok(None);
         };
-        let idx = st.next_index;
-        if idx >= st.color_samples.len() {
+        let raw_idx = st.decoder_raw_next;
+        if raw_idx >= st.raw_color_samples.len() {
             return Ok(None);
         }
 
-        let color_sample = st.color_samples[idx];
-        let alpha_sample = match &st.alpha_samples {
+        let color_sample = st.raw_color_samples[raw_idx];
+        let alpha_sample = match &st.raw_alpha_samples {
             Some(alphas) => {
-                let s = *alphas.get(idx).ok_or(Error::InvalidData(
+                let s = *alphas.get(raw_idx).ok_or(Error::InvalidData(
                     "alfa parçasında karşılık gelen örnek bulunamadı",
                 ))?;
                 Some(s)
@@ -708,7 +773,7 @@ impl<'a> AvifSequenceDecoder<'a> {
             None
         };
 
-        st.next_index = idx + 1;
+        st.decoder_raw_next = raw_idx + 1;
         if !build_output {
             return Ok(None);
         }
@@ -763,7 +828,7 @@ impl<'a> AvifSequenceDecoder<'a> {
         };
 
         let effective_threads = resolve_effective_threads(self.config.n_threads);
-        let image = AvifImage {
+        Ok(Some(AvifImage {
             width: color_buf.width,
             height: color_buf.height,
             chroma_width: color_buf.chroma_width,
@@ -787,28 +852,6 @@ impl<'a> AvifSequenceDecoder<'a> {
             effective_threads,
             butce: Some(Arc::clone(&self.butce)),
             _butce_tutucu: Some(Arc::new(frame_img_guard)),
-        };
-
-        let ts = self.info.timescale;
-        let pts_sec = if ts > 0 {
-            (color_sample.pts_in_timescale as f64) / (ts as f64)
-        } else {
-            0.0
-        };
-        let duration_sec = if ts > 0 {
-            (color_sample.duration_in_timescale as f64) / (ts as f64)
-        } else {
-            0.0
-        };
-
-        Ok(Some(AvifFrame {
-            image,
-            index: idx,
-            pts_in_timescale: color_sample.pts_in_timescale,
-            duration_in_timescale: color_sample.duration_in_timescale,
-            pts_sec,
-            duration_sec,
-            is_keyframe: is_keyframe_idx,
         }))
     }
 }

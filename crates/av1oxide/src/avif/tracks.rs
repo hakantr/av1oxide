@@ -10,7 +10,7 @@ use alloc::vec::Vec;
 use crate::avif::boxes::{
     ALPHA_AUX_URN_CICP, ALPHA_AUX_URN_HEVC, AvifContainer, ItemProperty, decompress_by_fourcc,
     is_supported_brand, parse_meta_box, parse_property_boxes, read_box_header, read_full_box,
-    read_i32_be, read_u32_be, read_u64_be,
+    read_i16_be, read_i32_be, read_i64_be, read_u32_be, read_u64_be,
 };
 use crate::error::{Error, Result};
 use crate::frame::butce::{Butce, ButceTutucu};
@@ -87,15 +87,88 @@ struct RawSampleTable {
     properties: Vec<ItemProperty>,
 }
 
+/// `elst` (`EditListBox`) içindeki tekil zaman çizelgesi girdisi.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct EditListEntry {
+    pub(crate) segment_duration: u64,
+    pub(crate) media_time: i64,
+    pub(crate) media_rate_integer: i16,
+    pub(crate) media_rate_fraction: i16,
+}
+
+/// Ayrıştırılmış `elst` kutusu.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct EditList {
+    pub(crate) flags: u32,
+    pub(crate) entries: Vec<EditListEntry>,
+}
+
+/// `elst` zaman çizelgesinden üretilen tekil sunum karesi kaydı.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct PresentedSample {
+    pub(crate) raw_index: usize,
+    pub(crate) pts_in_timescale: u64,
+    pub(crate) duration_in_timescale: u64,
+}
+
+/// `tkhd` 3×3 dönüşüm matrisinin birim 2×2 $D_4$ alt matrisi (`[[a, b], [c, d]]`, elemanlar `{-1, 0, 1}`).
+pub(crate) const TKHD_IDENTITY_MATRIX: [[i8; 2]; 2] = [[1, 0], [0, 1]];
+
+/// `irot`/`imir` çifti ile `tkhd` 2×2 $D_4$ matrisini (`stsd` → `tkhd` sırasıyla) birleştirir.
+pub(crate) fn compose_d4_transforms(
+    stsd_irot: Option<u8>,
+    stsd_imir: Option<u8>,
+    tkhd_mat: [[i8; 2]; 2],
+) -> (Option<u8>, Option<u8>) {
+    let mul = |lhs: [[i8; 2]; 2], rhs: [[i8; 2]; 2]| -> [[i8; 2]; 2] {
+        [
+            [
+                lhs[0][0] * rhs[0][0] + lhs[0][1] * rhs[1][0],
+                lhs[0][0] * rhs[0][1] + lhs[0][1] * rhs[1][1],
+            ],
+            [
+                lhs[1][0] * rhs[0][0] + lhs[1][1] * rhs[1][0],
+                lhs[1][0] * rhs[0][1] + lhs[1][1] * rhs[1][1],
+            ],
+        ]
+    };
+    let rot_mat = match stsd_irot.map(|a| a & 3) {
+        Some(1) => [[0, -1], [1, 0]],
+        Some(2) => [[-1, 0], [0, -1]],
+        Some(3) => [[0, 1], [-1, 0]],
+        _ => TKHD_IDENTITY_MATRIX,
+    };
+    let mir_mat = match stsd_imir.map(|m| m & 1) {
+        Some(0) => [[1, 0], [0, -1]],
+        Some(1) => [[-1, 0], [0, 1]],
+        _ => TKHD_IDENTITY_MATRIX,
+    };
+    let combined = mul(mul(rot_mat, mir_mat), tkhd_mat);
+    match combined {
+        [[1, 0], [0, 1]] => (None, None),
+        [[0, -1], [1, 0]] => (Some(1), None),
+        [[-1, 0], [0, -1]] => (Some(2), None),
+        [[0, 1], [-1, 0]] => (Some(3), None),
+        [[1, 0], [0, -1]] => (None, Some(0)),
+        [[-1, 0], [0, 1]] => (None, Some(1)),
+        [[0, 1], [1, 0]] => (Some(1), Some(0)),
+        [[0, -1], [-1, 0]] => (Some(1), Some(1)),
+        _ => (None, None),
+    }
+}
+
 /// Ayrıştırılmış tekil ISOBMFF `trak` kaydı.
 #[derive(Clone, Debug)]
 pub(crate) struct ParsedTrack<'a> {
     pub(crate) track_id: u32,
     pub(crate) width: u32,
     pub(crate) height: u32,
+    pub(crate) tkhd_matrix: [[i8; 2]; 2],
     pub(crate) handler_type: [u8; 4],
     pub(crate) media_timescale: u64,
     pub(crate) media_duration: u64,
+    pub(crate) movie_timescale: u64,
+    pub(crate) edit_list: Option<EditList>,
     pub(crate) repetition_count: LoopCount,
     pub(crate) is_av01: bool,
     pub(crate) properties: Vec<ItemProperty>,
@@ -184,6 +257,7 @@ pub(crate) fn parse_movie<'a>(data: &'a [u8], butce: &Arc<Butce>) -> Result<Pars
     let mut offset = 0usize;
     let mut major_brand: Option<[u8; 4]> = None;
     let mut compatible_brands: Vec<[u8; 4]> = Vec::new();
+    let mut ftyp_guard = ButceTutucu::bos(butce);
     let mut has_supported_brand = false;
     let mut moov_payload: Option<&'a [u8]> = None;
     let mut meta_payload: Option<Cow<'a, [u8]>> = None;
@@ -206,7 +280,17 @@ pub(crate) fn parse_movie<'a>(data: &'a [u8], butce: &Arc<Butce>) -> Result<Pars
                 if is_supported_brand(&major) {
                     has_supported_brand = true;
                 }
-                for &compat in raw_box.payload[8..].as_chunks::<4>().0 {
+                let compat_chunks = raw_box.payload[8..].as_chunks::<4>().0;
+                let compat_bytes = compat_chunks
+                    .len()
+                    .saturating_mul(core::mem::size_of::<[u8; 4]>());
+                ftyp_guard.ekle(compat_bytes)?;
+                compatible_brands
+                    .try_reserve(compat_chunks.len())
+                    .map_err(|_| Error::AllocationFailed {
+                        requested: compat_bytes,
+                    })?;
+                for &compat in compat_chunks {
                     compatible_brands.push(compat);
                     if is_supported_brand(&compat) {
                         has_supported_brand = true;
@@ -252,14 +336,19 @@ pub(crate) fn parse_movie<'a>(data: &'a [u8], butce: &Arc<Butce>) -> Result<Pars
     }
 
     let top_meta = if let Some(mraw) = meta_payload {
-        let parsed = parse_meta_box(
-            data,
-            mraw,
-            major_brand,
-            compatible_brands.clone(),
-            false,
-            butce,
-        )?;
+        let mut brands_copy = Vec::new();
+        let copy_bytes = compatible_brands
+            .len()
+            .saturating_mul(core::mem::size_of::<[u8; 4]>());
+        let _tmp_guard = Butce::tut(butce, copy_bytes)?;
+        brands_copy
+            .try_reserve_exact(compatible_brands.len())
+            .map_err(|_| Error::AllocationFailed {
+                requested: copy_bytes,
+            })?;
+        brands_copy.extend_from_slice(&compatible_brands);
+        drop(_tmp_guard);
+        let parsed = parse_meta_box(data, mraw, major_brand, brands_copy, false, butce)?;
         _cmin_guard = None;
         Some(parsed)
     } else {
@@ -267,6 +356,7 @@ pub(crate) fn parse_movie<'a>(data: &'a [u8], butce: &Arc<Butce>) -> Result<Pars
     };
 
     let mut tracks = Vec::new();
+    let mut tracks_guard = ButceTutucu::bos(butce);
     if let Some(moov) = moov_payload {
         parse_moov(
             data,
@@ -275,6 +365,7 @@ pub(crate) fn parse_movie<'a>(data: &'a [u8], butce: &Arc<Butce>) -> Result<Pars
             &compatible_brands,
             butce,
             &mut tracks,
+            &mut tracks_guard,
         )?;
     }
 
@@ -293,9 +384,11 @@ fn parse_moov<'a>(
     compatible_brands: &[[u8; 4]],
     butce: &Arc<Butce>,
     tracks: &mut Vec<ParsedTrack<'a>>,
+    tracks_guard: &mut ButceTutucu,
 ) -> Result<()> {
     let mut offset = 0usize;
     let mut seen_mvhd = false;
+    let mut movie_timescale = 0u64;
     while let Some(child) = read_box_header(moov_payload, offset)? {
         offset = child.next_offset;
         match &child.box_type {
@@ -304,7 +397,7 @@ fn parse_moov<'a>(
                     return Err(Error::InvalidData("moov içinde birden fazla mvhd kutusu"));
                 }
                 seen_mvhd = true;
-                validate_mvhd(child.payload)?;
+                movie_timescale = parse_mvhd(child.payload)?;
             }
             b"trak" => {
                 let track = parse_trak(
@@ -312,6 +405,7 @@ fn parse_moov<'a>(
                     child.payload,
                     major_brand,
                     compatible_brands,
+                    movie_timescale,
                     butce,
                 )?;
                 if matches!(&track.handler_type, b"pict" | b"vide" | b"auxv")
@@ -319,25 +413,39 @@ fn parse_moov<'a>(
                 {
                     return Err(Error::InvalidData("görüntü parçası boyutu sıfır olamaz"));
                 }
+                tracks_guard.ekle(core::mem::size_of::<ParsedTrack<'_>>())?;
+                tracks.try_reserve(1).map_err(|_| Error::AllocationFailed {
+                    requested: core::mem::size_of::<ParsedTrack<'_>>(),
+                })?;
                 tracks.push(track);
             }
             _ => {}
         }
     }
+    if movie_timescale != 0 {
+        for track in tracks.iter_mut() {
+            track.movie_timescale = movie_timescale;
+        }
+    }
     Ok(())
 }
 
-fn validate_mvhd(payload: &[u8]) -> Result<()> {
+fn parse_mvhd(payload: &[u8]) -> Result<u64> {
     let (ver, _flags, body) = read_full_box(payload)?;
-    let min_len = match ver {
-        0 => 96usize,
-        1 => 108usize,
+    let (min_len, ts_off) = match ver {
+        0 => (96usize, 8usize),
+        1 => (108usize, 16usize),
         _ => return Err(Error::Unsupported("desteklenmeyen mvhd sürümü")),
     };
     if body.len() < min_len {
         return Err(Error::InvalidData("kesik mvhd kutusu"));
     }
-    Ok(())
+    let timescale =
+        u64::from(read_u32_be(body, ts_off).ok_or(Error::InvalidData("kesik mvhd timescale"))?);
+    if timescale == 0 {
+        return Err(Error::InvalidData("mvhd timescale sıfır olamaz"));
+    }
+    Ok(timescale)
 }
 
 fn parse_trak<'a>(
@@ -345,6 +453,7 @@ fn parse_trak<'a>(
     trak_payload: &'a [u8],
     major_brand: [u8; 4],
     compatible_brands: &[[u8; 4]],
+    movie_timescale: u64,
     butce: &Arc<Butce>,
 ) -> Result<ParsedTrack<'a>> {
     let mut offset = 0usize;
@@ -354,12 +463,13 @@ fn parse_trak<'a>(
     let mut track_duration = 0u64;
     let mut width = 0u32;
     let mut height = 0u32;
+    let mut tkhd_matrix = TKHD_IDENTITY_MATRIX;
     let mut handler_type = [0u8; 4];
     let mut media_timescale = 0u64;
     let mut media_duration = 0u64;
-    let mut is_repeating = false;
-    let mut segment_duration = 0u64;
+    let mut edit_list: Option<EditList> = None;
     let mut references = Vec::new();
+    let mut meta_guard = ButceTutucu::bos(butce);
     let mut raw_stbl: Option<(RawSampleTable, ButceTutucu, ButceTutucu)> = None;
     let mut track_meta: Option<AvifContainer<'a>> = None;
 
@@ -371,30 +481,41 @@ fn parse_trak<'a>(
                     return Err(Error::InvalidData("trak içinde birden fazla tkhd kutusu"));
                 }
                 tkhd_seen = true;
-                let (tid, tdur, w, h) = parse_tkhd(child.payload)?;
-                track_id = tid;
-                track_duration = tdur;
-                width = w;
-                height = h;
+                let tkhd = parse_tkhd(child.payload)?;
+                track_id = tkhd.track_id;
+                track_duration = tkhd.duration;
+                width = tkhd.width;
+                height = tkhd.height;
+                tkhd_matrix = tkhd.matrix;
             }
             b"edts" => {
                 if edts_seen {
                     return Err(Error::InvalidData("trak içinde birden fazla edts kutusu"));
                 }
                 edts_seen = true;
-                let (rep, seg_dur) = parse_edts(child.payload)?;
-                is_repeating = rep;
-                segment_duration = seg_dur;
+                edit_list = Some(parse_edts(child.payload, &mut meta_guard)?);
             }
             b"tref" => {
-                parse_tref(child.payload, &mut references)?;
+                parse_tref(child.payload, &mut references, &mut meta_guard)?;
             }
             b"meta" => {
+                let mut brands_copy = Vec::new();
+                let copy_bytes = compatible_brands
+                    .len()
+                    .saturating_mul(core::mem::size_of::<[u8; 4]>());
+                let _tmp_guard = Butce::tut(butce, copy_bytes)?;
+                brands_copy
+                    .try_reserve_exact(compatible_brands.len())
+                    .map_err(|_| Error::AllocationFailed {
+                        requested: copy_bytes,
+                    })?;
+                brands_copy.extend_from_slice(compatible_brands);
+                drop(_tmp_guard);
                 track_meta = Some(parse_meta_box(
                     file_data,
                     Cow::Borrowed(child.payload),
                     major_brand,
-                    compatible_brands.to_vec(),
+                    brands_copy,
                     false,
                     butce,
                 )?);
@@ -417,29 +538,35 @@ fn parse_trak<'a>(
         return Err(Error::InvalidData("trak kutusunda zorunlu tkhd eksik"));
     }
 
-    let repetition_count = if !edts_seen {
-        LoopCount::Count(0)
-    } else if is_repeating {
-        if track_duration == INDEFINITE_DURATION_64 {
-            LoopCount::Infinite
-        } else {
-            if track_duration == 0 || segment_duration == 0 {
-                return Err(Error::InvalidData(
-                    "tekrarlayan edts için geçersiz track veya segment süresi (0)",
-                ));
+    let repetition_count = match &edit_list {
+        Some(el) if (el.flags & 1) != 0 => {
+            if el.entries.len() != 1 {
+                return Err(Error::InvalidData("tekrarlayan elst entry_count != 1"));
             }
-            let reps = track_duration.div_ceil(segment_duration).saturating_sub(1);
-            if reps > u64::from(i32::MAX as u32) {
+            let segment_duration = el.entries[0].segment_duration;
+            if segment_duration == 0 {
+                return Err(Error::InvalidData("elst segment_duration sıfır olamaz"));
+            }
+            if track_duration == INDEFINITE_DURATION_64 {
                 LoopCount::Infinite
             } else {
-                LoopCount::Count(reps as u32)
+                if track_duration == 0 {
+                    return Err(Error::InvalidData(
+                        "tekrarlayan edts için geçersiz track veya segment süresi (0)",
+                    ));
+                }
+                let reps = track_duration.div_ceil(segment_duration).saturating_sub(1);
+                if reps > u64::from(i32::MAX as u32) {
+                    LoopCount::Infinite
+                } else {
+                    LoopCount::Count(reps as u32)
+                }
             }
         }
-    } else {
-        LoopCount::Count(0)
+        _ => LoopCount::Count(0),
     };
 
-    let (is_av01, properties, samples, track_guard) =
+    let (is_av01, properties, samples, mut track_guard) =
         if let Some((stbl, mut prop_guard, _table_guard)) = raw_stbl {
             let is_av01 = stbl.is_av01;
             let (samples, sample_guard) = if is_av01 {
@@ -452,14 +579,18 @@ fn parse_trak<'a>(
         } else {
             (false, Vec::new(), Vec::new(), ButceTutucu::bos(butce))
         };
+    track_guard.birlestir(meta_guard);
 
     Ok(ParsedTrack {
         track_id,
         width,
         height,
+        tkhd_matrix,
         handler_type,
         media_timescale,
         media_duration,
+        movie_timescale,
+        edit_list,
         repetition_count,
         is_av01,
         properties,
@@ -470,7 +601,42 @@ fn parse_trak<'a>(
     })
 }
 
-fn parse_tkhd(payload: &[u8]) -> Result<(u32, u64, u32, u32)> {
+fn parse_tkhd_matrix(body: &[u8], matrix_off: usize) -> Result<[[i8; 2]; 2]> {
+    const P: i32 = 0x0001_0000;
+    const N: i32 = -0x0001_0000;
+    const W: i32 = 0x4000_0000;
+
+    let mut m = [0i32; 9];
+    for (i, slot) in m.iter_mut().enumerate() {
+        *slot = read_i32_be(body, matrix_off + i * 4)
+            .ok_or(Error::InvalidData("kesik tkhd dönüşüm matrisi"))?;
+    }
+    let [a, b, u, c, d, v, _x, _y, w] = m;
+    if u != 0 || v != 0 || w != W {
+        return Err(Error::Unsupported("desteklenmeyen tkhd dönüşüm matrisi"));
+    }
+    match [a, b, c, d] {
+        [P, 0, 0, P] => Ok([[1, 0], [0, 1]]),
+        [0, N, P, 0] => Ok([[0, -1], [1, 0]]),
+        [N, 0, 0, N] => Ok([[-1, 0], [0, -1]]),
+        [0, P, N, 0] => Ok([[0, 1], [-1, 0]]),
+        [P, 0, 0, N] => Ok([[1, 0], [0, -1]]),
+        [N, 0, 0, P] => Ok([[-1, 0], [0, 1]]),
+        [0, P, P, 0] => Ok([[0, 1], [1, 0]]),
+        [0, N, N, 0] => Ok([[0, -1], [-1, 0]]),
+        _ => Err(Error::Unsupported("desteklenmeyen tkhd dönüşüm matrisi")),
+    }
+}
+
+struct ParsedTkhd {
+    track_id: u32,
+    duration: u64,
+    width: u32,
+    height: u32,
+    matrix: [[i8; 2]; 2],
+}
+
+fn parse_tkhd(payload: &[u8]) -> Result<ParsedTkhd> {
     let (ver, _flags, body) = read_full_box(payload)?;
     let (track_id, duration, after_dur) = match ver {
         0 => {
@@ -491,16 +657,23 @@ fn parse_tkhd(payload: &[u8]) -> Result<(u32, u64, u32, u32)> {
         }
         _ => return Err(Error::Unsupported("desteklenmeyen tkhd sürümü")),
     };
+    let matrix = parse_tkhd_matrix(body, after_dur + 16)?;
     let dims_off = after_dur + 52;
     let w_fixed = read_u32_be(body, dims_off).ok_or(Error::InvalidData("kesik tkhd width"))?;
     let h_fixed = read_u32_be(body, dims_off + 4).ok_or(Error::InvalidData("kesik tkhd height"))?;
-    Ok((track_id, duration, w_fixed >> 16, h_fixed >> 16))
+    Ok(ParsedTkhd {
+        track_id,
+        duration,
+        width: w_fixed >> 16,
+        height: h_fixed >> 16,
+        matrix,
+    })
 }
 
-fn parse_edts(payload: &[u8]) -> Result<(bool, u64)> {
+fn parse_edts(payload: &[u8], guard: &mut ButceTutucu) -> Result<EditList> {
     let mut offset = 0usize;
     let mut seen_elst = false;
-    let mut result = (false, 0u64);
+    let mut result = EditList::default();
     while let Some(child) = read_box_header(payload, offset)? {
         offset = child.next_offset;
         if &child.box_type == b"elst" {
@@ -508,7 +681,7 @@ fn parse_edts(payload: &[u8]) -> Result<(bool, u64)> {
                 return Err(Error::InvalidData("edts içinde birden fazla elst kutusu"));
             }
             seen_elst = true;
-            result = parse_elst(child.payload)?;
+            result = parse_elst(child.payload, guard)?;
         }
     }
     if !seen_elst {
@@ -517,29 +690,211 @@ fn parse_edts(payload: &[u8]) -> Result<(bool, u64)> {
     Ok(result)
 }
 
-fn parse_elst(payload: &[u8]) -> Result<(bool, u64)> {
+fn parse_elst(payload: &[u8], guard: &mut ButceTutucu) -> Result<EditList> {
     let (ver, flags, body) = read_full_box(payload)?;
-    if (flags & 1) == 0 {
-        return Ok((false, 0));
+    if ver > 1 {
+        return Err(Error::Unsupported("desteklenmeyen elst sürümü"));
     }
-    let entry_count = read_u32_be(body, 0).ok_or(Error::InvalidData("kesik elst entry_count"))?;
-    if entry_count != 1 {
+    let entry_count =
+        read_u32_be(body, 0).ok_or(Error::InvalidData("kesik elst entry_count"))? as usize;
+    let wire_stride = if ver == 0 { 12usize } else { 20usize };
+    let needed = entry_count
+        .checked_mul(wire_stride)
+        .ok_or(Error::InvalidData("elst boyut taşması"))?;
+    if needed > body.len().saturating_sub(4) {
+        return Err(Error::InvalidData("kesik elst giriş dizisi"));
+    }
+    if (flags & 1) != 0 && entry_count != 1 {
         return Err(Error::InvalidData("tekrarlayan elst entry_count != 1"));
     }
-    let segment_duration = match ver {
-        0 => u64::from(
-            read_u32_be(body, 4).ok_or(Error::InvalidData("kesik elst v0 segment_duration"))?,
-        ),
-        1 => read_u64_be(body, 4).ok_or(Error::InvalidData("kesik elst v1 segment_duration"))?,
-        _ => return Err(Error::Unsupported("desteklenmeyen elst sürümü")),
-    };
-    if segment_duration == 0 {
-        return Err(Error::InvalidData("elst segment_duration sıfır olamaz"));
+    reserve_table_budget(entry_count, core::mem::size_of::<EditListEntry>(), guard)?;
+    let mut entries = Vec::new();
+    entries
+        .try_reserve_exact(entry_count)
+        .map_err(|_| Error::AllocationFailed {
+            requested: entry_count.saturating_mul(core::mem::size_of::<EditListEntry>()),
+        })?;
+    let mut pos = 4usize;
+    for _ in 0..entry_count {
+        let (segment_duration, media_time) = if ver == 0 {
+            let sd = u64::from(
+                read_u32_be(body, pos)
+                    .ok_or(Error::InvalidData("kesik elst v0 segment_duration"))?,
+            );
+            let mt = i64::from(
+                read_i32_be(body, pos + 4).ok_or(Error::InvalidData("kesik elst v0 media_time"))?,
+            );
+            pos += 8;
+            (sd, mt)
+        } else {
+            let sd = read_u64_be(body, pos)
+                .ok_or(Error::InvalidData("kesik elst v1 segment_duration"))?;
+            let mt =
+                read_i64_be(body, pos + 8).ok_or(Error::InvalidData("kesik elst v1 media_time"))?;
+            pos += 16;
+            (sd, mt)
+        };
+        let media_rate_integer =
+            read_i16_be(body, pos).ok_or(Error::InvalidData("kesik elst media_rate_integer"))?;
+        let media_rate_fraction = read_i16_be(body, pos + 2)
+            .ok_or(Error::InvalidData("kesik elst media_rate_fraction"))?;
+        pos += 4;
+
+        if media_time < -1 {
+            return Err(Error::InvalidData("elst media_time -1 değerinden küçük"));
+        }
+        if media_time >= 0 && (media_rate_integer != 1 || media_rate_fraction != 0) {
+            return Err(Error::Unsupported("elst media_rate != 1.0 desteklenmiyor"));
+        }
+        if (flags & 1) != 0 && segment_duration == 0 {
+            return Err(Error::InvalidData("elst segment_duration sıfır olamaz"));
+        }
+        entries.push(EditListEntry {
+            segment_duration,
+            media_time,
+            media_rate_integer,
+            media_rate_fraction,
+        });
     }
-    Ok((true, segment_duration))
+    Ok(EditList { flags, entries })
 }
 
-fn parse_tref(payload: &[u8], refs: &mut Vec<TrackReference>) -> Result<()> {
+/// Parçanın `elst` düzenleme listesini uygulayarak sunum zaman çizelgesini (`PresentedSample`)
+/// ve toplam sunum süresini (`media_timescale` biriminde) üretir.
+pub(crate) fn build_presented_timeline(
+    track: &ParsedTrack<'_>,
+    guard: &mut ButceTutucu,
+) -> Result<(Vec<PresentedSample>, u64)> {
+    let identity_timeline = |guard: &mut ButceTutucu| -> Result<(Vec<PresentedSample>, u64)> {
+        let n = track.samples.len();
+        reserve_table_budget(n, core::mem::size_of::<PresentedSample>(), guard)?;
+        let mut out = Vec::new();
+        out.try_reserve_exact(n)
+            .map_err(|_| Error::AllocationFailed {
+                requested: n.saturating_mul(core::mem::size_of::<PresentedSample>()),
+            })?;
+        for (raw_index, s) in track.samples.iter().enumerate() {
+            out.push(PresentedSample {
+                raw_index,
+                pts_in_timescale: s.pts_in_timescale,
+                duration_in_timescale: s.duration_in_timescale,
+            });
+        }
+        Ok((out, track.media_duration))
+    };
+
+    let Some(ref edit_list) = track.edit_list else {
+        return identity_timeline(guard);
+    };
+    if edit_list.entries.is_empty() {
+        return identity_timeline(guard);
+    }
+
+    let media_ts = track.media_timescale.max(1);
+    let movie_ts = if track.movie_timescale > 0 {
+        track.movie_timescale
+    } else {
+        media_ts
+    };
+
+    let scale_seg_dur = |seg_dur: u64| -> Result<Option<u64>> {
+        if seg_dur == 0 {
+            return Ok(None);
+        }
+        let scaled_u128 = (u128::from(seg_dur) * u128::from(media_ts) + u128::from(movie_ts) / 2)
+            / u128::from(movie_ts);
+        let scaled = u64::try_from(scaled_u128)
+            .map_err(|_| Error::InvalidData("elst segment_duration dönüştürme taşması"))?;
+        Ok(Some(scaled))
+    };
+
+    // Standart tekrarlayan AVIS döngüsü (`flags & 1 != 0`, `entry_count == 1`, `media_time == 0`):
+    // medya kırpma yapmıyorsa ham zaman çizelgesini doğrudan koru.
+    if (edit_list.flags & 1) != 0 && edit_list.entries.len() == 1 {
+        let e = edit_list.entries[0];
+        if e.media_time == 0 {
+            let total_media_end = track
+                .samples
+                .iter()
+                .map(|s| s.pts_in_timescale.saturating_add(s.duration_in_timescale))
+                .max()
+                .unwrap_or(0);
+            let seg_media = scale_seg_dur(e.segment_duration)?;
+            if seg_media.is_none_or(|d| d >= total_media_end) {
+                return identity_timeline(guard);
+            }
+        }
+    }
+
+    let mut presented: Vec<PresentedSample> = Vec::new();
+    let mut timeline_pts: u64 = 0;
+
+    for entry in &edit_list.entries {
+        let seg_dur_media = scale_seg_dur(entry.segment_duration)?;
+        if entry.media_time == -1 {
+            timeline_pts = timeline_pts.saturating_add(seg_dur_media.unwrap_or(0));
+            continue;
+        }
+        let edit_start = entry.media_time as u64;
+        let edit_end = seg_dur_media.map(|d| edit_start.saturating_add(d));
+        let mut seg_max_end = timeline_pts;
+
+        for (raw_index, sample) in track.samples.iter().enumerate() {
+            let s_start = sample.pts_in_timescale;
+            let s_end = s_start.saturating_add(sample.duration_in_timescale);
+            let clip_start = s_start.max(edit_start);
+            let clip_end = match edit_end {
+                Some(ee) => s_end.min(ee),
+                None => s_end,
+            };
+            let include = clip_end > clip_start
+                || (sample.duration_in_timescale == 0
+                    && s_start == edit_start
+                    && edit_end.is_none_or(|ee| s_start < ee));
+            if include {
+                if presented.len() >= MAX_TRACK_SAMPLES {
+                    return Err(Error::BudgetExceeded {
+                        requested: presented.len() + 1,
+                        limit: MAX_TRACK_SAMPLES,
+                    });
+                }
+                let clipped_dur = clip_end.saturating_sub(clip_start);
+                let pres_pts = timeline_pts.saturating_add(clip_start - edit_start);
+                guard.ekle(core::mem::size_of::<PresentedSample>())?;
+                presented
+                    .try_reserve(1)
+                    .map_err(|_| Error::AllocationFailed {
+                        requested: core::mem::size_of::<PresentedSample>(),
+                    })?;
+                presented.push(PresentedSample {
+                    raw_index,
+                    pts_in_timescale: pres_pts,
+                    duration_in_timescale: clipped_dur,
+                });
+                seg_max_end = seg_max_end.max(pres_pts.saturating_add(clipped_dur));
+            }
+        }
+
+        timeline_pts = match seg_dur_media {
+            Some(d) => timeline_pts.saturating_add(d),
+            None => seg_max_end,
+        };
+    }
+
+    if presented.is_empty() {
+        return Err(Error::InvalidData(
+            "elst zaman çizelgesi hiç görünür kare üretmedi",
+        ));
+    }
+
+    Ok((presented, timeline_pts))
+}
+
+fn parse_tref(
+    payload: &[u8],
+    refs: &mut Vec<TrackReference>,
+    guard: &mut ButceTutucu,
+) -> Result<()> {
     let mut offset = 0usize;
     while let Some(child) = read_box_header(payload, offset)? {
         offset = child.next_offset;
@@ -547,14 +902,27 @@ fn parse_tref(payload: &[u8], refs: &mut Vec<TrackReference>) -> Result<()> {
             if child.payload.len() < 4 {
                 return Err(Error::InvalidData("tref referans kutusu 4 bayttan kısa"));
             }
-            for chunk in child.payload.as_chunks::<4>().0 {
+            let chunks = child.payload.as_chunks::<4>().0;
+            let bytes = chunks
+                .len()
+                .saturating_mul(core::mem::size_of::<TrackReference>());
+            guard.ekle(bytes)?;
+            refs.try_reserve(chunks.len())
+                .map_err(|_| Error::AllocationFailed { requested: bytes })?;
+            let mut pushed = 0usize;
+            for chunk in chunks {
                 let to_id = u32::from_be_bytes(*chunk);
                 if to_id != 0 {
                     refs.push(TrackReference {
                         ref_type: child.box_type,
                         to_track_id: to_id,
                     });
+                    pushed += 1;
                 }
+            }
+            let unused = chunks.len().saturating_sub(pushed);
+            if unused > 0 {
+                guard.dusur(unused.saturating_mul(core::mem::size_of::<TrackReference>()));
             }
         }
     }
@@ -717,7 +1085,11 @@ fn parse_chunk_offsets(
         return Err(Error::InvalidData("kesik stco/co64 ofset dizisi"));
     }
     reserve_table_budget(count, core::mem::size_of::<u64>(), guard)?;
-    stbl.chunks.reserve(count);
+    stbl.chunks
+        .try_reserve(count)
+        .map_err(|_| Error::AllocationFailed {
+            requested: count.saturating_mul(core::mem::size_of::<u64>()),
+        })?;
     for i in 0..count {
         let off = if large {
             read_u64_be(body, 4 + i * 8).ok_or(Error::InvalidData("kesik co64 ofseti"))?
@@ -742,7 +1114,11 @@ fn parse_stsc(payload: &[u8], stbl: &mut RawSampleTable, guard: &mut ButceTutucu
         return Err(Error::InvalidData("kesik stsc giriş dizisi"));
     }
     reserve_table_budget(count, core::mem::size_of::<SampleToChunk>(), guard)?;
-    stbl.sample_to_chunks.reserve(count);
+    stbl.sample_to_chunks
+        .try_reserve(count)
+        .map_err(|_| Error::AllocationFailed {
+            requested: count.saturating_mul(core::mem::size_of::<SampleToChunk>()),
+        })?;
     let mut prev_first = 0u32;
     for i in 0..count {
         let base = 4 + i * 12;
@@ -786,7 +1162,11 @@ fn parse_stsz(payload: &[u8], stbl: &mut RawSampleTable, guard: &mut ButceTutucu
             return Err(Error::InvalidData("kesik stsz örnek boyut dizisi"));
         }
         reserve_table_budget(sample_count, core::mem::size_of::<u32>(), guard)?;
-        stbl.sample_sizes.reserve(sample_count);
+        stbl.sample_sizes
+            .try_reserve(sample_count)
+            .map_err(|_| Error::AllocationFailed {
+                requested: sample_count.saturating_mul(core::mem::size_of::<u32>()),
+            })?;
         for i in 0..sample_count {
             let sz = read_u32_be(body, 8 + i * 4).ok_or(Error::InvalidData("kesik stsz"))?;
             stbl.sample_sizes.push(sz);
@@ -808,7 +1188,11 @@ fn parse_stts(payload: &[u8], stbl: &mut RawSampleTable, guard: &mut ButceTutucu
         return Err(Error::InvalidData("kesik stts giriş dizisi"));
     }
     reserve_table_budget(count, core::mem::size_of::<TimeToSample>(), guard)?;
-    stbl.time_to_samples.reserve(count);
+    stbl.time_to_samples
+        .try_reserve(count)
+        .map_err(|_| Error::AllocationFailed {
+            requested: count.saturating_mul(core::mem::size_of::<TimeToSample>()),
+        })?;
     for i in 0..count {
         let base = 4 + i * 8;
         let sample_count = read_u32_be(body, base).ok_or(Error::InvalidData("kesik stts"))?;
@@ -869,7 +1253,11 @@ fn parse_stss(payload: &[u8], stbl: &mut RawSampleTable, guard: &mut ButceTutucu
     }
     reserve_table_budget(count, core::mem::size_of::<u32>(), guard)?;
     stbl.has_stss = true;
-    stbl.sync_samples.reserve(count);
+    stbl.sync_samples
+        .try_reserve(count)
+        .map_err(|_| Error::AllocationFailed {
+            requested: count.saturating_mul(core::mem::size_of::<u32>()),
+        })?;
     for i in 0..count {
         let num = read_u32_be(body, 4 + i * 4).ok_or(Error::InvalidData("kesik stss"))?;
         stbl.sync_samples.push(num);
