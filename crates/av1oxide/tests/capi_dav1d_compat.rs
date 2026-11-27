@@ -1790,26 +1790,33 @@ fn capi_decode_frame_type_and_svc_per_obu_parity() {
 
             let mut out = Vec::new();
             let mut pic = Dav1dPicture::default();
+            // Resmî `dav1d` (`tools/dav1d.c:294-354`) akış protokolü: her `dav1d_send_data`
+            // ardından en fazla bir `dav1d_get_picture` çağrılır; arka arkaya `dav1d_get_picture`
+            // yalnızca EOS boşaltma (drain) aşamasında çağrılır.
             for &pkt in packets {
                 let mut data = Dav1dData::default();
                 let dst = dav1d_data_create(&mut data, pkt.len());
                 assert!(!dst.is_null());
                 ptr::copy_nonoverlapping(pkt.as_ptr(), dst, pkt.len());
                 loop {
-                    let rc = dav1d_send_data(c, &mut data);
-                    if rc == 0 {
+                    let s_rc = dav1d_send_data(c, &mut data);
+                    assert!(
+                        s_rc == 0 || s_rc == dav1d_err(EAGAIN),
+                        "dav1d_send_data beklenmeyen hata: {s_rc}"
+                    );
+                    let g_rc = dav1d_get_picture(c, &mut pic);
+                    if g_rc == 0 {
+                        out.push(copy_c_picture_planes(&pic));
+                        dav1d_picture_unref(&mut pic);
+                    } else {
+                        assert_eq!(g_rc, dav1d_err(EAGAIN));
+                    }
+                    if s_rc == 0 {
                         break;
                     }
-                    assert_eq!(rc, dav1d_err(EAGAIN));
-                    assert_eq!(dav1d_get_picture(c, &mut pic), 0);
-                    out.push(copy_c_picture_planes(&pic));
-                    dav1d_picture_unref(&mut pic);
-                }
-                while dav1d_get_picture(c, &mut pic) == 0 {
-                    out.push(copy_c_picture_planes(&pic));
-                    dav1d_picture_unref(&mut pic);
                 }
             }
+            // EOS drain döngüsü
             loop {
                 let rc = dav1d_get_picture(c, &mut pic);
                 if rc == dav1d_err(EAGAIN) {
