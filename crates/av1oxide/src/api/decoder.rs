@@ -40,7 +40,7 @@
 
 #![forbid(unsafe_code)]
 
-use crate::api::{Config, Packet};
+use crate::api::{Config, DecodeFrameType, InloopFilters, Packet};
 use crate::bitstream::frame_header::{
     FrameHeader, FrameHeaderContext, FrameType, TileGroupInfo, parse_tile_group,
 };
@@ -157,6 +157,9 @@ struct ParseState {
     /// yeniden dener (`src/obu.c:1527-1548`); yeni frame header ya da yeni
     /// dizi gelene kadar her OBU hata verir.
     dangling_show_existing: Option<usize>,
+    /// `decode_frame_type` filtresi nedeniyle atlanan bir karenin takip eden
+    /// `OBU_TILE_GROUP` birimlerini sessizce geçer (`dav1d` `src/obu.c`).
+    skipping_frame_tiles: bool,
 }
 
 /// Tile group OBU'sunun ham verisi (`tile_start`..=`tile_end`, başlık sonrası).
@@ -295,6 +298,13 @@ pub struct Decoder {
     /// `show_existing` yüzünden kare sayısından farklı olabildiği için
     /// tablo doğrulaması bu listeden yapılır (T42: `warp_local`).
     decoded_tools: Vec<crate::decode::intra::ToolCounts>,
+    /// Tanılama geçmişi (`frame_outputs`, `frame_output_flags`, `decoded_tools`)
+    /// toplansın mı? Varsayılan `false` (uzun ömürlü akışlarda sabit bellek).
+    collect_diagnostics: bool,
+    /// Etkin halka içi filtreler (`dav1d` `inloop_filters` uyumlu; varsayılan [`InloopFilters::ALL`]).
+    inloop_filters: InloopFilters,
+    /// Çözülecek kare türü filtresi (`dav1d` `decode_frame_type` uyumlu; varsayılan [`DecodeFrameType::All`]).
+    decode_frame_type: DecodeFrameType,
     /// Tanılama: yalnız ayrıştırma kipi (varsayılan kapalı; bkz.
     /// [`Decoder::set_parse_only`]).
     parse_only: bool,
@@ -343,6 +353,9 @@ impl Clone for Decoder {
             last_tools: self.last_tools,
             last_output_tools: self.last_output_tools,
             decoded_tools: self.decoded_tools.clone(),
+            collect_diagnostics: self.collect_diagnostics,
+            inloop_filters: self.inloop_filters,
+            decode_frame_type: self.decode_frame_type,
             parse_only: self.parse_only,
             outputs_pushed: self.outputs_pushed,
             allocation_peak: self.allocation_peak(),
@@ -406,7 +419,9 @@ impl Clone for Decoder {
                         Some(Ok(completed)) => {
                             cloned.decoded_frames += 1;
                             cloned.last_tools = Some(completed.decoded_tools);
-                            cloned.decoded_tools.push(completed.decoded_tools);
+                            if cloned.collect_diagnostics {
+                                cloned.decoded_tools.push(completed.decoded_tools);
+                            }
                             if let Some(ref rf) = completed.ref_frame {
                                 for (slot, reference) in cloned.pixel_refs.iter_mut().enumerate() {
                                     if task.refresh_frame_flags & (1 << slot) != 0 {
@@ -509,6 +524,9 @@ impl Decoder {
             last_tools: None,
             last_output_tools: None,
             decoded_tools: Vec::new(),
+            collect_diagnostics: false,
+            inloop_filters: InloopFilters::ALL,
+            decode_frame_type: DecodeFrameType::All,
             parse_only: false,
             outputs_pushed: 0,
             allocation_peak: 0,
@@ -600,6 +618,81 @@ impl Decoder {
     #[doc(hidden)]
     pub fn set_parse_only(&mut self, on: bool) {
         self.parse_only = on;
+    }
+
+    /// Kare başlığı ve araç geçmişi tanılama kayıtlarını (`drain_frame_headers`,
+    /// `drain_frame_output_flags`, `pending_frame_headers`, `decoded_tool_counts`)
+    /// etkinleştirir veya kapatır (varsayılan: `false`).
+    ///
+    /// Uzun ömürlü akışlarda bellek büyümesini önlemek için varsayılan olarak
+    /// kapalıdır; [`Decoder::last_tool_counts`], [`Decoder::decoded_frames`] ve
+    /// [`Decoder::frames_completed`] gibi `O(1)` sayaçlar bu ayardan bağımsız
+    /// olarak her zaman güncellenir.
+    pub fn set_collect_diagnostics(&mut self, enable: bool) {
+        self.collect_diagnostics = enable;
+    }
+
+    /// Kare-bazlı tanılama geçmişinin toplanıp toplanmadığını döndürür.
+    #[must_use]
+    pub const fn collect_diagnostics(&self) -> bool {
+        self.collect_diagnostics
+    }
+
+    /// Etkin halka içi filtreleri (`DEBLOCK`, `CDEF`, `RESTORATION`) ayarlar.
+    pub fn set_inloop_filters(&mut self, filters: InloopFilters) {
+        self.inloop_filters = filters;
+    }
+
+    /// Etkin halka içi filtre maskesini döndürür.
+    #[must_use]
+    pub const fn inloop_filters(&self) -> InloopFilters {
+        self.inloop_filters
+    }
+
+    /// Çözülecek kare türleri filtresini (`All`, `Reference`, `Intra`, `Key`) ayarlar.
+    pub fn set_decode_frame_type(&mut self, frame_type: DecodeFrameType) {
+        self.decode_frame_type = frame_type;
+    }
+
+    /// Geçerli kare türü filtresini döndürür.
+    #[must_use]
+    pub const fn decode_frame_type(&self) -> DecodeFrameType {
+        self.decode_frame_type
+    }
+
+    /// `dav1d` `src/obu.c:1531-1543` (`show_existing_frame`) kare türü süzgeci.
+    #[inline]
+    fn should_skip_show_existing(&self, frame_type: FrameType) -> bool {
+        match frame_type {
+            FrameType::Inter | FrameType::Switch => {
+                matches!(
+                    self.decode_frame_type,
+                    DecodeFrameType::Intra | DecodeFrameType::Key
+                )
+            }
+            FrameType::Intra => self.decode_frame_type == DecodeFrameType::Key,
+            FrameType::Key => false,
+        }
+    }
+
+    /// `dav1d` `src/obu.c:1641-1657` normal kare türü süzgeci.
+    #[inline]
+    fn should_skip_frame(&self, frame_type: FrameType, refresh_frame_flags: u8) -> bool {
+        match frame_type {
+            FrameType::Inter | FrameType::Switch => {
+                matches!(
+                    self.decode_frame_type,
+                    DecodeFrameType::Intra | DecodeFrameType::Key
+                ) || (self.decode_frame_type == DecodeFrameType::Reference
+                    && refresh_frame_flags == 0)
+            }
+            FrameType::Intra => {
+                self.decode_frame_type == DecodeFrameType::Key
+                    || (self.decode_frame_type == DecodeFrameType::Reference
+                        && refresh_frame_flags == 0)
+            }
+            FrameType::Key => false,
+        }
     }
 
     /// Girdi paketini OBU'lara böler ve işler (dav1d `dav1d_send_data` +
@@ -816,6 +909,33 @@ impl Decoder {
         // Yeni başlık önceki bekleyen kareyi geçersiz kılar (dav1d
         // `c->frame_hdr` aynı tampona yeniden ayrıştırılır, `src/obu.c:1279-1282`).
         self.parse.dangling_show_existing = None;
+        self.parse.skipping_frame_tiles = false;
+        // `dav1d` `decode_frame_type` (`KEY` / `INTRA`) filtresi: atlanan karelerde
+        // önceki referans yuvaları güncel olmayabileceğinden, tam başlık ayrıştırmasından
+        // önce ilk 3 bitten (`show_existing_frame`, `frame_type`) erken eleme yapılır.
+        if !sequence_header.reduced_still_picture_header
+            && matches!(
+                self.decode_frame_type,
+                DecodeFrameType::Key | DecodeFrameType::Intra
+            )
+            && let Some(&first_byte) = obu.payload.first()
+        {
+            let show_existing = (first_byte & 0x80) != 0;
+            if !show_existing {
+                let ftype = FrameType::from_raw((first_byte >> 5) & 0x03);
+                let skip = match self.decode_frame_type {
+                    DecodeFrameType::Key => ftype != FrameType::Key,
+                    DecodeFrameType::Intra => !matches!(ftype, FrameType::Key | FrameType::Intra),
+                    _ => false,
+                };
+                if skip {
+                    self.parse.header_state.clear_current();
+                    self.parse.pending_groups.clear();
+                    self.parse.skipping_frame_tiles = !is_frame_obu;
+                    return Ok(());
+                }
+            }
+        }
         let extension = obu.header.extension;
         let (temporal_id, spatial_id) =
             extension.map_or((0, 0), |ext| (ext.temporal_id, ext.spatial_id));
@@ -863,6 +983,8 @@ impl Decoder {
             if header.show_existing_frame {
                 // Gösterim OBU sonu denetiminde yapılır (`process_obu`).
                 self.parse.dangling_show_existing = Some(usize::from(header.existing_frame_idx));
+            } else if self.should_skip_frame(header.frame_type, header.refresh_frame_flags) {
+                self.parse.skipping_frame_tiles = true;
             } else {
                 self.parse.header_state.set_current(header);
             }
@@ -876,6 +998,9 @@ impl Decoder {
                     "frame OBU show_existing_frame taşıyamaz (obu.c 1311-1315)",
                 ),
             ));
+        }
+        if self.should_skip_frame(header.frame_type, header.refresh_frame_flags) {
+            return Ok(());
         }
         // OBU_FRAME: başlık bekleyen kare olur, bayt hizalanır, kalan baytlar
         // tile grubudur (dav1d `src/obu.c:1317-1321`, fall-through).
@@ -894,6 +1019,9 @@ impl Decoder {
     /// `DAV1D_OBU_TILE_GRP` (`src/obu.c:1322-1352`) + kare tamamlanınca çözüm
     /// (`src/obu.c:1640-1666`).
     fn process_tile_group(&mut self, payload: &[u8], bit_base: usize) -> Result<()> {
+        if self.parse.skipping_frame_tiles {
+            return Ok(());
+        }
         let Some(current) = self.parse.header_state.current() else {
             return Err(BitstreamError::new(
                 BitstreamErrorKind::InvalidTileGroup(
@@ -945,8 +1073,17 @@ impl Decoder {
         let Some(header) = self.parse.header_state.complete_frame() else {
             return Ok(());
         };
-        self.frame_outputs.push(header.clone());
-        self.frame_output_flags.push(header.show_frame);
+        if self.should_skip_frame(header.frame_type, header.refresh_frame_flags) {
+            self.parse
+                .header_state
+                .restore_slots(&prev_slots, header.refresh_frame_flags);
+            self.parse.pending_groups.clear();
+            return Ok(());
+        }
+        if self.collect_diagnostics {
+            self.frame_outputs.push(header.clone());
+            self.frame_output_flags.push(header.show_frame);
+        }
         self.parse.frames_completed += 1;
         let groups = core::mem::take(&mut self.parse.pending_groups);
         let seq = self.parse.sequence_header.clone();
@@ -1022,6 +1159,7 @@ impl Decoder {
         // sayılan ayırmalar + bu karenin tile verisi (`groups`).
         let grup_bayti: usize = groups.iter().map(|g| g.data.len()).sum();
         let butce = self.butce_defteri(grup_bayti);
+        let inloop_filters = self.inloop_filters;
         let decoded = split_tile_groups(groups, &header).and_then(|tiles| {
             decode_frame(
                 seq,
@@ -1031,6 +1169,7 @@ impl Decoder {
                 &self.pixel_refs,
                 &butce,
                 &self.pool,
+                inloop_filters,
             )
         });
         self.tepe_kat(&butce);
@@ -1094,7 +1233,9 @@ impl Decoder {
             };
             self.decoded_frames += 1;
             self.last_tools = Some(decoded_tools);
-            self.decoded_tools.push(decoded_tools);
+            if self.collect_diagnostics {
+                self.decoded_tools.push(decoded_tools);
+            }
             let itut_t35 = core::mem::take(&mut self.parse.itut_t35);
             if let Some((mut frame, tools)) = cikti {
                 if self.parse.current_packet_timestamp.is_some() {
@@ -1162,7 +1303,9 @@ impl Decoder {
         };
         self.decoded_frames += 1;
         self.last_tools = Some(decoded.tools);
-        self.decoded_tools.push(decoded.tools);
+        if self.collect_diagnostics {
+            self.decoded_tools.push(decoded.tools);
+        }
         // Referans yuvası grain'siz `PicBuf`'u saklar (`src/lib.c:311-330`).
         let entry = Arc::new(RefFrame::from_decoded(decoded, header.clone(), mc_identity));
         let mut evicted: [Option<Arc<RefFrame>>; 8] = [const { None }; 8];
@@ -1354,10 +1497,11 @@ impl Decoder {
         let cancel_worker = Arc::clone(&self.cancel_flag);
         let apply_grain_flag = self.config.apply_grain;
         let has_allocation_limit = self.config.allocation_limit.is_some();
+        let inloop_filters_w = self.inloop_filters;
 
         self.pool.spawn_async(move || {
             task_worker.started.store(true, Ordering::Release);
-            let run_res: Result<CompletedFrame> = (|| {
+            let body = || -> Result<CompletedFrame> {
                 if cancel_worker.load(Ordering::Acquire) {
                     return Err(Error::InvalidState("iptal edildi"));
                 }
@@ -1414,6 +1558,7 @@ impl Decoder {
                     &resolved_refs,
                     &frame_butce,
                     &pool_w,
+                    inloop_filters_w,
                 )?;
                 for r in resolved_refs.into_iter().flatten() {
                     if let Ok(rf) = Arc::try_unwrap(r) {
@@ -1551,7 +1696,15 @@ impl Decoder {
                     output,
                     _butce_tutucu: tutucular,
                 })
-            })();
+            };
+            #[cfg(feature = "std")]
+            let run_res: Result<CompletedFrame> =
+                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(body)) {
+                    Ok(res) => res,
+                    Err(_) => Err(Error::InvalidState("asenkron kare çözme görevi panikledi")),
+                };
+            #[cfg(not(feature = "std"))]
+            let run_res: Result<CompletedFrame> = body();
 
             if run_res.is_err() {
                 task_worker.out_slot.mark_failed();
@@ -1680,7 +1833,9 @@ impl Decoder {
                         let has_limit = self.config.allocation_limit.is_some();
                         self.decoded_frames += 1;
                         self.last_tools = Some(completed.decoded_tools);
-                        self.decoded_tools.push(completed.decoded_tools);
+                        if self.collect_diagnostics {
+                            self.decoded_tools.push(completed.decoded_tools);
+                        }
                         let mut evicted: [Option<Arc<RefFrame>>; 8] = [const { None }; 8];
                         if let Some(rf_arc) = completed.ref_frame {
                             for (slot, reference) in self.pixel_refs.iter_mut().enumerate() {
@@ -1779,8 +1934,19 @@ impl Decoder {
         let fail = |what: &'static str| -> Result<()> {
             Err(BitstreamError::new(BitstreamErrorKind::InvalidFrameHeader(what), 0).into())
         };
-        if self.parse.header_state.reference(slot).is_none() {
+        let Some(ref_hdr) = self.parse.header_state.reference(slot) else {
+            if matches!(
+                self.decode_frame_type,
+                DecodeFrameType::Key | DecodeFrameType::Intra
+            ) {
+                self.parse.dangling_show_existing = None;
+                return Ok(());
+            }
             return fail("show_existing_frame: referans yuva boş (obu.c 1529)");
+        };
+        if self.should_skip_show_existing(ref_hdr.frame_type) {
+            self.parse.dangling_show_existing = None;
+            return Ok(());
         }
         if !self.parse_only && self.pixel_refs.get(slot).and_then(Option::as_ref).is_none() {
             return fail("show_existing_frame: referans resmi yok (obu.c 1544)");
@@ -1830,8 +1996,10 @@ impl Decoder {
         // **Tuzak:** başlık çıktısı **gösterilen** karenin başlığıdır
         // (framehdr differential'ı bunu bekler); dav1d `show_existing`'i her
         // zaman `c->out`a verir (`src/obu.c:1550-1560`).
-        self.frame_outputs.push(displayed.clone());
-        self.frame_output_flags.push(true);
+        if self.collect_diagnostics {
+            self.frame_outputs.push(displayed.clone());
+            self.frame_output_flags.push(true);
+        }
         self.parse.frames_completed += 1;
         if self.parse_only {
             self.outputs
@@ -1882,8 +2050,19 @@ impl Decoder {
         let fail = |what: &'static str| -> Result<()> {
             Err(BitstreamError::new(BitstreamErrorKind::InvalidFrameHeader(what), 0).into())
         };
-        if self.parse.header_state.reference(slot).is_none() {
+        let Some(ref_hdr) = self.parse.header_state.reference(slot) else {
+            if matches!(
+                self.decode_frame_type,
+                DecodeFrameType::Key | DecodeFrameType::Intra
+            ) {
+                self.parse.dangling_show_existing = None;
+                return Ok(());
+            }
             return fail("show_existing_frame: referans yuva boş (obu.c 1529)");
+        };
+        if self.should_skip_show_existing(ref_hdr.frame_type) {
+            self.parse.dangling_show_existing = None;
+            return Ok(());
         }
         let Some(promise) = self.slot_promises.get(slot).and_then(Clone::clone) else {
             return fail("show_existing_frame: referans resmi yok (obu.c 1544)");
@@ -1942,8 +2121,10 @@ impl Decoder {
             let Some(displayed) = self.parse.header_state.show_existing(slot) else {
                 return fail("show_existing_frame: referans yuva boş (obu.c 1529)");
             };
-            self.frame_outputs.push(displayed.clone());
-            self.frame_output_flags.push(true);
+            if self.collect_diagnostics {
+                self.frame_outputs.push(displayed.clone());
+                self.frame_output_flags.push(true);
+            }
             self.parse.frames_completed += 1;
             let output_seq = self.outputs_pushed;
             self.outputs_pushed += 1;
@@ -1996,8 +2177,10 @@ impl Decoder {
         let Some(displayed) = self.parse.header_state.show_existing(slot) else {
             return fail("show_existing_frame: referans yuva boş (obu.c 1529)");
         };
-        self.frame_outputs.push(displayed.clone());
-        self.frame_output_flags.push(true);
+        if self.collect_diagnostics {
+            self.frame_outputs.push(displayed.clone());
+            self.frame_output_flags.push(true);
+        }
         self.parse.frames_completed += 1;
         let output_seq = self.outputs_pushed;
         self.outputs_pushed += 1;
@@ -2124,7 +2307,9 @@ impl Decoder {
         )
     }
 
-    /// Çıktı sırasıyla biriken kare başlıklarını **boşaltır**.
+    /// Çıktı sırasıyla biriken kare başlıklarını **boşaltır** (yalnızca
+    /// [`Decoder::set_collect_diagnostics`]`(true)` etkinken doldurulur;
+    /// varsayılan olarak boş döner).
     ///
     /// Sıra dav1d `dav1d_get_picture` sırasıyla aynıdır: tek iş parçacıklı
     /// çözücüde kodlama sırası; `show_existing_frame` durumunda **gösterilen
@@ -2136,7 +2321,8 @@ impl Decoder {
         core::mem::take(&mut self.frame_outputs)
     }
 
-    /// `drain_frame_headers()` ile **hizalı** gösterim bayrakları.
+    /// `drain_frame_headers()` ile **hizalı** gösterim bayrakları (yalnızca
+    /// [`Decoder::set_collect_diagnostics`]`(true)` etkinken doldurulur).
     ///
     /// `true` ise çıktı karesi `show_frame`/`show_existing_frame` ile
     /// gösterilir (dav1d varsayılan çıktı kümesi).
@@ -2144,7 +2330,8 @@ impl Decoder {
         core::mem::take(&mut self.frame_output_flags)
     }
 
-    /// Bekleyen çıktı kare başlığı sayısı.
+    /// Bekleyen çıktı kare başlığı sayısı (yalnızca
+    /// [`Decoder::set_collect_diagnostics`]`(true)` etkinken büyür).
     #[must_use]
     pub fn pending_frame_headers(&self) -> usize {
         self.frame_outputs.len()
@@ -2263,7 +2450,8 @@ impl Decoder {
         self.last_output_tools.as_ref()
     }
 
-    /// Çözülen **her** karenin araç sayaçları (çözüm sırasıyla).
+    /// Çözülen **her** karenin araç sayaçları (çözüm sırasıyla; yalnızca
+    /// [`Decoder::set_collect_diagnostics`]`(true)` etkinken doldurulur).
     #[must_use]
     pub fn decoded_tool_counts(&self) -> &[crate::decode::intra::ToolCounts] {
         &self.decoded_tools
@@ -3385,5 +3573,67 @@ mod tests {
         .expect("2 iş parçacıklı kurulum");
         let d2 = d.clone();
         assert_eq!(d2.config().n_threads, 2);
+    }
+
+    #[test]
+    fn uzun_omurlu_decoder_varsayilan_kipte_sabit_bellek_tutar() {
+        // 1x1 8-bit 4:2:0 AV1 anahtar kare (TD + Sequence Header + Keyframe).
+        const PKT_1X1: &[u8] = &[
+            0x12, 0x00, 0x0A, 0x09, 0x00, 0x00, 0x00, 0x00, 0x00, 0x7D, 0xFC, 0xC0, 0x20, 0x32,
+            0x17, 0x10, 0x01, 0x91, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x68,
+            0xD2, 0x16, 0x8C, 0x64, 0xBE, 0x2E, 0xC7, 0xDA, 0xEE, 0x96,
+        ];
+
+        // 1. Varsayılan kipte (`collect_diagnostics == false`): 1000 karelik döngüde
+        //    `kalici_bayt()` ve `allocation_peak()` sabit kalır.
+        let mut probe = Decoder::new(Config {
+            n_threads: 1,
+            max_frame_delay: 1,
+            ..Config::default()
+        })
+        .unwrap();
+        assert!(!probe.collect_diagnostics());
+        for _ in 0..10 {
+            probe.send_packet(&Packet::new(PKT_1X1)).unwrap();
+            let _ = probe.receive_frame().unwrap().unwrap();
+        }
+        let steady_peak = probe.allocation_peak();
+        let steady_kalici = probe.kalici_bayt();
+
+        let mut dec = Decoder::new(Config {
+            n_threads: 1,
+            max_frame_delay: 1,
+            allocation_limit: Some(steady_peak),
+            ..Config::default()
+        })
+        .unwrap();
+        for _ in 0..1_000 {
+            dec.send_packet(&Packet::new(PKT_1X1))
+                .expect("sabit bütçe altında 1000 kare çözülmeli");
+            let frame = dec.receive_frame().unwrap().expect("kare üretilmeli");
+            assert_eq!((frame.width(), frame.height()), (1, 1));
+        }
+        assert_eq!(dec.decoded_frames(), 1_000);
+        assert_eq!(dec.frames_completed(), 1_000);
+        assert!(dec.last_tool_counts().is_some());
+        assert_eq!(dec.pending_frame_headers(), 0);
+        assert!(dec.decoded_tool_counts().is_empty());
+        assert_eq!(dec.kalici_bayt(), steady_kalici);
+        assert!(dec.allocation_peak() <= steady_peak);
+
+        // 2. `set_collect_diagnostics(true)` açıldığında geçmiş kayıtları çalışır.
+        let mut dec_diag = Decoder::new(Config {
+            n_threads: 1,
+            max_frame_delay: 1,
+            ..Config::default()
+        })
+        .unwrap();
+        dec_diag.set_collect_diagnostics(true);
+        dec_diag.send_packet(&Packet::new(PKT_1X1)).unwrap();
+        let _ = dec_diag.receive_frame().unwrap().unwrap();
+        assert_eq!(dec_diag.pending_frame_headers(), 1);
+        assert_eq!(dec_diag.drain_frame_headers().len(), 1);
+        assert_eq!(dec_diag.drain_frame_output_flags(), vec![true]);
+        assert_eq!(dec_diag.decoded_tool_counts().len(), 1);
     }
 }

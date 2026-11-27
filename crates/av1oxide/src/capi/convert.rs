@@ -4,22 +4,24 @@
 
 use core::ffi::{c_int, c_uint};
 
-use crate::api::Config;
+use crate::api::{Config, DecodeFrameType, InloopFilters};
 use crate::bitstream::frame_header::{FilmGrainData, FilmGrainHeader, FrameHeader};
 use crate::bitstream::{ObuType, SequenceHeader, SequenceHeaderParseOptions, split_next_with};
 use crate::capi::types::{
-    DAV1D_DECODEFRAMETYPE_ALL, DAV1D_INLOOPFILTER_ALL, DAV1D_MAX_CDEF_STRENGTHS,
+    DAV1D_DECODEFRAMETYPE_ALL, DAV1D_DECODEFRAMETYPE_INTRA, DAV1D_DECODEFRAMETYPE_KEY,
+    DAV1D_DECODEFRAMETYPE_REFERENCE, DAV1D_INLOOPFILTER_ALL, DAV1D_INLOOPFILTER_CDEF,
+    DAV1D_INLOOPFILTER_DEBLOCK, DAV1D_INLOOPFILTER_RESTORATION, DAV1D_MAX_CDEF_STRENGTHS,
     DAV1D_MAX_FRAME_DELAY, DAV1D_MAX_OPERATING_POINTS, DAV1D_MAX_SEGMENTS, DAV1D_MAX_THREADS,
     DAV1D_MAX_TILE_COLS, DAV1D_MAX_TILE_ROWS, DAV1D_PIXEL_LAYOUT_I400, DAV1D_PIXEL_LAYOUT_I420,
-    DAV1D_PIXEL_LAYOUT_I422, DAV1D_PIXEL_LAYOUT_I444, DAV1D_REFS_PER_FRAME, Dav1dFilmGrainData,
-    Dav1dFrameHeader, Dav1dFrameHeaderCdef, Dav1dFrameHeaderDelta, Dav1dFrameHeaderDeltaLf,
-    Dav1dFrameHeaderDeltaQ, Dav1dFrameHeaderFilmGrain, Dav1dFrameHeaderLoopfilter,
-    Dav1dFrameHeaderOperatingPoint, Dav1dFrameHeaderQuant, Dav1dFrameHeaderRestoration,
-    Dav1dFrameHeaderSegmentation, Dav1dFrameHeaderSuperRes, Dav1dFrameHeaderTiling,
-    Dav1dLoopfilterModeRefDeltas, Dav1dPixelLayout, Dav1dSegmentationData,
-    Dav1dSegmentationDataSet, Dav1dSequenceHeader, Dav1dSequenceHeaderOperatingParameterInfo,
-    Dav1dSequenceHeaderOperatingPoint, Dav1dSettings, Dav1dWarpedMotionParams, EINVAL, ENOENT,
-    ENOMEM, ERANGE, dav1d_err,
+    DAV1D_PIXEL_LAYOUT_I422, DAV1D_PIXEL_LAYOUT_I444, DAV1D_REFS_PER_FRAME, Dav1dDecodeFrameType,
+    Dav1dFilmGrainData, Dav1dFrameHeader, Dav1dFrameHeaderCdef, Dav1dFrameHeaderDelta,
+    Dav1dFrameHeaderDeltaLf, Dav1dFrameHeaderDeltaQ, Dav1dFrameHeaderFilmGrain,
+    Dav1dFrameHeaderLoopfilter, Dav1dFrameHeaderOperatingPoint, Dav1dFrameHeaderQuant,
+    Dav1dFrameHeaderRestoration, Dav1dFrameHeaderSegmentation, Dav1dFrameHeaderSuperRes,
+    Dav1dFrameHeaderTiling, Dav1dInloopFilterType, Dav1dLoopfilterModeRefDeltas, Dav1dPixelLayout,
+    Dav1dSegmentationData, Dav1dSegmentationDataSet, Dav1dSequenceHeader,
+    Dav1dSequenceHeaderOperatingParameterInfo, Dav1dSequenceHeaderOperatingPoint, Dav1dSettings,
+    Dav1dWarpedMotionParams, EINVAL, ENOENT, ENOMEM, ERANGE, dav1d_err,
 };
 use crate::decode::warpv::get_shear_params;
 use crate::error::{BitstreamErrorKind, Error};
@@ -42,6 +44,32 @@ pub(crate) fn frame_delay_from_settings(s: &Dav1dSettings) -> Result<c_int, c_in
     Ok(cfg.effective_frame_delay() as c_int)
 }
 
+/// `Dav1dInloopFilterType` → [`InloopFilters`].
+pub(crate) const fn inloop_filters_from_c(mask: Dav1dInloopFilterType) -> InloopFilters {
+    let mut bits = 0u8;
+    if (mask & DAV1D_INLOOPFILTER_DEBLOCK) != 0 {
+        bits |= InloopFilters::DEBLOCK.bits();
+    }
+    if (mask & DAV1D_INLOOPFILTER_CDEF) != 0 {
+        bits |= InloopFilters::CDEF.bits();
+    }
+    if (mask & DAV1D_INLOOPFILTER_RESTORATION) != 0 {
+        bits |= InloopFilters::RESTORATION.bits();
+    }
+    InloopFilters::from_bits_truncate(bits)
+}
+
+/// `Dav1dDecodeFrameType` → [`DecodeFrameType`].
+pub(crate) const fn decode_frame_type_from_c(ft: Dav1dDecodeFrameType) -> Option<DecodeFrameType> {
+    match ft {
+        DAV1D_DECODEFRAMETYPE_ALL => Some(DecodeFrameType::All),
+        DAV1D_DECODEFRAMETYPE_REFERENCE => Some(DecodeFrameType::Reference),
+        DAV1D_DECODEFRAMETYPE_INTRA => Some(DecodeFrameType::Intra),
+        DAV1D_DECODEFRAMETYPE_KEY => Some(DecodeFrameType::Key),
+        _ => None,
+    }
+}
+
 /// `Dav1dSettings` yapısını doğrular ve `av1oxide::Config`'e dönüştürür.
 pub(crate) fn settings_to_config(s: &Dav1dSettings) -> Result<Config, c_int> {
     if s.n_threads < 0
@@ -50,8 +78,8 @@ pub(crate) fn settings_to_config(s: &Dav1dSettings) -> Result<Config, c_int> {
         || s.max_frame_delay > DAV1D_MAX_FRAME_DELAY
         || s.operating_point < 0
         || s.operating_point > 31
-        || s.inloop_filters != DAV1D_INLOOPFILTER_ALL
-        || s.decode_frame_type != DAV1D_DECODEFRAMETYPE_ALL
+        || (s.inloop_filters & !DAV1D_INLOOPFILTER_ALL) != 0
+        || decode_frame_type_from_c(s.decode_frame_type).is_none()
     {
         return Err(dav1d_err(EINVAL));
     }

@@ -13,16 +13,17 @@ use std::sync::Arc;
 
 use crate::api::{Decoder, OutputCapiMeta};
 use crate::capi::convert::{
-    bpc_to_bit_depth, chroma_to_pixel_layout, error_to_dav1d, film_grain_from_c,
-    frame_delay_from_settings, frame_header_to_c, has_grain_c, parse_sequence_header_bytes,
-    pixel_layout_to_chroma, seq_header_to_c, settings_to_config,
+    bpc_to_bit_depth, chroma_to_pixel_layout, decode_frame_type_from_c, error_to_dav1d,
+    film_grain_from_c, frame_delay_from_settings, frame_header_to_c, has_grain_c,
+    inloop_filters_from_c, parse_sequence_header_bytes, pixel_layout_to_chroma, seq_header_to_c,
+    settings_to_config,
 };
 use crate::capi::types::{
     DAV1D_API_VERSION_MAJOR, DAV1D_API_VERSION_MINOR, DAV1D_API_VERSION_PATCH,
     DAV1D_PICTURE_ALIGNMENT, Dav1dContentLightLevel, Dav1dContext, Dav1dData, Dav1dDataProps,
-    Dav1dEventFlags, Dav1dFrameHeader, Dav1dITUTT35, Dav1dMasteringDisplay, Dav1dPicAllocator,
-    Dav1dPicture, Dav1dPictureParameters, Dav1dRef, Dav1dSequenceHeader, Dav1dSettings, EAGAIN,
-    EINVAL, ENOMEM, dav1d_err,
+    Dav1dEventFlags, Dav1dFrameHeader, Dav1dITUTT35, Dav1dLogger, Dav1dMasteringDisplay,
+    Dav1dPicAllocator, Dav1dPicture, Dav1dPictureParameters, Dav1dRef, Dav1dSequenceHeader,
+    Dav1dSettings, EAGAIN, EINVAL, ENOMEM, dav1d_err,
 };
 use crate::frame::{Frame, PlaneType};
 
@@ -113,6 +114,7 @@ impl Drop for RefInner {
 pub(crate) struct ContextInner {
     pub(crate) decoder: Decoder,
     pub(crate) allocator: Dav1dPicAllocator,
+    pub(crate) logger: Dav1dLogger,
     pub(crate) all_layers: bool,
     pub(crate) ready_pic: Option<(Frame, OutputCapiMeta)>,
     pub(crate) cached_pic: Option<(Frame, OutputCapiMeta)>,
@@ -155,6 +157,27 @@ fn ref_inc(ptr: *mut Dav1dRef) -> *mut Dav1dRef {
         }
     }
     ptr
+}
+
+fn log_capi_message(logger: &Dav1dLogger, msg: &str) {
+    if logger.callback.is_null() {
+        return;
+    }
+    let Ok(cmsg) = std::ffi::CString::new(msg) else {
+        return;
+    };
+    let cookie = logger.cookie;
+    let cb_ptr = logger.callback;
+    let _ = catch_unwind(AssertUnwindSafe(|| {
+        // SAFETY: (1) ISA koşulu yoktur (C günlük geri çağrısı çağrımı).
+        // (2) sınır: `cb_ptr` null değildir ve `Dav1dLogger` sözleşmesi gereği `void (*callback)(void *cookie, const char *format, ...)` imzasına sahip geçerli bir C fonksiyon işaretçisidir; `c"%s\n"` ve `cmsg` NUL sonludur.
+        // (3) hizalama/takma ad: format dizesi ile `cmsg` salt-okunur C dizeleridir ve çağrı süresince canlıdır.
+        unsafe {
+            let cb: unsafe extern "C" fn(*mut c_void, *const c_char, ...) =
+                core::mem::transmute(cb_ptr);
+            cb(cookie, c"%s\n".as_ptr(), cmsg.as_ptr());
+        }
+    }));
 }
 
 fn ref_dec(slot: &mut *mut Dav1dRef) {
@@ -587,16 +610,27 @@ pub unsafe extern "C" fn dav1d_open(
         };
         let config = match settings_to_config(settings) {
             Ok(cfg) => cfg,
-            Err(code) => return code,
+            Err(code) => {
+                log_capi_message(&settings.logger, "dav1d_open: invalid settings");
+                return code;
+            }
         };
-        let decoder = match Decoder::new(config) {
+        let mut decoder = match Decoder::new(config) {
             Ok(dec) => dec,
-            Err(err) => return error_to_dav1d(&err),
+            Err(err) => {
+                log_capi_message(&settings.logger, &format!("dav1d_open: {err}"));
+                return error_to_dav1d(&err);
+            }
         };
+        decoder.set_inloop_filters(inloop_filters_from_c(settings.inloop_filters));
+        if let Some(ft) = decode_frame_type_from_c(settings.decode_frame_type) {
+            decoder.set_decode_frame_type(ft);
+        }
         let ctx = Box::new(Dav1dContext {
             inner: ContextInner {
                 decoder,
                 allocator: settings.allocator,
+                logger: settings.logger,
                 all_layers: settings.all_layers != 0,
                 ready_pic: None,
                 cached_pic: None,
@@ -711,6 +745,7 @@ fn pull_ready_nonblocking(ctx: &mut ContextInner) {
         }
         Ok(None) => {}
         Err(err) => {
+            log_capi_message(&ctx.logger, &format!("dav1d decode error: {err}"));
             if let Some(tag) = ctx.decoder.last_error_packet_tag() {
                 record_error_props_for_tag(ctx, tag, None);
             }
@@ -810,6 +845,7 @@ fn gen_picture(ctx: &mut ContextInner) -> c_int {
                 }
             }
             Err(err) => {
+                log_capi_message(&ctx.logger, &format!("dav1d_send_data error: {err}"));
                 let code = error_to_dav1d(&err);
                 let err_tag = ctx.decoder.last_error_packet_tag().unwrap_or(tag);
                 let fallback_props = clone_data_props(&ctx.pending_in.m);
@@ -989,6 +1025,7 @@ pub unsafe extern "C" fn dav1d_get_picture(c: *mut Dav1dContext, out: *mut Dav1d
                         return dav1d_err(EAGAIN);
                     }
                     Err(err) => {
+                        log_capi_message(&ctx.logger, &format!("dav1d_get_picture error: {err}"));
                         if let Some(tag) = ctx.decoder.last_error_packet_tag() {
                             record_error_props_for_tag(ctx, tag, None);
                         }

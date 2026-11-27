@@ -1337,3 +1337,165 @@ fn capi_send_data_returns_eagain_when_pending_slot_full_and_matches_rust_decoder
         dav1d_close(&mut ctx);
     }
 }
+
+#[test]
+fn capi_inloop_filters_decode_frame_type_and_logger_callback() {
+    use av1oxide::capi::types::{
+        DAV1D_DECODEFRAMETYPE_ALL, DAV1D_DECODEFRAMETYPE_INTRA, DAV1D_DECODEFRAMETYPE_KEY,
+        DAV1D_DECODEFRAMETYPE_REFERENCE, DAV1D_INLOOPFILTER_ALL, DAV1D_INLOOPFILTER_CDEF,
+        DAV1D_INLOOPFILTER_DEBLOCK, DAV1D_INLOOPFILTER_NONE, DAV1D_INLOOPFILTER_RESTORATION,
+    };
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    unsafe extern "C" fn test_logger_cb(
+        cookie: *mut core::ffi::c_void,
+        fmt: *const core::ffi::c_char,
+        _: ...
+    ) {
+        if !cookie.is_null() && !fmt.is_null() {
+            // SAFETY: `cookie` bu test boyunca canlı `AtomicUsize` örneğidir.
+            let hits = unsafe { &*(cookie as *const AtomicUsize) };
+            hits.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let ivf_path = manifest_dir.join(
+        "tests/fixtures/streams/Syntax_AV1_mainb8ss420_432x240_001_vq_aom_ctest_4.2.stripped.ivf",
+    );
+    let raw = std::fs::read(&ivf_path).expect("IVF fikstürü okunmalı");
+    let mut packets: Vec<Vec<u8>> = Vec::new();
+    let mut pos = 32usize;
+    while pos + 12 <= raw.len() {
+        let sz = u32::from_le_bytes(raw[pos..pos + 4].try_into().unwrap()) as usize;
+        pos += 12;
+        packets.push(raw[pos..pos + sz].to_vec());
+        pos += sz;
+    }
+
+    let log_hits = AtomicUsize::new(0);
+
+    // SAFETY: C-ABI çağrıları bu test içinde ayrılan geçerli yapılarla yapılır.
+    unsafe {
+        // 1. Geçersiz `inloop_filters` ve `decode_frame_type` reddedilir ve logger çağrılır.
+        let mut bad_s = Dav1dSettings::default();
+        dav1d_default_settings(&mut bad_s);
+        bad_s.logger.cookie = (&log_hits as *const AtomicUsize) as *mut core::ffi::c_void;
+        bad_s.logger.callback = test_logger_cb as *const core::ffi::c_void;
+        bad_s.inloop_filters = DAV1D_INLOOPFILTER_ALL | 0x8;
+        let mut ctx: *mut Dav1dContext = core::ptr::null_mut();
+        assert_eq!(dav1d_open(&mut ctx, &bad_s), dav1d_err(EINVAL));
+        assert!(ctx.is_null());
+        assert!(log_hits.load(Ordering::SeqCst) >= 1);
+
+        bad_s.inloop_filters = DAV1D_INLOOPFILTER_ALL;
+        bad_s.decode_frame_type = DAV1D_DECODEFRAMETYPE_KEY + 1;
+        assert_eq!(dav1d_open(&mut ctx, &bad_s), dav1d_err(EINVAL));
+        assert!(ctx.is_null());
+
+        // 2. Tüm geçerli `inloop_filters` kombinasyonları (`NONE`, `DEBLOCK`, `CDEF`, `RESTORATION`,
+        //    `DEBLOCK|RESTORATION`, `ALL`) kabul edilip çalışır.
+        let mut decoded_none = Vec::new();
+        let mut decoded_all = Vec::new();
+        for mask in [
+            DAV1D_INLOOPFILTER_NONE,
+            DAV1D_INLOOPFILTER_DEBLOCK,
+            DAV1D_INLOOPFILTER_CDEF,
+            DAV1D_INLOOPFILTER_RESTORATION,
+            DAV1D_INLOOPFILTER_DEBLOCK | DAV1D_INLOOPFILTER_RESTORATION,
+            DAV1D_INLOOPFILTER_ALL,
+        ] {
+            let mut s = Dav1dSettings::default();
+            dav1d_default_settings(&mut s);
+            s.n_threads = 1;
+            s.max_frame_delay = 1;
+            s.inloop_filters = mask;
+            let mut c: *mut Dav1dContext = core::ptr::null_mut();
+            assert_eq!(dav1d_open(&mut c, &s), 0, "mask={mask} açılmalı");
+            let mut d = Dav1dData::default();
+            let p = dav1d_data_create(&mut d, packets[0].len());
+            core::ptr::copy_nonoverlapping(packets[0].as_ptr(), p, packets[0].len());
+            assert_eq!(dav1d_send_data(c, &mut d), 0);
+            let mut pic = Dav1dPicture::default();
+            assert_eq!(dav1d_get_picture(c, &mut pic), 0);
+            if mask == DAV1D_INLOOPFILTER_NONE || mask == DAV1D_INLOOPFILTER_ALL {
+                let w = pic.p.w as usize;
+                let h = pic.p.h as usize;
+                let stride = pic.stride[0] as usize;
+                let base = pic.data[0] as *const u8;
+                let mut rows = Vec::with_capacity(w * h);
+                for r in 0..h {
+                    rows.extend_from_slice(core::slice::from_raw_parts(base.add(r * stride), w));
+                }
+                if mask == DAV1D_INLOOPFILTER_NONE {
+                    decoded_none = rows;
+                } else {
+                    decoded_all = rows;
+                }
+            }
+            dav1d_picture_unref(&mut pic);
+            dav1d_close(&mut c);
+        }
+        assert!(!decoded_none.is_empty() && !decoded_all.is_empty());
+        assert_ne!(
+            decoded_none, decoded_all,
+            "inloop_filters=NONE çıktısı ALL çıktısından farklı olmalıdır"
+        );
+
+        // 3. `decode_frame_type = KEY`: çok kareli IVF'den yalnızca anahtar kareler çıkar.
+        let count_for_ft = |ft: u32| -> usize {
+            let mut s = Dav1dSettings::default();
+            dav1d_default_settings(&mut s);
+            s.n_threads = 1;
+            s.max_frame_delay = 1;
+            s.decode_frame_type = ft;
+            let mut c: *mut Dav1dContext = core::ptr::null_mut();
+            assert_eq!(dav1d_open(&mut c, &s), 0);
+            let mut count = 0usize;
+            for pkt in &packets {
+                let mut d = Dav1dData::default();
+                let p = dav1d_data_create(&mut d, pkt.len());
+                core::ptr::copy_nonoverlapping(pkt.as_ptr(), p, pkt.len());
+                assert_eq!(dav1d_send_data(c, &mut d), 0);
+                let mut pic = Dav1dPicture::default();
+                while dav1d_get_picture(c, &mut pic) == 0 {
+                    count += 1;
+                    dav1d_picture_unref(&mut pic);
+                }
+            }
+            let mut pic = Dav1dPicture::default();
+            while dav1d_get_picture(c, &mut pic) == 0 {
+                count += 1;
+                dav1d_picture_unref(&mut pic);
+            }
+            dav1d_close(&mut c);
+            count
+        };
+        let all_cnt = count_for_ft(DAV1D_DECODEFRAMETYPE_ALL);
+        let ref_cnt = count_for_ft(DAV1D_DECODEFRAMETYPE_REFERENCE);
+        let intra_cnt = count_for_ft(DAV1D_DECODEFRAMETYPE_INTRA);
+        let key_cnt = count_for_ft(DAV1D_DECODEFRAMETYPE_KEY);
+        assert!(all_cnt >= 5);
+        assert!(ref_cnt <= all_cnt);
+        assert!(intra_cnt >= key_cnt && key_cnt >= 1 && key_cnt < all_cnt);
+
+        // 4. `logger` bozuk paket hatasında çağrılır.
+        let before = log_hits.load(Ordering::SeqCst);
+        let mut s = Dav1dSettings::default();
+        dav1d_default_settings(&mut s);
+        s.n_threads = 1;
+        s.max_frame_delay = 1;
+        s.logger.cookie = (&log_hits as *const AtomicUsize) as *mut core::ffi::c_void;
+        s.logger.callback = test_logger_cb as *const core::ffi::c_void;
+        let mut c: *mut Dav1dContext = core::ptr::null_mut();
+        assert_eq!(dav1d_open(&mut c, &s), 0);
+        let bad_obu = [0x0Au8, 0x7F, 0xFF]; // kesik OBU
+        let mut d = Dav1dData::default();
+        let p = dav1d_data_create(&mut d, bad_obu.len());
+        core::ptr::copy_nonoverlapping(bad_obu.as_ptr(), p, bad_obu.len());
+        assert!(dav1d_send_data(c, &mut d) < 0);
+        dav1d_data_unref(&mut d);
+        assert!(log_hits.load(Ordering::SeqCst) > before);
+        dav1d_close(&mut c);
+    }
+}

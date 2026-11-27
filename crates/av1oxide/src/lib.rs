@@ -113,7 +113,7 @@
 //! - `crates/av1oxide/src` altındaki `218` kaynak dosyadan `124`'ü doğrudan `#![forbid(unsafe_code)]`
 //!   taşır (kalan `5` üst modül kökü `0` `unsafe` bloğu içerir); yalnız [`audit::UNSAFE_EXEMPTIONS`]
 //!   içindeki `88` `x86_64`/`aarch64` SIMD dosyası ve `1` C-ABI sınır dosyası (`capi/ffi.rs`)
-//!   dar kapsamlı işlemler için muaf tutulur (`0` güvensiz işlev imzası, `397` blok).
+//!   dar kapsamlı işlemler için muaf tutulur (`0` güvensiz işlev imzası, `398` blok).
 //!
 //! ## Bağımlılık Politikası
 //!
@@ -173,7 +173,7 @@ pub mod thread;
 #[cfg(feature = "msac-trace")]
 pub mod trace;
 
-pub use api::{Config, Decoder, DecoderState, Packet};
+pub use api::{Config, DecodeFrameType, Decoder, DecoderState, InloopFilters, Packet};
 pub use error::{Error, Result, SizeStage};
 pub use frame::{BitDepth, ChromaFormat, Frame, FrameMetadata, FramePlane, PlaneLayout, PlaneType};
 

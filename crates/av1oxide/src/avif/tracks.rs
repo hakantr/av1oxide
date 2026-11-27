@@ -10,7 +10,7 @@ use alloc::vec::Vec;
 use crate::avif::boxes::{
     ALPHA_AUX_URN_CICP, ALPHA_AUX_URN_HEVC, AvifContainer, ItemProperty, decompress_by_fourcc,
     is_supported_brand, parse_meta_box, parse_property_boxes, read_box_header, read_full_box,
-    read_u32_be, read_u64_be,
+    read_i32_be, read_u32_be, read_u64_be,
 };
 use crate::error::{Error, Result};
 use crate::frame::butce::{Butce, ButceTutucu};
@@ -67,6 +67,12 @@ struct TimeToSample {
     sample_delta: u32,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct CompositionOffset {
+    sample_count: u32,
+    sample_offset: i64,
+}
+
 #[derive(Clone, Debug, Default)]
 struct RawSampleTable {
     chunks: Vec<u64>,
@@ -74,6 +80,7 @@ struct RawSampleTable {
     all_samples_size: u32,
     sample_sizes: Vec<u32>,
     time_to_samples: Vec<TimeToSample>,
+    composition_offsets: Vec<CompositionOffset>,
     has_stss: bool,
     sync_samples: Vec<u32>,
     is_av01: bool,
@@ -650,6 +657,7 @@ fn parse_stbl(
             b"stsc" => parse_stsc(child.payload, &mut stbl, &mut table_guard)?,
             b"stsz" => parse_stsz(child.payload, &mut stbl, &mut table_guard)?,
             b"stts" => parse_stts(child.payload, &mut stbl, &mut table_guard)?,
+            b"ctts" => parse_ctts(child.payload, &mut stbl, &mut table_guard)?,
             b"stss" => parse_stss(child.payload, &mut stbl, &mut table_guard)?,
             _ => {}
         }
@@ -813,6 +821,40 @@ fn parse_stts(payload: &[u8], stbl: &mut RawSampleTable, guard: &mut ButceTutucu
     Ok(())
 }
 
+fn parse_ctts(payload: &[u8], stbl: &mut RawSampleTable, guard: &mut ButceTutucu) -> Result<()> {
+    let (ver, _flags, body) = read_full_box(payload)?;
+    if ver > 1 {
+        return Err(Error::Unsupported("ctts sürümü > 1 desteklenmiyor"));
+    }
+    let count = read_u32_be(body, 0).ok_or(Error::InvalidData("kesik ctts entry_count"))? as usize;
+    let needed = count
+        .checked_mul(8)
+        .ok_or(Error::InvalidData("ctts boyut taşması"))?;
+    if needed > body.len().saturating_sub(4) {
+        return Err(Error::InvalidData("kesik ctts giriş dizisi"));
+    }
+    reserve_table_budget(count, core::mem::size_of::<CompositionOffset>(), guard)?;
+    stbl.composition_offsets
+        .try_reserve(count)
+        .map_err(|_| Error::AllocationFailed {
+            requested: count.saturating_mul(core::mem::size_of::<CompositionOffset>()),
+        })?;
+    for i in 0..count {
+        let base = 4 + i * 8;
+        let sample_count = read_u32_be(body, base).ok_or(Error::InvalidData("kesik ctts"))?;
+        let sample_offset = if ver == 0 {
+            i64::from(read_u32_be(body, base + 4).ok_or(Error::InvalidData("kesik ctts v0"))?)
+        } else {
+            i64::from(read_i32_be(body, base + 4).ok_or(Error::InvalidData("kesik ctts v1"))?)
+        };
+        stbl.composition_offsets.push(CompositionOffset {
+            sample_count,
+            sample_offset,
+        });
+    }
+    Ok(())
+}
+
 fn parse_stss(payload: &[u8], stbl: &mut RawSampleTable, guard: &mut ButceTutucu) -> Result<()> {
     let (ver, _flags, body) = read_full_box(payload)?;
     if ver != 0 {
@@ -835,26 +877,100 @@ fn parse_stss(payload: &[u8], stbl: &mut RawSampleTable, guard: &mut ButceTutucu
     Ok(())
 }
 
-fn sample_count_of_chunk(stsc: &[SampleToChunk], chunk_index: usize) -> u32 {
-    let chunk_num = (chunk_index as u32).saturating_add(1);
-    for entry in stsc.iter().rev() {
-        if entry.first_chunk <= chunk_num {
-            return entry.samples_per_chunk;
-        }
-    }
-    0
+/// İleri yönlü `O(1)` amortize `stsc` imleci (`stsc` `first_chunk` kesin artan sıradadır).
+struct StscCursor<'a> {
+    entries: &'a [SampleToChunk],
+    idx: usize,
 }
 
-fn sample_delta_at(stts: &[TimeToSample], index: usize) -> u64 {
-    let mut rem = index;
-    for entry in stts {
-        let count = entry.sample_count as usize;
-        if rem < count {
-            return u64::from(entry.sample_delta);
-        }
-        rem -= count;
+impl<'a> StscCursor<'a> {
+    fn new(entries: &'a [SampleToChunk]) -> Self {
+        Self { entries, idx: 0 }
     }
-    0
+
+    #[inline]
+    fn samples_for_chunk(&mut self, chunk_index: usize) -> u32 {
+        if self.entries.is_empty() {
+            return 0;
+        }
+        let chunk_num = (chunk_index as u32).saturating_add(1);
+        while self.idx + 1 < self.entries.len()
+            && self.entries[self.idx + 1].first_chunk <= chunk_num
+        {
+            self.idx += 1;
+        }
+        if self.entries[self.idx].first_chunk <= chunk_num {
+            self.entries[self.idx].samples_per_chunk
+        } else {
+            0
+        }
+    }
+}
+
+/// İleri yönlü `O(1)` amortize `stts` imleci.
+struct SttsCursor<'a> {
+    entries: &'a [TimeToSample],
+    idx: usize,
+    rem_in_entry: u32,
+    cur_delta: u64,
+}
+
+impl<'a> SttsCursor<'a> {
+    fn new(entries: &'a [TimeToSample]) -> Self {
+        Self {
+            entries,
+            idx: 0,
+            rem_in_entry: 0,
+            cur_delta: 0,
+        }
+    }
+
+    #[inline]
+    fn next_delta(&mut self) -> u64 {
+        while self.rem_in_entry == 0 {
+            let Some(entry) = self.entries.get(self.idx) else {
+                return 0;
+            };
+            self.idx += 1;
+            self.rem_in_entry = entry.sample_count;
+            self.cur_delta = u64::from(entry.sample_delta);
+        }
+        self.rem_in_entry -= 1;
+        self.cur_delta
+    }
+}
+
+/// İleri yönlü `O(1)` amortize `ctts` (`CompositionOffsetBox`) imleci.
+struct CttsCursor<'a> {
+    entries: &'a [CompositionOffset],
+    idx: usize,
+    rem_in_entry: u32,
+    cur_offset: i64,
+}
+
+impl<'a> CttsCursor<'a> {
+    fn new(entries: &'a [CompositionOffset]) -> Self {
+        Self {
+            entries,
+            idx: 0,
+            rem_in_entry: 0,
+            cur_offset: 0,
+        }
+    }
+
+    #[inline]
+    fn next_offset(&mut self) -> i64 {
+        while self.rem_in_entry == 0 {
+            let Some(entry) = self.entries.get(self.idx) else {
+                return 0;
+            };
+            self.idx += 1;
+            self.rem_in_entry = entry.sample_count;
+            self.cur_offset = entry.sample_offset;
+        }
+        self.rem_in_entry -= 1;
+        self.cur_offset
+    }
 }
 
 fn build_track_samples(
@@ -867,8 +983,9 @@ fn build_track_samples(
         return Ok((Vec::new(), sample_guard));
     }
     let mut total_samples = 0usize;
+    let mut count_stsc = StscCursor::new(&stbl.sample_to_chunks);
     for chunk_idx in 0..stbl.chunks.len() {
-        let count = sample_count_of_chunk(&stbl.sample_to_chunks, chunk_idx) as usize;
+        let count = count_stsc.samples_for_chunk(chunk_idx) as usize;
         if count == 0 {
             return Err(Error::InvalidData("stbl içinde 0 örnekli yığın (chunk)"));
         }
@@ -888,12 +1005,21 @@ fn build_track_samples(
         &mut sample_guard,
     )?;
 
-    let mut samples = Vec::with_capacity(total_samples);
+    let mut samples = Vec::new();
+    samples
+        .try_reserve_exact(total_samples)
+        .map_err(|_| Error::AllocationFailed {
+            requested: total_samples.saturating_mul(core::mem::size_of::<TrackSample>()),
+        })?;
+    let mut stsc_cursor = StscCursor::new(&stbl.sample_to_chunks);
+    let mut stts_cursor = SttsCursor::new(&stbl.time_to_samples);
+    let mut ctts_cursor = CttsCursor::new(&stbl.composition_offsets);
+    let has_ctts = !stbl.composition_offsets.is_empty();
     let mut size_idx = 0usize;
-    let mut pts = 0u64;
+    let mut dts = 0u64;
 
     for (chunk_idx, &chunk_off) in stbl.chunks.iter().enumerate() {
-        let count = sample_count_of_chunk(&stbl.sample_to_chunks, chunk_idx) as usize;
+        let count = stsc_cursor.samples_for_chunk(chunk_idx) as usize;
         let mut cur_off = chunk_off;
         for _ in 0..count {
             let sz_u32 = if stbl.all_samples_size > 0 {
@@ -922,7 +1048,19 @@ fn build_track_samples(
                 ));
             }
 
-            let dur = sample_delta_at(&stbl.time_to_samples, size_idx);
+            let dur = stts_cursor.next_delta();
+            let pts = if has_ctts {
+                let ctts_off = ctts_cursor.next_offset();
+                let pts_i128 = i128::from(dts) + i128::from(ctts_off);
+                if pts_i128 < 0 || pts_i128 > i128::from(u64::MAX) {
+                    return Err(Error::InvalidData(
+                        "ctts bileşik zaman damgası (pts) aralık dışında",
+                    ));
+                }
+                pts_i128 as u64
+            } else {
+                dts
+            };
             samples.push(TrackSample {
                 offset: off_usize,
                 size: sz_usize,
@@ -930,7 +1068,7 @@ fn build_track_samples(
                 duration_in_timescale: dur,
                 is_keyframe: !stbl.has_stss,
             });
-            pts = pts.saturating_add(dur);
+            dts = dts.saturating_add(dur);
             cur_off = end_u64;
             size_idx += 1;
         }
@@ -950,4 +1088,139 @@ fn build_track_samples(
     }
 
     Ok((samples, sample_guard))
+}
+
+#[cfg(test)]
+mod tests {
+    use alloc::sync::Arc;
+    use alloc::vec;
+    use alloc::vec::Vec;
+
+    use super::{
+        CompositionOffset, RawSampleTable, SampleToChunk, TimeToSample, build_track_samples,
+        parse_ctts,
+    };
+    use crate::error::Error;
+    use crate::frame::butce::{Butce, ButceTutucu};
+
+    #[test]
+    fn build_track_samples_linear_with_100k_entries() {
+        let n = 100_000usize;
+        let mut chunks = Vec::with_capacity(n);
+        let mut stsc = Vec::with_capacity(n);
+        let mut stts = Vec::with_capacity(n);
+        for i in 0..n {
+            chunks.push((i as u64) * 16);
+            stsc.push(SampleToChunk {
+                first_chunk: (i as u32) + 1,
+                samples_per_chunk: 1,
+            });
+            stts.push(TimeToSample {
+                sample_count: 1,
+                sample_delta: 30,
+            });
+        }
+        let stbl = RawSampleTable {
+            chunks,
+            sample_to_chunks: stsc,
+            all_samples_size: 16,
+            sample_sizes: Vec::new(),
+            time_to_samples: stts,
+            composition_offsets: Vec::new(),
+            has_stss: false,
+            sync_samples: Vec::new(),
+            is_av01: true,
+            properties: Vec::new(),
+        };
+        let butce = Arc::new(Butce::yeni(None, 0));
+        let (samples, _g) =
+            build_track_samples(&stbl, n * 16, &butce).expect("100k örnek hızla üretilmeli");
+        assert_eq!(samples.len(), n);
+        assert_eq!(samples[0].pts_in_timescale, 0);
+        assert_eq!(samples[n - 1].pts_in_timescale, ((n - 1) as u64) * 30);
+    }
+
+    #[test]
+    fn ctts_v0_and_signed_v1_adjust_pts_and_reject_negative_pts() {
+        let butce = Arc::new(Butce::yeni(None, 0));
+
+        // ctts v0 (u32 ofsetler): dts=[0, 10, 20], offset=[20, 0, 10] -> pts=[20, 10, 30]
+        let mut ctts_v0 = vec![0u8, 0, 0, 0]; // ver=0, flags=0
+        ctts_v0.extend_from_slice(&3u32.to_be_bytes());
+        for (cnt, off) in [(1u32, 20u32), (1, 0), (1, 10)] {
+            ctts_v0.extend_from_slice(&cnt.to_be_bytes());
+            ctts_v0.extend_from_slice(&off.to_be_bytes());
+        }
+        let mut stbl_v0 = RawSampleTable {
+            chunks: vec![0],
+            sample_to_chunks: vec![SampleToChunk {
+                first_chunk: 1,
+                samples_per_chunk: 3,
+            }],
+            all_samples_size: 4,
+            time_to_samples: vec![TimeToSample {
+                sample_count: 3,
+                sample_delta: 10,
+            }],
+            ..RawSampleTable::default()
+        };
+        let mut g0 = ButceTutucu::bos(&butce);
+        parse_ctts(&ctts_v0, &mut stbl_v0, &mut g0).expect("ctts v0 ayrıştırılmalı");
+        let (s0, _) = build_track_samples(&stbl_v0, 64, &butce).unwrap();
+        assert_eq!(
+            s0.iter().map(|s| s.pts_in_timescale).collect::<Vec<_>>(),
+            vec![20, 10, 30]
+        );
+
+        // ctts v1 (işaretli i32 ofsetler): dts=[0, 10, 20], offset=[+10, -5, -10] -> pts=[10, 5, 10]
+        let mut ctts_v1 = vec![1u8, 0, 0, 0]; // ver=1, flags=0
+        ctts_v1.extend_from_slice(&3u32.to_be_bytes());
+        for (cnt, off) in [(1u32, 10i32), (1, -5), (1, -10)] {
+            ctts_v1.extend_from_slice(&cnt.to_be_bytes());
+            ctts_v1.extend_from_slice(&off.to_be_bytes());
+        }
+        let mut stbl_v1 = RawSampleTable {
+            chunks: vec![0],
+            sample_to_chunks: vec![SampleToChunk {
+                first_chunk: 1,
+                samples_per_chunk: 3,
+            }],
+            all_samples_size: 4,
+            time_to_samples: vec![TimeToSample {
+                sample_count: 3,
+                sample_delta: 10,
+            }],
+            ..RawSampleTable::default()
+        };
+        let mut g1 = ButceTutucu::bos(&butce);
+        parse_ctts(&ctts_v1, &mut stbl_v1, &mut g1).expect("ctts v1 ayrıştırılmalı");
+        let (s1, _) = build_track_samples(&stbl_v1, 64, &butce).unwrap();
+        assert_eq!(
+            s1.iter().map(|s| s.pts_in_timescale).collect::<Vec<_>>(),
+            vec![10, 5, 10]
+        );
+
+        // Negatif pts (dts=0 + offset=-1) reddedilmeli.
+        let stbl_neg = RawSampleTable {
+            chunks: vec![0],
+            sample_to_chunks: vec![SampleToChunk {
+                first_chunk: 1,
+                samples_per_chunk: 1,
+            }],
+            all_samples_size: 4,
+            time_to_samples: vec![TimeToSample {
+                sample_count: 1,
+                sample_delta: 10,
+            }],
+            composition_offsets: vec![CompositionOffset {
+                sample_count: 1,
+                sample_offset: -1,
+            }],
+            ..RawSampleTable::default()
+        };
+        assert!(matches!(
+            build_track_samples(&stbl_neg, 64, &butce),
+            Err(Error::InvalidData(_))
+        ));
+    }
 }

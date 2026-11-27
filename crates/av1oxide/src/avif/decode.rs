@@ -180,11 +180,12 @@ pub(crate) fn compute_clap_rect(
 
     // cropX = w/2 + horizOffN/horizOffD - cropW/2
     //       = ((w - cropW) * horizOffD + 2 * horizOffN) / (2 * horizOffD)
-    let hd = i64::from(clap.horiz_off_d);
-    let vd = i64::from(clap.vert_off_d);
-    let num_x = (i64::from(w) - i64::from(crop_w)) * hd + 2 * i64::from(clap.horiz_off_n);
+    // Ara çarpımlarda `i64` taşmasını önlemek için `i128` aritmetiği kullanılır.
+    let hd = i128::from(clap.horiz_off_d);
+    let vd = i128::from(clap.vert_off_d);
+    let num_x = (i128::from(w) - i128::from(crop_w)) * hd + 2 * i128::from(clap.horiz_off_n);
     let den_x = 2 * hd;
-    let num_y = (i64::from(h) - i64::from(crop_h)) * vd + 2 * i64::from(clap.vert_off_n);
+    let num_y = (i128::from(h) - i128::from(crop_h)) * vd + 2 * i128::from(clap.vert_off_n);
     let den_y = 2 * vd;
 
     if (num_x % den_x) != 0 || (num_y % den_y) != 0 {
@@ -192,18 +193,18 @@ pub(crate) fn compute_clap_rect(
             "clap sol-üst kırpma ofseti tam sayı değil",
         ));
     }
-    let x0_i64 = num_x / den_x;
-    let y0_i64 = num_y / den_y;
-    if x0_i64 < 0
-        || y0_i64 < 0
-        || x0_i64 + i64::from(crop_w) > i64::from(w)
-        || y0_i64 + i64::from(crop_h) > i64::from(h)
+    let x0_i128 = num_x / den_x;
+    let y0_i128 = num_y / den_y;
+    if x0_i128 < 0
+        || y0_i128 < 0
+        || x0_i128 + i128::from(crop_w) > i128::from(w)
+        || y0_i128 + i128::from(crop_h) > i128::from(h)
     {
         return Err(Error::InvalidData(
             "clap kırpma bölgesi görüntü sınırları dışında",
         ));
     }
-    Ok((x0_i64 as u32, y0_i64 as u32, crop_w, crop_h))
+    Ok((x0_i128 as u32, y0_i128 as u32, crop_w, crop_h))
 }
 
 /// Bir öğenin dönüşüm öncesi (`raw_w`, `raw_h`) ve dönüşümler (`clap`, `irot`, `imir`) sonrası
@@ -1074,12 +1075,14 @@ fn decode_av01_item(
     let mut av1c_opt: Option<&Av1CProperty> = None;
     let mut operating_point: u8 = 0;
     let mut layer_sel: Option<u16> = None;
+    let mut a1lx_opt: Option<[usize; 3]> = None;
     let mut has_ispe = false;
 
     for (p, _) in &props {
         match p {
             ItemProperty::Av1C(av1c) => av1c_opt = Some(av1c),
             ItemProperty::A1op(op) => operating_point = *op,
+            ItemProperty::A1lx(sizes) => a1lx_opt = Some(*sizes),
             ItemProperty::Lsel(ls) => layer_sel = Some(*ls),
             ItemProperty::Ispe { width, height } => {
                 has_ispe = true;
@@ -1095,6 +1098,47 @@ fn decode_av01_item(
     }
 
     let (payload, payload_guard) = container.resolve_item_data(item_id, butce)?;
+
+    // `lsel` (0..=3) ile birlikte `a1lx` mevcutsa `libavif` (`read.c:743-756`) gibi katman
+    // sayısı ve önek bayt uzunluğu doğrulanır.
+    let target_layer_id = layer_sel.filter(|&ls| ls != 0xFFFF);
+    let decode_payload: &[u8] = if let Some(target_layer) = target_layer_id {
+        if let Some(a1lx) = a1lx_opt {
+            let mut layer_sizes = [0usize; 4];
+            let mut layer_count = 0usize;
+            let mut sum = 0usize;
+            for &sz in &a1lx {
+                if sz == 0 {
+                    break;
+                }
+                sum = sum
+                    .checked_add(sz)
+                    .ok_or(Error::InvalidData("a1lx katman boyut toplamı taşması"))?;
+                if sum > payload.len() {
+                    return Err(Error::InvalidData(
+                        "a1lx katman boyutları öğe boyutunu aşıyor",
+                    ));
+                }
+                layer_sizes[layer_count] = sz;
+                layer_count += 1;
+            }
+            if sum < payload.len() && layer_count < 4 {
+                layer_sizes[layer_count] = payload.len() - sum;
+                layer_count += 1;
+            }
+            if usize::from(target_layer) >= layer_count {
+                return Err(Error::InvalidData(
+                    "lsel hedef katmanı a1lx katman sayısını aşıyor",
+                ));
+            }
+            let prefix_len: usize = layer_sizes[..=usize::from(target_layer)].iter().sum();
+            &payload[..prefix_len]
+        } else {
+            &payload
+        }
+    } else {
+        &payload
+    };
 
     let dec_config = Config {
         n_threads: threads_for_item,
@@ -1113,25 +1157,27 @@ fn decode_av01_item(
     {
         decoder.send_packet(&Packet::new(&av1c.config_obus))?;
     }
-    decoder.send_packet(&Packet::new(&payload))?;
+    decoder.send_packet(&Packet::new(decode_payload))?;
     decoder.flush();
 
     let mut chosen_frame: Option<Frame> = None;
-    let mut idx = 0u16;
-    while let Some(frame) = decoder.receive_frame()? {
-        if let Some(target_layer) = layer_sel {
-            if idx == target_layer {
+    while let Some((frame, meta)) = decoder.receive_frame_capi(true)? {
+        if let Some(target_layer) = target_layer_id {
+            let spatial_id = meta.frame_hdr.as_ref().map_or(0u8, |h| h.spatial_id);
+            if u16::from(spatial_id) == target_layer {
                 chosen_frame = Some(frame);
                 break;
             }
-            chosen_frame = Some(frame);
         } else {
             chosen_frame = Some(frame);
         }
-        idx = idx.saturating_add(1);
     }
 
-    let frame = chosen_frame.ok_or(Error::InvalidData("AV1 öğesinden görünür kare üretilemedi"))?;
+    let frame = chosen_frame.ok_or(Error::InvalidData(if target_layer_id.is_some() {
+        "lsel ile seçilen uzamsal katman AV1 öğesinde bulunamadı"
+    } else {
+        "AV1 öğesinden görünür kare üretilemedi"
+    }))?;
     let seq_color = decoder.sequence_header().map(|seq| ColorInfo {
         color_primaries: u16::from(seq.pri),
         transfer_characteristics: u16::from(seq.trc),
@@ -2393,5 +2439,40 @@ mod tests {
         drop(buf10);
         assert_eq!(b10_ok.canli(), 0);
         let _ = ButceTutucu::bos(&b10_ok);
+    }
+
+    #[test]
+    fn compute_clap_rect_extreme_values_do_not_overflow() {
+        use super::compute_clap_rect;
+        use crate::avif::image::CleanAperture;
+
+        let extreme_max = CleanAperture {
+            width_n: 1,
+            width_d: 1,
+            height_n: 1,
+            height_d: 1,
+            horiz_off_n: i32::MAX,
+            horiz_off_d: u32::MAX,
+            vert_off_n: i32::MIN,
+            vert_off_d: u32::MAX,
+        };
+        assert!(matches!(
+            compute_clap_rect(u32::MAX, u32::MAX, &extreme_max),
+            Err(Error::InvalidData(_))
+        ));
+
+        let exact_center = CleanAperture {
+            width_n: 1,
+            width_d: 1,
+            height_n: 1,
+            height_d: 1,
+            horiz_off_n: 0,
+            horiz_off_d: u32::MAX,
+            vert_off_n: 0,
+            vert_off_d: u32::MAX,
+        };
+        let rect = compute_clap_rect(u32::MAX, u32::MAX, &exact_center)
+            .expect("u32::MAX × u32::MAX taşmadan hesaplanmalı");
+        assert_eq!(rect, ((u32::MAX - 1) / 2, (u32::MAX - 1) / 2, 1, 1));
     }
 }

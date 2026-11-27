@@ -9634,6 +9634,7 @@ pub(crate) fn validate_frame_refs(
 /// kalan [`Error::Unsupported`] gerekçeleri yalnız eksik referans
 /// ("referans çözülmedi"), `show_existing_frame` (bu yola gelmez) ve geçersiz
 /// `seq.hbd`'dir; bu durumda **hiçbir çıktı üretilmez**.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn decode_frame(
     seq: &SequenceHeader,
     hdr: &FrameHeader,
@@ -9642,6 +9643,7 @@ pub(crate) fn decode_frame(
     refs: &[Option<Arc<RefFrame>>; 8],
     butce: &Butce,
     pool: &crate::thread::WorkerPool,
+    inloop_filters: crate::api::InloopFilters,
 ) -> Result<DecodedFrame> {
     if hdr.show_existing_frame {
         return Err(Error::Unsupported("show_existing_frame"));
@@ -9755,16 +9757,21 @@ pub(crate) fn decode_frame(
             }
         }
     }
+    let run_deblock = inloop_filters.contains(crate::api::InloopFilters::DEBLOCK) && !dt.lf_off;
+    let run_cdef = inloop_filters.contains(crate::api::InloopFilters::CDEF) && !dt.cdef_off;
+    let run_lr = inloop_filters.contains(crate::api::InloopFilters::RESTORATION) && !dt.lr_off;
+
     // --- deblocking (`recon_tmpl.c:1987-2020`): kare bittikten sonra,
     // SB satırı sırasıyla önce dikey sonra yatay kenarlar. Intra tahmin
     // filtrelenmemiş pikselleri kullandığı için sonuç dav1d ile aynıdır.
-    if let Some(lf) = dec.lf.as_mut().filter(|_| !dt.lf_off) {
+    if let Some(lf) = dec.lf.as_mut().filter(|_| run_deblock) {
         lf.apply(&mut dec.pic, hdr, dec.frame_no, dec.bdsp.lf(), pool);
     }
     // LR şerit sınırı satırları deblocking sonrası, CDEF öncesi piksellerdir
     // (`dav1d_copy_lpf`, `lf_apply_tmpl.c:104-`); tam kare yerine yalnız LR
     // açık düzlemlerin 4-satırlık şerit sınırları saklanır (`4.A.1`).
-    let mut pre_cdef = match dec.lr.as_ref() {
+    // CDEF kapalı olsa dahi LR açıkken deblock-sonrası (veya ham) piksellerden alınır.
+    let mut pre_cdef = match dec.lr.as_ref().filter(|_| run_lr) {
         Some(lr) => {
             let old_pre = work_bufs
                 .lr_cdef_backup
@@ -9783,7 +9790,7 @@ pub(crate) fn decode_frame(
     // Filtre girdileri deblocking sonrası, CDEF öncesi piksellerdir; CDEF
     // kare sonunda 8 satırlık bantlar hâlinde uygulanır (bkz. `decode::cdef`).
     {
-        if !dt.cdef_off {
+        if run_cdef {
             let (chroma, bd, frame_no) = (dec.chroma, dec.bd, dec.frame_no);
             crate::decode::cdef::apply(
                 &mut dec.pic,
@@ -9863,7 +9870,7 @@ pub(crate) fn decode_frame(
     // --- loop restoration (`recon_tmpl.c:2105-2106`): CDEF'ten (ve superres
     // büyütmesinden) **sonra**. Referans yuvasına LR sonrası kare gider.
     if let (Some(lr), Some(pre)) = (dec.lr.as_ref(), pre_cdef.as_mut())
-        && !dt.lr_off
+        && run_lr
     {
         let kernels = crate::decode::lr::LrKernels {
             wiener: dsp.for_bit_depth(bd).lr().wiener,

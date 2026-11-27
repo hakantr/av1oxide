@@ -228,6 +228,81 @@ impl Config {
     }
 }
 
+/// Halka içi filtre bit maskesi (`dav1d` `enum Dav1dInloopFilterType` uyumlu).
+///
+/// Varsayılan değer [`InloopFilters::ALL`] olup deblocking, CDEF ve Loop Restoration
+/// aşamalarının tamamını etkinleştirir. `SuperRes` ölçekleme aşaması bu bayraktan
+/// bağımsız olarak her zaman uygulanır.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct InloopFilters(u8);
+
+impl InloopFilters {
+    /// Hiçbir halka içi filtre uygulanmaz (`DAV1D_INLOOPFILTER_NONE`).
+    pub const NONE: Self = Self(0);
+    /// Deblocking (halka süzgeci) etkin (`DAV1D_INLOOPFILTER_DEBLOCK`).
+    pub const DEBLOCK: Self = Self(1 << 0);
+    /// CDEF yönlü kenar süzgeci etkin (`DAV1D_INLOOPFILTER_CDEF`).
+    pub const CDEF: Self = Self(1 << 1);
+    /// Loop Restoration (Wiener / SGR) etkin (`DAV1D_INLOOPFILTER_RESTORATION`).
+    pub const RESTORATION: Self = Self(1 << 2);
+    /// Tüm halka içi filtreler etkin (`DAV1D_INLOOPFILTER_ALL`).
+    pub const ALL: Self = Self((1 << 0) | (1 << 1) | (1 << 2));
+
+    /// Ham bit maskesini döndürür.
+    #[must_use]
+    pub const fn bits(self) -> u8 {
+        self.0
+    }
+
+    /// Yalnızca geçerli bitleri koruyarak maskedeki değerden `InloopFilters` oluşturur.
+    #[must_use]
+    pub const fn from_bits_truncate(bits: u8) -> Self {
+        Self(bits & Self::ALL.0)
+    }
+
+    /// Verilen bayrakların tamamı bu maskede etkin mi?
+    #[must_use]
+    pub const fn contains(self, other: Self) -> bool {
+        (self.0 & other.0) == other.0
+    }
+}
+
+impl Default for InloopFilters {
+    fn default() -> Self {
+        Self::ALL
+    }
+}
+
+impl core::ops::BitOr for InloopFilters {
+    type Output = Self;
+
+    fn bitor(self, rhs: Self) -> Self::Output {
+        Self(self.0 | rhs.0)
+    }
+}
+
+impl core::ops::BitAnd for InloopFilters {
+    type Output = Self;
+
+    fn bitand(self, rhs: Self) -> Self::Output {
+        Self(self.0 & rhs.0)
+    }
+}
+
+/// Çözülecek kare türlerini belirleyen filtre (`dav1d` `enum Dav1dDecodeFrameType` uyumlu).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum DecodeFrameType {
+    /// Tüm kareler çözülür (`DAV1D_DECODEFRAMETYPE_ALL`).
+    #[default]
+    All,
+    /// Yalnızca referans olarak saklanan kareler çözülür (`DAV1D_DECODEFRAMETYPE_REFERENCE`).
+    Reference,
+    /// Yalnızca intra (Key + Intra-only) kareler çözülür (`DAV1D_DECODEFRAMETYPE_INTRA`).
+    Intra,
+    /// Yalnızca anahtar (`Key`) kareler çözülür (`DAV1D_DECODEFRAMETYPE_KEY`).
+    Key,
+}
+
 #[cfg(test)]
 mod tests {
     use super::{Config, MAX_FRAME_DELAY, MAX_THREADS};

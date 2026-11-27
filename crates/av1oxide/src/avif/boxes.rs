@@ -79,6 +79,8 @@ pub(crate) enum ItemProperty {
     Mdcv(MasteringDisplay),
     /// `a1op`: AV1 çalışma noktası (`operating_point`) seçimi.
     A1op(u8),
+    /// `a1lx`: AV1 katmanlı görüntü indeksleme bayt boyutları (`[layer0, layer1, layer2]`).
+    A1lx([usize; 3]),
     /// `lsel`: AV1 uzamsal katman (`layer_id`) seçimi.
     Lsel(u16),
     /// `auxC`: yardımcı görüntü türü URN dizesi ve alt tür verisi.
@@ -1135,11 +1137,42 @@ pub(crate) fn parse_property_boxes(
                 }
                 ItemProperty::A1op(op_index)
             }
+            b"a1lx" => {
+                if prop_box.payload.is_empty() {
+                    return Err(Error::InvalidData("kesik a1lx kutusu"));
+                }
+                let large_size = (prop_box.payload[0] & 1) != 0;
+                let layer_sizes = if large_size {
+                    if prop_box.payload.len() < 13 {
+                        return Err(Error::InvalidData("kesik 32-bit a1lx kutusu (< 13 bayt)"));
+                    }
+                    [
+                        read_u32_be(prop_box.payload, 1).unwrap_or(0) as usize,
+                        read_u32_be(prop_box.payload, 5).unwrap_or(0) as usize,
+                        read_u32_be(prop_box.payload, 9).unwrap_or(0) as usize,
+                    ]
+                } else {
+                    if prop_box.payload.len() < 7 {
+                        return Err(Error::InvalidData("kesik 16-bit a1lx kutusu (< 7 bayt)"));
+                    }
+                    [
+                        usize::from(read_u16_be(prop_box.payload, 1).unwrap_or(0)),
+                        usize::from(read_u16_be(prop_box.payload, 3).unwrap_or(0)),
+                        usize::from(read_u16_be(prop_box.payload, 5).unwrap_or(0)),
+                    ]
+                };
+                ItemProperty::A1lx(layer_sizes)
+            }
             b"lsel" => {
                 if prop_box.payload.len() < 2 {
                     return Err(Error::InvalidData("kesik lsel kutusu"));
                 }
                 let layer_id = read_u16_be(prop_box.payload, 0).unwrap_or(0);
+                if layer_id != 0xFFFF && layer_id >= 4 {
+                    return Err(Error::InvalidData(
+                        "lsel layer_id geçersiz (0..=3 veya 0xFFFF olmalı)",
+                    ));
+                }
                 ItemProperty::Lsel(layer_id)
             }
             b"auxC" if !is_track => {

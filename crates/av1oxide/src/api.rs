@@ -25,8 +25,8 @@ mod config;
 mod decoder;
 mod packet;
 
-pub use config::{Config, MAX_FRAME_DELAY, MAX_THREADS};
-#[cfg(feature = "std")]
+pub use config::{Config, DecodeFrameType, InloopFilters, MAX_FRAME_DELAY, MAX_THREADS};
+#[allow(unused_imports)]
 pub(crate) use decoder::OutputCapiMeta;
 pub use decoder::{Decoder, DecoderState};
 pub use packet::Packet;

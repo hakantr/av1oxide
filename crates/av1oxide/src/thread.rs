@@ -183,6 +183,8 @@ struct TaskBatch {
     remaining: CachePadded<AtomicUsize>,
     /// Şimdiye kadar hata veren en küçük görev indeksi (`usize::MAX` = hata yok).
     first_error_idx: CachePadded<AtomicUsize>,
+    /// En küçük indeksli hatayı (veya panik hatasını) tutan paylaşılan yuva.
+    first_error: FirstErrorSlot,
     /// Görev çalıştırıcısı (`(worker_id, task_idx, &TaskBatch)`).
     runner: TaskRunnerFn,
     /// Parti tamamlanma koşul değişkeni kilidi.
@@ -195,10 +197,20 @@ struct TaskBatch {
 /// sayacını düşüren ve son görevse çağıran iş parçacığını uyandıran RAII bekçisi.
 struct TaskDoneGuard<'a> {
     batch: &'a TaskBatch,
+    idx: usize,
+    completed: bool,
 }
 
 impl Drop for TaskDoneGuard<'_> {
     fn drop(&mut self) {
+        if !self.completed {
+            record_first_error(
+                &self.batch.first_error,
+                self.batch,
+                self.idx,
+                Error::InvalidState("paralel işçi görevi panikledi"),
+            );
+        }
         // ORDERING: Görevin çıktı dilimine yaptığı tüm yazımları (`Release`)
         // bariyer sonrasındaki ana iş parçacığına yayınlar; son görev
         // `Acquire` ile önceki tüm görevlerin tamamlamalarını birleştirir
@@ -220,14 +232,32 @@ impl TaskBatch {
             if idx >= self.n_tasks {
                 break;
             }
-            let _done_guard = TaskDoneGuard { batch: self };
+            let mut done_guard = TaskDoneGuard {
+                batch: self,
+                idx,
+                completed: false,
+            };
             // ORDERING: Daha küçük indeksli bir görev zaten hata verdiyse,
             // deterministik ilk-hata sonucu (`first_error_idx`) değişmeyeceği
             // için bu görevi erken atla (ADR-0004 §4-5).
             if idx > self.first_error_idx.load(Ordering::Acquire) {
+                done_guard.completed = true;
                 continue;
             }
-            (self.runner)(worker_id, idx, self);
+            #[cfg(feature = "std")]
+            {
+                let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    (self.runner)(worker_id, idx, self);
+                }));
+                if res.is_ok() {
+                    done_guard.completed = true;
+                }
+            }
+            #[cfg(not(feature = "std"))]
+            {
+                (self.runner)(worker_id, idx, self);
+                done_guard.completed = true;
+            }
         }
     }
 }
@@ -716,6 +746,7 @@ impl WorkerPool {
             next_task: CachePadded::new(AtomicUsize::new(0)),
             remaining: CachePadded::new(AtomicUsize::new(n_tasks)),
             first_error_idx: CachePadded::new(AtomicUsize::new(usize::MAX)),
+            first_error: Arc::clone(&first_error),
             runner: Box::new(move |worker_id: usize, idx: usize, batch_ref: &TaskBatch| {
                 let mut guard = slots_worker[idx].lock();
                 if let Some(ref mut item) = *guard
@@ -786,6 +817,7 @@ impl WorkerPool {
             next_task: CachePadded::new(AtomicUsize::new(0)),
             remaining: CachePadded::new(AtomicUsize::new(n_tasks)),
             first_error_idx: CachePadded::new(AtomicUsize::new(usize::MAX)),
+            first_error: Arc::clone(&first_error),
             runner: Box::new(move |worker_id: usize, idx: usize, batch_ref: &TaskBatch| {
                 if let Err(err) = op(worker_id, idx) {
                     record_first_error(&first_error_worker, batch_ref, idx, err);
@@ -866,8 +898,14 @@ fn worker_loop(worker_id: usize, shared: &SharedQueue) {
             }
         };
         match item {
-            WorkItem::Batch(batch) => batch.drain_tasks(worker_id),
-            WorkItem::Async(task) => task(),
+            WorkItem::Batch(batch) => {
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    batch.drain_tasks(worker_id);
+                }));
+            }
+            WorkItem::Async(task) => {
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(task));
+            }
         }
     }
 }
@@ -1039,5 +1077,43 @@ mod tests {
         drop(g4);
         let g_full = pool.acquire_scope_workers(8);
         assert_eq!(g_full.total_threads(), 4);
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn panikleyen_paralel_gorev_hata_dondurur_ve_havuzu_saglam_birakir() {
+        let pool = WorkerPool::new(2);
+        let mut items = vec![10usize, 20usize];
+        let res = pool.execute_tasks(&mut items, |_wid, idx, val| {
+            if idx == 1 {
+                panic!("test-paralel-panik");
+            }
+            *val += 1;
+            Ok(())
+        });
+        assert_eq!(
+            res,
+            Err(Error::InvalidState("paralel işçi görevi panikledi"))
+        );
+
+        let res_idx = pool.execute_indexed(2, |_wid, idx| {
+            if idx == 0 {
+                panic!("test-indexed-panik");
+            }
+            Ok(())
+        });
+        assert_eq!(
+            res_idx,
+            Err(Error::InvalidState("paralel işçi görevi panikledi"))
+        );
+
+        // Panik sonrasında havuz işçileri canlı kalmalı ve sonraki partiyi normal çözmelidir.
+        let mut healthy = vec![1usize, 2, 3, 4];
+        pool.execute_tasks(&mut healthy, |_wid, idx, val| {
+            *val = idx + 100;
+            Ok(())
+        })
+        .expect("panik sonrası havuz sağlıklı çalışmalı");
+        assert_eq!(healthy, vec![100, 101, 102, 103]);
     }
 }

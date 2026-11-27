@@ -2226,3 +2226,267 @@ fn avif_container_tables_fake_counts_and_prepared_metadata_respect_budget() {
     .expect_err("2x2 AVIF max_pixels=3 ile parse_info_with aşamasında reddedilmeli");
     assert!(matches!(err_grid_px, Error::BudgetExceeded { .. }));
 }
+
+/// `6.B.2`: `lsel` uzamsal katman (`spatial_id`) seçimi ve `a1lx` önek/katman doğrulaması.
+#[test]
+fn avif_lsel_spatial_id_and_a1lx_validation() {
+    // 2 katmanlı sentetik 1x1 AV1 akışı:
+    // - TD + SequenceHeader (13 bayt)
+    // - Katman 0: spatial_id = 0, show_frame = 0 (gizli anahtar kare)
+    // - Katman 1: spatial_id = 1, show_frame = 1 (görünür anahtar kare, Y=190)
+    let td_and_seq: &[u8] = &SAMPLE_1X1_AV1_OBU[..13];
+    const LAYER0_FRAME_PAYLOAD: &[u8] = &[
+        0x00, 0x00, 0xFF, 0x64, 0x40, 0x00, 0x00, 0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x68, 0xD2,
+        0x16, 0x8C, 0x64, 0xBE, 0x2E, 0xC7, 0xDA, 0xEE, 0x96,
+    ];
+    let layer1_frame_payload: &[u8] = &SAMPLE_1X1_AV1_OBU[15..];
+
+    let mut layered_obu = Vec::new();
+    layered_obu.extend_from_slice(td_and_seq);
+    // OBU_FRAME (6) + extension_flag(1) + has_size_field(1) = 0x36; ext spatial_id=0 -> 0x00
+    layered_obu.push(0x36);
+    layered_obu.push(0x00);
+    layered_obu.push(LAYER0_FRAME_PAYLOAD.len() as u8);
+    layered_obu.extend_from_slice(LAYER0_FRAME_PAYLOAD);
+    let layer0_total_len = layered_obu.len();
+    // OBU_FRAME (6) + extension_flag(1) + has_size_field(1) = 0x36; ext spatial_id=1 -> 0x08
+    layered_obu.push(0x36);
+    layered_obu.push(0x08);
+    layered_obu.push(layer1_frame_payload.len() as u8);
+    layered_obu.extend_from_slice(layer1_frame_payload);
+
+    let build_layered_avif = |lsel: Option<u16>, a1lx: Option<[u16; 3]>| -> Vec<u8> {
+        let ftyp = make_ftyp(b"avif", &[*b"mif1"]);
+        let hdlr = make_hdlr_pict();
+        let pitm = make_full_box(b"pitm", 0, 0, &1u16.to_be_bytes());
+        let mut iinf_body = Vec::new();
+        iinf_body.extend_from_slice(&1u16.to_be_bytes());
+        iinf_body.extend_from_slice(&make_infe_v2(1, b"av01", None));
+        let iinf = make_full_box(b"iinf", 0, 0, &iinf_body);
+
+        let mut ipco_body = Vec::new();
+        ipco_body.extend_from_slice(&make_ispe(1, 1));
+        let mut props: Vec<(u8, bool)> = vec![(1, false)];
+        let mut next_idx = 2u8;
+        if let Some(layer_id) = lsel {
+            ipco_body.extend_from_slice(&make_box(b"lsel", &layer_id.to_be_bytes()));
+            props.push((next_idx, true));
+            next_idx += 1;
+        }
+        if let Some(sizes) = a1lx {
+            let mut a1lx_body = vec![0u8]; // large_size = 0 (16-bit)
+            for s in sizes {
+                a1lx_body.extend_from_slice(&s.to_be_bytes());
+            }
+            ipco_body.extend_from_slice(&make_box(b"a1lx", &a1lx_body));
+            props.push((next_idx, false));
+        }
+        let ipco = make_box(b"ipco", &ipco_body);
+        let mut ipma_body = Vec::new();
+        ipma_body.extend_from_slice(&1u32.to_be_bytes());
+        ipma_body.extend_from_slice(&1u16.to_be_bytes());
+        ipma_body.push(props.len() as u8);
+        for (idx, ess) in props {
+            ipma_body.push(if ess { 0x80 | idx } else { idx });
+        }
+        let ipma = make_full_box(b"ipma", 0, 0, &ipma_body);
+        let mut iprp_body = Vec::new();
+        iprp_body.extend_from_slice(&ipco);
+        iprp_body.extend_from_slice(&ipma);
+        let iprp = make_box(b"iprp", &iprp_body);
+
+        let idat = make_box(b"idat", &layered_obu);
+        let mut iloc_body = vec![0x44u8, 0x00];
+        iloc_body.extend_from_slice(&1u16.to_be_bytes());
+        iloc_body.extend_from_slice(&1u16.to_be_bytes());
+        iloc_body.extend_from_slice(&1u16.to_be_bytes()); // construction_method = 1 (idat)
+        iloc_body.extend_from_slice(&0u16.to_be_bytes());
+        iloc_body.extend_from_slice(&1u16.to_be_bytes());
+        iloc_body.extend_from_slice(&0u32.to_be_bytes());
+        iloc_body.extend_from_slice(&(layered_obu.len() as u32).to_be_bytes());
+        let iloc = make_full_box(b"iloc", 1, 0, &iloc_body);
+
+        let mut meta_children = Vec::new();
+        for b in [&hdlr, &pitm, &iinf, &iprp, &iloc, &idat] {
+            meta_children.extend_from_slice(b);
+        }
+        let mut file = ftyp;
+        file.extend_from_slice(&make_full_box(b"meta", 0, 0, &meta_children));
+        file
+    };
+
+    let valid_a1lx = Some([layer0_total_len as u16, 0, 0]);
+
+    // 1. lsel = 0 -> alt katman show_frame = 0 olduğundan görünür katman 0 karesi yok -> Err.
+    assert!(matches!(
+        decode(&build_layered_avif(Some(0), valid_a1lx)),
+        Err(Error::InvalidData(_))
+    ));
+    assert!(matches!(
+        decode(&build_layered_avif(Some(0), None)),
+        Err(Error::InvalidData(_))
+    ));
+
+    // 2. lsel = 1 -> uzamsal katman 1 (show_frame = 1) seçilir ve Y=190 çözülür.
+    let img_l1 = decode(&build_layered_avif(Some(1), valid_a1lx))
+        .expect("lsel=1 + a1lx ile katman 1 çözülmeli");
+    assert_eq!(img_l1.y_plane_u8(), Some(&[190u8][..]));
+    let img_l1_no_a1lx =
+        decode(&build_layered_avif(Some(1), None)).expect("lsel=1 (a1lx olmadan) çözülmeli");
+    assert_eq!(img_l1_no_a1lx.y_plane_u8(), Some(&[190u8][..]));
+
+    // 3. lsel = 0xFFFF (tüm katmanlar) -> son görünür katman 1 çözülür.
+    let img_all =
+        decode(&build_layered_avif(Some(0xFFFF), valid_a1lx)).expect("lsel=0xFFFF ile çözülmeli");
+    assert_eq!(img_all.y_plane_u8(), Some(&[190u8][..]));
+
+    // 4. lsel = 2 -> katman 2 mevcut değil (hem a1lx sınırında hem spatial_id aramasında Err).
+    assert!(matches!(
+        decode(&build_layered_avif(Some(2), valid_a1lx)),
+        Err(Error::InvalidData(_))
+    ));
+    assert!(matches!(
+        decode(&build_layered_avif(Some(2), None)),
+        Err(Error::InvalidData(_))
+    ));
+
+    // 5. lsel = 4 -> geçersiz katman kimliği (AV1 en fazla 4 uzamsal katman: 0..=3) -> Err.
+    assert!(matches!(
+        decode(&build_layered_avif(Some(4), valid_a1lx)),
+        Err(Error::InvalidData(_))
+    ));
+}
+
+/// `6.B.1`: `AvifSequenceDecoder` içinde `ctts` v0 (işaretsiz) ve v1 (işaretli) PTS hesaplaması.
+#[test]
+fn avif_sequence_ctts_v0_and_signed_v1_pts() {
+    let build_avis_with_ctts = |ctts_ver: u8, ctts_entries: &[(u32, u32)]| -> Vec<u8> {
+        let samples = [SAMPLE_1X1_AV1_OBU, SAMPLE_1X1_AV1_OBU, SAMPLE_1X1_AV1_OBU];
+        let ftyp = make_ftyp(b"avis", &[*b"msf1", *b"avif", *b"miaf"]);
+
+        let mut mvhd_body = vec![0u8; 96];
+        mvhd_body[8..12].copy_from_slice(&30u32.to_be_bytes());
+        mvhd_body[12..16].copy_from_slice(&30u32.to_be_bytes());
+        let mvhd = make_full_box(b"mvhd", 0, 0, &mvhd_body);
+
+        let make_trak = |chunk_offset: u32| -> Vec<u8> {
+            let mut tkhd_body = vec![0u8; 80];
+            tkhd_body[8..12].copy_from_slice(&1u32.to_be_bytes());
+            tkhd_body[16..20].copy_from_slice(&30u32.to_be_bytes());
+            tkhd_body[72..76].copy_from_slice(&(1u32 << 16).to_be_bytes());
+            tkhd_body[76..80].copy_from_slice(&(1u32 << 16).to_be_bytes());
+            let tkhd = make_full_box(b"tkhd", 0, 3, &tkhd_body);
+
+            let mut mdhd_body = vec![0u8; 20];
+            mdhd_body[8..12].copy_from_slice(&30u32.to_be_bytes());
+            mdhd_body[12..16].copy_from_slice(&30u32.to_be_bytes());
+            let mdhd = make_full_box(b"mdhd", 0, 0, &mdhd_body);
+
+            let mut hdlr_body = Vec::new();
+            hdlr_body.extend_from_slice(&0u32.to_be_bytes());
+            hdlr_body.extend_from_slice(b"pict");
+            hdlr_body.extend_from_slice(&[0u8; 13]);
+            let hdlr = make_full_box(b"hdlr", 0, 0, &hdlr_body);
+
+            let mut av01_payload = vec![0u8; 78];
+            av01_payload[24..26].copy_from_slice(&1u16.to_be_bytes());
+            av01_payload[26..28].copy_from_slice(&1u16.to_be_bytes());
+            av01_payload.extend_from_slice(&make_box(b"av1C", &[0x81, 0x00, 0x0C, 0x00]));
+            let mut stsd_body = Vec::new();
+            stsd_body.extend_from_slice(&1u32.to_be_bytes());
+            stsd_body.extend_from_slice(&make_box(b"av01", &av01_payload));
+            let stsd = make_full_box(b"stsd", 0, 0, &stsd_body);
+
+            // stts: 3 örnek, her biri delta = 10 -> dts = [0, 10, 20]
+            let mut stts_body = Vec::new();
+            stts_body.extend_from_slice(&1u32.to_be_bytes());
+            stts_body.extend_from_slice(&3u32.to_be_bytes());
+            stts_body.extend_from_slice(&10u32.to_be_bytes());
+            let stts = make_full_box(b"stts", 0, 0, &stts_body);
+
+            // ctts
+            let mut ctts_body = Vec::new();
+            ctts_body.extend_from_slice(&(ctts_entries.len() as u32).to_be_bytes());
+            for &(cnt, off) in ctts_entries {
+                ctts_body.extend_from_slice(&cnt.to_be_bytes());
+                ctts_body.extend_from_slice(&off.to_be_bytes());
+            }
+            let ctts = make_full_box(b"ctts", ctts_ver, 0, &ctts_body);
+
+            let mut stsc_body = Vec::new();
+            stsc_body.extend_from_slice(&1u32.to_be_bytes());
+            stsc_body.extend_from_slice(&1u32.to_be_bytes());
+            stsc_body.extend_from_slice(&3u32.to_be_bytes());
+            stsc_body.extend_from_slice(&1u32.to_be_bytes());
+            let stsc = make_full_box(b"stsc", 0, 0, &stsc_body);
+
+            let mut stsz_body = Vec::new();
+            stsz_body.extend_from_slice(&0u32.to_be_bytes());
+            stsz_body.extend_from_slice(&3u32.to_be_bytes());
+            for s in &samples {
+                stsz_body.extend_from_slice(&(s.len() as u32).to_be_bytes());
+            }
+            let stsz = make_full_box(b"stsz", 0, 0, &stsz_body);
+
+            let mut stco_body = Vec::new();
+            stco_body.extend_from_slice(&1u32.to_be_bytes());
+            stco_body.extend_from_slice(&chunk_offset.to_be_bytes());
+            let stco = make_full_box(b"stco", 0, 0, &stco_body);
+
+            let mut stbl_body = Vec::new();
+            for b in [&stsd, &stts, &ctts, &stsc, &stsz, &stco] {
+                stbl_body.extend_from_slice(b);
+            }
+            let stbl = make_box(b"stbl", &stbl_body);
+            let minf = make_box(b"minf", &stbl);
+            let mut mdia_body = Vec::new();
+            for b in [&mdhd, &hdlr, &minf] {
+                mdia_body.extend_from_slice(b);
+            }
+            let mdia = make_box(b"mdia", &mdia_body);
+            let mut trak_body = Vec::new();
+            trak_body.extend_from_slice(&tkhd);
+            trak_body.extend_from_slice(&mdia);
+            make_box(b"trak", &trak_body)
+        };
+
+        let mut mdat_payload = Vec::new();
+        for s in &samples {
+            mdat_payload.extend_from_slice(s);
+        }
+        let dummy_moov = make_box(b"moov", &[mvhd.as_slice(), &make_trak(0)].concat());
+        let data_off = (ftyp.len() + dummy_moov.len() + 8) as u32;
+        let moov = make_box(b"moov", &[mvhd.as_slice(), &make_trak(data_off)].concat());
+        let mdat = make_box(b"mdat", &mdat_payload);
+
+        let mut file = ftyp;
+        file.extend_from_slice(&moov);
+        file.extend_from_slice(&mdat);
+        file
+    };
+
+    // 1. ctts v0 (işaretsiz ofsetler): dts=[0, 10, 20] + [20, 0, 5] -> pts=[20, 10, 25]
+    let avis_v0 = build_avis_with_ctts(0, &[(1, 20), (1, 0), (1, 5)]);
+    let mut dec_v0 = AvifSequenceDecoder::new(&avis_v0).expect("ctts v0 açılmalı");
+    let mut pts_v0 = Vec::new();
+    while let Some(f) = dec_v0.next_frame().expect("ctts v0 kare") {
+        pts_v0.push(f.pts_in_timescale);
+    }
+    assert_eq!(pts_v0, vec![20, 10, 25]);
+
+    // 2. ctts v1 (işaretli i32 ofsetler): dts=[0, 10, 20] + [10, -5, 0] -> pts=[10, 5, 20]
+    let avis_v1 = build_avis_with_ctts(1, &[(1, 10), (1, (-5i32) as u32), (1, 0)]);
+    let mut dec_v1 = AvifSequenceDecoder::new(&avis_v1).expect("ctts v1 açılmalı");
+    let mut pts_v1 = Vec::new();
+    while let Some(f) = dec_v1.next_frame().expect("ctts v1 kare") {
+        pts_v1.push(f.pts_in_timescale);
+    }
+    assert_eq!(pts_v1, vec![10, 5, 20]);
+
+    // 3. ctts v1 negatif PTS (dts=0 + (-1) = -1 < 0) reddedilmeli.
+    let avis_neg = build_avis_with_ctts(1, &[(1, (-1i32) as u32), (2, 0)]);
+    assert!(matches!(
+        AvifSequenceDecoder::new(&avis_neg),
+        Err(Error::InvalidData(_))
+    ));
+}
