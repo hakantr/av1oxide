@@ -2657,11 +2657,25 @@ fn capi_install_prefix_rlimit_fsize_cleans_partial_stage_files() {
 
     // 2. Doğrudan derlenmiş `install_capi_prefix` ikilisini `SIGXFSZ` yoksayılı ve
     //    `RLIMIT_FSIZE = 16 KiB` (`ulimit -f 32` * 512 B) ile çalıştır.
-    let bin_path = workspace_root
-        .join("target")
+    let cargo_target_base = std::env::var_os("CARGO_TARGET_DIR")
+        .map(PathBuf::from)
+        .map(|p| {
+            if p.is_absolute() {
+                p
+            } else {
+                workspace_root.join(p)
+            }
+        })
+        .unwrap_or_else(|| workspace_root.join("target"));
+    let bin_path = cargo_target_base
         .join("release")
         .join("examples")
         .join("install_capi_prefix");
+    assert!(
+        bin_path.is_file(),
+        "derlenmiş install_capi_prefix ikilisi bulunmalı: {}",
+        bin_path.display()
+    );
     let limited = Command::new("sh")
         .current_dir(workspace_root)
         .args([
@@ -2675,9 +2689,14 @@ fn capi_install_prefix_rlimit_fsize_cleans_partial_stage_files() {
         .output()
         .expect("RLIMIT_FSIZE alt süreci çalıştırılmalı");
 
+    let limited_stderr = String::from_utf8_lossy(&limited.stderr);
     assert!(
         !limited.status.success(),
         "16 KiB RLIMIT_FSIZE altında kurulum başarısız olmalı"
+    );
+    assert!(
+        limited_stderr.contains("sahnelenemedi"),
+        "hata sahneleme yazma sınırından (RLIMIT_FSIZE) gelmeli, stderr: {limited_stderr}"
     );
     assert_eq!(
         std::fs::read(&sentinel_hdr).unwrap(),

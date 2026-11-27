@@ -137,12 +137,22 @@ fn sibling_temp_path(dst: &Path, tag: &str, pid: u32, idx: usize) -> Result<Path
     Ok(parent.join(format!(".av1oxide_{tag}_{pid}_{idx}_{name}")))
 }
 
+fn copy_file_streaming(src: &Path, dst: &Path) -> std::io::Result<()> {
+    let mut reader = fs::File::open(src)?;
+    let src_meta = reader.metadata()?;
+    let mut writer = fs::File::create(dst)?;
+    std::io::copy(&mut reader, &mut writer)?;
+    writer.sync_data()?;
+    fs::set_permissions(dst, src_meta.permissions())?;
+    Ok(())
+}
+
 fn stage_action(action: &InstallAction, stage_path: &Path) -> Result<(), String> {
     if fs::symlink_metadata(stage_path).is_ok() {
         let _ = fs::remove_file(stage_path);
     }
     let res = match action {
-        InstallAction::CopyFile { src, .. } => fs::copy(src, stage_path).map(|_| ()).map_err(|e| {
+        InstallAction::CopyFile { src, .. } => copy_file_streaming(src, stage_path).map_err(|e| {
             format!(
                 "{} -> {} sahnelenemedi: {e}",
                 src.display(),
@@ -165,7 +175,7 @@ fn stage_action(action: &InstallAction, stage_path: &Path) -> Result<(), String>
                     .parent()
                     .unwrap_or_else(|| Path::new("."))
                     .join(target_rel);
-                fs::copy(&src, stage_path).map(|_| ()).map_err(|e| {
+                copy_file_streaming(&src, stage_path).map_err(|e| {
                     format!(
                         "{} -> {} kopyalanamadı: {e}",
                         src.display(),
