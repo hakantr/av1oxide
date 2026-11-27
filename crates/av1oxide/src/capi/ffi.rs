@@ -725,6 +725,7 @@ pub unsafe extern "C" fn dav1d_open(
             }
         };
         decoder.set_inloop_filters(inloop_filters_from_c(settings.inloop_filters));
+        decoder.set_capi_strict_frame_delay(true);
         if let Some(ft) = decode_frame_type_from_c(settings.decode_frame_type) {
             decoder.set_decode_frame_type(ft);
         }
@@ -933,11 +934,8 @@ fn output_picture_ready(ctx: &mut ContextInner, drain: bool) -> bool {
                 }
                 continue;
             }
-            if let Some((_, cached_meta)) = ctx.cached_pic.as_ref() {
-                let cached_sid = cached_meta.frame_hdr.as_ref().map_or(0, |h| h.spatial_id);
-                if drain || cached_sid >= max_spatial_id {
-                    return true;
-                }
+            if ctx.cached_pic.is_some() && drain {
+                return true;
             }
             if ctx.ready_pic.is_some() {
                 ctx.cached_pic = ctx.ready_pic.take();
@@ -1196,7 +1194,7 @@ pub unsafe extern "C" fn dav1d_get_picture(c: *mut Dav1dContext, out: *mut Dav1d
         }
 
         let single_fc = ctx.decoder.config().effective_frame_delay() == 1;
-        if output_picture_ready(ctx, drain && single_fc) {
+        if output_picture_ready(ctx, single_fc) {
             if ctx.cached_error != 0 {
                 let err_code = ctx.cached_error;
                 ctx.cached_error = 0;

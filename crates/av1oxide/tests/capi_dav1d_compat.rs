@@ -1767,18 +1767,136 @@ fn capi_decode_frame_type_and_svc_per_obu_parity() {
         DAV1D_DECODEFRAMETYPE_REFERENCE,
     };
 
+    #[derive(Clone, Copy)]
+    struct Dav1dApi {
+        default_settings: unsafe extern "C" fn(*mut Dav1dSettings),
+        open: unsafe extern "C" fn(*mut *mut Dav1dContext, *const Dav1dSettings) -> c_int,
+        close: unsafe extern "C" fn(*mut *mut Dav1dContext),
+        data_create: unsafe extern "C" fn(*mut Dav1dData, usize) -> *mut u8,
+        send_data: unsafe extern "C" fn(*mut Dav1dContext, *mut Dav1dData) -> c_int,
+        get_picture: unsafe extern "C" fn(*mut Dav1dContext, *mut Dav1dPicture) -> c_int,
+        picture_unref: unsafe extern "C" fn(*mut Dav1dPicture),
+    }
+
+    let av1oxide_api = Dav1dApi {
+        default_settings: dav1d_default_settings,
+        open: dav1d_open,
+        close: dav1d_close,
+        data_create: dav1d_data_create,
+        send_data: dav1d_send_data,
+        get_picture: dav1d_get_picture,
+        picture_unref: dav1d_picture_unref,
+    };
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    struct RefDav1dLib {
+        handle: *mut c_void,
+        api: Dav1dApi,
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    impl RefDav1dLib {
+        fn try_load(so_path: &std::path::Path) -> Option<Self> {
+            use core::ffi::c_char;
+            use std::ffi::CString;
+            unsafe extern "C" {
+                fn dlopen(filename: *const c_char, flags: c_int) -> *mut c_void;
+                fn dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void;
+            }
+            const RTLD_NOW: c_int = 2;
+            const RTLD_LOCAL: c_int = 0;
+            if !so_path.is_file() {
+                return None;
+            }
+            let cpath = CString::new(so_path.to_str()?).ok()?;
+            // SAFETY: Referans C `libdav1d.so.7` paylaşımlı kütüphanesi salt test karşılaştırması için yüklenir.
+            unsafe {
+                let handle = dlopen(cpath.as_ptr(), RTLD_NOW | RTLD_LOCAL);
+                if handle.is_null() {
+                    return None;
+                }
+                let sym = |name: &CStr| -> *mut c_void { dlsym(handle, name.as_ptr()) };
+                let f_def = sym(c"dav1d_default_settings");
+                let f_open = sym(c"dav1d_open");
+                let f_close = sym(c"dav1d_close");
+                let f_create = sym(c"dav1d_data_create");
+                let f_send = sym(c"dav1d_send_data");
+                let f_get = sym(c"dav1d_get_picture");
+                let f_unref = sym(c"dav1d_picture_unref");
+                if [f_def, f_open, f_close, f_create, f_send, f_get, f_unref]
+                    .iter()
+                    .any(|p| p.is_null())
+                {
+                    return None;
+                }
+                Some(Self {
+                    handle,
+                    api: Dav1dApi {
+                        default_settings: core::mem::transmute::<
+                            *mut c_void,
+                            unsafe extern "C" fn(*mut Dav1dSettings),
+                        >(f_def),
+                        open: core::mem::transmute::<
+                            *mut c_void,
+                            unsafe extern "C" fn(
+                                *mut *mut Dav1dContext,
+                                *const Dav1dSettings,
+                            ) -> c_int,
+                        >(f_open),
+                        close: core::mem::transmute::<
+                            *mut c_void,
+                            unsafe extern "C" fn(*mut *mut Dav1dContext),
+                        >(f_close),
+                        data_create: core::mem::transmute::<
+                            *mut c_void,
+                            unsafe extern "C" fn(*mut Dav1dData, usize) -> *mut u8,
+                        >(f_create),
+                        send_data: core::mem::transmute::<
+                            *mut c_void,
+                            unsafe extern "C" fn(*mut Dav1dContext, *mut Dav1dData) -> c_int,
+                        >(f_send),
+                        get_picture: core::mem::transmute::<
+                            *mut c_void,
+                            unsafe extern "C" fn(*mut Dav1dContext, *mut Dav1dPicture) -> c_int,
+                        >(f_get),
+                        picture_unref: core::mem::transmute::<
+                            *mut c_void,
+                            unsafe extern "C" fn(*mut Dav1dPicture),
+                        >(f_unref),
+                    },
+                })
+            }
+        }
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    impl Drop for RefDav1dLib {
+        fn drop(&mut self) {
+            unsafe extern "C" {
+                fn dlclose(handle: *mut c_void) -> c_int;
+            }
+            // SAFETY: `self.handle`, `dlopen` ile açılmış geçerli tanıtıcıdır.
+            unsafe {
+                let _ = dlclose(self.handle);
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn decode_packets_capi(
+        api: Dav1dApi,
         packets: &[&[u8]],
         n_threads: c_int,
         mfd: c_int,
         decode_frame_type: u32,
         all_layers: c_int,
         apply_grain: c_int,
+        while_drain: bool,
     ) -> Vec<Vec<Vec<u8>>> {
         // SAFETY: Her çağrı bağımsız bir `Dav1dContext` açıp kapatır ve tamponları güvenle yönetir.
         unsafe {
             let mut s = Dav1dSettings::default();
-            dav1d_default_settings(&mut s);
+            (api.default_settings)(&mut s);
             s.n_threads = n_threads;
             s.max_frame_delay = mfd;
             s.decode_frame_type = decode_frame_type;
@@ -1786,30 +1904,40 @@ fn capi_decode_frame_type_and_svc_per_obu_parity() {
             s.apply_grain = apply_grain;
 
             let mut c: *mut Dav1dContext = ptr::null_mut();
-            assert_eq!(dav1d_open(&mut c, &s), 0);
+            assert_eq!((api.open)(&mut c, &s), 0);
 
             let mut out = Vec::new();
             let mut pic = Dav1dPicture::default();
-            // Resmî `dav1d` (`tools/dav1d.c:294-354`) akış protokolü: her `dav1d_send_data`
-            // ardından en fazla bir `dav1d_get_picture` çağrılır; arka arkaya `dav1d_get_picture`
-            // yalnızca EOS boşaltma (drain) aşamasında çağrılır.
             for &pkt in packets {
                 let mut data = Dav1dData::default();
-                let dst = dav1d_data_create(&mut data, pkt.len());
+                let dst = (api.data_create)(&mut data, pkt.len());
                 assert!(!dst.is_null());
                 ptr::copy_nonoverlapping(pkt.as_ptr(), dst, pkt.len());
                 loop {
-                    let s_rc = dav1d_send_data(c, &mut data);
+                    let s_rc = (api.send_data)(c, &mut data);
                     assert!(
                         s_rc == 0 || s_rc == dav1d_err(EAGAIN),
                         "dav1d_send_data beklenmeyen hata: {s_rc}"
                     );
-                    let g_rc = dav1d_get_picture(c, &mut pic);
-                    if g_rc == 0 {
-                        out.push(copy_c_picture_planes(&pic));
-                        dav1d_picture_unref(&mut pic);
+                    if while_drain {
+                        loop {
+                            let g_rc = (api.get_picture)(c, &mut pic);
+                            if g_rc == 0 {
+                                out.push(copy_c_picture_planes(&pic));
+                                (api.picture_unref)(&mut pic);
+                            } else {
+                                assert_eq!(g_rc, dav1d_err(EAGAIN));
+                                break;
+                            }
+                        }
                     } else {
-                        assert_eq!(g_rc, dav1d_err(EAGAIN));
+                        let g_rc = (api.get_picture)(c, &mut pic);
+                        if g_rc == 0 {
+                            out.push(copy_c_picture_planes(&pic));
+                            (api.picture_unref)(&mut pic);
+                        } else {
+                            assert_eq!(g_rc, dav1d_err(EAGAIN));
+                        }
                     }
                     if s_rc == 0 {
                         break;
@@ -1818,15 +1946,15 @@ fn capi_decode_frame_type_and_svc_per_obu_parity() {
             }
             // EOS drain döngüsü
             loop {
-                let rc = dav1d_get_picture(c, &mut pic);
+                let rc = (api.get_picture)(c, &mut pic);
                 if rc == dav1d_err(EAGAIN) {
                     break;
                 }
                 assert_eq!(rc, 0);
                 out.push(copy_c_picture_planes(&pic));
-                dav1d_picture_unref(&mut pic);
+                (api.picture_unref)(&mut pic);
             }
-            dav1d_close(&mut c);
+            (api.close)(&mut c);
             out
         }
     }
@@ -1855,6 +1983,12 @@ fn capi_decode_frame_type_and_svc_per_obu_parity() {
         .unwrap()
         .to_path_buf();
 
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    let ref_dav1d =
+        RefDav1dLib::try_load(&workspace_root.join(".cache/dav1d-build-asm/src/libdav1d.so.7"));
+    #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+    let ref_dav1d: Option<()> = None;
+
     // 1. `ccvb_film_grain.ivf` ve 10-bit `av1-1-b10-23-film_grain-50.ivf` (varsa):
     //    `decode_frame_type = ALL/REFERENCE/INTRA/KEY` referans `dav1d` kare sayısı eşliği.
     let ft_cases = [
@@ -1882,12 +2016,46 @@ fn capi_decode_frame_type_and_svc_per_obu_parity() {
         let ivf = parse_ivf(&raw);
         let pkts: Vec<&[u8]> = ivf.iter().map(|&(_, p)| p).collect();
         for (nt, mfd) in [(1, 1), (4, 2)] {
-            let all_frames = decode_packets_capi(&pkts, nt, mfd, DAV1D_DECODEFRAMETYPE_ALL, 1, 0);
-            let ref_frames =
-                decode_packets_capi(&pkts, nt, mfd, DAV1D_DECODEFRAMETYPE_REFERENCE, 1, 0);
-            let intra_frames =
-                decode_packets_capi(&pkts, nt, mfd, DAV1D_DECODEFRAMETYPE_INTRA, 1, 0);
-            let key_frames = decode_packets_capi(&pkts, nt, mfd, DAV1D_DECODEFRAMETYPE_KEY, 1, 0);
+            let all_frames = decode_packets_capi(
+                av1oxide_api,
+                &pkts,
+                nt,
+                mfd,
+                DAV1D_DECODEFRAMETYPE_ALL,
+                1,
+                0,
+                false,
+            );
+            let ref_frames = decode_packets_capi(
+                av1oxide_api,
+                &pkts,
+                nt,
+                mfd,
+                DAV1D_DECODEFRAMETYPE_REFERENCE,
+                1,
+                0,
+                false,
+            );
+            let intra_frames = decode_packets_capi(
+                av1oxide_api,
+                &pkts,
+                nt,
+                mfd,
+                DAV1D_DECODEFRAMETYPE_INTRA,
+                1,
+                0,
+                false,
+            );
+            let key_frames = decode_packets_capi(
+                av1oxide_api,
+                &pkts,
+                nt,
+                mfd,
+                DAV1D_DECODEFRAMETYPE_KEY,
+                1,
+                0,
+                false,
+            );
             assert_eq!(all_frames.len(), exp_all, "{:?} t={nt}", path.file_name());
             assert_eq!(ref_frames.len(), exp_ref, "{:?} t={nt}", path.file_name());
             assert_eq!(
@@ -1902,9 +2070,15 @@ fn capi_decode_frame_type_and_svc_per_obu_parity() {
         }
     }
 
-    // 2. SVC akışlarında (`L2T1`, `L2T2` varsa) OBU-başına-ayrı-paket + `all_layers = 0` / `1`
-    //    ve `n_threads = 4, max_frame_delay = 2` eşliği.
-    for svc_name in ["av1-1-b8-22-svc-L2T1.ivf", "av1-1-b8-22-svc-L2T2.ivf"] {
+    // 2. SVC akışlarında (`L1T2`, `L2T1`, `L2T2` varsa) IVF ve 1-OBU-başına-paket,
+    //    `all_layers = 0` / `1`, `while_drain = false` / `true` ve `(1,1)/(4,1)/(4,2)/(4,4)`
+    //    matrisinde gerçek C `libdav1d` ile birebir kare sayısı + piksel düzlemi eşliği.
+    let svc_cases = [
+        ("av1-1-b8-22-svc-L1T2.ivf", false),
+        ("av1-1-b8-22-svc-L2T1.ivf", true),
+        ("av1-1-b8-22-svc-L2T2.ivf", true),
+    ];
+    for (svc_name, has_two_spatial_layers) in svc_cases {
         let svc_path = workspace_root
             .join(".cache/dav1d-test-data/8-bit/svc")
             .join(svc_name);
@@ -1917,32 +2091,103 @@ fn capi_decode_frame_type_and_svc_per_obu_parity() {
         let obu_pkts = split_to_single_obu_packets(&ivf);
         assert!(obu_pkts.len() > tu_pkts.len());
 
-        for (all_layers, expected_count) in [(0, 8usize), (1, 16usize)] {
-            let ref_tu =
-                decode_packets_capi(&tu_pkts, 1, 1, DAV1D_DECODEFRAMETYPE_ALL, all_layers, 0);
-            assert_eq!(
-                ref_tu.len(),
-                expected_count,
-                "{svc_name} all_layers={all_layers}"
-            );
-            for (nt, mfd) in [(1, 1), (4, 2)] {
-                let per_obu = decode_packets_capi(
-                    &obu_pkts,
-                    nt,
-                    mfd,
-                    DAV1D_DECODEFRAMETYPE_ALL,
-                    all_layers,
-                    0,
-                );
-                assert_eq!(
-                    per_obu.len(),
-                    expected_count,
-                    "{svc_name} per-OBU t={nt} mfd={mfd} all_layers={all_layers}"
-                );
-                assert_eq!(
-                    per_obu, ref_tu,
-                    "{svc_name} per-OBU t={nt} mfd={mfd} all_layers={all_layers} piksel-özdeş olmalı"
-                );
+        let ref_tu_l0 = decode_packets_capi(
+            av1oxide_api,
+            &tu_pkts,
+            1,
+            1,
+            DAV1D_DECODEFRAMETYPE_ALL,
+            0,
+            0,
+            false,
+        );
+        let ref_tu_l1 = decode_packets_capi(
+            av1oxide_api,
+            &tu_pkts,
+            1,
+            1,
+            DAV1D_DECODEFRAMETYPE_ALL,
+            1,
+            0,
+            false,
+        );
+        assert_eq!(ref_tu_l0.len(), 8, "{svc_name} IVF all_layers=0");
+        assert_eq!(
+            ref_tu_l1.len(),
+            if has_two_spatial_layers { 16 } else { 8 },
+            "{svc_name} IVF all_layers=1"
+        );
+
+        for (mode_name, pkts, is_per_obu) in [
+            ("IVF", tu_pkts.as_slice(), false),
+            ("OBU", obu_pkts.as_slice(), true),
+        ] {
+            for all_layers in [0, 1] {
+                for while_drain in [false, true] {
+                    for (nt, mfd) in [(1, 1), (4, 1), (4, 2), (4, 4)] {
+                        let expected_count = if !has_two_spatial_layers {
+                            8usize
+                        } else if all_layers == 1 {
+                            16usize
+                        } else if !is_per_obu {
+                            8usize
+                        } else if mfd == 1 {
+                            16usize
+                        } else if !while_drain {
+                            8usize
+                        } else if mfd == 2 {
+                            11usize
+                        } else {
+                            10usize
+                        };
+
+                        let got = decode_packets_capi(
+                            av1oxide_api,
+                            pkts,
+                            nt,
+                            mfd,
+                            DAV1D_DECODEFRAMETYPE_ALL,
+                            all_layers,
+                            0,
+                            while_drain,
+                        );
+                        assert_eq!(
+                            got.len(),
+                            expected_count,
+                            "{svc_name} {mode_name} all_layers={all_layers} wd={while_drain} t={nt} mfd={mfd}"
+                        );
+                        if expected_count == ref_tu_l0.len() {
+                            assert_eq!(
+                                got, ref_tu_l0,
+                                "{svc_name} {mode_name} all_layers={all_layers} wd={while_drain} t={nt} mfd={mfd} ref_tu_l0 ile piksel-özdeş olmalı"
+                            );
+                        } else if expected_count == ref_tu_l1.len() {
+                            assert_eq!(
+                                got, ref_tu_l1,
+                                "{svc_name} {mode_name} all_layers={all_layers} wd={while_drain} t={nt} mfd={mfd} ref_tu_l1 ile piksel-özdeş olmalı"
+                            );
+                        }
+                        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+                        if let Some(ref_lib) = ref_dav1d.as_ref() {
+                            let expected_c = decode_packets_capi(
+                                ref_lib.api,
+                                pkts,
+                                nt,
+                                mfd,
+                                DAV1D_DECODEFRAMETYPE_ALL,
+                                all_layers,
+                                0,
+                                while_drain,
+                            );
+                            assert_eq!(
+                                got, expected_c,
+                                "{svc_name} {mode_name} all_layers={all_layers} wd={while_drain} t={nt} mfd={mfd} gerçek C libdav1d ile piksel-özdeş olmalı"
+                            );
+                        }
+                        #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+                        let _ = &ref_dav1d;
+                    }
+                }
             }
         }
     }

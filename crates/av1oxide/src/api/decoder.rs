@@ -332,6 +332,10 @@ pub struct Decoder {
     /// Tanılama: yalnız ayrıştırma kipi (varsayılan kapalı; bkz.
     /// [`Decoder::set_parse_only`]).
     parse_only: bool,
+    /// C-ABI `dav1d` `out_delayed[0..n_fc]` halka tamponu gecikme uyumu: etkinse `n_fc > 1`
+    /// kareleri erken emekliye ayrılmaz, tam `n_fc` yuva dolunca veya `block == true` (`drain`)
+    /// çağrısında sırayla teslim edilir (`false` = saf Rust düşük gecikmeli kip).
+    capi_strict_frame_delay: bool,
     /// Çıktı kuyruğuna şimdiye kadar eklenen giriş sayısı (kare ya da
     /// desteklenmeyen); film grain izinin resim sırası (tanılama).
     outputs_pushed: u64,
@@ -381,6 +385,7 @@ impl Clone for Decoder {
             inloop_filters: self.inloop_filters,
             decode_frame_type: self.decode_frame_type,
             parse_only: self.parse_only,
+            capi_strict_frame_delay: self.capi_strict_frame_delay,
             outputs_pushed: self.outputs_pushed,
             allocation_peak: self.allocation_peak(),
         };
@@ -552,6 +557,7 @@ impl Decoder {
             inloop_filters: InloopFilters::ALL,
             decode_frame_type: DecodeFrameType::All,
             parse_only: false,
+            capi_strict_frame_delay: false,
             outputs_pushed: 0,
             allocation_peak: 0,
         })
@@ -676,6 +682,13 @@ impl Decoder {
     /// Çözülecek kare türleri filtresini (`All`, `Reference`, `Intra`, `Key`) ayarlar.
     pub fn set_decode_frame_type(&mut self, frame_type: DecodeFrameType) {
         self.decode_frame_type = frame_type;
+    }
+
+    /// C-ABI `dav1d` deterministik `n_fc` halka tamponu gecikmesini (`out_delayed[0..n_fc]`)
+    /// etkinleştirir veya kapatır (`dav1d_open` içinde etkinleştirilir; saf Rust API varsayılan `false`).
+    #[cfg_attr(not(feature = "std"), allow(dead_code))]
+    pub(crate) fn set_capi_strict_frame_delay(&mut self, enable: bool) {
+        self.capi_strict_frame_delay = enable;
     }
 
     /// Geçerli kare türü filtresini döndürür.
@@ -1426,18 +1439,27 @@ impl Decoder {
         prealloc: Option<&mut PreallocCb<'_>>,
     ) -> Result<()> {
         let n_fc = self.config.effective_frame_delay();
-        // 1. Zaten tamamlanmış ön uçuş görevlerini bloklamadan emekliye ayır.
-        while self
-            .in_flight
-            .front()
-            .is_some_and(InFlightEntry::is_done_nonblocking)
-        {
-            self.retire_front_in_flight(false)?;
-        }
-        // 2. Uçuş kuyruğundaki aktif çözme görevi sayısı `n_fc` sınırındaysa
-        //    en eski uçuş karesini bekleyip emekliye ayır.
-        while self.in_flight.iter().filter(|e| e.is_decode()).count() >= n_fc {
-            self.retire_front_in_flight(true)?;
+        if self.capi_strict_frame_delay {
+            // C `dav1d` `out_delayed[0..n_fc]` halka tamponu semantiği: kareler erken
+            // emekliye ayrılmaz, tam `n_fc` yuva dolunca en eski yuva (`Decode` veya
+            // `ShowExisting`) sırayla emekliye ayrılır.
+            while self.in_flight.len() >= n_fc {
+                self.retire_front_in_flight(true)?;
+            }
+        } else {
+            // 1. Zaten tamamlanmış ön uçuş görevlerini bloklamadan emekliye ayır.
+            while self
+                .in_flight
+                .front()
+                .is_some_and(InFlightEntry::is_done_nonblocking)
+            {
+                self.retire_front_in_flight(false)?;
+            }
+            // 2. Uçuş kuyruğundaki aktif çözme görevi sayısı `n_fc` sınırındaysa
+            //    en eski uçuş karesini bekleyip emekliye ayır.
+            while self.in_flight.iter().filter(|e| e.is_decode()).count() >= n_fc {
+                self.retire_front_in_flight(true)?;
+            }
         }
         // 3. Eğer bu karenin başvurduğu yuvalardan biri arka planda hata vermiş
         //    bir uçuş karesine aitse, erken doğrulamadan önce o kareyi emekliye
@@ -2230,10 +2252,12 @@ impl Decoder {
             0
         };
 
-        // Bütçe sınırı (`allocation_limit`) açıksa veya uçuş kuyruğu boşsa
-        // senkron doğrula; aksi hâlde uçuşta çözülen karenin bitmesini
-        // beklemeden `InFlightEntry::ShowExisting` olarak kuyruğa ekle.
-        if self.config.allocation_limit.is_some() || self.in_flight.is_empty() {
+        // Bütçe sınırı (`allocation_limit`) açıksa veya (saf Rust kipte) uçuş kuyruğu boşsa
+        // senkron doğrula; C-ABI sıkı gecikme kipinde (`dav1d` `obu.c:1564-1607`) `show_existing`
+        // de `out_delayed[0..n_fc]` kuyruğunda tam `n_fc` yuva gecikmesiyle sıraya girer.
+        if self.config.allocation_limit.is_some()
+            || (!self.capi_strict_frame_delay && self.in_flight.is_empty())
+        {
             while !promise.is_done_nonblocking() {
                 if let Some(work) = self.pool.try_pop_async_task() {
                     work();
@@ -2326,6 +2350,12 @@ impl Decoder {
             return Ok(());
         }
 
+        if self.capi_strict_frame_delay {
+            let n_fc = self.config.effective_frame_delay();
+            while self.in_flight.len() >= n_fc {
+                self.retire_front_in_flight(true)?;
+            }
+        }
         self.parse.dangling_show_existing = None;
         let Some(displayed) = self.parse.header_state.show_existing(slot) else {
             return fail("show_existing_frame: referans yuva boş (obu.c 1529)");
@@ -2416,6 +2446,9 @@ impl Decoder {
                 };
                 self.sync_shared_kalici();
                 return out;
+            }
+            if !block && self.capi_strict_frame_delay && self.config.effective_frame_delay() > 1 {
+                return Ok(None);
             }
             if !self.retire_front_in_flight(block)? {
                 return Ok(None);
