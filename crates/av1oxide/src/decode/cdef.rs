@@ -1472,7 +1472,14 @@ fn apply_parallel_inplace(
     if let Some((first_wb, rest_wbs)) = worker_bufs.split_first_mut() {
         std::thread::scope(|s| {
             for wb in rest_wbs {
-                s.spawn(|| run_worker(wb));
+                // `Scope::spawn` iş parçacığı açılamazsa panikler; açılamayan işçi atlanır ve
+                // paylaşılan kuyruğu çağıran iş parçacığı (ve açılabilen işçiler) boşaltır.
+                if std::thread::Builder::new()
+                    .spawn_scoped(s, || run_worker(wb))
+                    .is_err()
+                {
+                    break;
+                }
             }
             run_worker(first_wb);
         });

@@ -1669,7 +1669,14 @@ impl LfFrame {
         let n_spawn = total_threads.min(n_jobs).saturating_sub(1);
         std::thread::scope(|s| {
             for _ in 0..n_spawn {
-                s.spawn(run_worker);
+                // `Scope::spawn` iş parçacığı açılamazsa panikler; açılamayan işçi atlanır ve
+                // paylaşılan kuyruğu çağıran iş parçacığı (ve açılabilen işçiler) boşaltır.
+                if std::thread::Builder::new()
+                    .spawn_scoped(s, run_worker)
+                    .is_err()
+                {
+                    break;
+                }
             }
             run_worker();
         });

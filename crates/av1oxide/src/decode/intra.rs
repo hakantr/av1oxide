@@ -10814,7 +10814,14 @@ fn decode_tiles_parallel(
                 let n_spawn = guard.total_threads().min(n_merge_tasks).saturating_sub(1);
                 std::thread::scope(|s| {
                     for _ in 0..n_spawn {
-                        s.spawn(run_merge);
+                        // `Scope::spawn` iş parçacığı açılamazsa panikler; açılamayan işçi
+                        // atlanır ve paylaşılan kuyruğu çağıran iş parçacığı boşaltır.
+                        if std::thread::Builder::new()
+                            .spawn_scoped(s, run_merge)
+                            .is_err()
+                        {
+                            break;
+                        }
                     }
                     run_merge();
                 });

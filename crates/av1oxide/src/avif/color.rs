@@ -1854,29 +1854,17 @@ fn convert_image_strips<S: SampleSource, M: MatrixKernel, O: PixelSink>(
             }
 
             if strips.len() > 1 {
-                let last = strips.pop();
-                std::thread::scope(|scope| {
-                    for (ys, ye, strip_buf) in strips {
-                        scope.spawn(move || {
-                            convert_strip(
-                                y_plane,
-                                u_plane,
-                                v_plane,
-                                strip_buf,
-                                ys,
-                                ye,
-                                w,
-                                h,
-                                cw,
-                                ch,
-                                chroma_format,
-                                src,
-                                matrix,
-                                sink,
-                            );
-                        });
-                    }
-                    if let Some((ys, ye, strip_buf)) = last {
+                // Şeritler paylaşılan bir kuyruktan çekilir: `Scope::spawn` iş parçacığı
+                // açılamazsa panikler; burada açılamayan işçi atlanır ve kalan şeritleri
+                // çağıran iş parçacığı (ve açılabilen işçiler) dönüştürür.
+                let n_workers = strips.len() - 1;
+                let queue = crate::sync::Mutex::new(strips);
+                let queue = &queue;
+                let run = move || {
+                    loop {
+                        let Some((ys, ye, strip_buf)) = queue.lock().pop() else {
+                            break;
+                        };
                         convert_strip(
                             y_plane,
                             u_plane,
@@ -1894,6 +1882,17 @@ fn convert_image_strips<S: SampleSource, M: MatrixKernel, O: PixelSink>(
                             sink,
                         );
                     }
+                };
+                std::thread::scope(|scope| {
+                    for _ in 0..n_workers {
+                        if std::thread::Builder::new()
+                            .spawn_scoped(scope, run)
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                    run();
                 });
                 return;
             }

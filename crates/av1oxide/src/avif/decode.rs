@@ -1958,25 +1958,22 @@ fn decode_grid_tiles_into_canvas(
     }
     drop(first_wave);
 
-    // 2. Kalan karoları en fazla `wave_size` (worker_count) büyüklüğünde dalgalar halinde çöz,
-    //    tuvale yaz ve bir sonraki dalgaya geçmeden tüm dalga tamponlarını iade et.
-    let mut offset = first_end;
-    while offset < num_unique {
-        let end = (offset + wave_size).min(num_unique);
-        let mut wave_tiles = decode_grid_wave(
-            container,
-            &unique_ids[offset..end],
-            config,
-            1,
-            is_alpha,
-            depth,
-            butce,
-        )?;
-        for (i, tile) in wave_tiles.drain(..).enumerate() {
-            validate_grid_tile(&tile, tile_w, tile_h, bit_depth, chroma_format, is_alpha)?;
+    // 2. Kalan karoları en çok `wave_size` işçiyle çöz; her karo çağıran iş parçacığında
+    //    tuvale yazılır ve tamponu hemen iade edilir.
+    decode_grid_rest(
+        container,
+        &unique_ids[first_end..],
+        first_end,
+        wave_size,
+        config,
+        is_alpha,
+        depth,
+        butce,
+        |u_idx, tile| {
+            validate_grid_tile(tile, tile_w, tile_h, bit_depth, chroma_format, is_alpha)?;
             copy_tile_for_unique_index(
-                &tile,
-                offset + i,
+                tile,
+                u_idx,
                 cols,
                 has_dups,
                 &cell_head,
@@ -1986,10 +1983,9 @@ fn decode_grid_tiles_into_canvas(
                 &mut u_canvas,
                 &mut v_canvas,
             );
-            drop(tile);
-        }
-        offset = end;
-    }
+            Ok(())
+        },
+    )?;
     drop((dedup_unique_ids, cell_head, cell_next, grid_plan_guard));
 
     Ok(PlanarBuffer {
@@ -2096,6 +2092,123 @@ fn decode_grid_wave(
         )?);
     }
     Ok(wave_tiles)
+}
+
+/// İlk dalgadan sonra kalan grid karolarını çözer ve her karoyu `tuvale_yaz(benzersiz_indeks,
+/// karo)` ile tuvale yazdırır.
+///
+/// `std` altında en çok `workers - 1` işçi **bir kez** açılır ve çağıran iş parçacığı da işçi
+/// olarak çalışır: her işçi sıradaki karoyu paylaşılan sayaçtan alır, çözer, tuvale kilit
+/// altında yazar ve tamponu hemen bırakır. Böylece bellekte aynı anda en çok `workers` çözülmüş
+/// karo bulunur (dalga düzeninin üst sınırı), iş parçacığı açma maliyeti karo sayısıyla büyümez
+/// ve küçük karolarda tek bir tüketicinin darboğazı oluşmaz. Açılamayan işçi atlanır; hiçbiri
+/// açılamazsa karoların hepsini çağıran iş parçacığı çözer.
+#[allow(clippy::too_many_arguments)]
+fn decode_grid_rest<F>(
+    container: &AvifContainer<'_>,
+    ids: &[u32],
+    base_index: usize,
+    workers: usize,
+    config: &AvifDecodeConfig,
+    is_alpha: bool,
+    depth: usize,
+    butce: &Arc<Butce>,
+    mut tuvale_yaz: F,
+) -> Result<()>
+where
+    F: FnMut(usize, &PlanarBuffer) -> Result<()> + Send,
+{
+    #[cfg(all(feature = "std", not(target_arch = "wasm32")))]
+    if workers > 1 && ids.len() > 1 {
+        use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+        /// Tuval yazıcısı ve işçilerin ortak sonucu (ilk hata, yazılan karo sayısı).
+        struct Yazici<'f, F> {
+            tuvale_yaz: &'f mut F,
+            hata: Option<Error>,
+            yazilan: usize,
+        }
+
+        let next = AtomicUsize::new(0);
+        let abort = AtomicBool::new(false);
+        let yazici = crate::sync::Mutex::new(Yazici {
+            tuvale_yaz: &mut tuvale_yaz,
+            hata: None,
+            yazilan: 0,
+        });
+        let calis = |butce: &Arc<Butce>| {
+            while !abort.load(Ordering::Relaxed) {
+                let i = next.fetch_add(1, Ordering::Relaxed);
+                let Some(&tid) = ids.get(i) else {
+                    break;
+                };
+                let sonuc =
+                    decode_item_planar(container, tid, config, 1, is_alpha, depth + 1, butce);
+                let yazildi = {
+                    let mut y = yazici.lock();
+                    if y.hata.is_some() {
+                        break;
+                    }
+                    match sonuc.and_then(|tile| {
+                        (y.tuvale_yaz)(base_index + i, &tile)?;
+                        Ok(tile)
+                    }) {
+                        Ok(tile) => {
+                            y.yazilan += 1;
+                            Ok(tile)
+                        }
+                        Err(err) => {
+                            y.hata = Some(err);
+                            Err(())
+                        }
+                    }
+                };
+                // Karo tamponu (ve bütçe payı) kilit dışında bırakılır.
+                if yazildi.is_err() {
+                    abort.store(true, Ordering::Relaxed);
+                    break;
+                }
+                drop(yazildi);
+            }
+        };
+        let worker_count = workers.min(ids.len());
+        let panik = std::thread::scope(|s| {
+            let mut handles: Vec<std::thread::ScopedJoinHandle<'_, ()>> = Vec::new();
+            if handles.try_reserve_exact(worker_count - 1).is_ok() {
+                for _ in 1..worker_count {
+                    let butce_w = Arc::clone(butce);
+                    let calis = &calis;
+                    // `Scope::spawn` iş parçacığı açılamazsa panikler; açılamayan işçi atlanır.
+                    match std::thread::Builder::new().spawn_scoped(s, move || calis(&butce_w)) {
+                        Ok(h) => handles.push(h),
+                        Err(_) => break,
+                    }
+                }
+            }
+            calis(butce);
+            let mut panik = false;
+            for h in handles {
+                panik |= h.join().is_err();
+            }
+            panik
+        });
+        let y = yazici.into_inner();
+        if let Some(err) = y.hata {
+            return Err(err);
+        }
+        if panik || y.yazilan < ids.len() {
+            return Err(Error::InvalidState("grid karo iş parçacığı sonlandı"));
+        }
+        return Ok(());
+    }
+
+    #[cfg(not(all(feature = "std", not(target_arch = "wasm32"))))]
+    let _ = workers;
+    for (i, &tid) in ids.iter().enumerate() {
+        let tile = decode_item_planar(container, tid, config, 1, is_alpha, depth + 1, butce)?;
+        tuvale_yaz(base_index + i, &tile)?;
+    }
+    Ok(())
 }
 
 struct GridCanvasGeom {

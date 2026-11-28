@@ -14,6 +14,11 @@ pub const IVF_HEADER_MIN_LEN: usize = 32;
 /// Standart IVF kare başlığı boyutu (`12` bayt: `u32` boyut + `i64` PTS).
 pub const IVF_FRAME_HEADER_LEN: usize = 12;
 
+/// [`IvfReader::read_packet_into`] tamponunun, mevcut kapasite yetmediğinde ilk büyüme adımı
+/// (`64 KiB`); sonraki adımlar okunan veriyle ikiye katlanır.
+#[cfg(feature = "std")]
+pub(crate) const IVF_READ_CHUNK: usize = 64 * 1024;
+
 /// Ayrıştırılmış IVF dosya başlığı (`32` bayt).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct IvfHeader {
@@ -220,8 +225,11 @@ impl<R: std::io::Read> IvfReader<R> {
 
     /// Sıradaki IVF karesini `buf` içine okur ve PTS değerini döndürür.
     ///
-    /// `buf` kapasitesi zaten yeterli olduğunda ek yığın tahsisi yapılmaz. Akış
-    /// temiz biçimde bittiğinde `Ok(None)` döndürülür.
+    /// `buf` kapasitesi zaten yeterli olduğunda ek yığın tahsisi yapılmaz. Yetmediğinde
+    /// tampon beyan edilen kare boyutuna bir kerede değil, gelen veriyle orantılı
+    /// (`64 KiB`'tan başlayıp ikiye katlanarak) büyür; böylece kesik bir
+    /// akış büyük bir kare boyutu beyan ederek okunmamış veri için bellek ayırtamaz.
+    /// Akış temiz biçimde bittiğinde `Ok(None)` döndürülür.
     pub fn read_packet_into(&mut self, buf: &mut alloc::vec::Vec<u8>) -> Result<Option<i64>> {
         if self.pending_skip > 0 && !drain_pending_skip(&mut self.reader, &mut self.pending_skip) {
             buf.clear();
@@ -272,15 +280,24 @@ impl<R: std::io::Read> IvfReader<R> {
             });
         }
         buf.clear();
-        if buf.capacity() < frame_size {
-            buf.try_reserve(frame_size)
-                .map_err(|_| Error::AllocationFailed {
-                    requested: frame_size,
-                })?;
-        }
-        buf.resize(frame_size, 0);
         let mut read_so_far = 0usize;
         while read_so_far < frame_size {
+            if read_so_far == buf.len() {
+                // Mevcut kapasite kadar bir kerede, ötesinde okunan veriyle orantılı büyü.
+                let hedef = read_so_far
+                    .saturating_mul(2)
+                    .max(IVF_READ_CHUNK)
+                    .max(buf.capacity())
+                    .min(frame_size);
+                if buf.capacity() < hedef && buf.try_reserve(hedef - buf.len()).is_err() {
+                    // Okuma hatası koluyla aynı: kalan yük sonraki çağrıda atlanır ki akış
+                    // kare sınırında hizalı kalsın.
+                    self.pending_skip = frame_size - read_so_far;
+                    buf.clear();
+                    return Err(Error::AllocationFailed { requested: hedef });
+                }
+                buf.resize(hedef, 0);
+            }
             match self.reader.read(&mut buf[read_so_far..]) {
                 Ok(0) => {
                     buf.clear();
@@ -437,6 +454,40 @@ mod tests {
         assert_eq!(reader.read_packet_into(&mut buf).unwrap(), Some(20));
         assert_eq!(buf, &[1, 2]);
         assert_eq!(buf.capacity(), cap_before);
+        assert_eq!(reader.read_packet_into(&mut buf).unwrap(), None);
+    }
+
+    /// Kesik bir akış büyük kare boyutu beyan ettiğinde tampon beyan edilen boyuta değil,
+    /// gelen veriye göre büyümeli; tam kare ise baytları bozulmadan okunmalı.
+    #[cfg(feature = "std")]
+    #[test]
+    fn ivf_reader_kesik_buyuk_kare_beyaninda_bellegi_veriyle_orantili_ayirir() {
+        use super::{IVF_READ_CHUNK, IvfReader};
+
+        let declared: u32 = 200 * 1024 * 1024;
+        let mut ivf = make_ivf(&[]);
+        ivf.extend_from_slice(&declared.to_le_bytes());
+        ivf.extend_from_slice(&7i64.to_le_bytes());
+        ivf.extend_from_slice(&[0xAB; 100]);
+        let mut reader = IvfReader::new(ivf.as_slice()).expect("başlık geçerli");
+        let mut buf = Vec::new();
+        assert!(matches!(
+            reader.read_packet_into(&mut buf),
+            Err(Error::InvalidData(_))
+        ));
+        assert!(buf.is_empty());
+        assert!(
+            buf.capacity() <= 2 * IVF_READ_CHUNK,
+            "kesik kare için ayrılan kapasite beyan edilen boyutla değil veriyle orantılı olmalı: {}",
+            buf.capacity()
+        );
+
+        let payload: Vec<u8> = (0..(3 * IVF_READ_CHUNK + 17)).map(|i| i as u8).collect();
+        let ivf = make_ivf(&[(5, &payload)]);
+        let mut reader = IvfReader::new(ivf.as_slice()).expect("başlık geçerli");
+        let mut buf = Vec::new();
+        assert_eq!(reader.read_packet_into(&mut buf).unwrap(), Some(5));
+        assert_eq!(buf, payload);
         assert_eq!(reader.read_packet_into(&mut buf).unwrap(), None);
     }
 }

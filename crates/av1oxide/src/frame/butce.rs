@@ -361,7 +361,12 @@ impl Butce {
                 Ok(_) => {
                     // ORDERING: `tepe` monoton artan bir istatistiktir;
                     // `fetch_max` atomik olarak en büyük `istenen` değerini korur.
-                    self.tepe.fetch_max(istenen, Ordering::Relaxed);
+                    // `tepe` yalnız arttığından `istenen <= tepe` iken `fetch_max`
+                    // etkisizdir; atlanması paylaşılan defterde (ör. paralel grid
+                    // karoları) gereksiz okuma-değiştirme-yazma trafiğini önler.
+                    if istenen > self.tepe.load(Ordering::Relaxed) {
+                        self.tepe.fetch_max(istenen, Ordering::Relaxed);
+                    }
                     return Ok(());
                 }
                 Err(guncel) => {
