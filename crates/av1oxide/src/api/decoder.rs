@@ -606,6 +606,15 @@ impl Decoder {
         for group in &self.parse.pending_groups {
             toplam = toplam.saturating_add(group.data.len());
         }
+        toplam = toplam.saturating_add(itut_t35_vec_bytes(&self.parse.itut_t35));
+        for meta in &self.output_capi_meta {
+            toplam = toplam.saturating_add(itut_t35_vec_bytes(&meta.itut_t35));
+        }
+        for entry in &self.in_flight {
+            if let InFlightEntry::ShowExisting { capi_meta, .. } = entry {
+                toplam = toplam.saturating_add(itut_t35_vec_bytes(&capi_meta.itut_t35));
+            }
+        }
         toplam
             .saturating_add(core::mem::size_of_val(self.frame_outputs.as_slice()))
             .saturating_add(core::mem::size_of_val(self.decoded_tools.as_slice()))
@@ -1573,7 +1582,11 @@ impl Decoder {
         // 5. Paylaşılan bütçe tabanını senkronla, tile grup baytlarını ve tile
         //    boyut sınırlarını (`split_tile_groups`) doğrula.
         self.pipeline_butce.taban_guncelle(self.kalici_bayt());
-        let grup_bayti: usize = groups.iter().map(|g| g.data.len()).sum();
+        let grup_bayti: usize = groups
+            .iter()
+            .map(|g| g.data.len())
+            .sum::<usize>()
+            .saturating_add(itut_t35_vec_bytes(&self.parse.itut_t35));
         let grup_tutucu = match Butce::tut(&self.pipeline_butce, grup_bayti) {
             Ok(t) => t,
             Err(err) => {
@@ -2821,7 +2834,7 @@ impl Decoder {
                 Ok(())
             }
             4 => {
-                // OBU_META_ITUT_T35 (`src/obu.c:1445-1501`)
+                // OBU_META_ITUT_T35 (`src/obu.c:1455-1520`, `e5fd231fe9`)
                 let start = reader.byte_position();
                 if let Some(rest) = obu.payload.get(start..) {
                     let Some(end) = memchr::memrchr(0x80, rest) else {
@@ -2840,10 +2853,49 @@ impl Decoder {
                         (0u8, 1usize)
                     };
                     if payload_start < end {
+                        // `dav1d` `src/obu.c:1475`: `(c->n_itut_t35 + 1) > INT_MAX / sizeof(*c->itut_t35)`
+                        const MAX_ITUT_T35_ENTRIES: usize = (i32::MAX as usize) / 24;
+                        if self.parse.itut_t35.len() >= MAX_ITUT_T35_ENTRIES {
+                            return Err(payload_error(
+                                obu,
+                                BitstreamErrorKind::InvalidFrameHeader(
+                                    "ITU-T T.35 girdi sayısı üst sınırı aşıldı (obu.c 1475)",
+                                ),
+                            ));
+                        }
+                        let old_cap = self.parse.itut_t35.capacity();
+                        let grow_entries = if self.parse.itut_t35.len() == old_cap {
+                            old_cap.max(4)
+                        } else {
+                            0
+                        };
+                        let grow_bytes = grow_entries
+                            .checked_mul(core::mem::size_of::<ItutT35Meta>())
+                            .ok_or(Error::SizeOverflow {
+                                stage: crate::error::SizeStage::TotalAllocation,
+                                lhs: grow_entries,
+                                rhs: core::mem::size_of::<ItutT35Meta>(),
+                            })?;
+                        let butce = self.butce_defteri(0);
+                        let res = butce
+                            .ayir(grow_bytes)
+                            .and_then(|()| butce.kopya(&rest[payload_start..end]));
+                        self.tepe_kat(&butce);
+                        let payload = res?;
+                        if self.parse.itut_t35.len() == old_cap {
+                            self.parse
+                                .itut_t35
+                                .try_reserve_exact(grow_entries)
+                                .map_err(|_| Error::AllocationFailed {
+                                    requested: old_cap
+                                        .saturating_add(grow_entries)
+                                        .saturating_mul(core::mem::size_of::<ItutT35Meta>()),
+                                })?;
+                        }
                         self.parse.itut_t35.push(ItutT35Meta {
                             country_code,
                             country_code_extension_byte: ext,
-                            payload: rest[payload_start..end].to_vec(),
+                            payload,
                         });
                     }
                 }
@@ -2853,6 +2905,16 @@ impl Decoder {
         }
     }
 }
+fn itut_t35_vec_bytes(items: &Vec<ItutT35Meta>) -> usize {
+    let mut bytes = items
+        .capacity()
+        .saturating_mul(core::mem::size_of::<ItutT35Meta>());
+    for item in items {
+        bytes = bytes.saturating_add(item.payload.capacity());
+    }
+    bytes
+}
+
 /// `n_fc >= 2` boru hattı için referans yuvası vaatlerini (`FrameSlot`) başlık
 /// düzeyinde doğrular (`dav1d` `decode.c:3446-3478`).
 fn validate_frame_refs_slots(
@@ -3851,5 +3913,105 @@ mod tests {
         assert_eq!(dec_diag.drain_frame_headers().len(), 1);
         assert_eq!(dec_diag.drain_frame_output_flags(), vec![true]);
         assert_eq!(dec_diag.decoded_tool_counts().len(), 1);
+    }
+
+    #[test]
+    fn itut_t35_metadata_butce_sinirina_uyar_ve_hata_sonrasi_durumu_korur() {
+        const PKT_1X1: &[u8] = &[
+            0x12, 0x00, 0x0A, 0x09, 0x00, 0x00, 0x00, 0x00, 0x00, 0x7D, 0xFC, 0xC0, 0x20, 0x32,
+            0x17, 0x10, 0x01, 0x91, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x68,
+            0xD2, 0x16, 0x8C, 0x64, 0xBE, 0x2E, 0xC7, 0xDA, 0xEE, 0x96,
+        ];
+
+        // Geçerli bir ITU-T T.35 OBU (type=5 -> 0x2A, size, meta_type=4, country_code=0xB5, payload, 0x80).
+        fn make_t35_obu(payload_len: usize, fill: u8) -> Vec<u8> {
+            let body_len = 1 + 1 + payload_len + 1;
+            let mut obu = Vec::with_capacity(2 + 4 + body_len);
+            obu.push(0x2A); // OBU_METADATA, has_size_field=1
+            let mut rem = body_len;
+            loop {
+                let mut b = (rem & 0x7F) as u8;
+                rem >>= 7;
+                if rem != 0 {
+                    b |= 0x80;
+                }
+                obu.push(b);
+                if rem == 0 {
+                    break;
+                }
+            }
+            obu.push(0x04); // OBU_META_ITUT_T35
+            obu.push(0xB5); // country_code
+            obu.resize(obu.len() + payload_len, fill);
+            obu.push(0x80); // trailing_one_bit
+            obu
+        }
+
+        let mut probe = Decoder::new(Config {
+            n_threads: 1,
+            max_frame_delay: 1,
+            ..Config::default()
+        })
+        .unwrap();
+        probe.send_packet(&Packet::new(PKT_1X1)).unwrap();
+        let _ = probe.receive_frame().unwrap().unwrap();
+        let base_peak = probe.allocation_peak();
+
+        // `allocation_limit = Some(base_peak + 256)` altında:
+        // 1. Küçük (32 bayt) ITU-T T.35 OBU kabul edilmeli ve `parse.itut_t35` içinde saklanmalı.
+        // 2. Bütçeyi aşan (1024 bayt) ikinci ITU-T T.35 OBU `Error::BudgetExceeded` döndürmeli
+        //    ve ilk ITU-T T.35 girdisini bozmamalı (`e5fd231fe9`).
+        // 3. Ardından gelen 1x1 kare paketi hatasız çözülmeli ve saklanan ilk T.35 metaverisini teslim etmeli.
+        let mut dec = Decoder::new(Config {
+            n_threads: 1,
+            max_frame_delay: 1,
+            allocation_limit: Some(base_peak + 256),
+            ..Config::default()
+        })
+        .unwrap();
+
+        let small_t35 = make_t35_obu(32, 0x42);
+        dec.send_packet(&Packet::new(&small_t35))
+            .expect("küçük T.35 OBU bütçe içinde kabul edilmeli");
+        assert_eq!(dec.parse.itut_t35.len(), 1);
+        assert_eq!(dec.parse.itut_t35[0].country_code, 0xB5);
+        assert_eq!(dec.parse.itut_t35[0].payload, vec![0x42; 32]);
+
+        let huge_t35 = make_t35_obu(base_peak + 1024, 0x99);
+        let err = dec
+            .send_packet(&Packet::new(&huge_t35))
+            .expect_err("bütçeyi aşan T.35 OBU BudgetExceeded döndürmeli");
+        assert!(
+            matches!(err, Error::BudgetExceeded { .. }),
+            "beklenen BudgetExceeded, gelen: {err:?}"
+        );
+        // İlk T.35 girdisi hiç bozulmadan korunmuş olmalı:
+        assert_eq!(dec.parse.itut_t35.len(), 1);
+        assert_eq!(dec.parse.itut_t35[0].payload, vec![0x42; 32]);
+
+        dec.send_packet(&Packet::new(PKT_1X1))
+            .expect("T.35 bütçe hatası sonrası kare paketi temiz çözülmeli");
+        let (frame, meta) = dec
+            .receive_frame_capi(true)
+            .unwrap()
+            .expect("kare üretilmeli");
+        assert_eq!((frame.width(), frame.height()), (1, 1));
+        assert_eq!(meta.itut_t35.len(), 1);
+        assert_eq!(meta.itut_t35[0].country_code, 0xB5);
+        assert_eq!(meta.itut_t35[0].payload, vec![0x42; 32]);
+        assert!(dec.parse.itut_t35.is_empty());
+
+        // 4. `kalici_bayt()` doğrulaması: tek başına sığan (`512` B) T.35 yükü canlıyken
+        //    kare çözümü (`base_peak + 512 > base_peak + 256`) `BudgetExceeded` üretmeli.
+        let med_t35 = make_t35_obu(512, 0x77);
+        dec.send_packet(&Packet::new(&med_t35))
+            .expect("512 B T.35 tek başına bütçeye sığmalı");
+        let frame_err = dec
+            .send_packet(&Packet::new(PKT_1X1))
+            .expect_err("512 B T.35 + kare çözümü bütçe sınırını aşmalı");
+        assert!(
+            matches!(frame_err, Error::BudgetExceeded { .. }),
+            "beklenen BudgetExceeded, gelen: {frame_err:?}"
+        );
     }
 }

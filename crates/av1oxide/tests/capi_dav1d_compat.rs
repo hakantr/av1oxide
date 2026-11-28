@@ -2985,3 +2985,400 @@ fn capi_delayed_decode_error_preserves_superframe_and_recovery_keyframe() {
         }
     }
 }
+
+/// Upstream `videolan/dav1d@f8ab763da5` (`frmhdr.w/h > seqhdr.max_w/h` -> `DAV1D_ERR(EINVAL)`)
+/// ve `videolan/dav1d@e5fd231fe9` (`OBU_META_ITUT_T35` tahsis/sınır sonrası sızıntısız toparlanma)
+/// diferansiyel C-ABI regresyon testi.
+#[test]
+fn capi_frame_size_exceeding_seq_max_and_itut_t35_parity() {
+    #[derive(Clone, Copy)]
+    struct Dav1dApi {
+        default_settings: unsafe extern "C" fn(*mut Dav1dSettings),
+        open: unsafe extern "C" fn(*mut *mut Dav1dContext, *const Dav1dSettings) -> c_int,
+        close: unsafe extern "C" fn(*mut *mut Dav1dContext),
+        data_create: unsafe extern "C" fn(*mut Dav1dData, usize) -> *mut u8,
+        data_unref: unsafe extern "C" fn(*mut Dav1dData),
+        send_data: unsafe extern "C" fn(*mut Dav1dContext, *mut Dav1dData) -> c_int,
+        get_picture: unsafe extern "C" fn(*mut Dav1dContext, *mut Dav1dPicture) -> c_int,
+        picture_unref: unsafe extern "C" fn(*mut Dav1dPicture),
+    }
+
+    let av1oxide_api = Dav1dApi {
+        default_settings: dav1d_default_settings,
+        open: dav1d_open,
+        close: dav1d_close,
+        data_create: dav1d_data_create,
+        data_unref: dav1d_data_unref,
+        send_data: dav1d_send_data,
+        get_picture: dav1d_get_picture,
+        picture_unref: dav1d_picture_unref,
+    };
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    struct RefDav1dLib {
+        handle: *mut c_void,
+        api: Dav1dApi,
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    impl RefDav1dLib {
+        fn try_load(so_path: &std::path::Path) -> Option<Self> {
+            use core::ffi::c_char;
+            use std::ffi::CString;
+            unsafe extern "C" {
+                fn dlopen(filename: *const c_char, flags: c_int) -> *mut c_void;
+                fn dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void;
+            }
+            const RTLD_NOW: c_int = 2;
+            const RTLD_LOCAL: c_int = 0;
+            if !so_path.is_file() {
+                return None;
+            }
+            let cpath = CString::new(so_path.to_str()?).ok()?;
+            // SAFETY: Referans C `libdav1d.so.7` paylaşımlı kütüphanesi salt test karşılaştırması için yüklenir.
+            unsafe {
+                let handle = dlopen(cpath.as_ptr(), RTLD_NOW | RTLD_LOCAL);
+                if handle.is_null() {
+                    return None;
+                }
+                let sym = |name: &CStr| -> *mut c_void { dlsym(handle, name.as_ptr()) };
+                let f_def = sym(c"dav1d_default_settings");
+                let f_open = sym(c"dav1d_open");
+                let f_close = sym(c"dav1d_close");
+                let f_create = sym(c"dav1d_data_create");
+                let f_dunref = sym(c"dav1d_data_unref");
+                let f_send = sym(c"dav1d_send_data");
+                let f_get = sym(c"dav1d_get_picture");
+                let f_unref = sym(c"dav1d_picture_unref");
+                if [
+                    f_def, f_open, f_close, f_create, f_dunref, f_send, f_get, f_unref,
+                ]
+                .iter()
+                .any(|p| p.is_null())
+                {
+                    return None;
+                }
+                Some(Self {
+                    handle,
+                    api: Dav1dApi {
+                        default_settings: core::mem::transmute::<
+                            *mut c_void,
+                            unsafe extern "C" fn(*mut Dav1dSettings),
+                        >(f_def),
+                        open: core::mem::transmute::<
+                            *mut c_void,
+                            unsafe extern "C" fn(
+                                *mut *mut Dav1dContext,
+                                *const Dav1dSettings,
+                            ) -> c_int,
+                        >(f_open),
+                        close: core::mem::transmute::<
+                            *mut c_void,
+                            unsafe extern "C" fn(*mut *mut Dav1dContext),
+                        >(f_close),
+                        data_create: core::mem::transmute::<
+                            *mut c_void,
+                            unsafe extern "C" fn(*mut Dav1dData, usize) -> *mut u8,
+                        >(f_create),
+                        data_unref: core::mem::transmute::<
+                            *mut c_void,
+                            unsafe extern "C" fn(*mut Dav1dData),
+                        >(f_dunref),
+                        send_data: core::mem::transmute::<
+                            *mut c_void,
+                            unsafe extern "C" fn(*mut Dav1dContext, *mut Dav1dData) -> c_int,
+                        >(f_send),
+                        get_picture: core::mem::transmute::<
+                            *mut c_void,
+                            unsafe extern "C" fn(*mut Dav1dContext, *mut Dav1dPicture) -> c_int,
+                        >(f_get),
+                        picture_unref: core::mem::transmute::<
+                            *mut c_void,
+                            unsafe extern "C" fn(*mut Dav1dPicture),
+                        >(f_unref),
+                    },
+                })
+            }
+        }
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    impl Drop for RefDav1dLib {
+        fn drop(&mut self) {
+            unsafe extern "C" {
+                fn dlclose(handle: *mut c_void) -> c_int;
+            }
+            // SAFETY: `self.handle`, `dlopen` ile açılmış geçerli tanıtıcıdır.
+            unsafe {
+                let _ = dlclose(self.handle);
+            }
+        }
+    }
+
+    struct MsbBits {
+        bits: Vec<u8>,
+    }
+    impl MsbBits {
+        fn new() -> Self {
+            Self { bits: Vec::new() }
+        }
+        fn bit(&mut self, v: u32) {
+            self.bits.push((v & 1) as u8);
+        }
+        fn bits(&mut self, v: u32, n: u32) {
+            for i in (0..n).rev() {
+                self.bit((v >> i) & 1);
+            }
+        }
+        fn bytes(self) -> Vec<u8> {
+            let mut out = vec![0u8; self.bits.len().div_ceil(8)];
+            for (i, b) in self.bits.iter().enumerate() {
+                if *b != 0 {
+                    out[i / 8] |= 1 << (7 - (i % 8));
+                }
+            }
+            out
+        }
+    }
+
+    fn wrap_obu(obu_type: u8, payload: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(2 + payload.len());
+        out.push((obu_type << 3) | 0x02); // has_size_field = 1
+        let mut rem = payload.len();
+        loop {
+            let mut b = (rem & 0x7F) as u8;
+            rem >>= 7;
+            if rem != 0 {
+                b |= 0x80;
+            }
+            out.push(b);
+            if rem == 0 {
+                break;
+            }
+        }
+        out.extend_from_slice(payload);
+        out
+    }
+
+    // `SEQ_OBU`: width_n_bits=8, height_n_bits=8, max_width=1 (0), max_height=1 (0).
+    let mut seq_bits = MsbBits::new();
+    seq_bits.bits(0, 3); // seq_profile = 0
+    seq_bits.bit(0); // still_picture = 0
+    seq_bits.bit(0); // reduced_still_picture_header = 0
+    seq_bits.bit(0); // timing_info_present_flag = 0
+    seq_bits.bit(0); // initial_display_delay_present_flag = 0
+    seq_bits.bits(0, 5); // operating_points_cnt_minus_1 = 0
+    seq_bits.bits(0, 12); // operating_point_idc[0] = 0
+    seq_bits.bits(0, 5); // seq_level_idx[0] = 0
+    seq_bits.bits(7, 4); // frame_width_bits_minus_1 = 7 (8 bit)
+    seq_bits.bits(7, 4); // frame_height_bits_minus_1 = 7 (8 bit)
+    seq_bits.bits(0, 8); // max_frame_width_minus_1 = 0 -> max_width = 1
+    seq_bits.bits(0, 8); // max_frame_height_minus_1 = 0 -> max_height = 1
+    seq_bits.bit(0); // frame_id_numbers_present_flag = 0
+    seq_bits.bit(1); // use_128x128_superblock = 1
+    seq_bits.bit(1); // enable_filter_intra = 1
+    seq_bits.bit(1); // enable_intra_edge_filter = 1
+    seq_bits.bit(1); // enable_interintra_compound = 1
+    seq_bits.bit(1); // enable_masked_compound = 1
+    seq_bits.bit(1); // enable_warped_motion = 1
+    seq_bits.bit(1); // enable_dual_filter = 1
+    seq_bits.bit(1); // enable_order_hint = 1
+    seq_bits.bit(1); // enable_jnt_comp = 1
+    seq_bits.bit(1); // enable_ref_frame_mvs = 1
+    seq_bits.bit(1); // seq_choose_screen_content_tools = 1
+    seq_bits.bit(1); // seq_choose_integer_mv = 1
+    seq_bits.bits(6, 3); // order_hint_bits_minus_1 = 6 (7 bit)
+    seq_bits.bit(0); // enable_superres = 0
+    seq_bits.bit(1); // enable_cdef = 1
+    seq_bits.bit(1); // enable_restoration = 1
+    seq_bits.bit(0); // high_bitdepth = 0
+    seq_bits.bit(0); // mono_chrome = 0
+    seq_bits.bit(0); // color_description_present_flag = 0
+    seq_bits.bit(0); // color_range = 0
+    seq_bits.bits(0, 2); // chroma_sample_position = 0
+    seq_bits.bit(0); // separate_uv_delta_q = 0
+    seq_bits.bit(0); // film_grain_params_present = 0
+    seq_bits.bit(1); // trailing_one_bit = 1
+    let seq_obu = wrap_obu(1, &seq_bits.bytes());
+
+    // 1. `KEY_FRAME` (`frame_size_override = 1`) içinde `width = 2 > max_width = 1` ve `height = 2 > max_height = 1`:
+    let build_bad_key_pkt = |w_m1: u32, h_m1: u32| -> Vec<u8> {
+        let mut fb = MsbBits::new();
+        fb.bit(0); // show_existing_frame = 0
+        fb.bits(0, 2); // frame_type = KEY_FRAME (0)
+        fb.bit(1); // show_frame = 1 (error_resilient_mode örtük olarak 1, bit okunmaz)
+        fb.bit(0); // disable_cdf_update = 0
+        fb.bit(0); // allow_screen_content_tools = 0
+        fb.bit(1); // frame_size_override_flag = 1
+        fb.bits(0, 7); // order_hint = 0
+        fb.bits(w_m1, 8); // frame_width_minus_1
+        fb.bits(h_m1, 8); // frame_height_minus_1
+        fb.bits(0, 32); // padding bits
+        fb.bits(0, 32);
+        let frame_obu = wrap_obu(6, &fb.bytes());
+        let mut pkt = vec![0x12, 0x00];
+        pkt.extend_from_slice(&seq_obu);
+        pkt.extend_from_slice(&frame_obu);
+        pkt
+    };
+
+    // 2. Geçerli 1x1 `KEY_FRAME` (`MINIMAL_1X1_OBUS`) ardından aynı sequence parametreleriyle
+    //    `max_width = 1, max_height = 1, width_n_bits = 8, height_n_bits = 8` altında
+    //    `INTER_FRAME` (`use_ref = true`, `found_ref = [0; 7]`, `frame_size_override = 1`)
+    //    içinde `width = 2 > max_width = 1`:
+    let build_bad_inter_pkt = |w_m1: u32, h_m1: u32| -> Vec<u8> {
+        let mut fb = MsbBits::new();
+        fb.bit(0); // show_existing_frame = 0
+        fb.bits(1, 2); // frame_type = INTER_FRAME (1)
+        fb.bit(1); // show_frame = 1
+        fb.bit(0); // error_resilient_mode = 0
+        fb.bit(0); // disable_cdf_update = 0
+        fb.bit(0); // allow_screen_content_tools = 0
+        fb.bit(1); // frame_size_override_flag = 1
+        fb.bits(1, 7); // order_hint = 1
+        fb.bits(0, 3); // primary_ref_frame = 0
+        fb.bits(0, 8); // refresh_frame_flags = 0
+        fb.bit(0); // frame_refs_short_signaling = 0
+        for _ in 0..7 {
+            fb.bits(0, 3); // ref_frame_idx[i] = 0
+        }
+        for _ in 0..7 {
+            fb.bit(0); // found_ref[i] = 0 (use_ref döngüsü)
+        }
+        fb.bits(w_m1, 8); // frame_width_minus_1
+        fb.bits(h_m1, 8); // frame_height_minus_1
+        fb.bits(0, 32); // padding bits
+        fb.bits(0, 32);
+        let frame_obu = wrap_obu(6, &fb.bytes());
+        let mut pkt = vec![0x12, 0x00];
+        pkt.extend_from_slice(&seq_obu);
+        pkt.extend_from_slice(&frame_obu);
+        pkt
+    };
+
+    let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    let ref_dav1d =
+        RefDav1dLib::try_load(&workspace_root.join(".cache/dav1d-build-asm/src/libdav1d.so.7"));
+
+    let run_seq = |api: Dav1dApi, pkts: &[&[u8]]| -> Vec<(c_int, c_int)> {
+        // SAFETY: Her koşu bağımsız `Dav1dContext` açıp kapatır.
+        unsafe {
+            let mut s = Dav1dSettings::default();
+            (api.default_settings)(&mut s);
+            s.n_threads = 1;
+            s.max_frame_delay = 1;
+            let mut c: *mut Dav1dContext = ptr::null_mut();
+            assert_eq!((api.open)(&mut c, &s), 0);
+            let mut results = Vec::new();
+            let mut pic = Dav1dPicture::default();
+            for &pkt in pkts {
+                let mut d = Dav1dData::default();
+                let dst = (api.data_create)(&mut d, pkt.len());
+                ptr::copy_nonoverlapping(pkt.as_ptr(), dst, pkt.len());
+                let sr = (api.send_data)(c, &mut d);
+                if d.sz > 0 {
+                    (api.data_unref)(&mut d);
+                }
+                let gr = (api.get_picture)(c, &mut pic);
+                if gr == 0 {
+                    (api.picture_unref)(&mut pic);
+                }
+                results.push((sr, gr));
+            }
+            (api.close)(&mut c);
+            results
+        }
+    };
+
+    for (w_m1, h_m1) in [(1u32, 0u32), (0u32, 1u32)] {
+        let bad_key = build_bad_key_pkt(w_m1, h_m1);
+        let bad_inter = build_bad_inter_pkt(w_m1, h_m1);
+
+        let got_key = run_seq(av1oxide_api, &[&bad_key]);
+        assert_eq!(
+            got_key[0],
+            (dav1d_err(EINVAL), dav1d_err(EAGAIN)),
+            "KEY frame_size_override max_width/height aşımı send_data'da -EINVAL döndürmeli (-ERANGE değil)"
+        );
+
+        let got_inter = run_seq(av1oxide_api, &[SAMPLE_OBU_PACKETS[0], &bad_inter]);
+        assert_eq!(got_inter[0], (0, 0));
+        assert_eq!(
+            got_inter[1],
+            (dav1d_err(EINVAL), dav1d_err(EAGAIN)),
+            "INTER frame_size_override max_width/height aşımı send_data'da -EINVAL döndürmeli"
+        );
+
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        if let Some(ref_lib) = ref_dav1d.as_ref() {
+            let exp_key = run_seq(ref_lib.api, &[&bad_key]);
+            let exp_inter = run_seq(ref_lib.api, &[SAMPLE_OBU_PACKETS[0], &bad_inter]);
+            assert_eq!(
+                got_key, exp_key,
+                "KEY frame_size_override reddi referans C libdav1d ile birebir aynı olmalı"
+            );
+            assert_eq!(
+                got_inter, exp_inter,
+                "INTER frame_size_override reddi referans C libdav1d ile birebir aynı olmalı"
+            );
+        }
+    }
+
+    // 3. `OBU_META_ITUT_T35` çoklu girdi + kare teslimi ve referans C `libdav1d` eşliği:
+    let mut t35_pkt = Vec::new();
+    t35_pkt.extend_from_slice(&wrap_obu(5, &[0x04, 0xB5, 0x11, 0x22, 0x33, 0x80]));
+    t35_pkt.extend_from_slice(&wrap_obu(5, &[0x04, 0xFF, 0x07, 0xAA, 0xBB, 0x80]));
+    t35_pkt.extend_from_slice(SAMPLE_OBU_PACKETS[0]);
+
+    let inspect_t35 = |api: Dav1dApi| -> Vec<(u8, u8, Vec<u8>)> {
+        // SAFETY: Bağımsız `Dav1dContext` üzerinde T.35 metaverisi okunup serbest bırakılır.
+        unsafe {
+            let mut s = Dav1dSettings::default();
+            (api.default_settings)(&mut s);
+            s.n_threads = 1;
+            s.max_frame_delay = 1;
+            let mut c: *mut Dav1dContext = ptr::null_mut();
+            assert_eq!((api.open)(&mut c, &s), 0);
+            let mut d = Dav1dData::default();
+            let dst = (api.data_create)(&mut d, t35_pkt.len());
+            ptr::copy_nonoverlapping(t35_pkt.as_ptr(), dst, t35_pkt.len());
+            assert_eq!((api.send_data)(c, &mut d), 0);
+            let mut pic = Dav1dPicture::default();
+            assert_eq!((api.get_picture)(c, &mut pic), 0);
+            let mut entries = Vec::new();
+            for i in 0..pic.n_itut_t35 {
+                let entry = &*pic.itut_t35.add(i);
+                let payload =
+                    std::slice::from_raw_parts(entry.payload, entry.payload_size).to_vec();
+                entries.push((
+                    entry.country_code,
+                    entry.country_code_extension_byte,
+                    payload,
+                ));
+            }
+            (api.picture_unref)(&mut pic);
+            (api.close)(&mut c);
+            entries
+        }
+    };
+
+    let got_t35 = inspect_t35(av1oxide_api);
+    assert_eq!(
+        got_t35,
+        vec![
+            (0xB5, 0x00, vec![0x11, 0x22, 0x33]),
+            (0xFF, 0x07, vec![0xAA, 0xBB]),
+        ]
+    );
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    if let Some(ref_lib) = ref_dav1d.as_ref() {
+        let exp_t35 = inspect_t35(ref_lib.api);
+        assert_eq!(got_t35, exp_t35);
+    }
+}

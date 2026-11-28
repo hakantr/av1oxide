@@ -72,6 +72,7 @@
 //! | `show_existing_frame` + `frame_id_numbers_present`: referans yok ya da `frame_id` uyuşmuyor | 425–431 |
 //! | katı kipte INTRA + `refresh_frame_flags == 0xff` | 501–505 |
 //! | `frame_size_with_refs`: referans kare yok | `read_frame_size` 349–352 |
+//! | `frame_size_with_refs` / `frame_size_override`: `width[1] > max_width` ya da `height > max_height` | `read_frame_size` 355–359, 380–384 |
 //! | referans seçim algoritmasında referans kare yok | 529–530 |
 //! | `delta_frame_id` ile hesaplanan `frame_id` uyuşmuyor | 585–590 |
 //! | `context_update_tile_id >= TileCols*TileRows` | 669–671 |
@@ -1097,6 +1098,12 @@ fn read_frame_size(
                 };
                 h.width[1] = ref_hdr.width[1];
                 h.height = ref_hdr.height;
+                if h.width[1] > seq.max_width || h.height > seq.max_height {
+                    return Err(invalid(
+                        reader,
+                        "frame_size_with_refs: kare boyutu sequence max_width/max_height sınırını aşıyor",
+                    ));
+                }
                 h.render_width = ref_hdr.render_width;
                 h.render_height = ref_hdr.render_height;
                 h.super_res.enabled = seq.super_res && reader.read_bit()? != 0;
@@ -1117,6 +1124,12 @@ fn read_frame_size(
     if h.frame_size_override {
         h.width[1] = reader.read_bits(u32::from(seq.width_n_bits))? as i32 + 1;
         h.height = reader.read_bits(u32::from(seq.height_n_bits))? as i32 + 1;
+        if h.width[1] > seq.max_width || h.height > seq.max_height {
+            return Err(invalid(
+                reader,
+                "frame_size_override: kare boyutu sequence max_width/max_height sınırını aşıyor",
+            ));
+        }
     } else {
         h.width[1] = seq.max_width;
         h.height = seq.max_height;
@@ -1955,7 +1968,7 @@ mod tests {
         DEFAULT_MODE_REF_DELTAS, DEFAULT_WM_PARAMS, FilmGrainData, FilmGrainHeader, FrameHeader,
         FrameHeaderContext, FrameType, LoopfilterModeRefDeltas, NUM_REF_FRAMES, PRIMARY_REF_NONE,
         WarpedMotionType, get_poc_diff, parse_tile_group, read_film_grain, read_frame_refs,
-        read_global_motion, read_loop_filter, read_segmentation, read_tile_info,
+        read_frame_size, read_global_motion, read_loop_filter, read_segmentation, read_tile_info,
     };
     use crate::bitstream::BitReader;
     use crate::bitstream::seq_header::SequenceHeader;
@@ -2400,5 +2413,101 @@ mod tests {
         assert_eq!(header.film_grain.data.num_y_points, 2);
         assert_eq!(header.film_grain.data.scaling_shift, 11);
         assert_eq!(header.film_grain.data.ar_coeff_lag, 2);
+    }
+
+    #[test]
+    fn frame_size_override_ve_with_refs_max_boyut_asimini_reddeder() {
+        let seq = SequenceHeader {
+            max_width: 64,
+            max_height: 48,
+            width_n_bits: 8,
+            height_n_bits: 8,
+            super_res: true,
+            ..SequenceHeader::default()
+        };
+        let refs_empty = [const { None }; NUM_REF_FRAMES];
+        let ctx_empty = empty_ctx(&seq, &refs_empty);
+
+        // 1. `frame_size_override`: (64, 48) geçerli.
+        {
+            let mut w = BitWriter::new();
+            w.bits(63, 8); // width = 64
+            w.bits(47, 8); // height = 48
+            w.bit(0); // super_res.enabled = 0
+            w.bit(0); // have_render_size = 0
+            let bytes = w.bytes();
+            let mut br = BitReader::new(&bytes);
+            let mut h = FrameHeader {
+                frame_size_override: true,
+                ..FrameHeader::default()
+            };
+            read_frame_size(&mut br, &ctx_empty, &mut h, false)
+                .expect("sınır içindeki frame_size_override kabul edilmeli");
+            assert_eq!((h.width[1], h.height), (64, 48));
+        }
+
+        // 2. `frame_size_override`: width = 65 > max_width = 64 -> super_res bitinden önce hata.
+        for (w_m1, h_m1) in [(64u32, 47u32), (63u32, 48u32)] {
+            let mut w = BitWriter::new();
+            w.bits(w_m1, 8);
+            w.bits(h_m1, 8);
+            w.bit(1); // super_res.enabled = 1 (okunmamalı!)
+            let bytes = w.bytes();
+            let mut br = BitReader::new(&bytes);
+            let mut h = FrameHeader {
+                frame_size_override: true,
+                ..FrameHeader::default()
+            };
+            let err = read_frame_size(&mut br, &ctx_empty, &mut h, false)
+                .expect_err("max_width/max_height aşan frame_size_override reddedilmeli");
+            let msg = format!("{err}");
+            assert!(
+                msg.contains("frame_size_override") && !msg.contains("frame_size_limit"),
+                "beklenmeyen hata iletisi: {msg}"
+            );
+            assert_eq!(
+                br.bit_position(),
+                16,
+                "hata super_res.enabled biti okunmadan tam 16. bitte üretilmeli"
+            );
+        }
+
+        // 3. `frame_size_with_refs`: referans kare boyutu `seq.max_width` veya `seq.max_height`
+        //    sınırını aşıyorsa `super_res.enabled` biti okunmadan reddedilmeli (`dav1d` `obu.c:355-359`).
+        for (ref_w, ref_h, should_ok) in [(64, 48, true), (65, 48, false), (64, 49, false)] {
+            let mut refs = [const { None }; NUM_REF_FRAMES];
+            refs[2] = Some(FrameHeader {
+                width: [ref_w, ref_w],
+                height: ref_h,
+                render_width: ref_w,
+                render_height: ref_h,
+                ..FrameHeader::default()
+            });
+            let ctx = empty_ctx(&seq, &refs);
+            let mut w = BitWriter::new();
+            w.bit(1); // found_ref[0] = 1 -> refidx[0] = 2
+            w.bit(0); // super_res.enabled = 0
+            let bytes = w.bytes();
+            let mut br = BitReader::new(&bytes);
+            let mut h = FrameHeader::default();
+            h.refidx[0] = 2;
+            let res = read_frame_size(&mut br, &ctx, &mut h, true);
+            if should_ok {
+                res.expect("sınır içindeki frame_size_with_refs kabul edilmeli");
+                assert_eq!((h.width[1], h.height), (64, 48));
+            } else {
+                let err = res.expect_err("sınırı aşan frame_size_with_refs reddedilmeli");
+                let msg = format!("{err}");
+                assert!(
+                    msg.contains("frame_size_with_refs") && !msg.contains("frame_size_limit"),
+                    "beklenmeyen hata iletisi: {msg}"
+                );
+                assert_eq!(
+                    br.bit_position(),
+                    1,
+                    "hata super_res.enabled biti okunmadan tam 1. bitte üretilmeli"
+                );
+            }
+        }
     }
 }

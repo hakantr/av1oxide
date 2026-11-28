@@ -389,7 +389,7 @@ fn attach_picture_metadata_parts(
     content_light: Option<(u16, u16)>,
     mastering_display: Option<MasteringDisplayMeta>,
     itut_t35: &[ItutT35Meta],
-) {
+) -> Result<(), c_int> {
     if let Some(seq) = seq_hdr {
         let mut boxed = Box::new(seq_header_to_c(seq));
         let ptr = &mut *boxed as *mut Dav1dSequenceHeader;
@@ -427,10 +427,21 @@ fn attach_picture_metadata_parts(
         pic.mastering_display_ref = r;
     }
     if !itut_t35.is_empty() {
-        let mut payloads: Vec<Vec<u8>> = Vec::with_capacity(itut_t35.len());
-        let mut entries: Vec<Dav1dITUTT35> = Vec::with_capacity(itut_t35.len());
+        let mut payloads: Vec<Vec<u8>> = Vec::new();
+        let mut entries: Vec<Dav1dITUTT35> = Vec::new();
+        if payloads.try_reserve_exact(itut_t35.len()).is_err()
+            || entries.try_reserve_exact(itut_t35.len()).is_err()
+        {
+            clear_picture_metadata_refs(pic);
+            return Err(dav1d_err(ENOMEM));
+        }
         for item in itut_t35 {
-            let mut p = item.payload.clone();
+            let mut p: Vec<u8> = Vec::new();
+            if p.try_reserve_exact(item.payload.len()).is_err() {
+                clear_picture_metadata_refs(pic);
+                return Err(dav1d_err(ENOMEM));
+            }
+            p.extend_from_slice(&item.payload);
             let ptr = if p.is_empty() {
                 core::ptr::null_mut()
             } else {
@@ -455,9 +466,10 @@ fn attach_picture_metadata_parts(
         pic.n_itut_t35 = n;
         pic.itut_t35_ref = r;
     }
+    Ok(())
 }
 
-fn attach_picture_metadata(pic: &mut Dav1dPicture, meta: &OutputCapiMeta) {
+fn attach_picture_metadata(pic: &mut Dav1dPicture, meta: &OutputCapiMeta) -> Result<(), c_int> {
     attach_picture_metadata_parts(
         pic,
         meta.seq_hdr.as_deref(),
@@ -465,7 +477,7 @@ fn attach_picture_metadata(pic: &mut Dav1dPicture, meta: &OutputCapiMeta) {
         meta.content_light,
         meta.mastering_display,
         &meta.itut_t35,
-    );
+    )
 }
 
 fn clear_picture_metadata_refs(pic: &mut Dav1dPicture) {
@@ -524,14 +536,17 @@ fn preallocate_custom_picture(
         m: props,
         ..Dav1dPicture::default()
     };
-    attach_picture_metadata_parts(
+    if let Err(e) = attach_picture_metadata_parts(
         &mut pic,
         req.seq_hdr,
         Some(req.frame_hdr),
         req.content_light,
         req.mastering_display,
         req.itut_t35,
-    );
+    ) {
+        picture_unref_value(&mut pic);
+        return Err(e);
+    }
     let rc = alloc_cb(&mut pic as *mut Dav1dPicture, allocator.cookie);
     if rc < 0 {
         picture_unref_value(&mut pic);
@@ -584,7 +599,12 @@ fn fill_output_picture(
     // (ör. FFmpeg `libdav1d_picture_allocator` `p->seq_hdr->hbd` okur).
     out.m = props;
     match meta_src {
-        PictureMetaSource::Owned(meta) => attach_picture_metadata(out, meta),
+        PictureMetaSource::Owned(meta) => {
+            if let Err(e) = attach_picture_metadata(out, meta) {
+                picture_unref_value(out);
+                return Err(e);
+            }
+        }
         PictureMetaSource::RetainFrom(src) => retain_picture_metadata(out, src),
     }
 
@@ -1175,9 +1195,19 @@ fn deliver_ready_picture(ctx: &mut ContextInner, out_ref: &mut Dav1dPicture) -> 
         if meta.is_show_existing {
             let props =
                 take_or_clone_packet_props(ctx, meta.packet_tag, frame.metadata().timestamp);
+            let err_props_backup = clone_data_props(&props);
             clear_picture_metadata_refs(&mut delivered);
             delivered.m = props;
-            attach_picture_metadata(&mut delivered, &meta);
+            if let Err(code) = attach_picture_metadata(&mut delivered, &meta) {
+                picture_unref_value(&mut delivered);
+                data_props_unref_value(&mut ctx.cached_error_props);
+                ctx.cached_error_props = err_props_backup;
+                cleanup_orphaned_preallocs(ctx);
+                cleanup_all_unused_packet_props(ctx);
+                return code;
+            }
+            let mut drop_backup = err_props_backup;
+            data_props_unref_value(&mut drop_backup);
         }
         picture_unref_value(out_ref);
         *out_ref = delivered;
