@@ -209,6 +209,39 @@ fn log_capi_message(logger: &Dav1dLogger, msg: &str) {
     }));
 }
 
+/// C `dav1d` `src/obu.c` (`dav1d_parse_obus`) ile birebir uyumlu OBU/başlık ayrıştırma
+/// günlük iletilerini üretir; karo/MSAC/referans/tahsis çözme hatalarında (`src/decode.c`,
+/// `src/thread_task.c`, `src/lib.c`) C `dav1d` gibi günlük yazmaz.
+fn log_capi_obu_error(logger: &Dav1dLogger, err: &crate::Error) {
+    use crate::error::BitstreamErrorKind;
+    let crate::Error::Bitstream(b) = err else {
+        return;
+    };
+    match b.kind {
+        BitstreamErrorKind::InvalidFrameHeader(msg) if msg.contains("frame_size_limit") => {
+            log_capi_message(logger, "Frame size exceeds limit");
+        }
+        BitstreamErrorKind::InvalidSequenceHeader(_) => {
+            log_capi_message(logger, "Error parsing sequence header");
+            log_capi_message(logger, "Error parsing OBU data");
+        }
+        BitstreamErrorKind::InvalidFrameHeader(msg)
+            if !msg.contains("sequence header yok")
+                && !msg.contains("show_existing_frame taşıyamaz")
+                && !msg.contains("ITU-T T.35") =>
+        {
+            log_capi_message(logger, "Error parsing frame header");
+            log_capi_message(logger, "Error parsing OBU data");
+        }
+        BitstreamErrorKind::UnexpectedEnd => {
+            log_capi_message(logger, "Overrun in OBU bit buffer");
+        }
+        _ => {
+            log_capi_message(logger, "Error parsing OBU data");
+        }
+    }
+}
+
 fn ref_dec(slot: &mut *mut Dav1dRef) {
     let ptr = *slot;
     *slot = core::ptr::null_mut();
@@ -782,7 +815,7 @@ pub unsafe extern "C" fn dav1d_open(
         let mut decoder = match Decoder::new(config) {
             Ok(dec) => dec,
             Err(err) => {
-                log_capi_message(&settings.logger, &format!("dav1d_open: {err}"));
+                log_capi_message(&settings.logger, "dav1d_open: invalid settings");
                 return error_to_dav1d(&err);
             }
         };
@@ -942,7 +975,6 @@ fn pull_ready_nonblocking(ctx: &mut ContextInner) {
         }
         Ok(None) => {}
         Err(err) => {
-            log_capi_message(&ctx.logger, &format!("dav1d decode error: {err}"));
             if let Some(tag) = ctx.decoder.last_error_packet_tag() {
                 record_error_props_for_tag(ctx, tag, None);
             }
@@ -1095,7 +1127,7 @@ fn gen_picture(ctx: &mut ContextInner) -> c_int {
                 }
             }
             Err(err) => {
-                log_capi_message(&ctx.logger, &format!("dav1d_send_data error: {err}"));
+                log_capi_obu_error(&ctx.logger, &err);
                 let code = prealloc_err.unwrap_or_else(|| error_to_dav1d(&err));
                 let err_tag = ctx.decoder.last_error_packet_tag().unwrap_or(tag);
                 let fallback_props = clone_data_props(&ctx.pending_in.m);
@@ -1361,7 +1393,6 @@ pub unsafe extern "C" fn dav1d_get_picture(c: *mut Dav1dContext, out: *mut Dav1d
                         return dav1d_err(EAGAIN);
                     }
                     Err(err) => {
-                        log_capi_message(&ctx.logger, &format!("dav1d_get_picture error: {err}"));
                         if let Some(tag) = ctx.decoder.last_error_packet_tag() {
                             record_error_props_for_tag(ctx, tag, None);
                         }

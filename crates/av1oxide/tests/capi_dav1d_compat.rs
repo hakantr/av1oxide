@@ -1635,7 +1635,9 @@ fn capi_inloop_filters_decode_frame_type_and_logger_callback() {
             assert!(intra_cnt >= key_cnt && key_cnt >= 1 && key_cnt < all_cnt);
         }
 
-        // 4. `logger` bozuk paket hatasında çağrılır ve gerçek hata metni biçimlenir.
+        // 4. `logger` bozuk OBU başlık/boyut hatasında C `dav1d` (`src/obu.c`) ile birebir aynı
+        //    İngilizce `"Error parsing OBU data\n"` mesajını üretir; karo/MSAC çözme hatasında ise
+        //    C `dav1d` gibi hiç günlük yazmaz (`0` mesaj).
         let before = log_messages.lock().unwrap().len();
         let mut s = Dav1dSettings::default();
         dav1d_default_settings(&mut s);
@@ -1653,14 +1655,189 @@ fn capi_inloop_filters_decode_frame_type_and_logger_callback() {
         dav1d_data_unref(&mut d);
         {
             let msgs = log_messages.lock().unwrap();
-            assert!(msgs.len() > before);
+            assert_eq!(msgs.len(), before + 1);
             let last = msgs.last().unwrap();
-            assert!(
-                last.ends_with('\n') && last.contains("dav1d_send_data error:"),
-                "bozuk paket log mesajı beklenenden farklı: {last:?}"
+            assert_eq!(
+                last, "Error parsing OBU data\n",
+                "bozuk paket log mesajı C dav1d ile birebir aynı olmalı: {last:?}"
             );
         }
+
+        // Karo/MSAC bozuk kare paketi: geçerli TD + Sequence Header + Frame Header korunup
+        // karo verisi 1 bayt `0x00`'a kısaltılır -> başlık ayrışır, karo çözümü hata verir,
+        // ancak `Dav1dLogger`'a yeni mesaj yazılmaz.
+        let mut corrupt_tile_pkt = Vec::new();
+        {
+            let pkt0 = &packets[0];
+            let seq = av1oxide::bitstream::parse_sequence_header_obus(pkt0)
+                .unwrap()
+                .unwrap();
+            let mut off = 0usize;
+            while off < pkt0.len() {
+                let start = off;
+                let Some(obu) = av1oxide::bitstream::split_next_with(pkt0, &mut off, true).unwrap()
+                else {
+                    break;
+                };
+                if obu.header.obu_type == av1oxide::bitstream::ObuType::Frame {
+                    let mut br = av1oxide::bitstream::BitReader::new(obu.payload);
+                    let refs0: [Option<av1oxide::bitstream::FrameHeader>; 8] = Default::default();
+                    let ctx_fh = av1oxide::bitstream::FrameHeaderContext {
+                        sequence_header: &seq,
+                        refs: &refs0,
+                        temporal_id: 0,
+                        spatial_id: 0,
+                        strict_std_compliance: false,
+                    };
+                    let fh = av1oxide::bitstream::FrameHeader::parse(&mut br, &ctx_fh).unwrap();
+                    br.align_to_byte();
+                    let fh_end = br.byte_position();
+                    let n_tiles = usize::from(fh.tiling.cols) * usize::from(fh.tiling.rows);
+                    let size_bytes = usize::from(fh.tiling.n_bytes);
+                    let mut body = obu.payload[..fh_end].to_vec();
+                    for t in 0..n_tiles {
+                        if t + 1 < n_tiles {
+                            body.resize(body.len() + size_bytes, 0u8);
+                        }
+                        body.push(0x00);
+                    }
+                    corrupt_tile_pkt.push(0x32); // OBU_FRAME, has_size_field=1
+                    let mut rem = body.len();
+                    loop {
+                        let mut b = (rem & 0x7F) as u8;
+                        rem >>= 7;
+                        if rem != 0 {
+                            b |= 0x80;
+                        }
+                        corrupt_tile_pkt.push(b);
+                        if rem == 0 {
+                            break;
+                        }
+                    }
+                    corrupt_tile_pkt.extend_from_slice(&body);
+                } else {
+                    corrupt_tile_pkt.extend_from_slice(&pkt0[start..off]);
+                }
+            }
+        }
+        assert!(!corrupt_tile_pkt.is_empty());
+
+        let before_tile_err = log_messages.lock().unwrap().len();
+        let mut d_tile = Dav1dData::default();
+        let p_tile = dav1d_data_create(&mut d_tile, corrupt_tile_pkt.len());
+        core::ptr::copy_nonoverlapping(corrupt_tile_pkt.as_ptr(), p_tile, corrupt_tile_pkt.len());
+        let send_rc = dav1d_send_data(c, &mut d_tile);
+        if d_tile.sz > 0 {
+            dav1d_data_unref(&mut d_tile);
+        }
+        let mut pic_tile = Dav1dPicture::default();
+        let get_rc = dav1d_get_picture(c, &mut pic_tile);
+        assert!(
+            send_rc < 0 || (get_rc < 0 && get_rc != dav1d_err(EAGAIN)),
+            "bozuk karo verisi hata döndürmeli: send_rc={send_rc}, get_rc={get_rc}"
+        );
+        assert_eq!(
+            log_messages.lock().unwrap().len(),
+            before_tile_err,
+            "karo/MSAC çözme hatasında Dav1dLogger'a mesaj yazılmamalı"
+        );
         dav1d_close(&mut c);
+
+        // Referans C `libdav1d.so.7` mevcutsa hem `bad_obu` hem `corrupt_tile_pkt` için
+        // üretilen günlük satırlarının birebir aynı olduğunu doğrula.
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        {
+            use core::ffi::c_char;
+            use std::ffi::CString;
+            unsafe extern "C" {
+                fn dlopen(filename: *const c_char, flags: c_int) -> *mut c_void;
+                fn dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void;
+                fn dlclose(handle: *mut c_void) -> c_int;
+            }
+            let workspace_root = manifest_dir.parent().unwrap().parent().unwrap();
+            let so_path = workspace_root.join(".cache/dav1d-build-asm/src/libdav1d.so.7");
+            if so_path.is_file() {
+                let cpath = CString::new(so_path.to_str().unwrap()).unwrap();
+                let handle = dlopen(cpath.as_ptr(), 2);
+                if !handle.is_null() {
+                    let sym = |name: &CStr| -> *mut c_void { dlsym(handle, name.as_ptr()) };
+                    let f_def = core::mem::transmute::<
+                        *mut c_void,
+                        unsafe extern "C" fn(*mut Dav1dSettings),
+                    >(sym(c"dav1d_default_settings"));
+                    let f_open = core::mem::transmute::<
+                        *mut c_void,
+                        unsafe extern "C" fn(*mut *mut Dav1dContext, *const Dav1dSettings) -> c_int,
+                    >(sym(c"dav1d_open"));
+                    let f_close = core::mem::transmute::<
+                        *mut c_void,
+                        unsafe extern "C" fn(*mut *mut Dav1dContext),
+                    >(sym(c"dav1d_close"));
+                    let f_create = core::mem::transmute::<
+                        *mut c_void,
+                        unsafe extern "C" fn(*mut Dav1dData, usize) -> *mut u8,
+                    >(sym(c"dav1d_data_create"));
+                    let f_dunref = core::mem::transmute::<
+                        *mut c_void,
+                        unsafe extern "C" fn(*mut Dav1dData),
+                    >(sym(c"dav1d_data_unref"));
+                    let f_send = core::mem::transmute::<
+                        *mut c_void,
+                        unsafe extern "C" fn(*mut Dav1dContext, *mut Dav1dData) -> c_int,
+                    >(sym(c"dav1d_send_data"));
+                    let f_get = core::mem::transmute::<
+                        *mut c_void,
+                        unsafe extern "C" fn(*mut Dav1dContext, *mut Dav1dPicture) -> c_int,
+                    >(sym(c"dav1d_get_picture"));
+
+                    let ref_logs: Mutex<Vec<String>> = Mutex::new(Vec::new());
+                    let mut rs = Dav1dSettings::default();
+                    f_def(&mut rs);
+                    rs.n_threads = 1;
+                    rs.max_frame_delay = 1;
+                    rs.logger.cookie = (&ref_logs as *const Mutex<Vec<String>>) as *mut c_void;
+                    rs.logger.callback = test_logger_cb as *const c_void;
+                    let mut rc_ctx: *mut Dav1dContext = core::ptr::null_mut();
+                    assert_eq!(f_open(&mut rc_ctx, &rs), 0);
+
+                    let mut rd = Dav1dData::default();
+                    let rp = f_create(&mut rd, bad_obu.len());
+                    core::ptr::copy_nonoverlapping(bad_obu.as_ptr(), rp, bad_obu.len());
+                    assert!(f_send(rc_ctx, &mut rd) < 0);
+                    if rd.sz > 0 {
+                        f_dunref(&mut rd);
+                    }
+                    assert_eq!(
+                        *ref_logs.lock().unwrap(),
+                        vec!["Error parsing OBU data\n".to_string()],
+                        "referans C libdav1d bad_obu log çıktısı eşleşmeli"
+                    );
+
+                    let mut rd_tile = Dav1dData::default();
+                    let rp_tile = f_create(&mut rd_tile, corrupt_tile_pkt.len());
+                    core::ptr::copy_nonoverlapping(
+                        corrupt_tile_pkt.as_ptr(),
+                        rp_tile,
+                        corrupt_tile_pkt.len(),
+                    );
+                    let r_send = f_send(rc_ctx, &mut rd_tile);
+                    if rd_tile.sz > 0 {
+                        f_dunref(&mut rd_tile);
+                    }
+                    let mut r_pic = Dav1dPicture::default();
+                    let r_get = f_get(rc_ctx, &mut r_pic);
+                    assert!(r_send < 0 || (r_get < 0 && r_get != dav1d_err(EAGAIN)));
+                    assert_eq!(
+                        ref_logs.lock().unwrap().len(),
+                        1,
+                        "referans C libdav1d karo/MSAC çözme hatasında ek log yazmamalı"
+                    );
+
+                    f_close(&mut rc_ctx);
+                    let _ = dlclose(handle);
+                }
+            }
+        }
     }
 }
 
