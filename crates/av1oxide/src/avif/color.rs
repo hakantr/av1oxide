@@ -234,6 +234,11 @@ impl SampleSource for TablesU16<'_> {
 /// H.273 renk matrisi çekirdeği.
 trait MatrixKernel: Copy + Send + Sync {
     fn to_rgb_f32(&self, unorm_y: u16, y_norm: f32, cb: f32, cr: f32) -> (f32, f32, f32);
+
+    #[inline(always)]
+    fn to_rgb_f32x4(&self, y: [(u16, f32); 4], cb: [f32; 4], cr: [f32; 4]) -> [(f32, f32, f32); 4] {
+        core::array::from_fn(|i| self.to_rgb_f32(y[i].0, y[i].1, cb[i], cr[i]))
+    }
 }
 
 /// Standart H.273 `(Kr, Kb)` doğrusal matris katsayıları (önceden hesaplanmış IEEE-754 özdeş terimler).
@@ -265,6 +270,18 @@ impl MatrixKernel for StandardMatrix {
         let b = y_norm + self.c_b * cb;
         let g = y_norm - ((2.0 * ((self.k_kr * cr) + (self.k_kb * cb))) / self.kg);
         (clamp01(r), clamp01(g), clamp01(b))
+    }
+
+    #[inline(always)]
+    fn to_rgb_f32x4(&self, y: [(u16, f32); 4], cb: [f32; 4], cr: [f32; 4]) -> [(f32, f32, f32); 4] {
+        let y = y.map(|(_, normalized)| normalized);
+        // Aynı IEEE-754 işlem sırasını her piksel için koruyarak kanalları ayrı hesapla.
+        let red: [f32; 4] = core::array::from_fn(|i| y[i] + self.c_r * cr[i]);
+        let green: [f32; 4] = core::array::from_fn(|i| {
+            y[i] - ((2.0 * ((self.k_kr * cr[i]) + (self.k_kb * cb[i]))) / self.kg)
+        });
+        let blue: [f32; 4] = core::array::from_fn(|i| y[i] + self.c_b * cb[i]);
+        core::array::from_fn(|i| (clamp01(red[i]), clamp01(green[i]), clamp01(blue[i])))
     }
 }
 
@@ -1532,32 +1549,34 @@ fn convert_c420_row_pair<S: SampleSource, M: MatrixKernel, O: PixelSink>(
             let (ot_l, ot_r) = ot_pair.split_at_mut(O::CHANNELS);
             let (ob_l, ob_r) = ob_pair.split_at_mut(O::CHANNELS);
 
-            // Üst-sol (2k + 1, 2r + 1): ağırlık sırası (00, 10, 01, 11)
-            let cb_tl = ((u00_9 + u10_3) + u01_3) + u11_1;
-            let cr_tl = ((v00_9 + v10_3) + v01_3) + v11_1;
-            let (uyt_l, ynt_l) = src.lookup_y(yt_pair[0]);
-            let (rtl, gtl, btl) = matrix.to_rgb_f32(uyt_l, ynt_l, cb_tl, cr_tl);
+            // Piksel sırası üst-sol, üst-sağ, alt-sol, alt-sağ.
+            let cb = [
+                ((u00_9 + u10_3) + u01_3) + u11_1,
+                ((u10_9 + u00_3) + u11_3) + u01_1,
+                ((u01_9 + u11_3) + u00_3) + u10_1,
+                ((u11_9 + u01_3) + u10_3) + u00_1,
+            ];
+            let cr = [
+                ((v00_9 + v10_3) + v01_3) + v11_1,
+                ((v10_9 + v00_3) + v11_3) + v01_1,
+                ((v01_9 + v11_3) + v00_3) + v10_1,
+                ((v11_9 + v01_3) + v10_3) + v00_1,
+            ];
+            let y = [
+                src.lookup_y(yt_pair[0]),
+                src.lookup_y(yt_pair[1]),
+                src.lookup_y(yb_pair[0]),
+                src.lookup_y(yb_pair[1]),
+            ];
+            let [
+                (rtl, gtl, btl),
+                (rtr, gtr, btr),
+                (rbl, gbl, bbl),
+                (rbr, gbr, bbr),
+            ] = matrix.to_rgb_f32x4(y, cb, cr);
             sink.write_rgb(ot_l, rtl, gtl, btl, a_top, x_l);
-
-            // Üst-sağ (2k + 2, 2r + 1): ağırlık sırası (10, 00, 11, 01)
-            let cb_tr = ((u10_9 + u00_3) + u11_3) + u01_1;
-            let cr_tr = ((v10_9 + v00_3) + v11_3) + v01_1;
-            let (uyt_r, ynt_r) = src.lookup_y(yt_pair[1]);
-            let (rtr, gtr, btr) = matrix.to_rgb_f32(uyt_r, ynt_r, cb_tr, cr_tr);
             sink.write_rgb(ot_r, rtr, gtr, btr, a_top, x_r);
-
-            // Alt-sol (2k + 1, 2r + 2): ağırlık sırası (01, 11, 00, 10)
-            let cb_bl = ((u01_9 + u11_3) + u00_3) + u10_1;
-            let cr_bl = ((v01_9 + v11_3) + v00_3) + v10_1;
-            let (uyb_l, ynb_l) = src.lookup_y(yb_pair[0]);
-            let (rbl, gbl, bbl) = matrix.to_rgb_f32(uyb_l, ynb_l, cb_bl, cr_bl);
             sink.write_rgb(ob_l, rbl, gbl, bbl, a_bot, x_l);
-
-            // Alt-sağ (2k + 2, 2r + 2): ağırlık sırası (11, 01, 10, 00)
-            let cb_br = ((u11_9 + u01_3) + u10_3) + u00_1;
-            let cr_br = ((v11_9 + v01_3) + v10_3) + v00_1;
-            let (uyb_r, ynb_r) = src.lookup_y(yb_pair[1]);
-            let (rbr, gbr, bbr) = matrix.to_rgb_f32(uyb_r, ynb_r, cb_br, cr_br);
             sink.write_rgb(ob_r, rbr, gbr, bbr, a_bot, x_r);
         }
     }
@@ -2571,7 +2590,10 @@ pub(crate) fn write_rgba16_scaled_ne_into(img: &AvifImage, dst: &mut [u8]) -> Re
 mod tests {
     use alloc::vec::Vec;
 
-    use super::{chroma_derived_kr_kb, validate_matrix_coefficients};
+    use super::{
+        MatrixKernel, StandardMatrix, chroma_derived_kr_kb, matrix_kr_kb,
+        validate_matrix_coefficients,
+    };
     use crate::error::Error;
 
     #[test]
@@ -2648,6 +2670,52 @@ mod tests {
                 validate_matrix_coefficients(unsupported),
                 Err(Error::Unsupported(_))
             ));
+        }
+    }
+
+    #[test]
+    fn standard_matrix_four_pixel_matches_scalar_bits() {
+        // Sınırlı aralık uçları ve kroma, işaretli sıfır, 8-bit yuvarlama eşikleri.
+        let cases = core::hint::black_box([
+            (
+                [
+                    (0, -16.0 / 219.0),
+                    (128, 112.0 / 219.0),
+                    (235, 1.0),
+                    (255, 239.0 / 219.0),
+                ],
+                [-128.0 / 224.0, 127.0 / 224.0, -0.25, 0.25],
+                [127.0 / 224.0, 0.175, 0.5, -0.5],
+            ),
+            (
+                [(0, -0.0), (1, 1.0 / 1023.0), (4095, 1.0), (2048, 0.5)],
+                [-0.0, -0.375, 0.0, 0.166_666_67],
+                [-0.0, 0.125, 0.0, -0.123_456_79],
+            ),
+            (
+                [
+                    (0, 0.5 / 255.0),
+                    (11, 11.5 / 255.0),
+                    (127, 127.5 / 255.0),
+                    (254, 254.5 / 255.0),
+                ],
+                [0.0; 4],
+                [0.0; 4],
+            ),
+        ]);
+        let bits = |(r, g, b): (f32, f32, f32)| [r.to_bits(), g.to_bits(), b.to_bits()];
+
+        for (coefficients, primaries) in [(1, 1), (6, 6), (9, 9), (12, 12)] {
+            let (kr, kb) = matrix_kr_kb(coefficients, primaries);
+            let matrix = StandardMatrix::new(kr, kb);
+            for (y, cb, cr) in cases {
+                let actual = matrix.to_rgb_f32x4(y, cb, cr).map(bits);
+                let expected: [[u32; 3]; 4] = core::array::from_fn(|i| {
+                    let (sample, normalized) = y[i];
+                    bits(matrix.to_rgb_f32(sample, normalized, cb[i], cr[i]))
+                });
+                assert_eq!(actual, expected, "matrix={coefficients}, y={y:?}");
+            }
         }
     }
 

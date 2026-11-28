@@ -212,14 +212,22 @@ fn log_capi_message(logger: &Dav1dLogger, msg: &str) {
 /// C `dav1d` `src/obu.c` (`dav1d_parse_obus`) ile birebir uyumlu OBU/başlık ayrıştırma
 /// günlük iletilerini üretir; karo/MSAC/referans/tahsis çözme hatalarında (`src/decode.c`,
 /// `src/thread_task.c`, `src/lib.c`) C `dav1d` gibi günlük yazmaz.
-fn log_capi_obu_error(logger: &Dav1dLogger, err: &crate::Error) {
+fn log_capi_obu_error(
+    logger: &Dav1dLogger,
+    err: &crate::Error,
+    size_limit_exceeded: Option<(i32, i32, u64)>,
+) {
     use crate::error::BitstreamErrorKind;
     let crate::Error::Bitstream(b) = err else {
         return;
     };
     match b.kind {
         BitstreamErrorKind::InvalidFrameHeader(msg) if msg.contains("frame_size_limit") => {
-            log_capi_message(logger, "Frame size exceeds limit");
+            if let Some((w, h, lim)) = size_limit_exceeded {
+                log_capi_message(logger, &format!("Frame size {w}x{h} exceeds limit {lim}"));
+            } else {
+                log_capi_message(logger, "Frame size exceeds limit");
+            }
         }
         BitstreamErrorKind::InvalidSequenceHeader(_) => {
             log_capi_message(logger, "Error parsing sequence header");
@@ -970,7 +978,9 @@ fn pull_ready_nonblocking(ctx: &mut ContextInner) {
         return;
     }
     match ctx.decoder.receive_frame_capi(false) {
-        Ok(Some(item)) => {
+        Ok(Some(mut item)) => {
+            ctx.event_flags |= item.1.event_flags;
+            item.1.event_flags = 0;
             ctx.ready_pic = Some(item);
         }
         Ok(None) => {}
@@ -1102,6 +1112,10 @@ fn gen_picture(ctx: &mut ContextInner) -> c_int {
             decoder.step_one_obu_capi(payload, &mut offset, Some(ts), tag, prealloc_opt)
         };
 
+        for warning in ctx.decoder.take_capi_warnings() {
+            log_capi_message(&ctx.logger, &warning);
+        }
+
         match step_res {
             Ok(true) => {
                 ctx.pending_offset = offset;
@@ -1127,7 +1141,8 @@ fn gen_picture(ctx: &mut ContextInner) -> c_int {
                 }
             }
             Err(err) => {
-                log_capi_obu_error(&ctx.logger, &err);
+                let size_limit_exceeded = ctx.decoder.take_last_frame_size_limit_exceeded();
+                log_capi_obu_error(&ctx.logger, &err, size_limit_exceeded);
                 let code = prealloc_err.unwrap_or_else(|| error_to_dav1d(&err));
                 let err_tag = ctx.decoder.last_error_packet_tag().unwrap_or(tag);
                 let fallback_props = clone_data_props(&ctx.pending_in.m);
@@ -1135,7 +1150,11 @@ fn gen_picture(ctx: &mut ContextInner) -> c_int {
                 ctx.pending_offset = 0;
                 ctx.pending_tag = 0;
                 cleanup_orphaned_preallocs(ctx);
-                record_error_props_for_tag(ctx, err_tag, Some(&fallback_props));
+                // C `dav1d` `src/obu.c:1310-1316`: `frame_size_limit` (`ERANGE`) hatasında
+                // `c->cached_error_props` güncellenmeden doğrudan `DAV1D_ERR(ERANGE)` dönülür.
+                if !(prealloc_err.is_none() && code == dav1d_err(crate::capi::ERANGE)) {
+                    record_error_props_for_tag(ctx, err_tag, Some(&fallback_props));
+                }
                 let mut fb_drop = fallback_props;
                 data_props_unref_value(&mut fb_drop);
                 cleanup_all_unused_packet_props(ctx);
@@ -1370,7 +1389,9 @@ pub unsafe extern "C" fn dav1d_get_picture(c: *mut Dav1dContext, out: *mut Dav1d
         if !single_fc && drain {
             loop {
                 match ctx.decoder.receive_frame_capi(true) {
-                    Ok(Some(item)) => {
+                    Ok(Some(mut item)) => {
+                        ctx.event_flags |= item.1.event_flags;
+                        item.1.event_flags = 0;
                         ctx.ready_pic = Some(item);
                         if output_picture_ready(ctx, false) {
                             if ctx.cached_error != 0 {
@@ -1499,7 +1520,6 @@ pub unsafe extern "C" fn dav1d_flush(c: *mut Dav1dContext) {
         ctx.pending_tag = 0;
         ctx.cached_error = 0;
         ctx.drain = false;
-        ctx.event_flags = 0;
         data_props_unref_value(&mut ctx.cached_error_props);
         while let Some((_, mut props)) = ctx.packet_props.pop_front() {
             data_props_unref_value(&mut props);

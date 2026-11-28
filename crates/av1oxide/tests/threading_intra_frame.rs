@@ -179,6 +179,21 @@ struct StreamRun {
     decoded_frames: u64,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+struct StreamOutput<'a> {
+    digests: &'a [[u64; 3]],
+    decoded_frames: u64,
+}
+
+impl StreamRun {
+    fn output(&self) -> StreamOutput<'_> {
+        StreamOutput {
+            digests: &self.digests,
+            decoded_frames: self.decoded_frames,
+        }
+    }
+}
+
 fn decode_stream(
     packets: &[Vec<u8>],
     n_threads: usize,
@@ -261,9 +276,16 @@ fn kare_ici_paralellik_1_2_3_4_8_16_0_thread_bit_ayni() {
                 panic!("n_threads={n_threads} çözülemedi ({}): {e}", path.display())
             });
             assert_eq!(
-                run,
-                ref_run,
-                "n_threads={n_threads} çıktısı veya allocation_peak n_threads=1'den farklı: {}",
+                run.output(),
+                ref_run.output(),
+                "n_threads={n_threads} çıktısı n_threads=1'den farklı: {}",
+                path.display()
+            );
+            assert!(
+                run.allocation_peak <= ref_run.allocation_peak,
+                "n_threads={n_threads} allocation_peak ({}) n_threads=1 ({}) sınırını aştı: {}",
+                run.allocation_peak,
+                ref_run.allocation_peak,
                 path.display()
             );
         }
@@ -286,8 +308,43 @@ fn test25_8k_1_2_4_8_thread_bit_ayni() {
     let ref_run = decode_stream(&packets, 1, None).expect("test25 n_threads=1");
     for &n_threads in &[2usize, 4, 8] {
         let run = decode_stream(&packets, n_threads, None).expect("test25 paralel");
-        assert_eq!(run, ref_run, "test25 n_threads={n_threads} farklı");
+        assert_eq!(
+            run.output(),
+            ref_run.output(),
+            "test25 n_threads={n_threads} farklı"
+        );
+        assert!(
+            run.allocation_peak <= ref_run.allocation_peak,
+            "test25 n_threads={n_threads} allocation_peak ({}) > n_threads=1 ({})",
+            run.allocation_peak,
+            ref_run.allocation_peak
+        );
     }
+}
+
+#[test]
+fn test54_8k_paralel_karo_tepe_butcesini_dusurur() {
+    if std::env::var_os("AV1OXIDE_THREAD_TEST_QUICK").is_some() {
+        return;
+    }
+    let root = repo_root();
+    let test54 = root.join(
+        ".cache/argon/extracted/argon_coveragetool_av1_base_and_extended_profiles_v2.1/profile0_not_annexb/streams/test54.obu",
+    );
+    if !test54.exists() {
+        return;
+    }
+    let mut packets = read_packets(&test54);
+    packets.truncate(2);
+    let ref_run = decode_stream(&packets, 1, None).expect("test54 n_threads=1");
+    let par_run = decode_stream(&packets, 8, None).expect("test54 n_threads=8");
+    assert_eq!(par_run.output(), ref_run.output());
+    assert!(
+        par_run.allocation_peak + (16 * 1024 * 1024) <= ref_run.allocation_peak,
+        "test54 paralel karo yolu tam kare refmvs ızgarasını atlayarak tepe bütçeyi düşürmeli: n_threads=1 {}, n_threads=8 {}",
+        ref_run.allocation_peak,
+        par_run.allocation_peak
+    );
 }
 
 #[test]
@@ -313,25 +370,23 @@ fn bozuk_tile_ve_butce_siniri_altinda_deterministik_hata_ve_sifir_deadlock() {
 
     // 1. Sıkı bütçe sınırı (`P` geçer, `P - 1` `Error::BudgetExceeded` döner).
     let ref_run = decode_stream(&packets, 1, None).expect("sınırsız 1 thread");
-    let peak = ref_run.allocation_peak;
-    assert_eq!(
-        decode_stream(&packets, 1, Some(peak)).expect("P bütçe 1 thread"),
-        ref_run
-    );
-    assert_eq!(
-        decode_stream(&packets, 8, Some(peak)).expect("P bütçe 8 thread"),
-        ref_run
-    );
-    let err_1 = decode_stream(&packets, 1, Some(peak - 1)).expect_err("P-1 bütçe 1 thread");
-    let err_8 = decode_stream(&packets, 8, Some(peak - 1)).expect_err("P-1 bütçe 8 thread");
-    assert_eq!(
-        err_1,
-        Error::BudgetExceeded {
-            requested: peak,
-            limit: peak - 1,
-        }
-    );
-    assert_eq!(err_8, err_1);
+    let par_run = decode_stream(&packets, 8, None).expect("sınırsız 8 thread");
+    assert_eq!(par_run.output(), ref_run.output());
+    for (n_threads, expected) in [(1usize, &ref_run), (8usize, &par_run)] {
+        let peak = expected.allocation_peak;
+        assert_eq!(
+            &decode_stream(&packets, n_threads, Some(peak)).expect("P bütçe"),
+            expected
+        );
+        let err = decode_stream(&packets, n_threads, Some(peak - 1)).expect_err("P-1 bütçe");
+        assert_eq!(
+            err,
+            Error::BudgetExceeded {
+                requested: peak,
+                limit: peak - 1,
+            }
+        );
+    }
 
     // 2. Bozuk tile yükü: son paketin (kare/tile verisinin) son baytlarını boz
     // veya kes; `n_threads = 1` ve `n_threads = 8` paniklemeden ve deadlock'a
@@ -352,4 +407,57 @@ fn bozuk_tile_ve_butce_siniri_altinda_deterministik_hata_ve_sifir_deadlock() {
             "bozuk girdi cut={cut} için 1 ve 8 thread sonucu farklı"
         );
     }
+}
+
+#[test]
+fn paralel_karo_temporal_hits_ve_tmvs_atlama_tutarliligi() {
+    let root = repo_root();
+    let stream_path = root.join(
+        "crates/av1oxide/tests/fixtures/streams/Syntax_AV1_mainb8ss420_432x240_002_vq_aom_ctest_4.2.stripped.ivf",
+    );
+    let packets = read_packets(&stream_path);
+
+    let run_with_tools = |n_threads: usize| {
+        let mut dec = Decoder::new(Config {
+            n_threads,
+            max_frame_delay: 1,
+            apply_grain: true,
+            output_invisible_frames: true,
+            ..Config::default()
+        })
+        .expect("decoder");
+        dec.set_collect_diagnostics(true);
+        let mut digests = Vec::new();
+        for pkt in &packets {
+            dec.send_packet(&Packet::new(pkt)).expect("send_packet");
+            while let Some(f) = dec.receive_frame().expect("receive_frame") {
+                digests.push(frame_digest(&f));
+            }
+        }
+        dec.flush();
+        while let Some(f) = dec.receive_frame().expect("receive_frame") {
+            digests.push(frame_digest(&f));
+        }
+        let temporal_counts: Vec<u64> = dec
+            .decoded_tool_counts()
+            .iter()
+            .map(|t| t.temporal_candidate)
+            .collect();
+        (digests, temporal_counts, dec.allocation_peak())
+    };
+
+    let (d1, t1, peak1) = run_with_tools(1);
+    let (d4, t4, peak4) = run_with_tools(4);
+    assert_eq!(
+        d1, d4,
+        "düzlem özetleri n_threads=1 ve 4 arasında özdeş olmalı"
+    );
+    assert_eq!(
+        t1, t4,
+        "temporal_candidate sayaçları paralel karo yolunda korunmalı"
+    );
+    assert!(
+        peak4 <= peak1,
+        "paralel karo tepe bütçesi ({peak4}) tek iş parçacığını ({peak1}) aşmamalı"
+    );
 }

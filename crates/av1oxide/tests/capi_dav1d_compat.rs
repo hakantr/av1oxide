@@ -3168,27 +3168,38 @@ fn capi_delayed_decode_error_preserves_superframe_and_recovery_keyframe() {
 /// diferansiyel C-ABI regresyon testi.
 #[test]
 fn capi_frame_size_exceeding_seq_max_and_itut_t35_parity() {
+    use std::sync::Mutex;
+
     #[derive(Clone, Copy)]
     struct Dav1dApi {
         default_settings: unsafe extern "C" fn(*mut Dav1dSettings),
         open: unsafe extern "C" fn(*mut *mut Dav1dContext, *const Dav1dSettings) -> c_int,
         close: unsafe extern "C" fn(*mut *mut Dav1dContext),
+        flush: unsafe extern "C" fn(*mut Dav1dContext),
         data_create: unsafe extern "C" fn(*mut Dav1dData, usize) -> *mut u8,
         data_unref: unsafe extern "C" fn(*mut Dav1dData),
+        data_props_unref: unsafe extern "C" fn(*mut Dav1dDataProps),
         send_data: unsafe extern "C" fn(*mut Dav1dContext, *mut Dav1dData) -> c_int,
         get_picture: unsafe extern "C" fn(*mut Dav1dContext, *mut Dav1dPicture) -> c_int,
         picture_unref: unsafe extern "C" fn(*mut Dav1dPicture),
+        get_event_flags: unsafe extern "C" fn(*mut Dav1dContext, *mut u32) -> c_int,
+        get_frame_error_data_props:
+            unsafe extern "C" fn(*mut Dav1dContext, *mut Dav1dDataProps) -> c_int,
     }
 
     let av1oxide_api = Dav1dApi {
         default_settings: dav1d_default_settings,
         open: dav1d_open,
         close: dav1d_close,
+        flush: dav1d_flush,
         data_create: dav1d_data_create,
         data_unref: dav1d_data_unref,
+        data_props_unref: dav1d_data_props_unref,
         send_data: dav1d_send_data,
         get_picture: dav1d_get_picture,
         picture_unref: dav1d_picture_unref,
+        get_event_flags: dav1d_get_event_flags,
+        get_frame_error_data_props: dav1d_get_decode_error_data_props,
     };
 
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
@@ -3222,13 +3233,18 @@ fn capi_frame_size_exceeding_seq_max_and_itut_t35_parity() {
                 let f_def = sym(c"dav1d_default_settings");
                 let f_open = sym(c"dav1d_open");
                 let f_close = sym(c"dav1d_close");
+                let f_flush = sym(c"dav1d_flush");
                 let f_create = sym(c"dav1d_data_create");
                 let f_dunref = sym(c"dav1d_data_unref");
+                let f_dpunref = sym(c"dav1d_data_props_unref");
                 let f_send = sym(c"dav1d_send_data");
                 let f_get = sym(c"dav1d_get_picture");
                 let f_unref = sym(c"dav1d_picture_unref");
+                let f_evflags = sym(c"dav1d_get_event_flags");
+                let f_errprops = sym(c"dav1d_get_decode_error_data_props");
                 if [
-                    f_def, f_open, f_close, f_create, f_dunref, f_send, f_get, f_unref,
+                    f_def, f_open, f_close, f_flush, f_create, f_dunref, f_dpunref, f_send, f_get,
+                    f_unref, f_evflags, f_errprops,
                 ]
                 .iter()
                 .any(|p| p.is_null())
@@ -3253,6 +3269,10 @@ fn capi_frame_size_exceeding_seq_max_and_itut_t35_parity() {
                             *mut c_void,
                             unsafe extern "C" fn(*mut *mut Dav1dContext),
                         >(f_close),
+                        flush: core::mem::transmute::<
+                            *mut c_void,
+                            unsafe extern "C" fn(*mut Dav1dContext),
+                        >(f_flush),
                         data_create: core::mem::transmute::<
                             *mut c_void,
                             unsafe extern "C" fn(*mut Dav1dData, usize) -> *mut u8,
@@ -3261,6 +3281,10 @@ fn capi_frame_size_exceeding_seq_max_and_itut_t35_parity() {
                             *mut c_void,
                             unsafe extern "C" fn(*mut Dav1dData),
                         >(f_dunref),
+                        data_props_unref: core::mem::transmute::<
+                            *mut c_void,
+                            unsafe extern "C" fn(*mut Dav1dDataProps),
+                        >(f_dpunref),
                         send_data: core::mem::transmute::<
                             *mut c_void,
                             unsafe extern "C" fn(*mut Dav1dContext, *mut Dav1dData) -> c_int,
@@ -3273,6 +3297,14 @@ fn capi_frame_size_exceeding_seq_max_and_itut_t35_parity() {
                             *mut c_void,
                             unsafe extern "C" fn(*mut Dav1dPicture),
                         >(f_unref),
+                        get_event_flags: core::mem::transmute::<
+                            *mut c_void,
+                            unsafe extern "C" fn(*mut Dav1dContext, *mut u32) -> c_int,
+                        >(f_evflags),
+                        get_frame_error_data_props: core::mem::transmute::<
+                            *mut c_void,
+                            unsafe extern "C" fn(*mut Dav1dContext, *mut Dav1dDataProps) -> c_int,
+                        >(f_errprops),
                     },
                 })
             }
@@ -3557,5 +3589,337 @@ fn capi_frame_size_exceeding_seq_max_and_itut_t35_parity() {
     if let Some(ref_lib) = ref_dav1d.as_ref() {
         let exp_t35 = inspect_t35(ref_lib.api);
         assert_eq!(got_t35, exp_t35);
+    }
+
+    // 4. `strict_std_compliance` karo sonu MSAC trailing bit + sıfır dolgu denetimi
+    //    (`decode.c:2620-2635, 2786-2791`):
+    //    Geçerli ilk paketin (`SAMPLE_OBU_PACKETS[0]`) sonuna `0x01` sıfır-dışı kuyruk baytı
+    //    eklendiğinde `strict_std_compliance = 0` altında çözülür (`0`), `strict_std_compliance = 1`
+    //    altında `-EINVAL` ile reddedilir.
+    let mut bad_msac_tail_pkt = Vec::new();
+    {
+        let pkt0 = SAMPLE_OBU_PACKETS[0];
+        let mut off = 0usize;
+        while off < pkt0.len() {
+            let start = off;
+            let Some(obu) = av1oxide::bitstream::split_next_with(pkt0, &mut off, true).unwrap()
+            else {
+                break;
+            };
+            if obu.header.obu_type == av1oxide::bitstream::ObuType::Frame {
+                let mut payload = obu.payload.to_vec();
+                payload.push(0x01); // sıfır olmayan MSAC kuyruk baytı
+                bad_msac_tail_pkt.extend_from_slice(&wrap_obu(6, &payload));
+            } else {
+                bad_msac_tail_pkt.extend_from_slice(&pkt0[start..off]);
+            }
+        }
+    }
+    let run_strict_msac = |api: Dav1dApi, strict: c_int| -> (c_int, c_int) {
+        // SAFETY: Bağımsız `Dav1dContext` üzerinde `strict_std_compliance` sınanır.
+        unsafe {
+            let mut s = Dav1dSettings::default();
+            (api.default_settings)(&mut s);
+            s.n_threads = 1;
+            s.max_frame_delay = 1;
+            s.strict_std_compliance = strict;
+            let mut c: *mut Dav1dContext = ptr::null_mut();
+            assert_eq!((api.open)(&mut c, &s), 0);
+            let mut d = Dav1dData::default();
+            let dst = (api.data_create)(&mut d, bad_msac_tail_pkt.len());
+            ptr::copy_nonoverlapping(bad_msac_tail_pkt.as_ptr(), dst, bad_msac_tail_pkt.len());
+            let sr = (api.send_data)(c, &mut d);
+            if d.sz > 0 {
+                (api.data_unref)(&mut d);
+            }
+            let mut pic = Dav1dPicture::default();
+            let gr = (api.get_picture)(c, &mut pic);
+            if gr == 0 {
+                (api.picture_unref)(&mut pic);
+            }
+            (api.close)(&mut c);
+            (sr, gr)
+        }
+    };
+    let got_non_strict = run_strict_msac(av1oxide_api, 0);
+    let got_strict = run_strict_msac(av1oxide_api, 1);
+    assert_eq!(got_non_strict, (0, 0));
+    assert_eq!(got_strict, (dav1d_err(EINVAL), dav1d_err(EAGAIN)));
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    if let Some(ref_lib) = ref_dav1d.as_ref() {
+        assert_eq!(got_non_strict, run_strict_msac(ref_lib.api, 0));
+        assert_eq!(got_strict, run_strict_msac(ref_lib.api, 1));
+    }
+
+    // 5. `max_frame_delay > 1` kipinde bozuk `tile_size_minus_1` (`split_tile_groups`) hatasının
+    //    `dav1d_send_data` yerine işçi görevine (`dav1d_get_picture`) ertelenmesi
+    //    (`decode.c:3191-3228`, `thread_task.c:802-814`):
+    //    2 karolu (128x64, `sb128 = 0`, 2 sütun x 1 satır) bir `KEY_FRAME` paketinde ilk karonun
+    //    `tile_size_minus_1` alanı kalan yükten büyük (`0xFF = 256 bayt`) verilir.
+    let bad_tile_size_pkt = {
+        let mut sb = MsbBits::new();
+        sb.bits(0, 3); // seq_profile = 0
+        sb.bit(0); // still_picture = 0
+        sb.bit(0); // reduced_still_picture_header = 0
+        sb.bit(0); // timing_info_present_flag = 0
+        sb.bit(0); // initial_display_delay_present_flag = 0
+        sb.bits(0, 5); // operating_points_cnt_minus_1 = 0
+        sb.bits(0, 12); // operating_point_idc[0] = 0
+        sb.bits(0, 5); // seq_level_idx[0] = 0
+        sb.bits(7, 4); // frame_width_bits_minus_1 = 7 (8 bit)
+        sb.bits(7, 4); // frame_height_bits_minus_1 = 7 (8 bit)
+        sb.bits(127, 8); // max_frame_width_minus_1 = 127 (128 px)
+        sb.bits(63, 8); // max_frame_height_minus_1 = 63 (64 px)
+        sb.bit(0); // frame_id_numbers_present_flag = 0
+        sb.bit(0); // use_128x128_superblock = 0 (64x64 SB -> 2x1 SB)
+        sb.bit(0); // enable_filter_intra = 0
+        sb.bit(0); // enable_intra_edge_filter = 0
+        sb.bit(0); // enable_interintra_compound = 0
+        sb.bit(0); // enable_masked_compound = 0
+        sb.bit(0); // enable_warped_motion = 0
+        sb.bit(0); // enable_dual_filter = 0
+        sb.bit(0); // enable_order_hint = 0
+        sb.bit(1); // seq_choose_screen_content_tools = 1
+        sb.bit(1); // seq_choose_integer_mv = 1
+        sb.bit(0); // enable_superres = 0
+        sb.bit(0); // enable_cdef = 0
+        sb.bit(0); // enable_restoration = 0
+        sb.bit(0); // high_bitdepth = 0
+        sb.bit(0); // mono_chrome = 0
+        sb.bit(0); // color_description_present_flag = 0
+        sb.bit(0); // color_range = 0
+        sb.bits(0, 2); // chroma_sample_position = 0
+        sb.bit(0); // separate_uv_delta_q = 0
+        sb.bit(0); // film_grain_params_present = 0
+        sb.bit(1); // trailing_one_bit = 1
+        let seq_2tile = wrap_obu(1, &sb.bytes());
+
+        let mut fb = MsbBits::new();
+        fb.bit(0); // show_existing_frame = 0
+        fb.bits(0, 2); // frame_type = KEY_FRAME
+        fb.bit(1); // show_frame = 1
+        fb.bit(0); // disable_cdf_update = 0
+        fb.bit(0); // allow_screen_content_tools = 0
+        fb.bit(0); // frame_size_override_flag = 0
+        fb.bit(0); // render_and_frame_size_different = 0
+        // tile_info: 128x64 (2x1 64x64 SB)
+        fb.bit(1); // uniform_tile_spacing_flag = 1
+        fb.bit(1); // increment_tile_cols_log2: 1 -> tile_cols_log2 = 1 (2 tile col)
+        // max_tile_Rows_log2 = 0 -> satır biti okunmaz
+        fb.bits(0, 1); // context_update_tile_id = 0 (1 bit)
+        fb.bits(0, 2); // tile_size_bytes_minus_1 = 0 (1 bayt)
+        // quantization_params:
+        fb.bits(64, 8); // base_q_idx = 64
+        fb.bit(0); // diff_uv_delta (ydc_delta_present = 0)
+        fb.bit(0); // udc_delta_present = 0
+        fb.bit(0); // uac_delta_present = 0
+        fb.bit(0); // using_qmatrix = 0
+        // segmentation_params:
+        fb.bit(0); // segmentation_enabled = 0
+        // delta_q_params:
+        fb.bit(0); // delta_q_present = 0
+        // loop_filter_params:
+        fb.bits(0, 6); // loop_filter_level[0] = 0
+        fb.bits(0, 6); // loop_filter_level[1] = 0
+        fb.bits(0, 3); // loop_filter_sharpness = 0
+        fb.bit(0); // loop_filter_delta_enabled = 0
+        // tx_mode:
+        fb.bit(0); // tx_mode_select = 0
+        // reduced_tx_set:
+        fb.bit(0);
+        let mut frame_body = fb.bytes();
+        // 2 karo: ilk karonun 1 baytlık `tile_size_minus_1` değeri `0xFF` (256 bayt),
+        // ancak toplam kalan veri yalnız 2 bayt -> `split_tile_groups` sınır aşımı!
+        frame_body.extend_from_slice(&[0xFF, 0x80, 0x80]);
+        let mut pkt = vec![0x12, 0x00];
+        pkt.extend_from_slice(&seq_2tile);
+        pkt.extend_from_slice(&wrap_obu(6, &frame_body));
+        pkt
+    };
+    let run_bad_tile_size = |api: Dav1dApi, mfd: c_int| -> (c_int, c_int, c_int) {
+        // SAFETY: Bağımsız `Dav1dContext` üzerinde `max_frame_delay` davranışı sınanır.
+        unsafe {
+            let mut s = Dav1dSettings::default();
+            (api.default_settings)(&mut s);
+            s.n_threads = 2;
+            s.max_frame_delay = mfd;
+            let mut c: *mut Dav1dContext = ptr::null_mut();
+            assert_eq!((api.open)(&mut c, &s), 0);
+            let mut d = Dav1dData::default();
+            let dst = (api.data_create)(&mut d, bad_tile_size_pkt.len());
+            ptr::copy_nonoverlapping(bad_tile_size_pkt.as_ptr(), dst, bad_tile_size_pkt.len());
+            let sr = (api.send_data)(c, &mut d);
+            if d.sz > 0 {
+                (api.data_unref)(&mut d);
+            }
+            let mut pic = Dav1dPicture::default();
+            let gr1 = (api.get_picture)(c, &mut pic);
+            if gr1 == 0 {
+                (api.picture_unref)(&mut pic);
+            }
+            let gr2 = (api.get_picture)(c, &mut pic);
+            if gr2 == 0 {
+                (api.picture_unref)(&mut pic);
+            }
+            (api.close)(&mut c);
+            (sr, gr1, gr2)
+        }
+    };
+    let got_mfd1 = run_bad_tile_size(av1oxide_api, 1);
+    let got_mfd2 = run_bad_tile_size(av1oxide_api, 2);
+    assert_eq!(
+        got_mfd1,
+        (dav1d_err(EINVAL), dav1d_err(EAGAIN), dav1d_err(EAGAIN)),
+        "max_frame_delay=1 iken bozuk tile_size_minus_1 send_data'da -EINVAL döndürmeli"
+    );
+    assert_eq!(
+        got_mfd2,
+        (0, dav1d_err(EAGAIN), dav1d_err(EINVAL)),
+        "max_frame_delay=2 iken bozuk tile_size_minus_1 send_data'da 0 dönüp drain get_picture'da -EINVAL döndürmeli"
+    );
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    if let Some(ref_lib) = ref_dav1d.as_ref() {
+        assert_eq!(got_mfd1, run_bad_tile_size(ref_lib.api, 1));
+        assert_eq!(got_mfd2, run_bad_tile_size(ref_lib.api, 2));
+    }
+
+    // 6. C-ABI `dav1d_flush` `event_flags` korumu (`lib.c:389, 517`) ve
+    //    `frame_size_limit` `ERANGE` hatasında `cached_error_props` korunumu + günlük formatı
+    //    (`obu.c:1310-1316`) + ölümcül olmayan T.35/Metadata/OBU uyarı günlükleri (`obu.c:1471, 1533, 1547`):
+    unsafe extern "C" {
+        fn vsnprintf(
+            s: *mut core::ffi::c_char,
+            n: usize,
+            format: *const core::ffi::c_char,
+            arg: core::ffi::VaList<'_>,
+        ) -> c_int;
+    }
+    unsafe extern "C" fn edge_logger_cb(
+        cookie: *mut c_void,
+        fmt: *const core::ffi::c_char,
+        ap: core::ffi::VaList<'_>,
+    ) {
+        if !cookie.is_null() && !fmt.is_null() {
+            let mut buf = [0u8; 512];
+            // SAFETY: `buf` 512 bayt yazılabilir yerel tampondur; `fmt` ve `ap` C variadic
+            // `Dav1dLogger.callback` çağrısından geçerli olarak gelir; `cookie` canlı `Mutex<Vec<String>>` adresidir.
+            unsafe {
+                let n = vsnprintf(
+                    buf.as_mut_ptr() as *mut core::ffi::c_char,
+                    buf.len(),
+                    fmt,
+                    ap,
+                );
+                if n > 0 {
+                    let text = CStr::from_ptr(buf.as_ptr() as *const core::ffi::c_char)
+                        .to_string_lossy()
+                        .into_owned();
+                    let logs = &*(cookie as *const Mutex<Vec<String>>);
+                    logs.lock().unwrap().push(text);
+                }
+            }
+        }
+    }
+    let run_edge_cases = |api: Dav1dApi| -> (u32, c_int, i64, Vec<String>) {
+        let logs: Mutex<Vec<String>> = Mutex::new(Vec::new());
+        // SAFETY: Bağımsız `Dav1dContext` üzerinde `event_flags`, `ERANGE` ve `logger` sınanır.
+        unsafe {
+            let mut s = Dav1dSettings::default();
+            (api.default_settings)(&mut s);
+            s.n_threads = 1;
+            s.max_frame_delay = 1;
+            s.frame_size_limit = 100; // 432x240 = 103680 > 100 -> ERANGE
+            s.logger.cookie = (&logs as *const Mutex<Vec<String>>) as *mut c_void;
+            s.logger.callback = edge_logger_cb as *const c_void;
+            let mut c: *mut Dav1dContext = ptr::null_mut();
+            assert_eq!((api.open)(&mut c, &s), 0);
+
+            // (a) İlk pakette geçerli kare çözülüp `ready_pic` oluşsun, ardından `get_picture`
+            //     çağrılmadan `dav1d_flush` çağrılsın -> `DAV1D_EVENT_FLAG_NEW_SEQUENCE` korunmalı!
+            let mut s_no_lim = s;
+            s_no_lim.frame_size_limit = 0;
+            let mut c_fl: *mut Dav1dContext = ptr::null_mut();
+            assert_eq!((api.open)(&mut c_fl, &s_no_lim), 0);
+            let pkt0 = SAMPLE_OBU_PACKETS[0];
+            let mut d0 = Dav1dData::default();
+            let p0 = (api.data_create)(&mut d0, pkt0.len());
+            ptr::copy_nonoverlapping(pkt0.as_ptr(), p0, pkt0.len());
+            assert_eq!((api.send_data)(c_fl, &mut d0), 0);
+            (api.flush)(c_fl);
+            let mut flags_after_flush: u32 = 0;
+            assert_eq!((api.get_event_flags)(c_fl, &mut flags_after_flush), 0);
+            (api.close)(&mut c_fl);
+
+            // (b) `c` üzerinde önce `EINVAL` hatası (`timestamp = 111`) üretip `cached_error_props`
+            //     dolduralım, ardından `frame_size_limit` (`ERANGE`, `timestamp = 222`) paketi
+            //     gönderelim -> `cached_error_props.timestamp` `111` olarak kalmalı ve
+            //     `"Frame size 128x64 exceeds limit 100\n"` günlüklenmeli.
+            let bad_obu = [0x0Au8, 0x7F, 0xFF];
+            let mut d_einval = Dav1dData::default();
+            let p_einval = (api.data_create)(&mut d_einval, bad_obu.len());
+            ptr::copy_nonoverlapping(bad_obu.as_ptr(), p_einval, bad_obu.len());
+            d_einval.m.timestamp = 111;
+            assert_eq!((api.send_data)(c, &mut d_einval), dav1d_err(EINVAL));
+            (api.data_unref)(&mut d_einval);
+
+            // Uyarı OBU'ları + `frame_size_limit` aşan 128x64 paketi:
+            // - Bozuk T.35 (`[0x04, 0xB5, 0x00]` -> `0x80` yok)
+            // - Bilinmeyen Metadata OBU (`meta_type = 32` -> `[0x20, 0x80]`)
+            // - Yok sayılan Metadata OBU (`meta_type = 6` -> `[0x06, 0x80]`, günlük yazmamalı)
+            // - Bilinmeyen OBU tipi `9` (`Reserved(9)`, 3 bayt yük)
+            // - `OBU_PADDING` (`15`, günlük yazmamalı)
+            let mut combo_pkt = Vec::new();
+            combo_pkt.extend_from_slice(&wrap_obu(5, &[0x04, 0xB5, 0x00]));
+            combo_pkt.extend_from_slice(&wrap_obu(5, &[0x20, 0x80]));
+            combo_pkt.extend_from_slice(&wrap_obu(5, &[0x06, 0x80]));
+            combo_pkt.extend_from_slice(&wrap_obu(9, &[0x01, 0x02, 0x03]));
+            combo_pkt.extend_from_slice(&wrap_obu(15, &[0x00, 0x00]));
+            combo_pkt.extend_from_slice(&bad_tile_size_pkt);
+
+            let mut d_erange = Dav1dData::default();
+            let p_erange = (api.data_create)(&mut d_erange, combo_pkt.len());
+            ptr::copy_nonoverlapping(combo_pkt.as_ptr(), p_erange, combo_pkt.len());
+            d_erange.m.timestamp = 222;
+            let erange_rc = (api.send_data)(c, &mut d_erange);
+            (api.data_unref)(&mut d_erange);
+
+            let mut err_props = Dav1dDataProps::default();
+            assert_eq!((api.get_frame_error_data_props)(c, &mut err_props), 0);
+            let ts_after_erange = err_props.timestamp;
+            (api.data_props_unref)(&mut err_props);
+            (api.close)(&mut c);
+
+            let collected = logs.lock().unwrap().clone();
+            (flags_after_flush, erange_rc, ts_after_erange, collected)
+        }
+    };
+
+    let (got_flags, got_erange_rc, got_ts, got_logs) = run_edge_cases(av1oxide_api);
+    assert_eq!(
+        got_flags, DAV1D_EVENT_FLAG_NEW_SEQUENCE,
+        "dav1d_flush event_flags alanını sıfırlamamalı"
+    );
+    assert_eq!(got_erange_rc, dav1d_err(ERANGE));
+    assert_eq!(
+        got_ts, 111,
+        "ERANGE hatası cached_error_props değerini ezmemeli"
+    );
+    assert_eq!(
+        got_logs,
+        vec![
+            "Error parsing OBU data\n".to_string(),
+            "Malformed ITU-T T.35 metadata message format\n".to_string(),
+            "Unknown Metadata OBU type 32\n".to_string(),
+            "Unknown OBU type 9 of size 3\n".to_string(),
+            "Frame size 128x64 exceeds limit 100\n".to_string(),
+        ]
+    );
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    if let Some(ref_lib) = ref_dav1d.as_ref() {
+        let (exp_flags, exp_erange_rc, exp_ts, exp_logs) = run_edge_cases(ref_lib.api);
+        assert_eq!(got_flags, exp_flags);
+        assert_eq!(got_erange_rc, exp_erange_rc);
+        assert_eq!(got_ts, exp_ts);
+        assert_eq!(got_logs, exp_logs);
     }
 }

@@ -248,6 +248,33 @@ impl<'a> MsacContext<'a> {
         self.pos
     }
 
+    /// Karo sonu MSAC izleyen bit (`1` işaret biti + `0` dolgusu) ve kalan sıfır bayt
+    /// doğrulaması (`dav1d` `check_trailing_bits_after_symbol_coder`, `src/decode.c:2620-2635`).
+    ///
+    /// `true` geçerli, `false` bozuk/geçersiz bit dizisini gösterir.
+    #[inline]
+    #[must_use]
+    pub fn check_trailing_bits(&self) -> bool {
+        if self.cnt <= -15 {
+            return false;
+        }
+        let n_bits = -(self.cnt + 14);
+        debug_assert!(n_bits <= 0);
+        let n_bytes = ((n_bits + 7) >> 3) as isize;
+        let Some(p_idx) = self.pos.checked_add_signed(n_bytes) else {
+            return false;
+        };
+        if p_idx == 0 || p_idx > self.buf.len() {
+            return false;
+        }
+        let pattern = 128u8 >> (((n_bits - 1) & 7) as u32);
+        let mask = pattern.wrapping_mul(2).wrapping_sub(1);
+        if (self.buf[p_idx - 1] & mask) != pattern {
+            return false;
+        }
+        self.buf[p_idx..].iter().all(|&b| b == 0)
+    }
+
     /// `ctx_refill` (`msac.c:41-58`).
     ///
     /// Pencereyi 24 bitlik "serbest" alanı dolduracak biçimde besler. Veri
@@ -940,5 +967,83 @@ mod tests {
         assert_eq!(inv_recenter(5, 4), 7); // çift
         assert_eq!(inv_recenter(5, 3), 3); // tek: 5 - 2
         assert_eq!(inv_recenter(0, 0), 0);
+    }
+
+    /// `check_trailing_bits` (`dav1d` `check_trailing_bits_after_symbol_coder`, `decode.c:2620-2635`)
+    /// bütün 8 bit hizalamalarında `1` işaret bitini ve izleyen `0` dolgusunu doğrular.
+    #[test]
+    fn check_trailing_bits_tum_hizalamalar_ve_bozuk_dolgular() {
+        for consumed_in_byte in 0..8i32 {
+            // `n_bits = -(cnt + 14)`: `buf[pos - 1]` içinde `consumed_in_byte` (0..8) bit
+            // tüketilmişse kalan `1..=8` bit için `n_bits = -7 + consumed_in_byte` (`-7..=0`),
+            // yani `cnt = -7 - consumed_in_byte` (`-14..=-7`) ve `n_bytes = 0` (`p_idx = pos`).
+            let cnt = -7 - consumed_in_byte;
+            let marker = 128u8 >> (consumed_in_byte as u32);
+            let buf_ok = [0xAAu8, marker, 0x00, 0x00];
+            let s_ok = MsacContext {
+                buf: &buf_ok,
+                pos: 2,
+                dif: 0,
+                rng: 0x8000,
+                cnt,
+                allow_update_cdf: true,
+                isa: MsacIsa::Scalar,
+            };
+            assert!(
+                s_ok.check_trailing_bits(),
+                "consumed={consumed_in_byte} marker=0x{marker:02x} geçerli olmalı"
+            );
+
+            // İşaret biti eksik (`0x00`): reddedilmeli.
+            let buf_zero = [0xAAu8, 0x00, 0x00];
+            let s_zero = MsacContext {
+                buf: &buf_zero,
+                pos: 2,
+                ..s_ok
+            };
+            assert!(
+                !s_zero.check_trailing_bits(),
+                "consumed={consumed_in_byte} eksik işaret biti reddedilmeli"
+            );
+
+            // İşaret bitinden sonra aynı baytta fazladan `1` biti varsa: reddedilmeli.
+            if marker > 1 {
+                let buf_low_bit = [0xAAu8, marker | 1, 0x00];
+                let s_low = MsacContext {
+                    buf: &buf_low_bit,
+                    pos: 2,
+                    ..s_ok
+                };
+                assert!(
+                    !s_low.check_trailing_bits(),
+                    "consumed={consumed_in_byte} düşük bitteki 1 reddedilmeli"
+                );
+            }
+
+            // Sonraki dolgu baytlarında sıfır dışı bayt varsa: reddedilmeli.
+            let buf_bad_tail = [0xAAu8, marker, 0x00, 0x01];
+            let s_tail = MsacContext {
+                buf: &buf_bad_tail,
+                pos: 2,
+                ..s_ok
+            };
+            assert!(
+                !s_tail.check_trailing_bits(),
+                "consumed={consumed_in_byte} sıfır dışı kuyruk baytı reddedilmeli"
+            );
+        }
+
+        // `cnt <= -15` (aşım): her zaman `false`.
+        let buf = [0x80u8, 0x00];
+        let s_over = MsacContext {
+            buf: &buf,
+            pos: 1,
+            dif: 0,
+            rng: 0x8000,
+            cnt: -15,
+            allow_update_cdf: true,
+            isa: MsacIsa::Scalar,
+        };
+        assert!(!s_over.check_trailing_bits());
     }
 }

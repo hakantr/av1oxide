@@ -198,6 +198,10 @@ struct ParseState {
     /// Bir sonraki çıktı üreten kareye taşınacak zamansal birim sınırı bayrağı
     /// (`OBU_TEMPORAL_DELIMITER` veya yeni dizi başlığı).
     pending_new_temporal_unit: bool,
+    /// Son `frame_size_limit` aşımında yakalanan `(width, height, limit)` üçlüsü (C-ABI `ERANGE` günlüğü için).
+    last_frame_size_limit_exceeded: Option<(i32, i32, u64)>,
+    /// C-ABI (`Dav1dLogger`) için biriken ölümcül olmayan OBU uyarı iletileri (`src/obu.c:1471, 1533, 1547`).
+    capi_warnings: Vec<String>,
 }
 
 /// Tile group OBU'sunun ham verisi (`tile_start`..=`tile_end`, başlık sonrası).
@@ -950,7 +954,16 @@ impl Decoder {
                         self.process_tile_group(obu.payload, obu.payload_offset_bits(), prealloc)?;
                     }
                     ObuType::Metadata => self.process_metadata_obu(obu, opts.strict)?,
-                    _ => {}
+                    ObuType::Padding => {}
+                    other => {
+                        if self.capi_strict_frame_delay {
+                            self.parse.capi_warnings.push(format!(
+                                "Unknown OBU type {} of size {}",
+                                other.raw(),
+                                obu.payload.len()
+                            ));
+                        }
+                    }
                 }
             }
         }
@@ -1032,6 +1045,10 @@ impl Decoder {
         // dav1d `src/obu.c:1300-1307`: sıfırdan farklı `frame_size_limit`,
         // `width[1] * height` sınırı aşan başlığı reddeder (`ERANGE`).
         if frame_size_exceeds(header.width[1], header.height, opts.frame_size_limit) {
+            if self.capi_strict_frame_delay {
+                self.parse.last_frame_size_limit_exceeded =
+                    Some((header.width[1], header.height, opts.frame_size_limit));
+            }
             return Err(payload_error(
                 obu,
                 BitstreamErrorKind::InvalidFrameHeader(
@@ -1293,6 +1310,7 @@ impl Decoder {
         let grup_bayti: usize = groups.iter().map(|g| g.data.len()).sum();
         let butce = self.butce_defteri(grup_bayti);
         let inloop_filters = self.inloop_filters;
+        let strict = self.config.strict_std_compliance;
         let decoded = split_tile_groups(groups, &header).and_then(|tiles| {
             decode_frame(
                 seq,
@@ -1303,6 +1321,7 @@ impl Decoder {
                 &butce,
                 &self.pool,
                 inloop_filters,
+                strict,
             )
         });
         self.tepe_kat(&butce);
@@ -1579,8 +1598,12 @@ impl Decoder {
             0
         };
 
-        // 5. Paylaşılan bütçe tabanını senkronla, tile grup baytlarını ve tile
-        //    boyut sınırlarını (`split_tile_groups`) doğrula.
+        // 5. Paylaşılan bütçe tabanını senkronla ve tile grup baytlarını ayır.
+        //    `split_tile_groups` denetimi C `dav1d` (`src/decode.c:3191-3228`,
+        //    `src/thread_task.c:802-814`) ile uyumlu olarak işçi görevine ertelenir;
+        //    böylece `max_frame_delay > 1` kipinde bozuk `tile_size_minus_1` hatası
+        //    senkron `send_packet`/`dav1d_send_data` yerine `receive_frame`/`dav1d_get_picture`
+        //    aşamasında bildirilir.
         self.pipeline_butce.taban_guncelle(self.kalici_bayt());
         let grup_bayti: usize = groups
             .iter()
@@ -1598,15 +1621,6 @@ impl Decoder {
                 return Err(err);
             }
         };
-        if let Err(err) = split_tile_groups(groups, &header) {
-            drop(grup_tutucu);
-            self.allocation_peak = self.allocation_peak.max(self.pipeline_butce.tepe());
-            self.clear_slots_late_error(header.refresh_frame_flags);
-            self.unsupported_frames += 1;
-            self.last_decode_error = Some(format!("{err}"));
-            self.last_error_packet_tag = Some(self.parse.current_packet_tag);
-            return Err(err);
-        }
 
         // 6. Girdi referans yuvası vaatlerini yakala ve bu karenin yenilediği
         //    yuvalara yeni `Pending` `FrameSlot` vaadini yerleştir.
@@ -1674,10 +1688,13 @@ impl Decoder {
         let apply_grain_flag = self.config.apply_grain;
         let has_allocation_limit = self.config.allocation_limit.is_some();
         let inloop_filters_w = self.inloop_filters;
+        let strict_w = self.config.strict_std_compliance;
 
         self.pool.spawn_async(move || {
             task_worker.started.store(true, Ordering::Release);
             let body = || -> Result<CompletedFrame> {
+                let mut tutucular = Vec::with_capacity(3);
+                tutucular.push(grup_tutucu);
                 if cancel_worker.load(Ordering::Acquire) {
                     return Err(Error::InvalidState("iptal edildi"));
                 }
@@ -1735,6 +1752,7 @@ impl Decoder {
                     &frame_butce,
                     &pool_w,
                     inloop_filters_w,
+                    strict_w,
                 )?;
                 for r in resolved_refs.into_iter().flatten() {
                     if let Ok(rf) = Arc::try_unwrap(r) {
@@ -1745,8 +1763,6 @@ impl Decoder {
                 }
                 let decoded_tools = decoded.tools;
                 let mc_identity = seq_w.mtrx == 0;
-                let mut tutucular = Vec::with_capacity(3);
-                tutucular.push(grup_tutucu);
 
                 // `4.A.1`: Referans olarak saklanmayan (`refresh_frame_flags == 0`) boru hattı
                 // karelerinde `RefFrame` tutulmaz; `segmap`/`tmvs` anında havuza iade edilir
@@ -2836,73 +2852,97 @@ impl Decoder {
             4 => {
                 // OBU_META_ITUT_T35 (`src/obu.c:1455-1520`, `e5fd231fe9`)
                 let start = reader.byte_position();
-                if let Some(rest) = obu.payload.get(start..) {
-                    let Some(end) = memchr::memrchr(0x80, rest) else {
-                        return Ok(());
-                    };
-                    if end == 0 || rest[end + 1..].iter().any(|&b| b != 0) {
-                        return Ok(());
-                    }
+                let mut valid = false;
+                if let Some(rest) = obu.payload.get(start..)
+                    && let Some(end) = memchr::memrchr(0x80, rest)
+                    && end > 0
+                    && rest[end + 1..].iter().all(|&b| b == 0)
+                {
                     let country_code = rest[0];
-                    let (ext, payload_start) = if country_code == 0xFF {
-                        if end < 2 {
-                            return Ok(());
-                        }
-                        (rest[1], 2usize)
-                    } else {
-                        (0u8, 1usize)
-                    };
-                    if payload_start < end {
-                        // `dav1d` `src/obu.c:1475`: `(c->n_itut_t35 + 1) > INT_MAX / sizeof(*c->itut_t35)`
-                        const MAX_ITUT_T35_ENTRIES: usize = (i32::MAX as usize) / 24;
-                        if self.parse.itut_t35.len() >= MAX_ITUT_T35_ENTRIES {
-                            return Err(payload_error(
-                                obu,
-                                BitstreamErrorKind::InvalidFrameHeader(
-                                    "ITU-T T.35 girdi sayısı üst sınırı aşıldı (obu.c 1475)",
-                                ),
-                            ));
-                        }
-                        let old_cap = self.parse.itut_t35.capacity();
-                        let grow_entries = if self.parse.itut_t35.len() == old_cap {
-                            old_cap.max(4)
+                    if country_code != 0xFF || end >= 2 {
+                        let (ext, payload_start) = if country_code == 0xFF {
+                            (rest[1], 2usize)
                         } else {
-                            0
+                            (0u8, 1usize)
                         };
-                        let grow_bytes = grow_entries
-                            .checked_mul(core::mem::size_of::<ItutT35Meta>())
-                            .ok_or(Error::SizeOverflow {
-                                stage: crate::error::SizeStage::TotalAllocation,
-                                lhs: grow_entries,
-                                rhs: core::mem::size_of::<ItutT35Meta>(),
-                            })?;
-                        let butce = self.butce_defteri(0);
-                        let res = butce
-                            .ayir(grow_bytes)
-                            .and_then(|()| butce.kopya(&rest[payload_start..end]));
-                        self.tepe_kat(&butce);
-                        let payload = res?;
-                        if self.parse.itut_t35.len() == old_cap {
-                            self.parse
-                                .itut_t35
-                                .try_reserve_exact(grow_entries)
-                                .map_err(|_| Error::AllocationFailed {
-                                    requested: old_cap
-                                        .saturating_add(grow_entries)
-                                        .saturating_mul(core::mem::size_of::<ItutT35Meta>()),
+                        if payload_start < end {
+                            valid = true;
+                            // `dav1d` `src/obu.c:1475`: `(c->n_itut_t35 + 1) > INT_MAX / sizeof(*c->itut_t35)`
+                            const MAX_ITUT_T35_ENTRIES: usize = (i32::MAX as usize) / 24;
+                            if self.parse.itut_t35.len() >= MAX_ITUT_T35_ENTRIES {
+                                return Err(payload_error(
+                                    obu,
+                                    BitstreamErrorKind::InvalidFrameHeader(
+                                        "ITU-T T.35 girdi sayısı üst sınırı aşıldı (obu.c 1475)",
+                                    ),
+                                ));
+                            }
+                            let old_cap = self.parse.itut_t35.capacity();
+                            let grow_entries = if self.parse.itut_t35.len() == old_cap {
+                                old_cap.max(4)
+                            } else {
+                                0
+                            };
+                            let grow_bytes = grow_entries
+                                .checked_mul(core::mem::size_of::<ItutT35Meta>())
+                                .ok_or(Error::SizeOverflow {
+                                    stage: crate::error::SizeStage::TotalAllocation,
+                                    lhs: grow_entries,
+                                    rhs: core::mem::size_of::<ItutT35Meta>(),
                                 })?;
+                            let butce = self.butce_defteri(0);
+                            let res = butce
+                                .ayir(grow_bytes)
+                                .and_then(|()| butce.kopya(&rest[payload_start..end]));
+                            self.tepe_kat(&butce);
+                            let payload = res?;
+                            if self.parse.itut_t35.len() == old_cap {
+                                self.parse
+                                    .itut_t35
+                                    .try_reserve_exact(grow_entries)
+                                    .map_err(|_| Error::AllocationFailed {
+                                        requested: old_cap
+                                            .saturating_add(grow_entries)
+                                            .saturating_mul(core::mem::size_of::<ItutT35Meta>()),
+                                    })?;
+                            }
+                            self.parse.itut_t35.push(ItutT35Meta {
+                                country_code,
+                                country_code_extension_byte: ext,
+                                payload,
+                            });
                         }
-                        self.parse.itut_t35.push(ItutT35Meta {
-                            country_code,
-                            country_code_extension_byte: ext,
-                            payload,
-                        });
                     }
+                }
+                if !valid && self.capi_strict_frame_delay {
+                    self.parse
+                        .capi_warnings
+                        .push("Malformed ITU-T T.35 metadata message format".into());
                 }
                 Ok(())
             }
-            _ => Ok(()),
+            3 | 5 => Ok(()),
+            _ => {
+                if meta_type > 31 && self.capi_strict_frame_delay {
+                    self.parse
+                        .capi_warnings
+                        .push(format!("Unknown Metadata OBU type {meta_type}"));
+                }
+                Ok(())
+            }
         }
+    }
+
+    /// Son `frame_size_limit` aşımında yakalanan `(width, height, limit)` üçlüsünü alır.
+    #[cfg_attr(not(feature = "std"), allow(dead_code))]
+    pub(crate) fn take_last_frame_size_limit_exceeded(&mut self) -> Option<(i32, i32, u64)> {
+        self.parse.last_frame_size_limit_exceeded.take()
+    }
+
+    /// Biriken ölümcül olmayan C-ABI OBU uyarı iletilerini (`Dav1dLogger`) alır ve temizler.
+    #[cfg_attr(not(feature = "std"), allow(dead_code))]
+    pub(crate) fn take_capi_warnings(&mut self) -> Vec<String> {
+        core::mem::take(&mut self.parse.capi_warnings)
     }
 }
 fn itut_t35_vec_bytes(items: &Vec<ItutT35Meta>) -> usize {

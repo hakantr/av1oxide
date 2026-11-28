@@ -179,7 +179,7 @@ impl RefMvs {
         dsp: RefmvsDsp,
         butce: &crate::frame::butce::Butce,
     ) -> crate::error::Result<Self> {
-        Self::new_with_reuse(width, height, dsp, Vec::new(), butce, false)
+        Self::new_with_reuse(width, height, dsp, Vec::new(), butce)
     }
 
     /// `Key` / `Intra` (`!allow_intrabc`) karelerde tam `iw4 × ih4` ızgarası
@@ -214,25 +214,16 @@ impl RefMvs {
 
     /// Havuzdan geri dönüştürülmüş `old_grid` varsa kapasitesi eşleştiğinde
     /// yeniden kullanarak `RefMvs` kurar (`F8b-1`).
-    ///
-    /// `skip_grid_fill == true` ise paralel çok-karolu birleştirmede tüm
-    /// `iw4 × ih4` ızgarası üzerine yazılacağından gereksiz `INVALID_BLOCK`
-    /// doldurması atlanır (`5.C.1`).
     pub(crate) fn new_with_reuse(
         width: usize,
         height: usize,
         dsp: RefmvsDsp,
         old_grid: Vec<RefBlock>,
         butce: &crate::frame::butce::Butce,
-        skip_grid_fill: bool,
     ) -> crate::error::Result<Self> {
         let iw4 = ((width + 7) >> 3) << 1;
         let ih4 = ((height + 7) >> 3) << 1;
-        let grid = if skip_grid_fill {
-            butce.reuse_vec_dirty(old_grid, iw4 * ih4, INVALID_BLOCK)?.0
-        } else {
-            butce.reuse_vec(old_grid, iw4 * ih4, INVALID_BLOCK)?
-        };
+        let grid = butce.reuse_vec(old_grid, iw4 * ih4, INVALID_BLOCK)?;
         Ok(Self {
             dsp,
             grid,
@@ -305,33 +296,6 @@ impl RefMvs {
             mfmv: self.mfmv,
             temporal_hits: core::sync::atomic::AtomicU64::new(0),
         })
-    }
-
-    /// Tile yerel `other` ızgarasının `[row_start..row_end) × [col_start..col_end)`
-    /// dikdörtgenini ve `temporal_hits` sayacını kare ızgarasına birleştirir.
-    #[allow(dead_code)]
-    pub(crate) fn merge_tile_from(&mut self, other: &Self, tile: TileBounds) {
-        if !other.grid.is_empty() && other.stride > 0 {
-            let y0 = tile.row_start.min(self.ih4);
-            let y1 = tile.row_end.min(self.ih4);
-            let x0 = tile.col_start.min(self.iw4);
-            let x1 = tile.col_end.min(self.iw4);
-            if x0 < x1 {
-                let w = x1 - x0;
-                for y in y0..y1 {
-                    let dst_off = y * self.iw4 + x0;
-                    let src_off = (y - other.y_base) * other.stride + (x0 - other.x_base);
-                    self.grid[dst_off..dst_off + w]
-                        .copy_from_slice(&other.grid[src_off..src_off + w]);
-                }
-            }
-        }
-        // ORDERING: Bariyer sonrası tek iş parçacıklı birleştirme.
-        let hits = other
-            .temporal_hits
-            .load(core::sync::atomic::Ordering::Relaxed);
-        self.temporal_hits
-            .fetch_add(hits, core::sync::atomic::Ordering::Relaxed);
     }
 
     /// Bir 4×4 hücrenin ızgara kaydı (`find_matching_ref` için).
@@ -483,19 +447,52 @@ impl RefMvs {
 
     /// `dav1d_refmvs_save_tmvs` (`refmvs.h:141-159`) — kare sonunda 8×8 ızgara.
     pub(crate) fn save_temporal(&self, out: &mut [TemporalBlock], stride: usize) {
-        let ih8 = (self.ih4 + 1) >> 1;
-        let iw8 = (self.iw4 + 1) >> 1;
-        let _ = ih8;
+        self.save_temporal_region(out, stride, self.iw4 >> 1, (self.ih4 >> 1).max(1));
+    }
+
+    /// Tile yerel `RefMvs` ızgarasını doğrudan kare `tmvs` haritasındaki
+    /// `[y_base..row_end) × [x_base..col_end)` dikdörtgenine yazar.
+    pub(crate) fn save_tile_temporal(
+        &self,
+        out: &mut [TemporalBlock],
+        stride: usize,
+        out_y0: usize,
+        row_end: usize,
+        col_end: usize,
+    ) {
+        let rows = row_end.min(self.ih4).saturating_sub(self.y_base) >> 1;
+        let cols = col_end.min(self.iw4).saturating_sub(self.x_base) >> 1;
+        if rows == 0 || cols == 0 {
+            return;
+        }
+        let offset = ((self.y_base >> 1).saturating_sub(out_y0))
+            .saturating_mul(stride)
+            .saturating_add(self.x_base >> 1);
+        if let Some(sub) = out.get_mut(offset..) {
+            self.save_temporal_region(sub, stride, cols, rows);
+        }
+    }
+
+    fn save_temporal_region(
+        &self,
+        out: &mut [TemporalBlock],
+        stride: usize,
+        cols: usize,
+        rows: usize,
+    ) {
+        if self.grid.is_empty() || self.stride == 0 || cols == 0 || rows == 0 {
+            return;
+        }
         crate::dsp::profil_olc!(
             RefmvsSaveTmvs,
             (self.dsp.save_tmvs)(
                 out,
                 stride,
                 &self.grid,
-                self.iw4,
+                self.stride,
                 &self.mfmv_sign,
-                iw8,
-                (self.ih4 >> 1).max(1),
+                cols,
+                rows,
                 0,
                 0,
             )
@@ -1995,6 +1992,37 @@ mod tests {
         assert_eq!(
             stack[0].mv[0], mv_row29,
             "by4=32 için ikincil satır 29 olmalı (0 değil)"
+        );
+    }
+
+    #[test]
+    fn karo_temporal_haritasi_sag_dolguyu_korur() {
+        let sentinel = TemporalBlock {
+            mv: Mv { y: 123, x: -456 },
+            ref_: 6,
+        };
+        let tile = TileBounds {
+            row_start: 0,
+            row_end: 2,
+            col_start: 0,
+            col_end: 4,
+        };
+        let mut base = RefMvs::new_empty(32, 32, crate::dsp::refmvs::RefmvsDsp::SCALAR);
+        base.mfmv_sign = [1; 7];
+        let mut tile_rmv = base.fork_for_tile(tile, true).expect("tile refmvs");
+        tile_rmv.splat_inter(0, 0, 2, 2, 17, Mv { y: 16, x: 24 }, 0, false, 3);
+        tile_rmv.splat_intra(2, 0, 2, 2, 17);
+
+        let stride = 8usize;
+        let mut out = alloc::vec![sentinel; stride * 4];
+        tile_rmv.save_tile_temporal(&mut out, stride, 0, tile.row_end, tile.col_end);
+
+        assert_eq!(out[0].mv, Mv { y: 16, x: 24 });
+        assert_eq!(out[0].ref_, 1);
+        assert!(out[1].is_empty());
+        assert_eq!(
+            out[2], sentinel,
+            "karo genişliği dışındaki dolgu yazılmamalı"
         );
     }
 }

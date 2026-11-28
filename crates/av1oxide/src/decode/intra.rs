@@ -1664,6 +1664,7 @@ struct Dec<'a> {
     multi_tile_frame: bool,
     segmentation_frame: bool,
     qmatrix_frame: bool,
+    strict_std_compliance: bool,
 }
 
 /// İki kenar ağacı (dav1d `dav1d_intra_edge_tree`) — süreçte bir kez kurulur.
@@ -2296,6 +2297,7 @@ impl<'a> Dec<'a> {
         buf_pool: &DecodeBufPool,
         butce: &'a Butce,
         parallel_tiles: bool,
+        strict_std_compliance: bool,
     ) -> Result<Self> {
         let bd = match seq.hbd {
             0 => BitDepth::Eight,
@@ -2435,7 +2437,7 @@ impl<'a> Dec<'a> {
             frame_segmap_stride: segmap_stride,
             pal: [[0u16; 8]; 3],
             frame_no: 0,
-            refmvs: if !need_refmvs {
+            refmvs: if !need_refmvs || parallel_tiles {
                 RefMvs::new_empty(width, height, *dsp.refmvs())
             } else {
                 RefMvs::new_with_reuse(
@@ -2444,7 +2446,6 @@ impl<'a> Dec<'a> {
                     *dsp.refmvs(),
                     core::mem::take(&mut work_bufs.refmvs_grid),
                     butce,
-                    tiles_cover_frame,
                 )?
             },
             refs,
@@ -2461,6 +2462,7 @@ impl<'a> Dec<'a> {
             multi_tile_frame: false,
             segmentation_frame: false,
             qmatrix_frame: false,
+            strict_std_compliance,
         };
         dec.sb128_frame = sb128;
         dec.multi_tile_frame = usize::from(hdr.tiling.cols) * usize::from(hdr.tiling.rows) > 1;
@@ -2842,6 +2844,15 @@ impl<'a> Dec<'a> {
                 lf.tx_right_uv[uvdst..uvdst + uvn]
                     .copy_from_slice(&self.blocks.left.tx_lpf_uv[uvoff..uvoff + uvn]);
             }
+        }
+        // dav1d `decode.c:2784-2792`: karo sonu MSAC izleyen bit + sıfır dolgu denetimi.
+        if self.strict_std_compliance
+            && row_end_sb >= usize::from(self.hdr.tiling.row_start_sb[tile_row + 1])
+            && !msac.check_trailing_bits()
+        {
+            return Err(Error::InvalidData(
+                "katı kip: karo sonunda MSAC trailing bit veya sıfır dolgusu geçersiz",
+            ));
         }
         // Tile sonu: bu tile satırının bittiği alt kenardaki `above.tx_lpf_*`
         // bağlamını bir sonraki tile satırının (`tile_row + 1`) deblocking
@@ -9652,6 +9663,7 @@ pub(crate) fn decode_frame(
     butce: &Butce,
     pool: &crate::thread::WorkerPool,
     inloop_filters: crate::api::InloopFilters,
+    strict_std_compliance: bool,
 ) -> Result<DecodedFrame> {
     if hdr.show_existing_frame {
         return Err(Error::Unsupported("show_existing_frame"));
@@ -9734,6 +9746,7 @@ pub(crate) fn decode_frame(
         buf_pool,
         butce,
         parallel_tiles,
+        strict_std_compliance,
     )?;
     if hdr.primary_ref_frame != 7 {
         dec.tools.cdf_load = 1;
@@ -9752,9 +9765,32 @@ pub(crate) fn decode_frame(
     );
     // Tanılama: refmvs çağrı izi kare sırası (`AV1OXIDE_REFMVS_TRACE`).
     dec.refmvs.set_frame(dec.frame_no);
+    // dav1d `decode.c:2766, 3720-3742`: temporal MV haritası (`save_tmvs`) yalnız
+    // referans yuvası yenileyen (`refresh_frame_flags != 0`) ve `seq.ref_frame_mvs`
+    // açık olan INTER/SWITCH karelerde kaydedilir.
+    let save_tmvs = is_inter && seq.ref_frame_mvs && hdr.refresh_frame_flags != 0;
+    let tmvs_stride = ((hdr.width[0] as usize + 127) & !127) >> 3;
+    let tmvs_len = tmvs_stride * (bh >> 1).max(1);
+    let allocate_tmvs = || {
+        let old_tmvs = buf_pool.take_tmvs_vec(tmvs_len, has_limit);
+        butce.reuse_vec(old_tmvs, tmvs_len, TemporalBlock::default())
+    };
+    let mut tmvs = Vec::new();
     let mut tile_cdfs: Vec<CdfContext> = butce.kapasite(n_tiles)?;
     if parallel_tiles {
-        decode_tiles_parallel(&mut dec, hdr, tiles, &cdf_in, &mut tile_cdfs, pool)?;
+        if save_tmvs {
+            tmvs = allocate_tmvs()?;
+        }
+        decode_tiles_parallel(
+            &mut dec,
+            hdr,
+            tiles,
+            &cdf_in,
+            &mut tile_cdfs,
+            &mut tmvs,
+            tmvs_stride,
+            pool,
+        )?;
     } else {
         for tile_row in 0..usize::from(hdr.tiling.rows) {
             for tile_col in 0..usize::from(hdr.tiling.cols) {
@@ -9915,17 +9951,9 @@ pub(crate) fn decode_frame(
     } else {
         cdf_in.clone()
     };
-    // --- temporal MV ızgarası (dav1d `decode.c:3230-3236`) ---------------
-    let tmvs_stride = ((hdr.width[0] as usize + 127) & !127) >> 3;
-    let ih8 = (hdr.height as usize + 7) >> 3;
-    let tmvs_len = tmvs_stride * ih8.max(1);
-    let mut tmvs = if !is_inter {
-        Vec::new()
-    } else {
-        let old_tmvs = buf_pool.take_tmvs_vec(tmvs_len, has_limit);
-        butce.reuse_vec(old_tmvs, tmvs_len, TemporalBlock::default())?
-    };
-    if is_inter {
+    // --- temporal MV ızgarası (dav1d `decode.c:2766, 3230-3236, 3720-3742`) --
+    if save_tmvs && !parallel_tiles {
+        tmvs = allocate_tmvs()?;
         dec.refmvs.save_temporal(&mut tmvs, tmvs_stride);
     }
 
@@ -10005,14 +10033,16 @@ pub(crate) fn decode_frame(
 
 /// Karedeki tüm `(tile_row, tile_col)` karolarını kalıcı `WorkerPool` üzerinde
 /// paralel çözer ve sonuçları deterministik `(tile_row, tile_col)` sırasıyla
-/// `dec` ve `tile_cdfs` içine birleştirir (`ADR-0004` §3.1, `F8b-2`).
-#[allow(clippy::too_many_lines)]
+/// `dec`, `tile_cdfs` ve `tmvs` içine birleştirir (`ADR-0004` §3.1, `F8b-2`).
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn decode_tiles_parallel(
     dec: &mut Dec<'_>,
     hdr: &FrameHeader,
     tiles: &[&[u8]],
     cdf_in: &CdfContext,
     tile_cdfs: &mut Vec<CdfContext>,
+    tmvs: &mut Vec<TemporalBlock>,
+    tmvs_stride: usize,
     pool: &crate::thread::WorkerPool,
 ) -> Result<()> {
     use crate::sync::Mutex;
@@ -10039,6 +10069,7 @@ fn decode_tiles_parallel(
         lr_counts: crate::decode::lr::LrSyntaxCounts,
         segmap: Vec<u8>,
         refmvs: Option<RefMvs>,
+        temporal_hits: u64,
         tools: ToolCounts,
     }
 
@@ -10047,6 +10078,7 @@ fn decode_tiles_parallel(
     let keyframe = matches!(hdr.frame_type, FrameType::Key | FrameType::Intra);
     let allow_intrabc = hdr.allow_intrabc;
     let need_refmvs = !keyframe || allow_intrabc;
+    let save_tmvs = !tmvs.is_empty();
     let need_segmap = hdr.segmentation.enabled && hdr.segmentation.update_map;
     let max_sb_rows = (dec.bh + dec.sb_step - 1) >> dec.sb_shift;
     let max_sb_cols = (dec.bw + dec.sb_step - 1) >> dec.sb_shift;
@@ -10118,6 +10150,7 @@ fn decode_tiles_parallel(
     let multi_tile_frame = dec.multi_tile_frame;
     let segmentation_frame = dec.segmentation_frame;
     let qmatrix_frame = dec.qmatrix_frame;
+    let strict_std_compliance = dec.strict_std_compliance;
 
     // Büyük çok-satırlı karelerde (`Y >= 4 MiB`, `n_rows >= 4`) karoları `tile_row`
     // dalgaları hâlinde çözüp anında birleştir (`5.C.1`): 120 karoluk geçici
@@ -10186,6 +10219,7 @@ fn decode_tiles_parallel(
                     lr_counts: crate::decode::lr::LrSyntaxCounts::default(),
                     segmap: Vec::new(),
                     refmvs: None,
+                    temporal_hits: 0,
                     tools: ToolCounts::default(),
                 });
             }
@@ -10312,6 +10346,7 @@ fn decode_tiles_parallel(
                 multi_tile_frame,
                 segmentation_frame,
                 qmatrix_frame,
+                strict_std_compliance,
             };
             let res = tdec.decode_tile(w.tile_row, w.tile_col, &w.data, &mut w.cdf);
             w.data = Vec::new();
@@ -10343,13 +10378,17 @@ fn decode_tiles_parallel(
             w.lr = lr;
             w.lr_counts = lr_counts;
             w.segmap = segmap;
-            if need_refmvs {
+            w.temporal_hits = refmvs
+                .temporal_hits
+                .load(core::sync::atomic::Ordering::Relaxed);
+            if save_tmvs {
                 w.refmvs = Some(refmvs);
             }
             w.tools = tools;
             res
         })?;
 
+        let mut temporal_hits = 0u64;
         for w in &mut works {
             if let (Some(dst_lr), Some(src_lr)) = (dec.lr.as_mut(), w.lr.take()) {
                 dst_lr.merge_tile_from(&src_lr);
@@ -10360,7 +10399,13 @@ fn decode_tiles_parallel(
             dec.lr_counts.wiener_units += w.lr_counts.wiener_units;
             dec.lr_counts.sgr_units += w.lr_counts.sgr_units;
             dec.tools.merge_from(&w.tools);
+            temporal_hits += w.temporal_hits;
             tile_cdfs.push(w.cdf.clone());
+        }
+        if temporal_hits != 0 {
+            dec.refmvs
+                .temporal_hits
+                .fetch_add(temporal_hits, core::sync::atomic::Ordering::Relaxed);
         }
 
         // Faz 2 (`5.C.1`): bu dalganın karolarını `tile_row` şeritlerine `split_at_mut`
@@ -10385,11 +10430,9 @@ fn decode_tiles_parallel(
                     col_start: usize,
                     col_end_sb4: usize,
                 }
-                struct RefMvsTileSrc {
+                struct TemporalTileSrc {
                     rmv: RefMvs,
-                    row_start: usize,
                     row_end: usize,
-                    col_start: usize,
                     col_end: usize,
                 }
                 struct LfTileSrc {
@@ -10430,7 +10473,7 @@ fn decode_tiles_parallel(
                         Vec::new()
                     },
                 ];
-                let mut refmvs_row_tiles: Vec<Vec<RefMvsTileSrc>> = if need_refmvs {
+                let mut temporal_row_tiles: Vec<Vec<TemporalTileSrc>> = if save_tmvs {
                     (0..wave_r_count)
                         .map(|_| Vec::with_capacity(n_cols))
                         .collect()
@@ -10479,12 +10522,10 @@ fn decode_tiles_parallel(
                             col_end_sb4: w.col_end_sb4,
                         });
                     }
-                    if need_refmvs && let Some(rmv) = w.refmvs {
-                        refmvs_row_tiles[local_r].push(RefMvsTileSrc {
+                    if save_tmvs && let Some(rmv) = w.refmvs {
+                        temporal_row_tiles[local_r].push(TemporalTileSrc {
                             rmv,
-                            row_start: w.row_start,
                             row_end: w.row_end,
-                            col_start: w.col_start,
                             col_end: w.col_end,
                         });
                     }
@@ -10520,12 +10561,10 @@ fn decode_tiles_parallel(
                         sv: usize,
                         tiles: Vec<PicTileSrc>,
                     },
-                    RefMvsStrip {
-                        dst: &'a mut [crate::decode::refmvs::RefBlock],
+                    TemporalMvStrip {
+                        dst: &'a mut [TemporalBlock],
                         dst_y0: usize,
-                        iw4: usize,
-                        ih4: usize,
-                        tiles: Vec<RefMvsTileSrc>,
+                        tiles: Vec<TemporalTileSrc>,
                     },
                     Lf {
                         lf: &'a mut crate::decode::loopfilter::LfFrame,
@@ -10543,7 +10582,6 @@ fn decode_tiles_parallel(
                 }
 
                 let mut tasks: Vec<ScopedMergeTask<'_>> = Vec::with_capacity(wave_r_count * 4 + 2);
-                let total_hits = core::sync::atomic::AtomicU64::new(0);
 
                 tasks.push(ScopedMergeTask::SegmapAndCdef {
                     segmap: dec.segmap.as_mut_slice(),
@@ -10553,29 +10591,27 @@ fn decode_tiles_parallel(
                     tiles: seg_cdef_tiles,
                 });
 
-                if need_refmvs {
-                    let iw4 = dec.refmvs.iw4;
-                    let ih4 = dec.refmvs.ih4;
-                    let wave_y0 = row_bounds_sb4[wave_r_start].0.min(ih4);
-                    let start_elem = wave_y0.saturating_mul(iw4).min(dec.refmvs.grid.len());
-                    let mut rem = &mut dec.refmvs.grid[start_elem..];
+                if save_tmvs {
+                    let wave_y0 = row_bounds_sb4[wave_r_start].0.min(dec.bh) >> 1;
+                    let start_elem = wave_y0.saturating_mul(tmvs_stride).min(tmvs.len());
+                    let mut rem = &mut tmvs[start_elem..];
                     let mut cur_y = wave_y0;
-                    for (local_r, row_tiles) in refmvs_row_tiles.into_iter().enumerate() {
+                    for (local_r, row_tiles) in temporal_row_tiles.into_iter().enumerate() {
                         let r = wave_r_start + local_r;
                         let (_, _, r_end) = row_bounds_sb4[r];
-                        let y1 = r_end.min(ih4);
+                        let y1 = r_end.min(dec.bh) >> 1;
                         let take_elems = if r + 1 == n_rows {
                             rem.len()
                         } else {
-                            y1.saturating_sub(cur_y).saturating_mul(iw4).min(rem.len())
+                            y1.saturating_sub(cur_y)
+                                .saturating_mul(tmvs_stride)
+                                .min(rem.len())
                         };
                         let (band, rest) = rem.split_at_mut(take_elems);
                         rem = rest;
-                        tasks.push(ScopedMergeTask::RefMvsStrip {
+                        tasks.push(ScopedMergeTask::TemporalMvStrip {
                             dst: band,
                             dst_y0: cur_y,
-                            iw4,
-                            ih4,
                             tiles: row_tiles,
                         });
                         cur_y = y1;
@@ -10708,42 +10744,15 @@ fn decode_tiles_parallel(
                                 }
                             }
                         }
-                        ScopedMergeTask::RefMvsStrip {
-                            dst,
-                            dst_y0,
-                            iw4,
-                            ih4,
-                            tiles,
-                        } => {
-                            let strip_rows = dst.len().checked_div(iw4).unwrap_or(0);
-                            let strip_y1 = (dst_y0 + strip_rows).min(ih4);
-                            let mut hits = 0u64;
+                        ScopedMergeTask::TemporalMvStrip { dst, dst_y0, tiles } => {
                             for t in tiles {
-                                let other_rmv = t.rmv;
-                                if !other_rmv.grid.is_empty() && other_rmv.stride > 0 {
-                                    let y0 = t.row_start.max(dst_y0).min(strip_y1);
-                                    let y1 = t.row_end.min(strip_y1);
-                                    let x0 = t.col_start.min(iw4);
-                                    let x1 = t.col_end.min(iw4);
-                                    if x0 < x1 {
-                                        let copy_w = x1 - x0;
-                                        let src_x0 = x0 - other_rmv.x_base;
-                                        for y in y0..y1 {
-                                            let dst_off = (y - dst_y0) * iw4 + x0;
-                                            let src_off =
-                                                (y - other_rmv.y_base) * other_rmv.stride + src_x0;
-                                            dst[dst_off..dst_off + copy_w].copy_from_slice(
-                                                &other_rmv.grid[src_off..src_off + copy_w],
-                                            );
-                                        }
-                                    }
-                                }
-                                hits += other_rmv
-                                    .temporal_hits
-                                    .load(core::sync::atomic::Ordering::Relaxed);
-                            }
-                            if hits > 0 {
-                                total_hits.fetch_add(hits, core::sync::atomic::Ordering::Relaxed);
+                                t.rmv.save_tile_temporal(
+                                    dst,
+                                    tmvs_stride,
+                                    dst_y0,
+                                    t.row_end,
+                                    t.col_end,
+                                );
                             }
                         }
                         ScopedMergeTask::Lf { lf, w4, h4, tiles } => {
@@ -10811,19 +10820,12 @@ fn decode_tiles_parallel(
                 });
                 drop(queue);
                 drop(guard);
-
-                let hits = total_hits.into_inner();
-                if hits > 0 {
-                    dec.refmvs
-                        .temporal_hits
-                        .fetch_add(hits, core::sync::atomic::Ordering::Relaxed);
-                }
             }
         }
 
         if !merged_scoped {
             // Geri-düşüş yolu (küçük kareler, tek satırlı tile ızgaraları veya `no_std`/`wasm32`):
-            // 6 bağımsız hedef bileşeni (`Pic Y`, `Pic U`, `Pic V`, `RefMvs::grid`, `LfFrame`,
+            // 6 bağımsız hedef bileşeni (`Pic Y`, `Pic U`, `Pic V`, `tmvs`, `LfFrame`,
             // `segmap + CdefState`) `WorkerPool` üzerinde paralel birleştir.
             #[allow(clippy::large_enum_variant)]
             enum MergeComponent {
@@ -10835,11 +10837,8 @@ fn decode_tiles_parallel(
                     sh: usize,
                     sv: usize,
                 },
-                RefMvsGrid {
-                    grid: Vec<crate::decode::refmvs::RefBlock>,
-                    iw4: usize,
-                    ih4: usize,
-                    hits: u64,
+                TemporalMvs {
+                    data: Vec<TemporalBlock>,
                 },
                 Lf {
                     lf: crate::decode::loopfilter::LfFrame,
@@ -10883,12 +10882,9 @@ fn decode_tiles_parallel(
                     sv: dec.pic.ss_ver,
                 });
             }
-            if need_refmvs {
-                jobs.push(MergeComponent::RefMvsGrid {
-                    grid: core::mem::take(&mut dec.refmvs.grid),
-                    iw4: dec.refmvs.iw4,
-                    ih4: dec.refmvs.ih4,
-                    hits: 0,
+            if save_tmvs {
+                jobs.push(MergeComponent::TemporalMvs {
+                    data: core::mem::take(tmvs),
                 });
             }
             if let Some(lf) = dec.lf.take() {
@@ -10980,43 +10976,16 @@ fn decode_tiles_parallel(
                             }
                         }
                     }
-                    MergeComponent::RefMvsGrid {
-                        grid,
-                        iw4,
-                        ih4,
-                        hits,
-                    } => {
-                        let iw4 = *iw4;
-                        let ih4 = *ih4;
+                    MergeComponent::TemporalMvs { data } => {
                         for w_lock in works_for_workers.iter() {
-                            let (other_rmv, row_start, row_end, col_start, col_end) = {
+                            let (other_rmv, row_end, col_end) = {
                                 let mut w = w_lock.lock();
                                 let Some(r) = w.refmvs.take() else {
                                     continue;
                                 };
-                                (r, w.row_start, w.row_end, w.col_start, w.col_end)
+                                (r, w.row_end, w.col_end)
                             };
-                            if !other_rmv.grid.is_empty() && other_rmv.stride > 0 {
-                                let y0 = row_start.min(ih4);
-                                let y1 = row_end.min(ih4);
-                                let x0 = col_start.min(iw4);
-                                let x1 = col_end.min(iw4);
-                                if x0 < x1 {
-                                    let copy_w = x1 - x0;
-                                    let src_x0 = x0 - other_rmv.x_base;
-                                    for y in y0..y1 {
-                                        let dst_off = y * iw4 + x0;
-                                        let src_off =
-                                            (y - other_rmv.y_base) * other_rmv.stride + src_x0;
-                                        grid[dst_off..dst_off + copy_w].copy_from_slice(
-                                            &other_rmv.grid[src_off..src_off + copy_w],
-                                        );
-                                    }
-                                }
-                            }
-                            *hits += other_rmv
-                                .temporal_hits
-                                .load(core::sync::atomic::Ordering::Relaxed);
+                            other_rmv.save_tile_temporal(data, tmvs_stride, 0, row_end, col_end);
                         }
                     }
                     MergeComponent::Lf { lf, w4, h4 } => {
@@ -11127,11 +11096,8 @@ fn decode_tiles_parallel(
                     MergeComponent::PicPlane { plane, data, .. } => {
                         dec.pic.data[plane] = data;
                     }
-                    MergeComponent::RefMvsGrid { grid, hits, .. } => {
-                        dec.refmvs.grid = grid;
-                        dec.refmvs
-                            .temporal_hits
-                            .fetch_add(hits, core::sync::atomic::Ordering::Relaxed);
+                    MergeComponent::TemporalMvs { data } => {
+                        *tmvs = data;
                     }
                     MergeComponent::Lf { lf, .. } => {
                         dec.lf = Some(lf);
