@@ -1604,12 +1604,17 @@ impl Decoder {
         //    böylece `max_frame_delay > 1` kipinde bozuk `tile_size_minus_1` hatası
         //    senkron `send_packet`/`dav1d_send_data` yerine `receive_frame`/`dav1d_get_picture`
         //    aşamasında bildirilir.
-        self.pipeline_butce.taban_guncelle(self.kalici_bayt());
+        //    Bekleyen T.35 yükü (`parse.itut_t35`) aşağıda `mem::take` ile bu karenin
+        //    `capi_meta` kaydına geçer ve kare uçuştayken `grup_tutucu` ile tutulur; bu
+        //    yüzden tabandan çıkarılır, aksi halde aynı baytlar iki kez sayılırdı.
+        let t35_bayti = itut_t35_vec_bytes(&self.parse.itut_t35);
+        self.pipeline_butce
+            .taban_guncelle(self.kalici_bayt().saturating_sub(t35_bayti));
         let grup_bayti: usize = groups
             .iter()
             .map(|g| g.data.len())
             .sum::<usize>()
-            .saturating_add(itut_t35_vec_bytes(&self.parse.itut_t35));
+            .saturating_add(t35_bayti);
         let grup_tutucu = match Butce::tut(&self.pipeline_butce, grup_bayti) {
             Ok(t) => t,
             Err(err) => {
@@ -3955,37 +3960,40 @@ mod tests {
         assert_eq!(dec_diag.decoded_tool_counts().len(), 1);
     }
 
+    /// T.35 bütçe testlerinin ortak 1x1 kare paketi.
+    const T35_PKT_1X1: &[u8] = &[
+        0x12, 0x00, 0x0A, 0x09, 0x00, 0x00, 0x00, 0x00, 0x00, 0x7D, 0xFC, 0xC0, 0x20, 0x32, 0x17,
+        0x10, 0x01, 0x91, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x68, 0xD2, 0x16,
+        0x8C, 0x64, 0xBE, 0x2E, 0xC7, 0xDA, 0xEE, 0x96,
+    ];
+
+    /// Geçerli bir ITU-T T.35 OBU (type=5 -> 0x2A, size, meta_type=4, country_code=0xB5, payload, 0x80).
+    fn make_t35_obu(payload_len: usize, fill: u8) -> Vec<u8> {
+        let body_len = 1 + 1 + payload_len + 1;
+        let mut obu = Vec::with_capacity(2 + 4 + body_len);
+        obu.push(0x2A); // OBU_METADATA, has_size_field=1
+        let mut rem = body_len;
+        loop {
+            let mut b = (rem & 0x7F) as u8;
+            rem >>= 7;
+            if rem != 0 {
+                b |= 0x80;
+            }
+            obu.push(b);
+            if rem == 0 {
+                break;
+            }
+        }
+        obu.push(0x04); // OBU_META_ITUT_T35
+        obu.push(0xB5); // country_code
+        obu.resize(obu.len() + payload_len, fill);
+        obu.push(0x80); // trailing_one_bit
+        obu
+    }
+
     #[test]
     fn itut_t35_metadata_butce_sinirina_uyar_ve_hata_sonrasi_durumu_korur() {
-        const PKT_1X1: &[u8] = &[
-            0x12, 0x00, 0x0A, 0x09, 0x00, 0x00, 0x00, 0x00, 0x00, 0x7D, 0xFC, 0xC0, 0x20, 0x32,
-            0x17, 0x10, 0x01, 0x91, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x68,
-            0xD2, 0x16, 0x8C, 0x64, 0xBE, 0x2E, 0xC7, 0xDA, 0xEE, 0x96,
-        ];
-
-        // Geçerli bir ITU-T T.35 OBU (type=5 -> 0x2A, size, meta_type=4, country_code=0xB5, payload, 0x80).
-        fn make_t35_obu(payload_len: usize, fill: u8) -> Vec<u8> {
-            let body_len = 1 + 1 + payload_len + 1;
-            let mut obu = Vec::with_capacity(2 + 4 + body_len);
-            obu.push(0x2A); // OBU_METADATA, has_size_field=1
-            let mut rem = body_len;
-            loop {
-                let mut b = (rem & 0x7F) as u8;
-                rem >>= 7;
-                if rem != 0 {
-                    b |= 0x80;
-                }
-                obu.push(b);
-                if rem == 0 {
-                    break;
-                }
-            }
-            obu.push(0x04); // OBU_META_ITUT_T35
-            obu.push(0xB5); // country_code
-            obu.resize(obu.len() + payload_len, fill);
-            obu.push(0x80); // trailing_one_bit
-            obu
-        }
+        const PKT_1X1: &[u8] = T35_PKT_1X1;
 
         let mut probe = Decoder::new(Config {
             n_threads: 1,
@@ -4053,5 +4061,51 @@ mod tests {
             matches!(frame_err, Error::BudgetExceeded { .. }),
             "beklenen BudgetExceeded, gelen: {frame_err:?}"
         );
+    }
+
+    /// Boru hattı yolunda (`n_threads >= 2`, `max_frame_delay >= 2`) bekleyen T.35 yükü
+    /// bütçede yalnız bir kez sayılmalı: kare `grup_tutucu` payına geçerken taban da aynı
+    /// baytları içerirse `taban + 1,5 X` sınırı altında gerçekte sığan kare reddedilir.
+    #[test]
+    fn itut_t35_boru_hattinda_butcede_bir_kez_sayilir() {
+        const X: usize = 64 * 1024;
+        let cfg = |allocation_limit: Option<usize>| Config {
+            n_threads: 2,
+            max_frame_delay: 2,
+            allocation_limit,
+            ..Config::default()
+        };
+        let mut probe = Decoder::new(cfg(None)).unwrap();
+        probe.send_packet(&Packet::new(T35_PKT_1X1)).unwrap();
+        probe.flush();
+        let _ = probe.receive_frame().unwrap().unwrap();
+        let base_peak = probe.allocation_peak();
+
+        let mut unlimited = Decoder::new(cfg(None)).unwrap();
+        unlimited
+            .send_packet(&Packet::new(&make_t35_obu(X, 0x5A)))
+            .unwrap();
+        unlimited.send_packet(&Packet::new(T35_PKT_1X1)).unwrap();
+        unlimited.flush();
+        let _ = unlimited.receive_frame().unwrap().unwrap();
+        let fark = unlimited.allocation_peak().saturating_sub(base_peak);
+        assert!(
+            fark < X + X / 2,
+            "T.35 yükü tepe bütçeye bir kez eklenmeli: fark={fark}, X={X}"
+        );
+
+        let mut dec = Decoder::new(cfg(Some(base_peak + X + X / 2))).unwrap();
+        dec.send_packet(&Packet::new(&make_t35_obu(X, 0x5A)))
+            .expect("T.35 OBU bütçe içinde kabul edilmeli");
+        dec.send_packet(&Packet::new(T35_PKT_1X1))
+            .expect("T.35 yükü bir kez sayıldığında kare bütçeye sığmalı");
+        dec.flush();
+        let (frame, meta) = dec
+            .receive_frame_capi(true)
+            .unwrap()
+            .expect("kare üretilmeli");
+        assert_eq!((frame.width(), frame.height()), (1, 1));
+        assert_eq!(meta.itut_t35.len(), 1);
+        assert_eq!(meta.itut_t35[0].payload.len(), X);
     }
 }

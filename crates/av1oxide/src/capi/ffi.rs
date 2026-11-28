@@ -161,6 +161,26 @@ fn ref_into_raw(payload: RefPayload) -> *mut Dav1dRef {
     Arc::into_raw(arc) as *mut Dav1dRef
 }
 
+/// `payload`'ı yeni bir `Dav1dRef` içine yerleştirir ve C'ye verilecek alan işaretçisini
+/// (`Dav1dPicture.seq_hdr` gibi) yük son yerine konduktan **sonra** türetir.
+///
+/// `Box` taşındığında Rust'ın takma ad kuralları o kutudan daha önce türetilmiş işaretçileri
+/// geçersiz kılar. İşaretçi burada `Arc` tek sahipken (`Arc::get_mut`) alınır; kutu bundan
+/// sonra hiç taşınmaz ve son referans düşene kadar aynı yerde kalır.
+#[allow(clippy::arc_with_non_send_sync)]
+fn ref_into_raw_with_field<T>(
+    payload: RefPayload,
+    field: fn(&mut RefPayload) -> Option<&mut T>,
+) -> (*mut Dav1dRef, *mut T) {
+    let mut arc = Arc::new(Dav1dRef {
+        inner: RefInner(payload),
+    });
+    let ptr = Arc::get_mut(&mut arc)
+        .and_then(|r| field(&mut r.inner.0))
+        .map_or(core::ptr::null_mut(), |v| v as *mut T);
+    (Arc::into_raw(arc) as *mut Dav1dRef, ptr)
+}
+
 fn ref_inc(ptr: *mut Dav1dRef) -> *mut Dav1dRef {
     if !ptr.is_null() {
         // SAFETY: (1) ISA koşulu yoktur (platformdan bağımsız C-ABI referans sayımı).
@@ -432,40 +452,42 @@ fn attach_picture_metadata_parts(
     itut_t35: &[ItutT35Meta],
 ) -> Result<(), c_int> {
     if let Some(seq) = seq_hdr {
-        let mut boxed = Box::new(seq_header_to_c(seq));
-        let ptr = &mut *boxed as *mut Dav1dSequenceHeader;
-        let r = ref_into_raw(RefPayload::SeqHdr(boxed));
-        pic.seq_hdr = ptr;
-        pic.seq_hdr_ref = r;
+        let payload = RefPayload::SeqHdr(Box::new(seq_header_to_c(seq)));
+        (pic.seq_hdr_ref, pic.seq_hdr) = ref_into_raw_with_field(payload, |p| match p {
+            RefPayload::SeqHdr(b) => Some(&mut **b),
+            _ => None,
+        });
     }
     if let Some(fh) = frame_hdr {
-        let mut boxed = Box::new(frame_header_to_c(fh));
-        let ptr = &mut *boxed as *mut Dav1dFrameHeader;
-        let r = ref_into_raw(RefPayload::FrameHdr(boxed));
-        pic.frame_hdr = ptr;
-        pic.frame_hdr_ref = r;
+        let payload = RefPayload::FrameHdr(Box::new(frame_header_to_c(fh)));
+        (pic.frame_hdr_ref, pic.frame_hdr) = ref_into_raw_with_field(payload, |p| match p {
+            RefPayload::FrameHdr(b) => Some(&mut **b),
+            _ => None,
+        });
     }
     if let Some((max_cll, max_fall)) = content_light {
-        let mut boxed = Box::new(Dav1dContentLightLevel {
+        let payload = RefPayload::ContentLight(Box::new(Dav1dContentLightLevel {
             max_content_light_level: max_cll,
             max_frame_average_light_level: max_fall,
-        });
-        let ptr = &mut *boxed as *mut Dav1dContentLightLevel;
-        let r = ref_into_raw(RefPayload::ContentLight(boxed));
-        pic.content_light = ptr;
-        pic.content_light_ref = r;
+        }));
+        (pic.content_light_ref, pic.content_light) =
+            ref_into_raw_with_field(payload, |p| match p {
+                RefPayload::ContentLight(b) => Some(&mut **b),
+                _ => None,
+            });
     }
     if let Some(md) = mastering_display {
-        let mut boxed = Box::new(Dav1dMasteringDisplay {
+        let payload = RefPayload::MasteringDisplay(Box::new(Dav1dMasteringDisplay {
             primaries: md.primaries,
             white_point: md.white_point,
             max_luminance: md.max_luminance,
             min_luminance: md.min_luminance,
-        });
-        let ptr = &mut *boxed as *mut Dav1dMasteringDisplay;
-        let r = ref_into_raw(RefPayload::MasteringDisplay(boxed));
-        pic.mastering_display = ptr;
-        pic.mastering_display_ref = r;
+        }));
+        (pic.mastering_display_ref, pic.mastering_display) =
+            ref_into_raw_with_field(payload, |p| match p {
+                RefPayload::MasteringDisplay(b) => Some(&mut **b),
+                _ => None,
+            });
     }
     if !itut_t35.is_empty() {
         let mut payloads: Vec<Vec<u8>> = Vec::new();

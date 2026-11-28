@@ -340,6 +340,7 @@ fn inspect_item_dimensions(
                     "grid dimg referans sayısı rows*cols ile uyuşmuyor",
                 ));
             }
+            ensure_grid_tiles_coded(container, tiles.clone())?;
             let first_tile = tiles.next().unwrap();
             let tile_info =
                 inspect_item_dimensions(container, first_tile, depth + 1, butce, config)?;
@@ -1697,6 +1698,30 @@ fn apply_item_transforms(
     Ok(())
 }
 
+/// Grid karolarının yalnız kodlanmış `av01` öğeleri olmasını zorunlu kılar (libavif de grid
+/// karosu olarak türetilmiş öğe kabul etmez).
+///
+/// Karo olarak `grid` ya da `iden` kabul edilseydi her düzey çözme işini karo sayısıyla
+/// çarpardı: birkaç KB'lık bir dosya derinlik sınırına kadar `M^düzey` yaprak çözümü ve
+/// her düzeyde yeni iş parçacıkları isteyebilirdi. Bu denetim tek bir grid katmanı bırakır;
+/// toplam çözme işi böylece dosyadaki `dimg` referans sayısıyla doğrusal kalır.
+fn ensure_grid_tiles_coded(
+    container: &AvifContainer<'_>,
+    tile_ids: impl IntoIterator<Item = u32>,
+) -> Result<()> {
+    for tid in tile_ids {
+        let info = container
+            .item_info(tid)
+            .ok_or(Error::InvalidData("grid karosu iinf içinde bulunamadı"))?;
+        if &info.item_type != b"av01" {
+            return Err(Error::InvalidData(
+                "grid karoları yalnız kodlanmış av01 öğeleri olabilir",
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn decode_grid_tiles_into_canvas(
     container: &AvifContainer<'_>,
     grid: GridDescriptor,
@@ -1717,6 +1742,7 @@ fn decode_grid_tiles_into_canvas(
             "grid dimg referans sayısı rows*cols ile uyuşmuyor",
         ));
     }
+    ensure_grid_tiles_coded(container, tile_ids.iter().copied())?;
 
     let has_dups = is_alpha && (1..tile_ids.len()).any(|i| tile_ids[..i].contains(&tile_ids[i]));
     let mut grid_plan_guard = ButceTutucu::bos(butce);
@@ -2012,23 +2038,39 @@ fn decode_grid_wave(
             .map_err(|_| Error::AllocationFailed {
                 requested: wave_vec_bytes,
             })?;
+        /// Dalgadaki bir karonun çözüleceği yer: açılabilen iş parçacığı ya da (iş parçacığı
+        /// açılamadıysa) çağıran iş parçacığında seri çözüm.
+        enum KaroIsi<'scope> {
+            Paralel(std::thread::ScopedJoinHandle<'scope, Result<PlanarBuffer>>),
+            Seri(u32),
+        }
         std::thread::scope(|s| {
-            let mut handles = Vec::new();
+            let mut handles: Vec<KaroIsi<'_>> = Vec::new();
             handles
                 .try_reserve_exact(wave_ids.len())
                 .map_err(|_| Error::AllocationFailed {
-                    requested: wave_ids.len() * core::mem::size_of::<usize>(),
+                    requested: wave_ids.len() * core::mem::size_of::<KaroIsi<'_>>(),
                 })?;
             for &tid in wave_ids {
                 let butce_w = Arc::clone(butce);
-                handles.push(s.spawn(move || {
-                    decode_item_planar(container, tid, config, 1, is_alpha, depth + 1, &butce_w)
-                }));
+                // `Scope::spawn` iş parçacığı açılamazsa panikler; `Builder::spawn_scoped`
+                // hatayı döndürür ve karo seri yola düşer.
+                let is = std::thread::Builder::new()
+                    .spawn_scoped(s, move || {
+                        decode_item_planar(container, tid, config, 1, is_alpha, depth + 1, &butce_w)
+                    })
+                    .map_or(KaroIsi::Seri(tid), KaroIsi::Paralel);
+                handles.push(is);
             }
-            for h in handles {
-                let tile = h
-                    .join()
-                    .map_err(|_| Error::InvalidState("grid karo iş parçacığı sonlandı"))??;
+            for is in handles {
+                let tile = match is {
+                    KaroIsi::Paralel(h) => h
+                        .join()
+                        .map_err(|_| Error::InvalidState("grid karo iş parçacığı sonlandı"))??,
+                    KaroIsi::Seri(tid) => {
+                        decode_item_planar(container, tid, config, 1, is_alpha, depth + 1, butce)?
+                    }
+                };
                 wave_tiles.push(tile);
             }
             Ok::<(), Error>(())

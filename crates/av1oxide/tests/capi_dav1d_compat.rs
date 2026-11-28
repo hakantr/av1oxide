@@ -1277,7 +1277,9 @@ fn capi_apply_grain_in_place_out_equals_in_has_no_uaf_or_leak() {
         assert_eq!(pic.n_itut_t35, 1);
         assert_eq!(free_counter.load(Ordering::SeqCst), 0);
 
-        let pic_ptr: *mut Dav1dPicture = &mut pic;
+        // `&raw mut`: ara `&mut` yeniden ödünç alması oluşturmaz; böylece aşağıdaki doğrudan
+        // `pic.*` okumaları C tarafındaki gibi aynı işaretçiyle yazılan alanlarla çakışmaz.
+        let pic_ptr: *mut Dav1dPicture = &raw mut pic;
         assert_eq!(dav1d_apply_grain(ctx, pic_ptr, pic_ptr as *const _), 0);
         assert_eq!(free_counter.load(Ordering::SeqCst), 0);
         assert_eq!((*pic.content_light).max_content_light_level, 1000);

@@ -477,6 +477,160 @@ fn build_grid_and_alpha_avif(
     file
 }
 
+/// Birincil öğesi `2×2` grid olan `.avif` oluşturur; karoların türü `karo_turu` ile seçilir:
+/// `av01` doğrudan kodlanmış karo, `grid` her karosu yine `2×2` av01 grid'i olan iç içe grid,
+/// `iden` her biri tek bir av01 öğesine bakan türetilmiş karo. Tüm öğeler `1×1`'dir.
+fn build_grid_with_tile_kind(tile_obu: &[u8], karo_turu: &[u8; 4]) -> Vec<u8> {
+    // (öğe kimliği, tür, idat verisi grid tanımı mı, dimg referansları)
+    let mut items: Vec<(u16, [u8; 4], bool, Vec<u16>)> = Vec::new();
+    let mut next_id = 1u16;
+    let mut leaf = || {
+        let id = next_id;
+        next_id += 1;
+        id
+    };
+    let mut leaves: Vec<u16> = Vec::new();
+    for _ in 0..4 {
+        let id = leaf();
+        items.push((id, *b"av01", false, Vec::new()));
+        leaves.push(id);
+    }
+    let tiles: Vec<u16> = match karo_turu {
+        b"av01" => leaves,
+        b"grid" => (0..4)
+            .map(|_| {
+                let id = leaf();
+                items.push((id, *b"grid", true, leaves.clone()));
+                id
+            })
+            .collect(),
+        b"iden" => leaves
+            .iter()
+            .map(|&target| {
+                let id = leaf();
+                items.push((id, *b"iden", false, vec![target]));
+                id
+            })
+            .collect(),
+        _ => panic!("desteklenmeyen karo türü"),
+    };
+    let primary = leaf();
+    items.push((primary, *b"grid", true, tiles));
+
+    let ftyp = make_ftyp(b"avif", &[*b"mif1", *b"miaf"]);
+    let hdlr = make_hdlr_pict();
+    let pitm = make_full_box(b"pitm", 0, 0, &primary.to_be_bytes());
+
+    let mut iinf_body = (items.len() as u16).to_be_bytes().to_vec();
+    for (id, typ, _, _) in &items {
+        iinf_body.extend_from_slice(&make_infe_v2(*id, typ, None));
+    }
+    let iinf = make_full_box(b"iinf", 0, 0, &iinf_body);
+
+    let ipco = make_box(b"ipco", &make_ispe(1, 1));
+    let mut ipma_body = (items.len() as u32).to_be_bytes().to_vec();
+    for (id, _, _, _) in &items {
+        ipma_body.extend_from_slice(&id.to_be_bytes());
+        ipma_body.push(1);
+        ipma_body.push(1);
+    }
+    let ipma = make_full_box(b"ipma", 0, 0, &ipma_body);
+    let iprp = make_box(b"iprp", &[ipco, ipma].concat());
+
+    let mut iref_body = Vec::new();
+    for (id, _, _, refs) in &items {
+        if refs.is_empty() {
+            continue;
+        }
+        let mut dimg = id.to_be_bytes().to_vec();
+        dimg.extend_from_slice(&(refs.len() as u16).to_be_bytes());
+        for r in refs {
+            dimg.extend_from_slice(&r.to_be_bytes());
+        }
+        iref_body.extend_from_slice(&make_box(b"dimg", &dimg));
+    }
+    let iref = make_full_box(b"iref", 0, 0, &iref_body);
+
+    // ImageGrid: version=0, flags=0, rows_minus_one=1, cols_minus_one=1, 1×1 çıktı.
+    let grid_desc = [0u8, 0, 1, 1, 0, 1, 0, 1];
+    let mut idat_payload = grid_desc.to_vec();
+    let tile_off = idat_payload.len() as u32;
+    idat_payload.extend_from_slice(tile_obu);
+    let idat = make_box(b"idat", &idat_payload);
+
+    // iloc v1, construction_method=1 (idat); `iden` öğelerinin verisi yoktur.
+    let located: Vec<_> = items.iter().filter(|(_, t, _, _)| t != b"iden").collect();
+    let mut iloc_body = vec![0x44, 0x00];
+    iloc_body.extend_from_slice(&(located.len() as u16).to_be_bytes());
+    for (id, _, is_grid, _) in located {
+        let (off, len) = if *is_grid {
+            (0u32, grid_desc.len() as u32)
+        } else {
+            (tile_off, tile_obu.len() as u32)
+        };
+        iloc_body.extend_from_slice(&id.to_be_bytes());
+        iloc_body.extend_from_slice(&1u16.to_be_bytes());
+        iloc_body.extend_from_slice(&0u16.to_be_bytes());
+        iloc_body.extend_from_slice(&1u16.to_be_bytes());
+        iloc_body.extend_from_slice(&off.to_be_bytes());
+        iloc_body.extend_from_slice(&len.to_be_bytes());
+    }
+    let iloc = make_full_box(b"iloc", 1, 0, &iloc_body);
+
+    let meta = make_full_box(
+        b"meta",
+        0,
+        0,
+        &[hdlr, pitm, iinf, iprp, iref, iloc, idat].concat(),
+    );
+    [ftyp, meta].concat()
+}
+
+/// Grid karoları yalnız kodlanmış `av01` öğeleri olabilir. İç içe grid (ya da `iden` karo)
+/// kabul edilseydi her düzey çözme işini karo sayısıyla çarpar ve birkaç KB'lık bir dosya
+/// dakikalarca CPU ve GB'larca bellek isteyebilirdi; `parse_info` ile `decode` aynı kararı
+/// vermelidir.
+#[test]
+fn avif_grid_tiles_must_be_coded_items() {
+    let duz = build_grid_with_tile_kind(SAMPLE_1X1_AV1_OBU, b"av01");
+    let info = parse_info(&duz).expect("av01 karolu grid parse_info başarılı olmalı");
+    assert_eq!((info.width, info.height), (1, 1));
+    for n_threads in [1, 4] {
+        let img = decode_with(
+            &duz,
+            &AvifDecodeConfig {
+                n_threads,
+                ..AvifDecodeConfig::default()
+            },
+        )
+        .expect("av01 karolu grid çözülmeli");
+        assert_eq!((img.width(), img.height()), (1, 1));
+    }
+
+    for karo_turu in [b"grid", b"iden"] {
+        let avif = build_grid_with_tile_kind(SAMPLE_1X1_AV1_OBU, karo_turu);
+        assert!(
+            matches!(parse_info(&avif), Err(Error::InvalidData(_))),
+            "{} karolu grid parse_info tarafından reddedilmeli",
+            String::from_utf8_lossy(karo_turu)
+        );
+        for n_threads in [1, 4] {
+            let res = decode_with(
+                &avif,
+                &AvifDecodeConfig {
+                    n_threads,
+                    ..AvifDecodeConfig::default()
+                },
+            );
+            assert!(
+                matches!(res, Err(Error::InvalidData(_))),
+                "{} karolu grid decode tarafından reddedilmeli (n_threads={n_threads})",
+                String::from_utf8_lossy(karo_turu)
+            );
+        }
+    }
+}
+
 #[test]
 fn avif_grid_2x2_single_and_multithread_parity_and_alpha() {
     // 1x1 karolardan oluşan 2x2 grid -> 1x1 ispe kırpmasıyla alfa (1x1) ile eşleşir;
